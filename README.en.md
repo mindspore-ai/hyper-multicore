@@ -14,7 +14,7 @@ private SHMEM communication resources.
 ## Quick start
 
 Use Linux with an Ascend NPU, Python/CPU architecture matching the wheel tags, and mutually compatible
-Torch/torch-npu, CANN and driver installations. The initial build matrix uses Python 3.10 / aarch64 / CANN 9.2.0.
+Torch/torch-npu, CANN and driver installations. Source builds require CANN 9.2.0.
 Runtime selection does not impose a PTA post-release floor or a CANN version pairing. See the
 [build and installation guide](docs/build.md) for prerequisites and source builds.
 

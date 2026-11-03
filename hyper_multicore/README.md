@@ -175,7 +175,7 @@ cross-node interface selection and group-local shutdown requirements.
 ### 下游模型集成
 
 DSV4.1、Qwen 和 TP/SP/CP/EP/FSDP 模型适配器及其集成测试由 HyperParallel 下游维护。
-本仓只提供独立组件及其公共接口，不拥有模型 YAML 或旧仓训练入口，也不依赖下游来完成测试。
+本仓只提供独立组件及其公共接口，不包含模型 YAML 或下游训练入口，也不依赖下游来完成测试。
 
 ### 输入与权重
 
@@ -243,7 +243,7 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-两条路径已验证 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
+两条路径支持 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
 关闭。模块 GC 仅登记使用权释放，不执行 collective；下一个资源组
 首次 forward 时，所有 SHMEM Root rank 一起核对资源表，只复用各 rank 都无成员且无待反向图的兼容
 workspace，其余可回收的孤儿 workspace 当场释放。此协调不在已绑定模型的每步 forward 中执行。
@@ -257,7 +257,7 @@ GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图�
 这些边界仍要求所有 rank 同序进入且没有在途调用/待反向图。异常、Ctrl+C、kill 或通信故障
 不承诺安全或及时退出，不从 signal handler 中执行 collective；SIGKILL 无法执行退出钩子。
 
-需要提前释放时，仍可调用原有 `MegaMoeExperts.close()`，示例中的 `model.close()` 保持逐层关闭；
+需要提前释放时，可调用 `MegaMoeExperts.close()`，示例中的 `model.close()` 保持逐层关闭；
 共享 workspace 在最后一个成员关闭时才释放，不释放普通模型参数。所有 SHMEM Root rank 须在无在途
 调用及待反向图时同序关闭。关闭失败会保留句柄供安全条件下重试，部分关闭的模块不能再次执行。
 只有所有 rank 均成功后才移除资源记录；对称内存部分释放状态不一致或原生 shutdown 失败须重启。
