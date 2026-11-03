@@ -448,29 +448,29 @@ class _FusedTransferFunction(torch.autograd.Function):
 
 
 def execute_shared(
-    owner: Any, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
+    owner: Any, experts: Any, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
     weights: tuple[torch.Tensor, torch.Tensor], counts: torch.Tensor, copies: torch.Tensor,
     plan_tokens: int, maximum_received: int,
 ) -> torch.Tensor:
     """Use the original HP route preparation, plan, kernels and pull lease order."""
-    executor = owner._get_virtual_executor(hidden, plan_tokens, maximum_received)
-    flat = hidden.reshape(-1, owner.hidden_size)
+    executor = owner._get_virtual_executor(experts, hidden, plan_tokens, maximum_received)
+    flat = hidden.reshape(-1, experts.hidden_size)
     engine = owner._persistent_engine(flat, executor)
     # Register the bank before HP prepares/publishes the current dynamic route.
     # Its restart descriptors preserve it if token-capacity agreement grows the heap.
     with torch.inference_mode(False), torch.no_grad():
-        pool = get_expert_pool(flat, engine, owner.local_experts, owner)
+        pool = get_expert_pool(flat, engine, experts.local_experts, owner)
     owner._transfer_pool = pool
     engine, route, claimed = owner._prepare_native_route(
-        flat, ids, probs, counts, weights, executor=executor, resources=engine)
-    pull = owner.dispatch_mode == "pull"
+        flat, ids, probs, counts, weights, engine)
+    pull = experts.dispatch_mode == "pull"
     try:
         plan = engine.plan_for_tokens(
             route.metadata.plan_tokens, flat.device, weight_grad_dtype=torch.float32)
         output = _FusedTransferFunction.apply(
             flat, weights[0].contiguous(), weights[1].contiguous(), route.metadata,
             plan, engine.workspace, (route.routed_tokens, ids, route.unpermute_mapping),
-            probs if pull else None, pull, copies, pool, owner.local_experts,
+            probs if pull else None, pull, copies, pool, experts.local_experts,
         )
     finally:
         if claimed:

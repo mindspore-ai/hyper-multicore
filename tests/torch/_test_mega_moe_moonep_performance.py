@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_multicore import shmem
-from hyper_multicore.moonep.mega_moe import MoonEPMegaMoeExperts
+from hyper_multicore import MegaMoeExperts
 from tests.torch import _test_mega_moe as reference
 
 
@@ -49,7 +49,8 @@ def _rank_balanced_expert_hot_route(shape):
 
 def _measure(shape, pattern, mode):
     baseline, _ = reference.new_layers(shape, dispatch_mode=mode)
-    moon = MoonEPMegaMoeExperts(
+    moon = MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD, dispatch_mode=mode).to(
         device=reference.DEVICE, dtype=torch.bfloat16)
@@ -83,10 +84,10 @@ def _measure(shape, pattern, mode):
                   "topk_ids_distinct": True, "warmup_per_backend": warmup, "order": list(order), "samples_ms": samples,
                   "median_ms": medians, "moonep_over_baseline": ratio,
                   "speedup": 1.0 / ratio, "correctness": "output/dX/probs/dW/SGD original HP tolerances",
-                  "statistics": dict(moon._transfer_pool.statistics) if moon._transfer_pool is not None else {},
-                  "placement_statistics": dict(moon.placement_statistics),
-                  "bank_bytes": (sum(x.numel()*x.element_size() for x in moon._transfer_pool.weights)
-                                 if moon._transfer_pool is not None else 0),
+                  "statistics": dict(moon._moonep._transfer_pool.statistics) if moon._moonep._transfer_pool is not None else {},
+                  "placement_statistics": dict(moon._moonep.placement_statistics),
+                  "bank_bytes": (sum(x.numel()*x.element_size() for x in moon._moonep._transfer_pool.weights)
+                                 if moon._moonep._transfer_pool is not None else 0),
                   "native_payload": str(Path(__file__).resolve().parents[3] / "build/native/payload"),
                   "shmem_heap_bytes": shmem.debug_state().get("config", {}).get("heap_size_bytes")}
         saved_calls = result["placement_statistics"]
@@ -94,7 +95,7 @@ def _measure(shape, pattern, mode):
             assert result["statistics"]["remote_gradient_returns"] > 0
         else:
             assert saved_calls["native_balanced_calls"] + saved_calls["native_cost_skip_calls"] > 0
-            assert moon._transfer_pool is None and moon._virtual_executor is None, (
+            assert moon._moonep._transfer_pool is None and moon._moonep._virtual_executor is None, (
                 "Ordinary fast path allocated placement resources")
         print("MOONEP_AB_RESULT", json.dumps(result), flush=True)
         return result

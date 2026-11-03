@@ -342,6 +342,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
+        enable_hot_replica: bool = False,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -366,6 +367,7 @@ class MegaMoeExperts(MulticoreModule):
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
+            enable_hot_replica: Enable MoonEP placement for this module.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
                 ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
@@ -375,8 +377,9 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
-        specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+        if not isinstance(enable_hot_replica, bool):
+            raise TypeError("enable_hot_replica must be a boolean")
+        configuration = {
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
@@ -391,7 +394,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        specification["auto_tokens"] = True
+        specification = {"local_num_tokens": _COMMUNICATION_SPLIT, **configuration, "auto_tokens": True}
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -401,6 +404,17 @@ class MegaMoeExperts(MulticoreModule):
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self._initialize_module_state(specification, create_parameters=create_parameters)
+        self._moonep = None
+        if enable_hot_replica:
+            from hyper_multicore.moonep.mega_moe import MoonEPExecution
+
+            self._moonep = MoonEPExecution(configuration)
+
+    def close(self) -> None:
+        """Release borrowed-expert resources before the native execution group."""
+        if self._moonep is not None:
+            self._moonep.close()
+        super().close()
 
     def _initialize_module_state(
         self, specification: Mapping[str, Any], *, create_parameters: bool,
@@ -627,6 +641,13 @@ class MegaMoeExperts(MulticoreModule):
         )
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
+        if self._moonep is not None:
+            if self.ep_size > 1:
+                return self._moonep.forward(self, hidden_states, hidden_flat, topk_ids, topk_weights,
+                                            tokens_per_expert, weights)
+            with torch.inference_mode(False), torch.no_grad():
+                engine = self._get_execution_resources(hidden_flat)
+                engine.workspace.ensure(engine.spec, hidden_flat.dtype, hidden_flat.device)
         resources = self._get_execution_resources(hidden_flat)
         route_options = {"autograd_mask": (
             int(torch.is_grad_enabled()) | (int(hidden_flat.requires_grad) << 1)
