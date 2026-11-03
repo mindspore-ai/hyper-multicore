@@ -24,7 +24,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .build_utils import atomic_json
+from .build_utils import atomic_json, version_label
 from .command_runner import message
 
 
@@ -39,9 +39,9 @@ def safe_component(value):
 
 
 def framework_slot(identity):
-    fields = [identity[name] for name in ("python_abi", "host_arch", "torch_version", "pta_version")]
-    fields.append(int(identity["torch_cxx11_abi"]))
-    python, arch, torch, pta, abi = map(safe_component, fields)
+    python, arch = (safe_component(identity[name]) for name in ("python_abi", "host_arch"))
+    torch, pta = (version_label(identity[name]) for name in ("torch_version", "pta_version"))
+    abi = int(identity["torch_cxx11_abi"])
     # CPU is the configured Torch distribution; retain local version labels to avoid collisions.
     return f"{python}-{arch}-torch{torch.removesuffix('.cpu')}-pt{pta}-abi{abi}"
 

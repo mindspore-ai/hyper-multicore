@@ -56,7 +56,7 @@ add_compile_options(
     -Wno-macro-redefined -Wno-ignored-attributes
 )
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 hp_detect_torch_build_contract("${Python3_EXECUTABLE}" TORCH)
 
 set(TORCH_INCLUDE_ROOT "${TORCH_PACKAGE_ROOT}/include")

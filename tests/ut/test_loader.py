@@ -83,7 +83,7 @@ class TestMulticoreNative(unittest.TestCase):
         self.addCleanup(_loader.load_torch_npu.cache_clear)
         with patch.object(_loader, "_component_root", return_value=self.native_root), patch.dict(
             os.environ, {"ASCEND_HOME_PATH": str(cann.parent)}
-        ), patch.object(_loader.metadata, "version", side_effect=lambda name: {"torch": "2.7.1+cpu", "torch-npu": "2.7.1.post11"}[name]), patch.object(
+        ), patch.object(_loader, "framework_package", side_effect=lambda name: {"version": {"torch": "2.7.1+cpu", "torch_npu": "2.7.1.post11"}[name]}), patch.object(
             _loader.importlib, "import_module", side_effect=error
         ) as imports, self.assertRaisesRegex(NativeComponentUnavailableError, "PTA-IMPORT-FAILED") as raised:
             _loader.load_torch_npu()

@@ -16,18 +16,54 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+from importlib import metadata, util
 import json
 from pathlib import Path
 import re
 
 
+def framework_package(package: str) -> dict:
+    """Describe the package selected by Python, including source trees without dist-info."""
+    spec = util.find_spec(package)
+    if spec is None or not spec.submodule_search_locations:
+        raise ModuleNotFoundError(f"Missing {package} package")
+    root = Path(next(iter(spec.submodule_search_locations))).resolve()
+    version = source_package_version(root)
+    if version == "unknown":
+        try:
+            distribution = metadata.distribution(package.replace("_", "-"))
+            if Path(distribution.locate_file(package)).resolve() == root:
+                version = distribution.version
+        except metadata.PackageNotFoundError:
+            pass
+    return {"version": version, "root": str(root)}
+
+
+def source_package_version(root: Path) -> str:
+    """Read literal version declarations without importing a backend or executing source."""
+    version = "unknown"
+    for filename in ("version.py", "__init__.py"):
+        path = root / filename
+        if not path.is_file():
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeError):
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets):
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    version = node.value.value
+    return version
+
+
 def release(version: str) -> str:
-    """Extract a stable framework branch without imposing a post-release floor."""
-    match = re.fullmatch(r"(\d+\.\d+\.\d+)(?:\.post\d+)?(?:\+[a-zA-Z0-9._-]+)?", version)
-    if match is None:
-        raise ValueError(f"Unrecognized framework release: {version!r}")
-    return match[1]
+    """Extract a numeric branch, or retain an opaque label without version admission rules."""
+    match = re.match(r"[vV]?(\d+\.\d+\.\d+)", version)
+    return match[1] if match else version
 
 
 def file_sha256(path: Path) -> str:
@@ -61,7 +97,7 @@ def variant_selection_key(variant: dict):
         raise ValueError("Adapter C++ ABI must be boolean")
     key = (variant.get("torch_release"), variant.get("pta_release"), variant["torch_cxx11_abi"])
     if not all(isinstance(v, str) and release(v) == v for v in key[:2]):
-        raise ValueError("Adapter selection requires explicit stable branches")
+        raise ValueError("Adapter selection requires branch or opaque framework labels")
     return identifier, key
 
 

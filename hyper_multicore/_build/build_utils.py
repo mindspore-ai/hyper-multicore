@@ -15,10 +15,22 @@
 """Small standard-library filesystem and timing primitives shared by build modules."""
 
 from contextlib import contextmanager
+import hashlib
 import json
 from pathlib import Path
+import re
 import time
 from collections.abc import Iterator
+
+
+def version_label(version: str) -> str:
+    """Encode a framework label for filenames without imposing version syntax."""
+    label = version.lower().replace("+", ".").replace("!", ".")
+    if len(label) <= 80 and re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", label):
+        return re.sub(r"[._-]+", ".", label)
+    readable = re.sub(r"[^a-z0-9]+", ".", label).strip(".")[:64].rstrip(".") or "unknown"
+    digest = hashlib.sha256(version.encode()).hexdigest()[:12]
+    return f"{readable}.{digest}"
 
 
 def atomic_json(path: Path, value: object) -> None:

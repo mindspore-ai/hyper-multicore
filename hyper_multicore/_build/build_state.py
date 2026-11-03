@@ -55,6 +55,8 @@ class BuildContext:
         self.commands = Commands(self.directory, root=root, events=self.events)
         self.frameworks = {}
         self.common_inputs = {}
+        self.isolated = False
+        self.common_cacheable = True
         self.preflight_hashes = ProbeHashes()
         self.native_inputs = NativeInputs(self.preflight_hashes)
         self.diagnostics = CacheDiagnostics(native, self.events)

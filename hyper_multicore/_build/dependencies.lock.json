@@ -14,7 +14,7 @@
     ],
     "frameworks": {
       "torch": "not pinned by the native build",
-      "torch_npu": "build: installed Torch pairing and CANN 9.2.0; runtime: branch/ABI selection without CANN version gating",
+      "torch_npu": "default build: installed framework and CANN capabilities; --all: configured framework pairs and CANN 9.2.0; runtime: branch/ABI selection without CANN version gating",
       "torch_cxx11_abi": "reported by the active torch package"
     }
   },

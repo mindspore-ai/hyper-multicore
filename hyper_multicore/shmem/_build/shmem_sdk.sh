@@ -10,13 +10,6 @@
 # -----------------------------------------------------------------------------------------------------------
 # Private SHMEM SDK preparation for Multicore builds.
 
-_HP_NATIVE_SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-if ! declare -F hp_cann_version_at_least >/dev/null; then
-    source "${_HP_NATIVE_SCRIPT_DIR}/../../../scripts/native/cann_version.sh"
-fi
-unset _HP_NATIVE_SCRIPT_DIR
-HP_MINIMUM_CANN_VERSION="9.2.0"
-
 function hp_prepare_shmem_sdk() {
     local project_root=$1
     local soc_list=$2
@@ -37,15 +30,7 @@ function hp_prepare_shmem_sdk() {
         echo "       Source the required CANN set_env.sh before invoking the native build." >&2
         return 3
     fi
-    local cann_version
     local cann_version_file="${ASCEND_HOME_PATH}/opp/version.info"
-    cann_version=$(hp_read_cann_version "${ASCEND_HOME_PATH}")
-    if ! hp_cann_version_at_least "${cann_version}" "${HP_MINIMUM_CANN_VERSION}"; then
-        echo "HP_NATIVE_REASON_CODE=UNSUPPORTED_CANN_VERSION"
-        echo "ERROR: CANN >= ${HP_MINIMUM_CANN_VERSION} is required, found " \
-            "'${cann_version:-unknown}' under ${ASCEND_HOME_PATH}." >&2
-        return 3
-    fi
     if ! command -v "${python_bin}" >/dev/null 2>&1; then
         echo "HP_NATIVE_REASON_CODE=PYTHON_BUILD_DEPENDENCY_NOT_FOUND"
         echo "ERROR: The selected Python executable is unavailable: ${python_bin}." >&2
@@ -106,8 +91,12 @@ print(hashlib.sha256(encoded).hexdigest())
             "${bisheng_path}" --version 2>&1 || true
             "${gcc_path}" --version 2>&1 || true
             "${gxx_path}" --version 2>&1 || true
-            sha256sum "${cann_version_file}" \
-                "${project_root}/hyper_multicore/cmake/hardening.cmake" \
+            if [[ -f "${cann_version_file}" ]]; then
+                sha256sum "${cann_version_file}"
+            else
+                printf '%s\n' "cann_version_info=missing"
+            fi
+            sha256sum "${project_root}/hyper_multicore/cmake/hardening.cmake" \
                 "${project_root}/hyper_multicore/shmem/cmake/shmem_wrapper/CMakeLists.txt" \
                 "${project_root}/hyper_multicore/shmem/_build/shmem_sdk.sh"
         } | sha256sum | awk '{print substr($1, 1, 16)}'

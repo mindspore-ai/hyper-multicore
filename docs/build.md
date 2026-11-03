@@ -8,9 +8,9 @@
 | 项目 | 要求 |
 | --- | --- |
 | 系统 | Linux；CPU 架构需具备配套的 Torch/PTA wheel 和 CANN 工具链 |
-| Python | 支持 >=3.10,<3.13；构建需要 Python 开发头文件和所选框架的兼容 wheel |
+| Python | >=3.10；构建需要 Python 开发头文件和所选框架的兼容 wheel |
 | 框架 | 相互配套的 Torch、torch-npu/PTA，NumPy >=1.26,<2 |
-| Ascend | 源码构建要求 CANN toolkit/ops 9.2.0；运行环境的 PTA/CANN/driver 须彼此兼容 |
+| Ascend | 默认构建使用当前激活的 CANN toolkit/ops；`--all` 要求 CANN 9.2.0；运行环境的 PTA/CANN/driver 须彼此兼容 |
 | 构建工具 | GCC/G++、CMake >=3.18、GNU Make、Git 和 CANN 编译工具（pybind11 头文件来自 Torch） |
 
 先激活所选 Python 环境并安装配套框架，然后从源码根目录运行：
@@ -20,8 +20,7 @@ source /path/to/cann/set_env.sh
 python -m pip install -r requirements.txt setuptools wheel "packaging>=22" decorator attrs psutil
 ```
 
-CANN 路径按实际安装位置填写；GCC 版本由
-[工具链检查脚本](../scripts/check_gcc_version.sh)检查。
+CANN 路径按实际安装位置填写；编译器是否可用由实际编译和链接检查确定。
 Torch adapter 和 SHMEM binding 的 C++ 标准由目标 TorchConfig 决定。完整矩阵中的 Torch 2.14
 要求正式 C++20；仅支持早期 C++20 草案的编译器不能满足其头文件检查。
 需要时在构建前显式设置 `HYPER_MULTICORE_FRAMEWORK_CXX` 为兼容目标 op-plugin 头文件、且支持该标准的 G++。
@@ -54,8 +53,17 @@ bash hyper_multicore/build.sh --soc-list ascend910b --jobs 24
 
 `--soc-list` 选择编译目标，`--jobs` 设置并行度。`--clean` 清理 native 工作及安装输出，
 保留 Git/框架下载缓存和已准备的框架环境。`--all` 只扩大框架矩阵，
-不隐含清缓存或增加 SoC。默认路径按实际头文件、执行桥和编译能力预检，不要求达到全量矩阵的 post 版本；
-缺少能力时明确失败，不自动替换本机框架。SHMEM 为必需内部依赖。任一 native 构建或校验失败都会非零退出并停止组包。
+不隐含清缓存或增加 SoC。默认路径直接使用当前解释器安装的 Torch/PTA，不读取发布矩阵，
+不检查版本格式、发布分支、上下限或矩阵成员资格。正式版、`.dev`、`a0`、`rc` 和自定义版本标识均可进入
+实际头文件、TorchConfig、编译及执行桥链接预检；缺少能力时报告实际原因，不自动替换本机框架。
+只有 `--all` 按配置准备准确版本的框架配对。SHMEM 为必需内部依赖。任一 native 构建或校验失败都会非零退出并停止组包。
+
+默认构建保留调用者的 `PYTHONPATH`、user-site 和搜索路径，探测、编译及组包使用同一环境。
+框架以 Python 实际解析到的包位置为准；源码包无需发行元数据，版本不可得时记录为 `unknown`。
+默认构建在能力预检前打印当前 Python 路径、Torch/PTA 版本原文及安装位置，并保存到 `build.log`。
+默认路径不设置 CANN 版本门禁，以实际工具、头文件、库和编译链接能力为准。
+CANN 路径及版本写入日志和构建记录；缺少版本文件时记录为 `unknown`，不影响能力检查。
+`--all` 在准备框架环境前检查 CANN 9.2.0 基线。
 
 | 输出 | 位置 |
 | --- | --- |
@@ -85,6 +93,8 @@ wheel 和 payload 成功发布后清理本次 staging；下一次构建回收遗
 `stages.json` 采用阶段列表，记录命令、耗时、状态、退出码及 `tools.log` 的起止字节位置；
 失败和中断也保存当前阶段，错误摘要只读取该阶段区间。内部 JSON 原样返回构建器并写入工具日志。
 CANN Python 导入检查只在终端显示结果，原始输出保存在 `tools.log`。
+默认构建在无法完整发现 CANN 编译输入时执行真实构建，禁用公共资源及依赖适配对的跨构建缓存复用；
+`--all` 要求完整输入认证。框架预检按 Python 扩展模块方式编译，并在所选 Python 中加载检查符号，不执行设备计算。
 
 编译链接预检按输入复用成功记录：框架头文件/库、Torch CMake 配置、Python 开发资源、
 CANN 头文件、实际链接依赖、编译器/生成器及有效选项均参与校验。
@@ -158,7 +168,9 @@ source build/native/payload/hyper_multicore/lib/set_env.bash
 
 ## 制品内容与兼容性
 
-默认 wheel 版本包含实际 `torch-npu` 发行版本，例如 `0.1.0.dev0+pt.2.12.0`。
+默认 wheel 版本包含 `torch-npu` 的安全文件名标签，例如 `0.1.0.dev0+pt.2.12.0`，
+开发版 `2.15.0.dev20261005+git2c8682d` 对应 `0.1.0.dev0+pt.2.15.0.dev20261005.git2c8682d`。
+包含特殊字符或过长的标识使用可读前缀和摘要，版本原文完整保存在 `build_info.json`。
 `--all` 全量 wheel 使用组件版本，不带单一 PTA 后缀，例如
 `hyper_multicore-0.1.0.dev0-cp310-cp310-linux_aarch64.whl`。
 框架矩阵配置的 PTA 版本为 2.7.1.post11、2.9.0.post9、2.10.0.post7、2.11.0.post3、2.12.0.post3、2.13.0 和 2.14.0，
@@ -194,6 +206,8 @@ payload 文件及 SHA256，包括 kernel、元数据、索引、配置和激活�
 应从可信构建输入重新生成并校验清单，不能通过跳过校验打包。
 加载按 Torch/PTA 分支、Python/CPU/C++ ABI 选定唯一适配对，不比较运行 PTA post 与构建版本的大小，
 也不以外部 PTA 库 SHA256、Torch commit、CANN 版本或版本文件哈希拦截。
+数字分支后的开发日期、预发布及 local 后缀不参与选择；无法提取数字分支的标识作为不透明选择键，
+不猜测其所属发布分支。默认和全量 wheel 均声明不固定版本的 `torch` 依赖。
 缺少 PTA、缺库/符号或初始化失败时保留原始原因和选中变体；一个进程不换用其他适配对重试。
 每组快照独立保存请求及准确解析结果，相同 wheel 本体只保存一份。
 本地安装清单使用哈希、`--no-index`、`--no-deps` 和纯 wheel 模式；缺少或损坏的文件不会联网补齐。

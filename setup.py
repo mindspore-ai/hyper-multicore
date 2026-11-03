@@ -21,7 +21,6 @@ from pathlib import Path
 import shutil
 import sys
 
-from packaging.requirements import Requirement
 from setuptools import Distribution, find_packages, setup
 from setuptools.command.build_py import build_py
 
@@ -47,17 +46,12 @@ info = (
 
 
 def get_install_requires() -> list[str]:
-    """Read runtime requirements and pin Torch to an explicitly selected native build."""
+    """Read runtime requirements without constraining framework distribution versions."""
     requirements = [
         line.strip()
         for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    if info is not None and info.get("build_mode", "current") == "current":
-        requirements = [
-            f"torch=={info['torch_version']}" if Requirement(value).name.lower() == "torch" else value
-            for value in requirements
-        ]
     return requirements
 
 
@@ -96,7 +90,7 @@ setup(
     url="https://github.com/mindspore-ai/hyper-multicore",
     license="Apache-2.0",
     license_files=["LICENSE", "Third_Party_Open_Source_Software_Notice"],
-    python_requires=">=3.10,<3.13",
+    python_requires=">=3.10",
     packages=find_packages(include=["hyper_multicore", "hyper_multicore.*"]),
     install_requires=get_install_requires(),
     scripts=["scripts/hyper_multicore_set_env.bash", "scripts/hyper_multicore_build_info"],

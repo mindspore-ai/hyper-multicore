@@ -25,6 +25,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from packaging.version import Version
 
 from tests.ut.build._build_test_support import ROOT, load_module, module_for
 
@@ -85,12 +86,14 @@ class TestArtifacts(unittest.TestCase):
         self.assertEqual(HELPER.artifact_version("2.9.0.post4"), "0.1.0.dev0+pt.2.9.0.post4")
         self.assertEqual(HELPER.artifact_version("2.9.0.post4+custom.1"),
                          "0.1.0.dev0+pt.2.9.0.post4.custom.1")
-        for value in ("", "unknown"):
-            with self.assertRaises(ValueError):
-                HELPER.artifact_version(value)
+        for value in ("2.15.0.dev20261005+git2c8682d", "internal build/42", "x" * 300):
+            with self.subTest(value=value):
+                version = HELPER.artifact_version(value)
+                self.assertEqual(str(Version(version)), version)
+        self.assertNotEqual(HELPER.artifact_version("internal build/42"), HELPER.artifact_version("internal/build 42"))
 
     def test_setup_reads_requirements_and_shared_component_version(self):
-        """Source metadata follows requirements; native metadata preserves the exact Torch build."""
+        """Source and native metadata leave framework versions unconstrained."""
         root = ROOT
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -114,7 +117,7 @@ class TestArtifacts(unittest.TestCase):
                     setup_metadata = setup.call_args.kwargs
                     self.assertEqual(setup_metadata["version"], "7.8.9.dev0+pt.2.12.0" if native else "7.8.9.dev0")
                     self.assertEqual(setup_metadata["install_requires"], [
-                        "torch==2.12.0+cpu" if native else "torch", "numpy>=1.26.4,<2",
+                        "torch", "numpy>=1.26.4,<2",
                     ])
                     self.assertNotIn("extras_require", setup_metadata)
                     self.assertEqual(setup_metadata["license_files"], [
@@ -123,9 +126,9 @@ class TestArtifacts(unittest.TestCase):
 
     def test_missing_pta_is_not_guessed(self):
         """Native identity creation must fail when torch-npu is not installed."""
-        with patch.object(HELPER.sys, "version_info", (3, 11)), patch.object(
-            metadata, "version", side_effect=metadata.PackageNotFoundError("torch-npu")
-        ), self.assertRaises(metadata.PackageNotFoundError):
+        with patch.object(HELPER.sys, "version_info", (3, 13)), patch.object(
+            HELPER._MANIFEST, "framework_package", side_effect=ModuleNotFoundError("torch_npu")
+        ), self.assertRaises(ModuleNotFoundError):
             HELPER.build_identity(Path("."), "ascend910b")
 
     def test_missing_native_payload_is_rejected(self):

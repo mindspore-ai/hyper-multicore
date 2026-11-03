@@ -31,9 +31,9 @@ from . import command_runner as CONSOLE, build_workspace as WORKSPACE
 from . import preflight_cache as PREFLIGHT
 from ._bootstrap import load_module
 from .command_runner import message
-from .build_utils import atomic_json as write_json, measured
+from .build_utils import atomic_json as write_json, measured, version_label
 from .build_state import BuildContext, BuildResult, PreparedFramework
-from .native_inputs import compiler_identity, tool_inputs
+from .native_inputs import NativeInputs, compiler_identity, tool_inputs
 from .native_cache import CacheTransaction, cache_valid, hashes, CACHE_SCHEMA_VERSION
 from .build_publication import publish_wheel, publish_payload, validate_elf, validate_wheel
 
@@ -101,7 +101,7 @@ def probe_identity(python: Path, socs: str, run: BuildContext, *, source=None, e
             json.dumps(expected or {}),
         ],
         label=f"probe-{python.parent.parent.name}",
-        env=FRAMEWORK.isolated_environment(python),
+        env=FRAMEWORK.build_environment(python, isolated=run.isolated),
         capture=True,
     )
     data = json.loads(result)
@@ -111,20 +111,12 @@ def probe_identity(python: Path, socs: str, run: BuildContext, *, source=None, e
     identity = data["identity"]
     identity["torch_release"] = MANIFEST.release(identity["torch_version"])
     identity["pta_release"] = MANIFEST.release(identity["pta_version"])
-    versions = [
-        line.partition("=")[2].strip()
-        for line in identity["cann_version_info"].splitlines()
-        if line.partition("=")[0].strip() == "Version"
-    ]
-    if versions != ["9.2.0"]:
-        raise ValueError(f"Builds require CANN 9.2.0, found {versions}")
-    identity["cann_version"] = versions[0]
     return identity
 
 
-def adapter_environment(python: Path) -> dict:
+def adapter_environment(python: Path, *, isolated=False) -> dict:
     """Allow newer framework compilers without changing the CANN vendor toolchain."""
-    env = FRAMEWORK.isolated_environment(python)
+    env = FRAMEWORK.build_environment(python, isolated=isolated)
     if "HYPER_MULTICORE_FRAMEWORK_CXX" in env:
         env["CXX"] = env["HYPER_MULTICORE_FRAMEWORK_CXX"]
     return env
@@ -233,14 +225,14 @@ def _cmake_pair(
     WORKSPACE.check_workspace(directory, ROOT)
     if args.clean and directory.exists():
         shutil.rmtree(directory)
-    identifier = "pt" + identity["pta_version"].replace("+", ".") + "-" + key[:12]
+    identifier = "pt" + version_label(identity["pta_version"]) + "-" + key[:12]
     paths = {
         "torch_so": f"adapters/{identifier}/libhyper_multicore_torch.so",
         "shmem_so": f"adapters/{identifier}/hyper_multicore_shmem_torch.so",
     }
     transaction.scopes[directory] = run.native_inputs.scope({"native": inputs, "probe": probe_inputs})
     with measured(run.events, "adapter-output-validation"):
-        cached = cache_valid(directory, key)
+        cached = run.common_cacheable and cache_valid(directory, key)
     run.events.append({"stage": identifier, "cache_hit": cached, "fingerprint": key})
     if cached:
         previous = json.loads((directory / "identity.json").read_text())
@@ -258,7 +250,7 @@ def _cmake_pair(
     transaction.prepare(directory)
     payload = directory / "payload"
     payload.mkdir(parents=True, exist_ok=True)
-    env = adapter_environment(python)
+    env = adapter_environment(python, isolated=run.isolated)
     env.update(SHMEM_HOME_PATH=str(sdk), SHMEM_SOURCE_DIR=str(sdk / "shmem"))
     env["LD_LIBRARY_PATH"] = os.pathsep.join(
         [str(common / "shmem/lib"), str(common / "shmem/lib/shmem"), env.get("LD_LIBRARY_PATH", "")]
@@ -309,23 +301,20 @@ def _cmake_pair(
     }
     write_json(directory / "identity.json", record)
     completion = {"fingerprint": key, "hashes": hashes(payload), "inputs": inputs}
-    transaction.complete(directory, completion)
+    if run.common_cacheable:
+        transaction.complete(directory, completion)
     return payload, record
 
 
-def validate_toolchain() -> None:
+def validate_toolchain(*, full_matrix=False) -> None:
     """Reject unavailable common build inputs before preparing any framework environment."""
     cann = os.environ.get("ASCEND_HOME_PATH", "")
-    if not cann:
-        raise ValueError("ASCEND_HOME_PATH is missing; source the CANN 9.2.0 set_env.sh before building")
-    version_file = Path(cann) / "opp/version.info"
-    versions = [
-        line.partition("=")[2].strip()
-        for line in version_file.read_text().splitlines()
-        if line.partition("=")[0].strip() == "Version"
-    ]
-    if versions != ["9.2.0"]:
-        raise ValueError(f"Builds require CANN 9.2.0, found {versions}")
+    if not cann or not Path(cann).is_dir():
+        raise ValueError("ASCEND_HOME_PATH must identify a toolkit directory; source the CANN set_env.sh before building")
+    identity = HELPERS.cann_identity(Path(cann))
+    message(f"CANN: {identity['cann_version']}; toolkit {identity['cann_root']}")
+    if full_matrix and identity["cann_version"] != "9.2.0":
+        raise ValueError(f"--all builds require CANN 9.2.0, found {identity['cann_version']}")
     required = ("cmake", "ctest", "gcc", "g++", "make", "git", "bisheng", "asc_opc", "readelf", "ldd", "ld")
     missing = [name for name in required if shutil.which(name) is None]
     if missing:
@@ -347,7 +336,7 @@ def build(args, publication) -> Path:
 def _build(args, run: BuildContext, transaction: CacheTransaction) -> BuildResult:
     """Coordinate task phases without duplicating cache, validation or publication policy."""
     started = time.monotonic()
-    validate_toolchain()
+    validate_toolchain(full_matrix=args.all)
     run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     transaction.input_checks.append(run.native_inputs.validate)
     with measured(run.events, "framework-preparation"):
@@ -396,7 +385,8 @@ def finish_maintenance(args, run: BuildContext, result: BuildResult):
 
 def prepare_frameworks(args, run: BuildContext, transaction=None):
     """Resolve the target interpreters and validate their actual identities and interfaces."""
-    targets = FRAMEWORK.load_targets(ROOT / "hyper_multicore/_build/frameworks.lock.json")
+    run.isolated = args.all
+    targets = FRAMEWORK.load_targets(ROOT / "hyper_multicore/_build/frameworks.lock.json") if args.all else []
     base = Path(sys.executable).absolute()
     mode = f"full framework matrix: {len(targets)} targets" if args.all else "locally installed framework"
     message(
@@ -411,7 +401,7 @@ def prepare_frameworks(args, run: BuildContext, transaction=None):
             FRAMEWORK.validate_target(target)
         pythons, identities = prepare_matrix_environments(targets, run, base, args.soc_list, source)
     else:
-        message(f"Using local Python: {base}; no framework environment creation or installation")
+        report_local_framework(base)
         pythons = [base]
         message("Checking framework build identity, headers and libraries")
         identities = [probe_identity(base, args.soc_list, run, source=source)]
@@ -423,12 +413,6 @@ def prepare_frameworks(args, run: BuildContext, transaction=None):
     )
     for identity in identities:
         identity["host_cxx"] = host_cxx
-    for identity in identities:
-        if not any(
-            t["torch_release"] == identity["torch_release"] and t["pta_release"] == identity["pta_release"]
-            for t in targets
-        ):
-            raise ValueError(f"No supported build branch: {identity['torch_version']}/{identity['pta_version']}")
     if args.all:
         for target, identity in zip(targets, identities):
             if (
@@ -436,8 +420,20 @@ def prepare_frameworks(args, run: BuildContext, transaction=None):
                 or identity["pta_version"] != target["pta_build_version"]
             ):
                 raise ValueError(f"Target framework identity changed: {target['id']}")
+            if identity["cann_version"] != "9.2.0":
+                raise ValueError(f"--all builds require CANN 9.2.0, found {identity['cann_version']}")
     preflight_frameworks(args, run, pythons, identities, host_cxx, transaction)
     return targets, pythons, identities, host_cxx
+
+
+def report_local_framework(python: Path):
+    """Show installed framework facts before capability probes, without importing them."""
+    message("Using locally installed framework; no environment creation or installation")
+    message(f"  {'Python':<14}: {python}")
+    for label, name in (("Torch", "torch"), ("torch_npu", "torch_npu")):
+        package = MANIFEST.framework_package(name)
+        message(f"  {label:<14}: {package['version']}")
+        message(f"  {label + ' path':<14}: {package['root']}")
 
 
 def prepare_matrix_environments(targets, run, base, socs, source):
@@ -550,7 +546,7 @@ def preflight_inputs(python, identity, host_cxx, env, run):
 def preflight_frameworks(args, run: BuildContext, pythons, identities, host_cxx, transaction=None):
     """Reuse only certified compile/link probes; never infer success from an existing SO."""
     for index, (python, identity) in enumerate(zip(pythons, identities), 1):
-        env, version = adapter_environment(python), identity["pta_version"]
+        env, version = adapter_environment(python, isolated=run.isolated), identity["pta_version"]
         env["CXX"] = shlex.join(host_cxx["command"])
         inputs = preflight_inputs(python, identity, host_cxx, env, run)
         key = FRAMEWORK.digest_json(inputs)
@@ -606,6 +602,70 @@ def cann_python_inputs(python, probe, env, run):
     return json.loads(output.rsplit("HP_CANN_IMPORT_INPUTS=", 1)[1])
 
 
+def asc_compilation_inputs(cann: Path, env: dict) -> tuple[Path, Path, Path]:
+    """Locate the compilation entry used by the selected ASC CMake configuration."""
+    roots = [Path(env["ASC_DIR"])] if env.get("ASC_DIR") else []
+    roots.extend(Path(p) for p in env.get("CMAKE_PREFIX_PATH", "").split(os.pathsep) if p)
+    roots.append(cann)
+    if any(not root.resolve().is_relative_to(cann.resolve()) for root in roots):
+        raise ValueError("External ASC search paths cannot be fully authenticated")
+    configs = [root / suffix / name for root in roots for suffix in ("", "lib64/cmake", "lib/cmake")
+               for name in ("ASCConfig.cmake", "asc-config.cmake") if (root / suffix / name).is_file()]
+    if not configs:
+        raise ValueError("ASC CMake configuration not located for input authentication")
+    config = configs[0]
+    contents = config.read_text()
+    if "compiler/tikcpp/ascendc_kernel_cmake" not in contents:
+        raise ValueError(f"ASC compilation layout not identified: {config}")
+    custom = env.get("CUSTOM_ASC_CMAKE_PATH")
+    cmake_root = Path(custom) if custom else cann / "compiler/tikcpp/ascendc_kernel_cmake"
+    probe = cmake_root / "fwk_modules/util/ascendc_compile_kernel.py"
+    if not probe.is_file():
+        raise ValueError(f"ASC compiler Python inputs not located: {probe}")
+    return probe, config, cmake_root
+
+
+def compiler_python_inputs(files: list[str], native: NativeInputs) -> dict:
+    """Track imported compiler dependencies at their actual locations, without dist-info."""
+    inputs = {}
+    for name in files:
+        path = Path(name)
+        if not path.is_file():
+            continue
+        if "site-packages" in path.parts:
+            index = path.parts.index("site-packages")
+            package = Path(*path.parts[:index + 2])
+            if package.is_dir():
+                inputs.update(native.tree(package))
+                continue
+        inputs[str(path)] = native.file(path)
+    return inputs
+
+
+def disable_common_cache(run: BuildContext, error: Exception) -> None:
+    """Unknown compiler inputs permit development builds but never certified reuse."""
+    run.common_cacheable = False
+    message(f"CANN input discovery incomplete: {error}; "
+            "common resources and adapters will be rebuilt without cache certification", "WARN")
+
+
+def discover_cann_inputs(args: argparse.Namespace, run: BuildContext, python: Path, cann: Path, env: dict) -> dict:
+    """Unidentified local tool inputs disable reuse; matrix builds require certification."""
+    try:
+        probe, config, cmake_root = asc_compilation_inputs(cann, env)
+        files = cann_python_inputs(python, probe, env, run.commands)
+        inputs = {"config": run.native_inputs.file(config), "modules": run.native_inputs.tree(cmake_root)}
+        inputs["python_modules"] = compiler_python_inputs(files, run.native_inputs)
+        development = run.native_inputs.cann(cann, env, run.commands, files)
+    except (OSError, ValueError, RuntimeError) as error:
+        if args.all:
+            raise
+        disable_common_cache(run, error)
+        return {"asc_configuration": {}, "cann_development": {}}
+    message("CANN Python compiler imports: passed")
+    return {"asc_configuration": inputs, "cann_development": development}
+
+
 def common_inputs(args, run: BuildContext, python: Path, identity: dict):
     """Collect only source, toolchain and compiler-Python inputs consumed by common tasks."""
     common_source = common_source_fingerprint()
@@ -619,32 +679,12 @@ def common_inputs(args, run: BuildContext, python: Path, identity: dict):
     compiler["selected_cxx"] = compiler_identity(
         os.environ.get("CXX", "c++"), run.commands, "selected-common-cxx-version"
     )
-    common_env = FRAMEWORK.cann_tool_environment(python)
-    tool_packages = run.commands(
-        [
-            str(python),
-            "-c",
-            "from importlib.metadata import version; import json; print(json.dumps({n:version(n) for n in ('numpy','decorator','attrs','psutil')}))",
-        ],
-        label="cann-python-packages",
-        env=FRAMEWORK.isolated_environment(python),
-        capture=True,
-    )
+    common_env = FRAMEWORK.cann_tool_environment(python, isolated=run.isolated)
     cann = Path(common_env["ASCEND_HOME_PATH"])
-    probe = cann / "compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/util/ascendc_compile_kernel.py"
-    if not probe.is_file():
-        probe = cann / (
-            platform.machine() + "-linux/tikcpp/ascendc_kernel_cmake/fwk_modules/util/ascendc_compile_kernel.py"
-        )
-    if not probe.is_file():
-        raise ValueError(f"Missing CANN ASC compilation entry point: {probe}")
-    python_files = cann_python_inputs(python, probe, common_env, run.commands)
-    message("CANN Python compiler imports: passed")
     inputs = {
         "cache_schema": CACHE_SCHEMA_VERSION,
         "source": common_source,
         "socs": args.soc_list,
-        "compiler_python_packages": json.loads(tool_packages),
         "cann_root": identity["cann_root"],
         "cann_sha": identity["cann_version_sha256"],
         "compiler": compiler,
@@ -652,7 +692,7 @@ def common_inputs(args, run: BuildContext, python: Path, identity: dict):
         "flags": compiler_inputs(common_env),
     }
     inputs["tools"] = run.native_inputs.common_tools(compiler, common_env, run.commands)
-    inputs["cann_development"] = run.native_inputs.cann(cann, common_env, run.commands, python_files)
+    inputs.update(discover_cann_inputs(args, run, python, cann, common_env))
     common_key = FRAMEWORK.digest_json(inputs)
     run.common_inputs = inputs
     return common_key, common_env
@@ -670,7 +710,7 @@ def build_common(
     run.diagnostics.observe("Shared native resources", common_key, run.common_inputs, common_dir)
     transaction.scopes[common_dir] = run.native_inputs.scope(run.common_inputs)
     with measured(run.events, "common-output-validation"):
-        hit = cache_valid(common_dir, common_key)
+        hit = run.common_cacheable and cache_valid(common_dir, common_key)
     report_native_cache("common resources", hit)
     run.events.append(
         {
@@ -701,25 +741,32 @@ def build_common(
                 args.soc_list,
                 "--jobs",
                 str(args.jobs),
-                *(["--clean"] if args.clean else []),
+                *(["--clean"] if args.clean or not run.common_cacheable else []),
             ],
             label="common-resources",
             env=env,
         )
         transaction.check(common_dir)
-        run.native_inputs.verify_consumed(common_dir, common_env["ASCEND_HOME_PATH"])
+        if run.common_cacheable:
+            try:
+                run.native_inputs.verify_consumed(common_dir, common_env["ASCEND_HOME_PATH"])
+            except RuntimeError as error:
+                if args.all:
+                    raise
+                disable_common_cache(run, error)
         sdk_record = json.loads((common_dir / "sdk.json").read_text())
-        transaction.complete(
-            common_dir,
-            {
-                "fingerprint": common_key,
-                "hashes": hashes(common),
-                "inputs": run.common_inputs,
-                "sdk_root": sdk_record["install_root"],
-                "sdk_hashes": hashes(Path(sdk_record["install_root"])),
-                "sdk_manifest_sha256": MANIFEST.file_sha256(common_dir / "sdk.json"),
-            },
-        )
+        if run.common_cacheable:
+            transaction.complete(
+                common_dir,
+                {
+                    "fingerprint": common_key,
+                    "hashes": hashes(common),
+                    "inputs": run.common_inputs,
+                    "sdk_root": sdk_record["install_root"],
+                    "sdk_hashes": hashes(Path(sdk_record["install_root"])),
+                    "sdk_manifest_sha256": MANIFEST.file_sha256(common_dir / "sdk.json"),
+                },
+            )
     sdk = Path(json.loads((common_dir / "sdk.json").read_text())["install_root"])
     return common, sdk
 
@@ -759,7 +806,7 @@ def build_adapters(
             ),
             "compiler": run.frameworks[str(python)].tools,
             "common_path": str(common),
-            "flags": compiler_inputs(adapter_environment(python)),
+            "flags": compiler_inputs(adapter_environment(python, isolated=run.isolated)),
             "framework": {
                 k: identity[k]
                 for k in (
@@ -840,7 +887,7 @@ def assemble_payload(args, run_id, identities, outputs, records, common, common_
 
 def package_wheel(python: Path, run: BuildContext, payload: Path, info: dict, transaction: CacheTransaction):
     """Validate the complete wheel and source state before atomically publishing its path."""
-    env = FRAMEWORK.isolated_environment(python)
+    env = FRAMEWORK.build_environment(python, isolated=run.isolated)
     env["HYPER_MULTICORE_NATIVE_OUTPUT_ROOT"] = str(payload)
     wheel_dir = payload.parent / "wheel"
     run.commands(
