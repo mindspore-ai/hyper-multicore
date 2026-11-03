@@ -73,7 +73,7 @@
 | build_placement(hidden, topk_ids, counts_by_source, capacity, rank) | 共享规划入口，输入当前调用的完整计数表，返回 ExpertPlacement 或 None。供后端内部使用。 |
 | select_native_route(experts, states, expert_indices, local_counts, ep_group) | HP native 接入点，返回本次调用的 NativeDispatchSelection；返回对象负责排序、专家偏移和进入专家模块。 |
 | run_local_experts(...) | 启用借用时，在原专家模块 forward 内使用 placement 提供的参数视图执行计算。 |
-| MoonEPMegaMoeExperts.forward(..., expert_weights=...) | 融合执行入口，接受外部参数视图；输出沿用已有 token 布局。 |
+| MegaMoeExperts(..., enable_hot_replica=True) 的 forward(..., expert_weights=...) | 融合执行入口，接受外部参数视图；输出沿用已有 token 布局。 |
 
 本篇细化社区议题中的运行时设计。配套《在 HyperParallel 接入 MoonEP》定义模型配置和 HP 侧调用边界。[社区 RFC #1128](https://github.com/mindspore-ai/hyper-parallel/issues/1128) · [社区 RFC 模板](https://github.com/mindspore-ai/hyper-parallel/blob/master/.github/ISSUE_TEMPLATE/003-RFC.yml)
 

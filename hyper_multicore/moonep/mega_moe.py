@@ -34,7 +34,7 @@ from .shmem_transfer import execute_shared, get_expert_pool
 _VIRTUAL_GROUPS: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
 
 
-class MoonEPMegaMoeExperts(MegaMoeExperts):
+class MoonEPExecution:
     """Share placement with ordinary EP while keeping MegaMoE's native schedule.
 
     Route selection precedes symmetric growth and source publication. Each
@@ -42,12 +42,11 @@ class MoonEPMegaMoeExperts(MegaMoeExperts):
     module and the shared bank is leased only while an executor uses its views.
     """
 
-    def __init__(self, **configuration: Any) -> None:
+    def __init__(self, configuration: dict[str, Any]) -> None:
         """Retain the original expert configuration and defer optional resources."""
-        super().__init__(**configuration)
         self._virtual_executor = None
         self._virtual_configuration = {
-            **configuration, "num_experts": 2 * self.num_experts, "create_parameters": False,
+            **configuration, "num_experts": 2 * configuration["num_experts"], "create_parameters": False,
         }
         self._transfer_pool = None
         self.placement_statistics = {
@@ -56,18 +55,18 @@ class MoonEPMegaMoeExperts(MegaMoeExperts):
         }
 
     def _get_virtual_executor(
-        self, hidden: torch.Tensor, plan_tokens: int, maximum_received: int,
+        self, experts: MegaMoeExperts, hidden: torch.Tensor, plan_tokens: int, maximum_received: int,
     ) -> MegaMoeExperts:
         """Reserve the cold virtual workspace and expert bank in one transaction."""
         if self._virtual_executor is not None:
             return self._virtual_executor
         with torch.inference_mode(False), torch.no_grad():
             executor = MegaMoeExperts(**self._virtual_configuration)
-        target = _VIRTUAL_GROUPS.get(self._resource_group)
+        target = _VIRTUAL_GROUPS.get(experts._resource_group)
         if target is None or target.closed or target.closing:
             target = executor._resource_group
-            target.shared = self._resource_group.shared
-            _VIRTUAL_GROUPS[self._resource_group] = target
+            target.shared = experts._resource_group.shared
+            _VIRTUAL_GROUPS[experts._resource_group] = target
         else:
             if target.compatibility_key != executor._resource_group.compatibility_key:
                 raise ValueError("Shared MoonEP virtual plans require matching HP configuration")
@@ -82,15 +81,14 @@ class MoonEPMegaMoeExperts(MegaMoeExperts):
             reservations = ((specification, layout),)
         with torch.inference_mode(False), torch.no_grad():
             self._transfer_pool = get_expert_pool(
-                hidden, self._resource_group.resources, self.local_experts, self, reservations,
+                hidden, experts._resource_group.resources, experts.local_experts, self, reservations,
             )
         self._virtual_executor = executor
         return executor
 
-    def _persistent_engine(self, flat: torch.Tensor, executor: MegaMoeExperts | None = None) -> Any:
+    @staticmethod
+    def _persistent_engine(flat: torch.Tensor, executor: MegaMoeExperts) -> Any:
         """Keep persistent state writable after an inference-only first call."""
-        if executor is None:
-            executor = self
         if executor._resource_group.resources is not None:
             return executor._get_execution_resources(flat)
         with torch.inference_mode(False), torch.no_grad():
@@ -99,11 +97,10 @@ class MoonEPMegaMoeExperts(MegaMoeExperts):
     def _prepare_native_route(
         self, flat: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
         counts: torch.Tensor | None, weights: tuple[torch.Tensor, torch.Tensor],
-        executor: MegaMoeExperts | None = None, select_route: Any = None, resources: Any = None,
+        engine: Any, select_route: Any = None,
     ) -> tuple[Any, Any, bool]:
         """Allocate only the route chosen after the existing count agreement."""
-        engine = self._persistent_engine(flat, executor) if resources is None else resources
-        pull = self.dispatch_mode == "pull"
+        pull = engine.spec.dispatch_mode == "pull"
         claimed = False
 
         def prepare_workspace(tokens: int, received: int) -> None:
@@ -167,37 +164,25 @@ class MoonEPMegaMoeExperts(MegaMoeExperts):
         self, engine: Any, maximum: int, target: int, weights: tuple[torch.Tensor, torch.Tensor],
     ) -> bool:
         return placement_is_profitable(
-            maximum, target, self.hidden_size, self.intermediate_size, engine.spec.num_cube_cores,
+            maximum, target, engine.spec.hidden_size, engine.spec.intermediate_size, engine.spec.num_cube_cores,
             sum(weight.numel() * weight.element_size() for weight in weights),
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor, *,
-        tokens_per_expert: torch.Tensor | None = None,
-        expert_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+        self, experts: MegaMoeExperts, hidden_states: torch.Tensor, flat: torch.Tensor,
+        topk_ids: torch.Tensor, topk_weights: torch.Tensor, tokens_per_expert: torch.Tensor | None,
+        weights: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         """Borrow only when rank imbalance is estimated to repay its transfer cost."""
-        weights = (self.gate_up_weight, self.down_weight) if expert_weights is None else expert_weights
-        flat = self._validate_forward_inputs(
-            hidden_states, topk_ids, topk_weights, tokens_per_expert, weights,
-        )
-        if torch.npu.is_current_stream_capturing():
-            raise RuntimeError("MegaMoe push heap growth does not support graph capture")
-        if self.ep_size == 1:
-            with torch.inference_mode(False), torch.no_grad():
-                engine = self._persistent_engine(flat)
-                engine.workspace.ensure(engine.spec, flat.dtype, flat.device)
-            return super().forward(hidden_states, topk_ids, topk_weights,
-                                   tokens_per_expert=tokens_per_expert, expert_weights=weights)
         placement = None
         selected_tokens = 0
-        engine = self._persistent_engine(flat)
+        engine = self._persistent_engine(flat, experts)
 
         def select_route(gathered: torch.Tensor, tokens: int, maximum: int, total: int | None) -> bool:
             """Choose placement using the existing validated count table."""
             nonlocal placement, selected_tokens
             selected_tokens = tokens
-            target = (total + self.ep_size - 1) // self.ep_size if total is not None else tokens * self.top_k
+            target = (total + experts.ep_size - 1) // experts.ep_size if total is not None else tokens * experts.top_k
             if maximum <= target:
                 self.placement_statistics["native_balanced_calls"] += 1
             elif not self._placement_is_profitable(engine, maximum, target, weights):
@@ -210,13 +195,13 @@ class MoonEPMegaMoeExperts(MegaMoeExperts):
             return True
 
         engine, route, claimed = self._prepare_native_route(
-            flat, topk_ids, topk_weights, tokens_per_expert, weights, select_route=select_route, resources=engine,
+            flat, topk_ids, topk_weights, tokens_per_expert, weights, engine, select_route=select_route,
         )
         try:
             if placement is None:
                 return self._execute_native_route(
                     flat, topk_ids, topk_weights, weights, engine, route,
-                    self.dispatch_mode == "pull", hidden_states.shape,
+                    engine.spec.dispatch_mode == "pull", hidden_states.shape,
                 )
         finally:
             if claimed:
@@ -225,9 +210,9 @@ class MoonEPMegaMoeExperts(MegaMoeExperts):
         counts = placement.counts_by_source
         maximum_received = 0
         if self._virtual_executor is None:
-            maximum_received = int(counts.reshape(self.ep_size, self.ep_size, -1).sum((0, 2)).max().item())
+            maximum_received = int(counts.reshape(experts.ep_size, experts.ep_size, -1).sum((0, 2)).max().item())
         return execute_shared(
-            self, hidden_states, placement.virtual_ids, topk_weights, weights,
+            self, experts, hidden_states, placement.virtual_ids, topk_weights, weights,
             counts[engine.spec.rank_id], placement.copies, selected_tokens, maximum_received,
         )
 
@@ -240,4 +225,3 @@ class MoonEPMegaMoeExperts(MegaMoeExperts):
                 pool.manager.close_workspace(pool)
         if self._virtual_executor is not None:
             self._virtual_executor.close()
-        super().close()

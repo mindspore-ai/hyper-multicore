@@ -23,6 +23,7 @@ import os
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,7 +37,7 @@ from hyper_multicore.moonep import placement as placement_module
 from hyper_multicore.diagnostics import profiler as multicore_profiler, schedule as diagnostic_schedule
 from hyper_multicore.diagnostics.profiler.cycle_trace import _records_for_task
 from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
-from hyper_multicore.moonep.mega_moe import MoonEPMegaMoeExperts
+from hyper_multicore import MegaMoeExperts
 from hyper_multicore.modules.mega_moe import function as native
 from hyper_multicore.moonep.shmem_transfer import load_bridge
 from hyper_multicore.moonep import mega_moe as moon_module
@@ -54,7 +55,7 @@ _FORCED_TRANSFER_COST = False
 def _force_transfer_cost(monkeypatch: pytest.MonkeyPatch):
     """Inject only cost selection to stress real transfers on inexpensive tiny cases."""
     monkeypatch.setitem(globals(), "_FORCED_TRANSFER_COST", True)
-    with patch.object(MoonEPMegaMoeExperts, "_placement_is_profitable", return_value=True):
+    with patch.object(moon_module.MoonEPExecution, "_placement_is_profitable", return_value=True):
         yield
 
 
@@ -109,7 +110,8 @@ def _new_pair(shape, mode, layout="EIO"):
             local = reference._local_tensor(parameter)
             local.normal_(std=local.shape[-1] ** -0.5)
     reference._copy_common_weights_to_mega(common, template)
-    moon = MoonEPMegaMoeExperts(
+    moon = MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD,
                                dispatch_mode=mode, expert_weight_layout=layout).to(
@@ -163,14 +165,11 @@ def _write(records):
 
 @pytest.mark.usefixtures("_force_transfer_cost")
 def test_moonep_original_precision():
-    """Run HP's original level0 route/SGD case with the MoonEP class factory."""
-    original = reference.MegaMoeExperts
-    reference.MegaMoeExperts = MoonEPMegaMoeExperts
-    try:
+    """Run the original level0 route/SGD case with hot replicas enabled."""
+    with patch.object(reference, "new_layers", partial(reference.new_layers, enable_hot_replica=True)):
         reference.test_mega_moe_level0_balanced()
-        _write({"original_case": "test_mega_moe_level0_balanced", "passed": True})
-    finally:
-        reference.MegaMoeExperts = original
+    _write({"original_case": "test_mega_moe_level0_balanced", "passed": True})
+
 
 
 @pytest.mark.usefixtures("_force_transfer_cost")
@@ -181,7 +180,7 @@ def test_moonep_checkpoint_retained_layers():
     shape = reference.MoeShape()
     pairs = [_new_pair(shape, mode) for _ in range(3)]
     moons, commons = [pair[0] for pair in pairs], [pair[1] for pair in pairs]
-    MoonEPMegaMoeExperts.share_execution_resources(moons)
+    MegaMoeExperts.share_execution_resources(moons)
     routes = [reference._make_fixed_route(shape, pattern)
               for pattern in ("balanced", "single_destination", "skew")]
     hidden, grad = reference.make_data(shape)
@@ -208,10 +207,10 @@ def test_moonep_checkpoint_retained_layers():
             assert expected["output"].float().abs().max().item() > 1e-3
             assert expected["input_grad"].float().abs().max().item() > 1e-3
             iterations.append({"retain_graph": retained, "max_abs": _compare(expected, actual)})
-        active_pools = [layer._transfer_pool for layer in moons if layer._transfer_pool is not None]
+        active_pools = [layer._moonep._transfer_pool for layer in moons if layer._moonep._transfer_pool is not None]
         pools = {id(pool) for pool in active_pools}
         engines = [group.resources for layer in moons
-                   for executor in (layer, layer._virtual_executor) if executor is not None
+                   for executor in (layer, layer._moonep._virtual_executor) if executor is not None
                    for group in (executor._resource_group,) if group.resources is not None]
         by_geometry = {}
         for engine in engines:
@@ -222,7 +221,7 @@ def test_moonep_checkpoint_retained_layers():
             "Compatible layers did not share the original HP workspace for each plan")
         stats = dict(active_pools[0].statistics)
         assert stats["remote_prefetches"] > 0 and stats["remote_gradient_returns"] > 0
-        assert moons[0].placement_statistics["native_balanced_calls"] > 0
+        assert moons[0]._moonep.placement_statistics["native_balanced_calls"] > 0
         _write({"dispatch_mode": mode, "checkpoint_mode": checkpoint_mode,
                 "iterations": iterations, "statistics": stats,
                 "expert_banks": len(pools),
@@ -239,11 +238,11 @@ def test_moonep_stream_exception_recovery():
 
     shape = reference.MoeShape()
     original = lifecycle._new_stack(shape)
-    with patch.object(lifecycle, "MegaMoeExperts", MoonEPMegaMoeExperts):
+    with patch.object(lifecycle, "MegaMoeExperts", partial(MegaMoeExperts, enable_hot_replica=True)):
         moons = lifecycle._new_stack(shape)
     for source, target in zip(original, moons):
         target.load_state_dict(source.state_dict())
-    MoonEPMegaMoeExperts.share_execution_resources(moons)
+    MegaMoeExperts.share_execution_resources(moons)
     streams = [torch.npu.Stream() for _ in range(2)]
     records = []
     try:
@@ -268,8 +267,8 @@ def test_moonep_stream_exception_recovery():
                     assert str(error) == "injected MoonEP launch error"
                 else:
                     raise AssertionError("The injected native failure did not propagate")
-            pool = moons[0]._transfer_pool
-            workspace = moons[0]._virtual_executor._resource_group.resources.workspace
+            pool = moons[0]._moonep._transfer_pool
+            workspace = moons[0]._moonep._virtual_executor._resource_group.resources.workspace
             logical_workspace = moons[0]._resource_group.resources.workspace
             assert not pool.in_use and not workspace.in_use and not logical_workspace.in_use, (
                 "Failed launch kept a resource lease")
@@ -302,9 +301,9 @@ def test_moonep_inference_then_training():
         expected = reference.run_layer(common, hidden, ids, probs, counts, grad)
         actual = reference.run_layer(moon, hidden, ids, probs, counts, grad)
         reference.assert_results_close(expected, actual)
-        assert not any(tensor.is_inference() for tensor in moon._transfer_pool.weights)
+        assert not any(tensor.is_inference() for tensor in moon._moonep._transfer_pool.weights)
         _write({"inference_first": True, "training_afterwards": True,
-                "statistics": dict(moon._transfer_pool.statistics)})
+                "statistics": dict(moon._moonep._transfer_pool.statistics)})
     finally:
         moon.close()
 
@@ -313,7 +312,7 @@ def test_moonep_inference_then_training():
 def test_moonep_original_poisoned_buffers():
     """Reuse every original zero-token/tail/NaN test with MoonEP enabled."""
 
-    with patch.object(reference, "MegaMoeExperts", MoonEPMegaMoeExperts):
+    with patch.object(reference, "new_layers", partial(reference.new_layers, enable_hot_replica=True)):
         zeroing.test_mega_moe_poisoned_buffers()
 
 @pytest.mark.usefixtures("_force_transfer_cost")
@@ -331,7 +330,7 @@ def test_moonep_heap_rebuild_with_live_graph():
     probs = route[1].detach().clone().requires_grad_(True)
     try:
         output = _forward([moon], leaf, [probs], [route], checkpoint_mode)
-        manager = moon._transfer_pool.manager
+        manager = moon._moonep._transfer_pool.manager
         before = manager.epoch
         late_shape = reference.MoeShape(intermediate_size=512)
         late, _ = _new_pair(late_shape, mode)
@@ -347,7 +346,7 @@ def test_moonep_heap_rebuild_with_live_graph():
                           _capture([moon], output, leaf, [probs]))
         _write({"dispatch_mode": mode, "checkpoint_mode": checkpoint_mode,
                 "before_epoch": before, "after_epoch": manager.epoch, "max_abs": maxima,
-                "statistics": dict(moon._transfer_pool.statistics)})
+                "statistics": dict(moon._moonep._transfer_pool.statistics)})
     finally:
         output = None
         gc.collect()
@@ -376,7 +375,8 @@ def test_moonep_clipping_with_borrowed_experts():
                                                dispatch_mode=mode, swiglu_limit=limit).to(
                                                    device=reference.DEVICE, dtype=torch.bfloat16)
             clamp._initialize_weights(common, baseline, shape)
-            moon = MoonEPMegaMoeExperts(
+            moon = MegaMoeExperts(
+                enable_hot_replica=True,
                 **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
                 ep_group=dist.group.WORLD,
                                        dispatch_mode=mode, swiglu_limit=limit).to(
@@ -391,10 +391,10 @@ def test_moonep_clipping_with_borrowed_experts():
             actual = reference.run_layer(moon, hidden, ids, probs, counts, grad)
             reference.assert_results_close(expected, actual)
             records.append({"limit": (None, clamp._CLAMP_LIMIT)[index], "passed": True})
-        assert pairs[0][1]._transfer_pool is pairs[1][1]._transfer_pool
-        assert pairs[0][1]._transfer_pool.statistics["remote_gradient_returns"] > 0
+        assert pairs[0][1]._moonep._transfer_pool is pairs[1][1]._moonep._transfer_pool
+        assert pairs[0][1]._moonep._transfer_pool.statistics["remote_gradient_returns"] > 0
         _write({"dispatch_mode": mode, "mixed_clipping_plans": records,
-                "statistics": dict(pairs[0][1]._transfer_pool.statistics)})
+                "statistics": dict(pairs[0][1]._moonep._transfer_pool.statistics)})
     finally:
         for pair in pairs:
             for layer in pair:
@@ -481,7 +481,8 @@ def test_moonep_hotspot_profiling():
     """Profile real borrowing under a forced-profitable test policy, then return gradients."""
     shape = reference.MoeShape(local_num_tokens=128, hidden_size=512, intermediate_size=128,
                                num_experts=16, top_k=4, ep_size=2)
-    layer = MoonEPMegaMoeExperts(
+    layer = MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD, dispatch_mode=os.environ["HP_MEGA_MOE_DISPATCH_MODE"],
     ).to(device=reference.DEVICE, dtype=torch.bfloat16)
@@ -491,8 +492,8 @@ def test_moonep_hotspot_profiling():
     probabilities = probabilities.detach().requires_grad_()
     try:
         layer(hidden, ids, probabilities, tokens_per_expert=counts).backward(upstream)
-        assert layer._virtual_executor is not None
-        pool = layer._transfer_pool
+        assert layer._moonep._virtual_executor is not None
+        pool = layer._moonep._transfer_pool
         before = dict(pool.statistics)
         layer.zero_grad(set_to_none=True)
         hidden.grad = probabilities.grad = None
@@ -505,7 +506,7 @@ def test_moonep_hotspot_profiling():
             profiler.step()
         path = Path(os.environ["HP_MEGA_MOE_PROFILE_RESULT_DIR"]) / f"rank{reference.RANK}_moon_trace.json"
         trace = profiler.export_chrome_trace(path)
-        resources = layer._virtual_executor._resource_group.resources
+        resources = layer._moonep._virtual_executor._resource_group.resources
         plan = resources.plan_for_tokens(shape.local_num_tokens, reference.DEVICE)
         assert plan.spec.num_experts == 2 * shape.num_experts
         _assert_complete_moon_forward_trace(trace, plan.spec)
@@ -518,7 +519,7 @@ def test_moonep_hotspot_profiling():
         dist.all_reduce(transfers)
         prefetches, gradient_returns = transfers.cpu().tolist()
         assert prefetches > 0 and gradient_returns > 0
-        assert layer.placement_statistics["moonep_calls"] >= 2
+        assert layer._moonep.placement_statistics["moonep_calls"] >= 2
         trace["megaKernelCycleTrace"].update(
             testMoonForcedProfitable=True, testMoonRemotePrefetches=prefetches,
             testMoonRemoteGradientReturns=gradient_returns, testMoonVirtualExperts=plan.spec.num_experts)
@@ -535,7 +536,8 @@ def test_moonep_distinct_geometries_and_streams():
     mode = os.environ["HP_MEGA_MOE_DISPATCH_MODE"]
     shapes = [reference.MoeShape(intermediate_size=size) for size in (128, 512, 256)]
     originals = [lifecycle._new_stack(shape, layers=1)[0] for shape in shapes]
-    moons = [MoonEPMegaMoeExperts(
+    moons = [MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD,
                                   dispatch_mode=mode).to(device=reference.DEVICE, dtype=torch.bfloat16)
@@ -552,7 +554,7 @@ def test_moonep_distinct_geometries_and_streams():
                 for index, (left, right) in enumerate(zip(expected, actual)):
                     torch.testing.assert_close(right, left, rtol=2e-2, atol=1e-5,
                                                msg=f"distinct geometry step={step} tensor={index}")
-        assert len({id(layer._transfer_pool) for layer in moons}) == len(shapes)
+        assert len({id(layer._moonep._transfer_pool) for layer in moons}) == len(shapes)
         _write({"dispatch_mode": mode, "intermediate_sizes": [shape.intermediate_size for shape in shapes],
                 "streams": 2, "microbatches": 2, "checkpoint_modes": [False, True]})
     finally:
@@ -575,7 +577,8 @@ def test_moonep_external_weights():
             **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
             ep_group=dist.group.WORLD,
                                             dispatch_mode=mode, create_parameters=False)
-        moon = MoonEPMegaMoeExperts(
+        moon = MegaMoeExperts(
+            enable_hot_replica=True,
             **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
             ep_group=dist.group.WORLD,
                                     dispatch_mode=mode, create_parameters=False)
@@ -610,7 +613,8 @@ def test_moonep_profitability_policy():
     mode = os.environ["HP_MEGA_MOE_DISPATCH_MODE"]
     shape = reference.MoeShape()
     baseline, common = reference.new_layers(shape, dispatch_mode=mode)
-    moon = MoonEPMegaMoeExperts(
+    moon = MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD,
                                 dispatch_mode=mode).to(device=reference.DEVICE, dtype=torch.bfloat16)
@@ -626,13 +630,13 @@ def test_moonep_profitability_policy():
                 actual = reference.run_layer(moon, hidden, ids, probs, counts, upstream)
                 reference.assert_results_close(expected, original)
                 reference.assert_results_close(expected, actual)
-                assert moon._virtual_executor is None, "Skipped route created a virtual workspace"
-                assert moon._transfer_pool is None, "Skipped route created an expert bank"
+                assert moon._moonep._virtual_executor is None, "Skipped route created a virtual workspace"
+                assert moon._moonep._transfer_pool is None, "Skipped route created an expert bank"
                 records.append({"pattern": pattern, "passed": True})
-        assert moon.placement_statistics["native_balanced_calls"] == 2
-        assert moon.placement_statistics["native_cost_skip_calls"] == 1
+        assert moon._moonep.placement_statistics["native_balanced_calls"] == 2
+        assert moon._moonep.placement_statistics["native_cost_skip_calls"] == 1
         _write({"dispatch_mode": mode, "production_policy": True,
-                "scenarios": records, "placement": dict(moon.placement_statistics)})
+                "scenarios": records, "placement": dict(moon._moonep.placement_statistics)})
     finally:
         moon.close()
         baseline.close()
@@ -644,7 +648,8 @@ def test_moonep_alternating_production_routes():
     shape = reference.MoeShape(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
                                num_experts=16, top_k=8)
     baseline, common = reference.new_layers(shape, dispatch_mode=mode)
-    moon = MoonEPMegaMoeExperts(
+    moon = MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD,
                                 dispatch_mode=mode).to(device=reference.DEVICE, dtype=torch.bfloat16)
@@ -678,13 +683,13 @@ def test_moonep_alternating_production_routes():
         expected = _run(baseline)
         actual = _run(moon)
         maxima = _compare(expected, actual)
-        assert moon.placement_statistics["native_balanced_calls"] >= 2
-        assert moon.placement_statistics["moonep_calls"] >= 2
-        assert moon._transfer_pool.statistics["remote_gradient_returns"] >= 2
+        assert moon._moonep.placement_statistics["native_balanced_calls"] >= 2
+        assert moon._moonep.placement_statistics["moonep_calls"] >= 2
+        assert moon._moonep._transfer_pool.statistics["remote_gradient_returns"] >= 2
         _write({"production_policy": True, "dispatch_mode": mode, "checkpoint_mode": checkpoint_mode,
                 "routes": ["balanced", "single_destination", "balanced", "single_destination"],
-                "max_abs": maxima, "placement": dict(moon.placement_statistics),
-                "statistics": dict(moon._transfer_pool.statistics)})
+                "max_abs": maxima, "placement": dict(moon._moonep.placement_statistics),
+                "statistics": dict(moon._moonep._transfer_pool.statistics)})
     finally:
         gc.collect()
         moon.close()
@@ -695,7 +700,8 @@ def test_moonep_fastpath_work_counts():
 
     shape = reference.MoeShape()
     baseline, _ = reference.new_layers(shape, dispatch_mode="push")
-    moon = MoonEPMegaMoeExperts(
+    moon = MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD).to(
         device=reference.DEVICE, dtype=torch.bfloat16)
@@ -745,7 +751,7 @@ def test_moonep_fastpath_work_counts():
             assert counter["host_tolist"]["calls"] == 10
             assert counter.get("global_synchronize", {"calls": 0})["calls"] == 0
             records[tag] = counter
-        assert moon._virtual_executor is None and moon._transfer_pool is None
+        assert moon._moonep._virtual_executor is None and moon._moonep._transfer_pool is None
         start = time.perf_counter()
         for _ in range(1000):
             with torch.inference_mode(False), torch.no_grad():
@@ -760,7 +766,8 @@ def test_moonep_native_inference_growth():
     """A cost-skipped inference hotspot may grow ordinary storage before training."""
     shape = reference.MoeShape()
     baseline, common = reference.new_layers(shape, dispatch_mode="push")
-    moon = MoonEPMegaMoeExperts(
+    moon = MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD).to(
         device=reference.DEVICE, dtype=torch.bfloat16)
@@ -777,8 +784,8 @@ def test_moonep_native_inference_growth():
         expected = reference.run_layer(common, hidden, ids, probabilities, counts, upstream)
         actual = reference.run_layer(moon, hidden, ids, probabilities, counts, upstream)
         reference.assert_results_close(expected, actual)
-        assert moon._virtual_executor is None
-        _write({"native_inference_growth": True, "placement": dict(moon.placement_statistics)})
+        assert moon._moonep._virtual_executor is None
+        _write({"native_inference_growth": True, "placement": dict(moon._moonep.placement_statistics)})
     finally:
         moon.close()
         baseline.close()
@@ -796,7 +803,7 @@ def test_moonep_dynamic_shared_tokens():
         pairs = [_new_pair(base_shape, mode, layout) for _ in range(2)]
         moons = [pair[0] for pair in pairs]
         commons = [pair[1] for pair in pairs]
-        MoonEPMegaMoeExperts.share_execution_resources(moons)
+        MegaMoeExperts.share_execution_resources(moons)
         retained = []
         try:
             warm_shape = base_shape
@@ -804,7 +811,7 @@ def test_moonep_dynamic_shared_tokens():
             warm_route = reference._make_fixed_route(warm_shape, "single_destination")
             with torch.inference_mode():
                 _forward(moons, warm_hidden, [warm_route[1]] * 2, [warm_route] * 2, "none")
-            manager = moons[0]._transfer_pool.manager
+            manager = moons[0]._moonep._transfer_pool.manager
             initial_epoch = manager.epoch
             ordinary = moons[0]._resource_group.resources
             assert ordinary.workspace.forward_event_counters is None, (
@@ -826,7 +833,7 @@ def test_moonep_dynamic_shared_tokens():
                 expected = _forward(commons, source_common, common_probs, routes, "none")
                 actual = _forward(moons, source_moon, moon_probs, routes, checkpoint_mode)
                 reference.assert_close("dynamic output", actual, expected)
-                resources = moons[0]._virtual_executor._resource_group.resources
+                resources = moons[0]._moonep._virtual_executor._resource_group.resources
                 epochs.append(manager.epoch)
                 capacities.append({"input_rows": [lengths[rank % len(lengths)] for rank in range(world_size)],
                                    "epoch": manager.epoch,
@@ -850,12 +857,12 @@ def test_moonep_dynamic_shared_tokens():
                     reference.assert_close("dynamic dW", actual_grad, expected_grad)
                 for parameter in moon.parameters():
                     assert parameter.grad.stride() == parameter.stride()
-            pool = moons[0]._transfer_pool
+            pool = moons[0]._moonep._transfer_pool
             assert pool.statistics["remote_gradient_returns"] > 0
             assert pool.manager.epoch > initial_epoch
             assert pool.manager.epoch == epochs[-1], "Backward replay grew a previously committed route"
-            assert (moons[0]._virtual_executor._resource_group.resources
-                    is moons[1]._virtual_executor._resource_group.resources)
+            assert (moons[0]._moonep._virtual_executor._resource_group.resources
+                    is moons[1]._moonep._virtual_executor._resource_group.resources)
             assert all(not tensor.is_inference() for tensor in pool.weights)
             records.append({"layout": layout, "source_lengths": [0, 129, 257, 64, 513, 128],
                             "initial_epoch": initial_epoch, "final_epoch": pool.manager.epoch,
@@ -874,7 +881,8 @@ def test_moonep_hotspot() -> None:
     shape = reference.MoeShape()
     mode = os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     baseline, common = reference.new_layers(shape)
-    moon = MoonEPMegaMoeExperts(
+    moon = MegaMoeExperts(
+        enable_hot_replica=True,
         **{key: value for key, value in asdict(shape).items() if key != "local_num_tokens"},
         ep_group=dist.group.WORLD,
                                dispatch_mode=mode).to(device=reference.DEVICE, dtype=torch.bfloat16)
@@ -896,7 +904,7 @@ def test_moonep_hotspot() -> None:
             return result
 
         with patch.object(placement_module, "allocate_experts", side_effect=recorded_allocate), \
-             patch.object(MoonEPMegaMoeExperts, "_placement_is_profitable", return_value=True):
+             patch.object(moon_module.MoonEPExecution, "_placement_is_profitable", return_value=True):
             actual = reference.run_layer(moon, hidden, ids, probs, counts, grad)
         assert placements and any(expert >= 0 for plan in placements for row in plan for expert in row), (
             "Hotspot allocator never assigned a borrowed expert")
@@ -905,7 +913,7 @@ def test_moonep_hotspot() -> None:
             "Hotspot placement did not assign an expert to a remote rank")
         reference.assert_results_close(expected, original)
         reference.assert_results_close(expected, actual)
-        pool = moon._transfer_pool
+        pool = moon._moonep._transfer_pool
         assert pool is not None, "Hotspot did not create a shared expert bank"
         assert pool.statistics["remote_prefetches"] > 0, "Hotspot never fetched borrowed experts"
         assert pool.statistics["remote_gradient_returns"] > 0, "Hotspot never returned borrowed gradients"
