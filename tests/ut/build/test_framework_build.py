@@ -19,11 +19,61 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 import pytest
 from tests.ut.build._build_test_support import ROOT, load_module, make_target, cached_resolution
 ENV = load_module("framework_environments")
 BUILD = load_module("build_controller")
+
+
+@pytest.fixture(name="local_preparation")
+def _local_preparation(monkeypatch, tmp_path):
+    """Exercise real framework dispatch while substituting expensive capability probes."""
+    version = "private build/42"
+    identity = dict.fromkeys(("torch_version", "pta_version"), version)
+    identity.update(cann_version="9.1.0.dev-local", cann_version_info="Version=9.1.0.dev-local\n")
+    monkeypatch.setattr(BUILD.MANIFEST, "framework_package", lambda name: {
+        "version": version, "root": str(tmp_path / "installed" / name)})
+    monkeypatch.setattr(BUILD.HELPERS, "_source_identity", lambda root: {})
+    monkeypatch.setattr(BUILD, "compiler_identity", lambda *_: {})
+    run = BUILD.BuildContext(ROOT, tmp_path / "native")
+    def _probe(*_args, **_kwargs):
+        run.events.append({"stage": "probe"})
+        return json.dumps({"identity": identity, "paths": {}, "timings": {}})
+    run.commands = _probe
+    return SimpleNamespace(all=False, soc_list="ascend910b", jobs=1), run, identity
+
+
+def test_current_framework_ignores_release_matrix(local_preparation, monkeypatch, capsys):
+    """Local versions reach capability checks even when the release matrix is unavailable."""
+    args, run, identity = local_preparation
+    def _unavailable(_path):
+        raise ValueError("missing or damaged release matrix")
+    monkeypatch.setattr(ENV, "load_targets", _unavailable)
+    probed = []
+    monkeypatch.setattr(BUILD, "preflight_frameworks", lambda *values: probed.extend(values[3]))
+    targets, _, identities, _ = BUILD.prepare_frameworks(args, run)
+    assert targets == [] and probed == identities
+    output = capsys.readouterr().out
+    assert identity["pta_version"] in output and "Torch" in output and "torch_npu" in output
+    assert "installed/torch" in output and "installed/torch_npu" in output
+
+
+@pytest.mark.parametrize("mismatch", ["framework", "cann"])
+def test_matrix_framework_still_requires_exact_pair(local_preparation, monkeypatch, mismatch):
+    """Matrix preparation cannot substitute the caller's development release for a locked pair."""
+    args, run, _ = local_preparation
+    args.all = True
+    target = ENV.load_targets(ROOT / "hyper_multicore/_build/frameworks.lock.json")[0]
+    monkeypatch.setattr(ENV, "load_targets", lambda _: [target])
+    identity = {"torch_version": target["torch_version"], "pta_version": target["pta_build_version"], "cann_version": "9.2.0"}
+    field = "pta_version" if mismatch == "framework" else "cann_version"
+    identity[field] = "2.15.0.dev20261005+git42" if mismatch == "framework" else "9.1.0"
+    monkeypatch.setattr(BUILD, "prepare_matrix_environments", lambda *_: ([Path(sys.executable)], [identity]))
+    monkeypatch.setattr(BUILD, "attach_framework_environments", lambda *_: None)
+    with pytest.raises(ValueError, match="Target framework identity changed|--all builds require CANN"):
+        BUILD.prepare_frameworks(args, run)
 
 
 def test_install_uses_verified_local_list_and_no_dependency_download(tmp_path):
@@ -102,30 +152,76 @@ def test_framework_compiler_override_does_not_change_common_toolchain():
         assert ENV.os.environ["CXX"] == "/system/g++"
 
 
-def test_cann_python_paths_are_scoped_to_compiler_workers(tmp_path):
-    """CANN tools need their imports, while pip must not inspect unrelated CANN distributions."""
-    cann = tmp_path / "cann"
-    paths = [cann / "python/site-packages", cann / "opp/built-in/op_impl/ai_core/tbe"]
-    for path in paths:
-        path.mkdir(parents=True)
-    python = Path("/owned/venv/bin/python")
-    with patch.dict(ENV.os.environ, {"ASCEND_HOME_PATH": str(cann), "PYTHONPATH": "/old/framework:/user/source"}):
-        installed = ENV.isolated_environment(python)
-        compiler = ENV.cann_tool_environment(python)
-    assert "PYTHONPATH" not in installed
-    assert compiler["PYTHONPATH"].split(ENV.os.pathsep) == list(map(str, paths))
-    assert compiler["HI_PYTHON"] == str(python)
-
-
-def test_cann_precheck_fails_before_framework_installation(tmp_path):
-    """A wrong CANN installation must be rejected before preparing the release matrix."""
+def test_cann_precheck_only_restricts_the_full_matrix(tmp_path, monkeypatch):
+    """Local toolkits reach capability checks; the full matrix retains its CANN baseline."""
     function = BUILD.validate_toolchain
     with patch.dict(BUILD.os.environ, {}, clear=True), pytest.raises(ValueError, match="source the CANN"):
         function()
     (tmp_path / "opp").mkdir()
-    (tmp_path / "opp/version.info").write_text("Version=9.1.0\n")
-    with patch.dict(BUILD.os.environ, {"ASCEND_HOME_PATH": str(tmp_path)}), pytest.raises(ValueError, match="9.2.0"):
+    version_file = tmp_path / "opp/version.info"
+    version_file.write_text("Version=9.1.0.dev-local\n")
+    monkeypatch.setattr(BUILD.shutil, "which", lambda name: f"/tools/{name}")
+    with patch.dict(BUILD.os.environ, {"ASCEND_HOME_PATH": str(tmp_path)}):
         function()
+        with pytest.raises(ValueError, match="--all builds require CANN 9.2.0"):
+            function(full_matrix=True)
+        version_file.unlink()
+        assert BUILD.HELPERS.cann_identity(tmp_path)["cann_version_sha256"] is None
+        function()
+        version_file.write_text("Version=9.2.0\n")
+        function(full_matrix=True)
+        monkeypatch.setattr(BUILD.shutil, "which", lambda name: None if name == "bisheng" else f"/tools/{name}")
+        with pytest.raises(ValueError, match="Missing native build tools.*bisheng"):
+            function()
+
+
+def test_local_environment_preserves_source_paths_and_partial_cann_layout(tmp_path):
+    """Developer imports and user-site settings survive all local build phases."""
+    cann = tmp_path / "cann"
+    modules = cann / "python/site-packages"
+    modules.mkdir(parents=True)
+    caller = {"ASCEND_HOME_PATH": str(cann), "PYTHONPATH": "/source/torch:/source/pta",
+              "PYTHONNOUSERSITE": "0", "CPATH": "/custom/headers", "Torch_DIR": "/source/cmake"}
+    python = Path(sys.executable)
+    with patch.dict(os.environ, caller):
+        environment = BUILD.adapter_environment(python)
+        compiler = ENV.cann_tool_environment(python)
+        assert all(environment[k] == v for k, v in caller.items())
+        assert compiler["PYTHONPATH"].split(os.pathsep) == ["/source/torch", "/source/pta", str(modules)]
+        assert compiler["PYTHONNOUSERSITE"] == "0"
+        isolated = ENV.cann_tool_environment(python, isolated=True)
+        assert isolated["PYTHONPATH"] == str(modules)
+        assert isolated["HI_PYTHON"] == str(python)
+        assert "PYTHONPATH" not in ENV.build_environment(python, isolated=True)
+
+
+def test_source_package_identity_ignores_unrelated_distribution(tmp_path, monkeypatch):
+    """No dist-info is required; build and runtime share the resolved source identity."""
+    manifest = BUILD.MANIFEST
+    package = tmp_path / "torch_npu"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "torch_npu", raising=False)
+    with patch.object(manifest.metadata, "distribution", side_effect=manifest.metadata.PackageNotFoundError):
+        assert manifest.framework_package("torch_npu") == {"root": str(package), "version": "unknown"}
+        (package / "version.py").write_text("__version__ = 'private build/42'\n")
+        assert manifest.framework_package("torch_npu")["version"] == "private build/42"
+
+
+def test_shmem_sdk_uses_tool_checks_without_a_cann_version_floor(tmp_path):
+    """The real shell SDK path reaches its tool checks on an older local CANN."""
+    cann = tmp_path / "cann"
+    (cann / "opp").mkdir(parents=True)
+    (cann / "opp/version.info").write_text("Version=9.1.0\n")
+    empty_path = tmp_path / "bin"
+    empty_path.mkdir()
+    result = subprocess.run(["/bin/bash", "-c", 'source "$1"; hp_prepare_shmem_sdk "$2" ascend910b 1',
+        "sdk-check", str(ROOT / "hyper_multicore/shmem/_build/shmem_sdk.sh"), str(ROOT)],
+        env={"PATH": str(empty_path), "PYTHON_BIN": sys.executable, "ASCEND_HOME_PATH": str(cann)},
+        text=True, capture_output=True, check=False)
+    assert result.returncode == 4 and "BUILD_TOOL_NOT_FOUND" in result.stdout
+    assert "UNSUPPORTED_CANN_VERSION" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("minor, forwarded", [(7, False), (14, True)])
@@ -143,6 +239,14 @@ def test_op_plugin_compilation_uses_actual_torch_branch(tmp_path, minor, forward
         header = torch / "include/torch/headeronly/version.h"
         header.parent.mkdir(parents=True)
     header.write_text(definitions)
+    cann = tmp_path / "cann"
+    (cann / "opp").mkdir(parents=True)
+    (cann / "opp/version.info").write_text("Version=9.2.0\n")
+    module = SimpleNamespace(__file__=str(torch / "__init__.py"),
+        version=SimpleNamespace(git_version="fixture"), _C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True))
+    with patch.dict(os.environ, ASCEND_HOME_PATH=str(cann)):
+        identity = BUILD.HELPERS.identity_metadata(ROOT, "ascend910b", module, "private torch/42", "custom pta/42", {}, {})
+    assert identity["op_plugin_version"] == f"V2R{minor}" and identity["torch_version"] == "private torch/42"
     plugin.write_text("#define V2R7 6\n#define V2R12 11\n#define V2R14 13\n#define VERSION_NEWEST V2R14\n")
     script = tmp_path / "check.cmake"
     script.write_text('include("%s")\nhp_detect_op_plugin_version("%s" "%s" selected)\nif(NOT selected STREQUAL "V2R%d")\nmessage(FATAL_ERROR "wrong branch")\nendif()\n' %

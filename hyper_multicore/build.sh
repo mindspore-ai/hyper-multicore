@@ -13,7 +13,6 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 source "${PROJECT_ROOT}/scripts/native/cann_version.sh"
-HP_MINIMUM_CANN_VERSION="9.2.0"
 BUILD_DIR="${PROJECT_ROOT}/build"
 NATIVE_ROOT="${BUILD_DIR}/native"
 WORK_ROOT="${HP_NATIVE_WORK_ROOT:-${NATIVE_ROOT}/work/multicore}"
@@ -326,11 +325,7 @@ if [[ -z "${ASCEND_HOME_PATH:-}" || ! -d "${ASCEND_HOME_PATH}" ]]; then
 fi
 CANN_VERSION_FILE="${ASCEND_HOME_PATH}/opp/version.info"
 CANN_VERSION=$(hp_read_cann_version "${ASCEND_HOME_PATH}")
-if [[ "${CANN_VERSION}" != "9.2.0" ]]; then
-    fail "UNSUPPORTED_CANN_VERSION" \
-        "CANN >= ${HP_MINIMUM_CANN_VERSION} is required, found " \
-        "'${CANN_VERSION:-unknown}' under ${ASCEND_HOME_PATH}." 3
-fi
+CANN_VERSION=${CANN_VERSION:-unknown}
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
     fail "PYTHON_BUILD_DEPENDENCY_NOT_FOUND" \
@@ -354,8 +349,6 @@ raise SystemExit(0 if find_spec("torch_npu") is not None else 1)
             "The selected Python must provide matching torch and torch_npu packages." 5
     fi
 
-source "${PROJECT_ROOT}/scripts/check_gcc_version.sh"
-check_gcc_version || fail "UNSUPPORTED_GCC" "Host GCC is outside the supported build range." 6
 
 MULTICORE_VENDOR_CMAKE="${PROJECT_ROOT}/hyper_multicore/cmake/vendor"
 
@@ -458,7 +451,11 @@ function calculate_vendor_fingerprint() {
                 "multicore_lock=${MULTICORE_LOCK_DIGEST}" \
                 "shmem_toolchain=${HP_SHMEM_TOOLCHAIN_KEY}" \
                 "arch=$(uname -m)"
-            sha256sum "${CANN_VERSION_FILE}"
+            if [[ -f "${CANN_VERSION_FILE}" ]]; then
+                sha256sum "${CANN_VERSION_FILE}"
+            else
+                printf '%s\n' "cann_version_info=missing"
+            fi
             sha256sum "${asc_opc_path}"
             sha256sum \
                 hyper_multicore/build.sh \

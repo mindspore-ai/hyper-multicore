@@ -141,8 +141,6 @@ raise SystemExit(0 if find_spec("torch_npu") is not None else 1)
         "The active Python environment must provide matching torch and torch_npu packages." 4
 fi
 
-source "${PROJECT_ROOT}/scripts/check_gcc_version.sh"
-check_gcc_version || fail "UNSUPPORTED_GCC" "Host GCC is outside the supported build range." 5
 source "${PROJECT_ROOT}/hyper_multicore/shmem/_build/shmem_sdk.sh"
 CURRENT_REASON_CODE="SHMEM_SDK_BUILD_FAILED"
 hp_prepare_shmem_sdk "${PROJECT_ROOT}" "${SOC_LIST}" "${NATIVE_JOBS}" "${CLEAN}"

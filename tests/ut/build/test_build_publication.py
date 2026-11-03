@@ -29,6 +29,19 @@ CACHE = load_module("native_cache")
 LAYOUT = BUILD.WORKSPACE
 
 
+def test_wheel_metadata_does_not_pin_framework_versions():
+    """Default wheels retain generic dependencies while recording the exact build separately."""
+    publication = load_module("build_publication")
+    info = {"build_mode": "current", "artifact_version": "0.1.0.dev0+pt.internal.42", "torch_version": "private torch/42"}
+    prefix = f"Name: hyper-multicore\nVersion: {info['artifact_version']}\nRequires-Dist: "
+    archive = SimpleNamespace(read=lambda _: (prefix + "torch\n").encode())
+    publication.validate_wheel_metadata(archive, "METADATA", info)
+    for requirement in ("torch==2.15.0.dev20261005+cpu", "torch @ https://example.invalid/torch.whl"):
+        archive = SimpleNamespace(read=lambda _, value=requirement: (prefix + value + "\n").encode())
+        with pytest.raises(ValueError, match="without a version constraint"):
+            publication.validate_wheel_metadata(archive, "METADATA", info)
+
+
 @pytest.fixture(name="staged_build")
 def _staged_build(tmp_path, monkeypatch):
     """Replace expensive workers while running the real transaction and publishers."""
@@ -45,7 +58,7 @@ def _staged_build(tmp_path, monkeypatch):
     def _prepare(_args, _context, guard):
         guard.input_checks.append(_validate)
         return [{"pta_release": "2.12.0"}], [Path(sys.executable)], [{}], {}
-    replacements = {"ROOT": tmp_path, "NATIVE": tmp_path / "native", "validate_toolchain": lambda: None,
+    replacements = {"ROOT": tmp_path, "NATIVE": tmp_path / "native", "validate_toolchain": lambda **_: None,
         "prepare_frameworks": _prepare, "common_inputs": lambda *_: ("key", {}),
         "build_common": lambda *_: (tmp_path / "common", tmp_path / "sdk"),
         "build_adapters": lambda *_: ([], [{"pta_version": "2.12.0"}]),

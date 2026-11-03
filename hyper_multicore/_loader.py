@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import ctypes
-from importlib import metadata, util
 import json
 from functools import lru_cache
 import importlib
@@ -29,7 +28,9 @@ from types import ModuleType
 from contextlib import contextmanager
 from threading import RLock
 
-from hyper_multicore._native_manifest import check_integrity, read_manifest, resource_path, select_variant
+from hyper_multicore._native_manifest import (
+    framework_package, check_integrity, read_manifest, resource_path, select_variant,
+)
 
 _VENDOR_NAME = "hyper_multicore_nn"
 _NATIVE_LOCK = RLock()
@@ -48,7 +49,7 @@ def diagnostic_context() -> str:
               "host_arch": platform.machine(), "cann_version": "unknown"}
     for package in ("torch", "torch-npu"):
         try:
-            actual[package] = metadata.version(package)
+            actual[package] = framework_package(package.replace("-", "_"))["version"]
         except Exception:  # Diagnostics must not replace the original import/load failure.
             actual[package] = "unavailable"
     try:
@@ -76,8 +77,8 @@ def load_torch_npu() -> ModuleType:
     native initialization. Failed imports are not cached and may be retried.
     """
     try:
-        metadata.version("torch-npu")
-    except metadata.PackageNotFoundError as error:
+        framework_package("torch_npu")
+    except ModuleNotFoundError as error:
         raise NativeComponentUnavailableError(
             f"[HYPER-MULTICORE-PTA-NOT-INSTALLED] Python={sys.executable}; install torch-npu "
             f"for your Torch/CANN environment. Inspect hyper_multicore_build_info for packaged branches. {diagnostic_context()}"
@@ -135,15 +136,15 @@ def get_multicore_paths() -> tuple[Path, Path]:
 def _runtime_identity() -> dict:
     """Read branch and ABI selectors without comparing external binary fingerprints."""
     try:
-        pta = metadata.version("torch-npu")
-    except metadata.PackageNotFoundError as error:
+        pta = framework_package("torch_npu")["version"]
+    except ModuleNotFoundError as error:
         raise NativeComponentUnavailableError(
             f"[HYPER-MULTICORE-PTA-NOT-INSTALLED] Python={sys.executable}; "
             "install matching Torch/PTA/CANN; inspect hyper_multicore_build_info."
         ) from error
     import torch
 
-    actual = {"torch_version": metadata.version("torch"), "pta_version": pta,
+    actual = {"torch_version": str(getattr(torch, "__version__", "unknown")), "pta_version": pta,
               "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
               "host_arch": platform.machine(), "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
               "cann_version": "unknown"}

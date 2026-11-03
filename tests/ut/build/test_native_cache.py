@@ -133,17 +133,6 @@ def test_make_dependencies_include_escaped_paths_and_cmake_modules(tmp_path):
     assert PROBE.dependency_files(tmp_path, None, {}, "2.12.0") == sorted([header, module])
 
 
-def test_conda_python_can_use_shared_library_when_static_config_is_stale(tmp_path):
-    shared = put(tmp_path / "libpython3.10.so")
-    values = {"LIBDIR": str(tmp_path), "LDVERSION": "3.10", "LDLIBRARY": "libpython3.10.a"}
-    function = HELPERS.python_development_library
-    with patch.object(module_for(function).sysconfig, "get_config_var", side_effect=values.get):
-        assert function() == shared
-        shared.unlink()
-        with pytest.raises(RuntimeError, match="Missing Python development library"):
-            function()
-
-
 def native_inputs():
     return INPUTS.NativeInputs(BUILD.HELPERS.ProbeHashes())
 
@@ -269,13 +258,11 @@ def test_fixed_slot_input_change_is_a_miss_but_matching_corruption_is_rejected(t
         BUILD.cache_valid(tmp_path, "old")
 
 
-def test_development_trees_and_python_library_are_content_inputs(tmp_path):
+def test_development_trees_are_content_inputs(tmp_path):
     paths = {"python_include": str(tmp_path / "python/include"),
-             "torch_cmake": str(tmp_path / "torch/share/cmake"),
-             "python_library": str(put(tmp_path / "python/libpython.so"))}
+             "torch_cmake": str(tmp_path / "torch/share/cmake")}
     files = [put(Path(paths["python_include"]) / "Python.h"),
-             put(Path(paths["torch_cmake"]) / "TorchConfig.cmake"),
-             Path(paths["python_library"])]
+             put(Path(paths["torch_cmake"]) / "TorchConfig.cmake")]
     (tmp_path / "cann/include").mkdir(parents=True)
     digest = HELPERS._sha256
     before = PROBE.development_inputs(paths, tmp_path / "cann", digest)
@@ -302,7 +289,7 @@ def test_adapter_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeyp
             put(directory / "payload/hyper_multicore_shmem_torch.so", data)
             state["source"] = data
     monkeypatch.setattr(BUILD, "NATIVE", tmp_path)
-    monkeypatch.setattr(BUILD, "adapter_environment", lambda _: {})
+    monkeypatch.setattr(BUILD, "adapter_environment", lambda _, **_kw: {})
     monkeypatch.setattr(BUILD, "validate_elf", lambda *_: None)
     monkeypatch.setattr(load_module("native_cache"), "source_observation", lambda: state["source"])
     context = BUILD.BuildContext(ROOT, tmp_path)
@@ -320,6 +307,10 @@ def test_adapter_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeyp
     commands.clear()
     assert _build()[1]["native_build_identity"] == record["native_build_identity"]
     assert not commands
+    context.common_cacheable = False
+    commands.clear()
+    _build()
+    assert commands and not (directory / "complete.json").exists()
 
 
 def test_common_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeypatch):
@@ -339,7 +330,7 @@ def test_common_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeypa
     context.commands = _worker
     def _build():
         with BUILD.CacheTransaction() as guard:
-            return BUILD.build_common(SimpleNamespace(clean=False, jobs=1, soc_list="ascend910b"),
+            return BUILD.build_common(SimpleNamespace(all=False, clean=False, jobs=1, soc_list="ascend910b"),
                 context, Path(sys.executable), key, {"ASCEND_HOME_PATH": str(tmp_path / "cann")}, guard)
     with pytest.raises(RuntimeError, match="changed"):
         _build()
@@ -350,6 +341,17 @@ def test_common_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeypa
     commands.clear()
     _build()
     assert not commands
+    context.common_cacheable = False
+    commands.clear()
+    _build()
+    assert "--clean" in commands[0] and not (directory / "complete.json").exists()
+
+    context.common_cacheable = True
+    def incomplete(*_args):
+        raise RuntimeError("Consumed CANN input is missing from native identity")
+    monkeypatch.setattr(context.native_inputs, "verify_consumed", incomplete)
+    _build()
+    assert context.common_cacheable is False and not (directory / "complete.json").exists()
 
 
 def test_restoring_source_bytes_during_build_is_still_rejected(tmp_path):
@@ -386,7 +388,7 @@ def test_python_headers_invalidate_preflight_and_adapter_across_builds(tmp_path,
         "torch_libraries_sha256", "libtorch_npu_sha256", "cann_version_sha256"), "fixed")
     identity.update(torch_version="2.12.0+cpu", pta_version="2.12.0.post3", pta_release="2.12.0",
         python_abi="cp310", host_arch="aarch64", torch_cxx11_abi=True, cann_root=str(tmp_path / "cann"))
-    development = {"python_include": str(include), "python_library": str(library), "torch_cmake": str(cmake)}
+    development = {"python_include": str(include), "torch_cmake": str(cmake)}
     slot = BUILD.WORKSPACE.framework_slot(identity)
     common_dir = native / "common" / BUILD.WORKSPACE.common_slot("ascend910b")
     args = SimpleNamespace(clean=False, jobs=1, soc_list="ascend910b")
@@ -428,3 +430,45 @@ def test_python_headers_invalidate_preflight_and_adapter_across_builds(tmp_path,
     assert results == [(False, False, False), (False, True, False), (True, True, True)]
     assert not any(label.startswith(("compile-", "preflight-compile-")) for label in commands)
     assert (native / "variants" / slot / "payload/libhyper_multicore_torch.so").read_text(encoding="utf-8") == "B"
+
+
+def test_default_incomplete_cann_discovery_builds_without_certification(tmp_path):
+    """An alternate toolkit reaches actual compilation; the release matrix remains strict."""
+    context = BUILD.BuildContext(ROOT, tmp_path / "native")
+    python = Path(sys.executable)
+    env = {"ASCEND_HOME_PATH": str(tmp_path)}
+    args = SimpleNamespace(all=False)
+    assert BUILD.discover_cann_inputs(args, context, python, tmp_path, env) == {
+        "asc_configuration": {}, "cann_development": {}}
+    assert context.common_cacheable is False
+    args.all = True
+    with pytest.raises(ValueError, match="ASC CMake configuration"):
+        BUILD.discover_cann_inputs(args, context, python, tmp_path, env)
+
+
+def test_probe_load_error_does_not_certify_success(tmp_path):
+    """Successful linking alone cannot hide an unresolved extension symbol."""
+    work, worker = probe_fixture(tmp_path)
+    def run(command, **kwargs):
+        if kwargs.get("label", "").startswith("preflight-load-"):
+            raise RuntimeError("undefined symbol: PyUnresolved")
+        return worker(command, **kwargs)
+    with pytest.raises(RuntimeError, match="undefined symbol"):
+        ensure(work, run)
+    assert not (work / "complete.json").exists()
+
+
+def test_asc_overrides_never_authenticate_a_different_configuration(tmp_path):
+    """ASC_DIR takes precedence; unknown external search inputs disable local reuse."""
+    cann = tmp_path / "cann"
+    first = put(cann / "selected/ASCConfig.cmake", "compiler/tikcpp/ascendc_kernel_cmake")
+    other = put(cann / "other/ASCConfig.cmake", "different configuration")
+    put(cann / "compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/util/ascendc_compile_kernel.py")
+    env = {"ASC_DIR": str(first.parent), "CMAKE_PREFIX_PATH": str(other.parent)}
+    assert BUILD.asc_compilation_inputs(cann, env)[1] == first
+    env["ASC_DIR"] = str(put(tmp_path / "external/ASCConfig.cmake").parent)
+    context = BUILD.BuildContext(ROOT, tmp_path / "native")
+    BUILD.discover_cann_inputs(SimpleNamespace(all=False), context, Path(sys.executable), cann, env)
+    assert context.common_cacheable is False
+    with pytest.raises(ValueError, match="External ASC search paths"):
+        BUILD.discover_cann_inputs(SimpleNamespace(all=True), context, Path(sys.executable), cann, env)

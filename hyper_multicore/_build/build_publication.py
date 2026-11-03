@@ -131,17 +131,15 @@ def validate_wheel_record(archive, record_path, names):
 
 
 def validate_wheel_metadata(archive, metadata_path, info):
-    """Keep the component version and default/full Torch dependency rules unchanged."""
+    """Verify the component identity and unconstrained framework dependency."""
     metadata = BytesParser().parsebytes(archive.read(metadata_path))
     if metadata["Name"].replace("_", "-") != "hyper-multicore" or metadata["Version"] != info["artifact_version"]:
         raise ValueError("Wheel distribution identity mismatch")
     from packaging.requirements import Requirement
 
     torch = [Requirement(v) for v in metadata.get_all("Requires-Dist", []) if Requirement(v).name.lower() == "torch"]
-    if len(torch) != 1 or (info["build_mode"] == "all" and str(torch[0].specifier)):
-        raise ValueError("Incorrect full-matrix Torch dependency")
-    if info["build_mode"] == "current" and str(torch[0].specifier) != "==" + info["torch_version"]:
-        raise ValueError("Incorrect default-wheel Torch dependency")
+    if len(torch) != 1 or str(torch[0].specifier) or torch[0].url:
+        raise ValueError("Wheel must declare Torch without a version constraint or direct URL")
 
 
 def validate_wheel_payload(archive, names, payload, info):

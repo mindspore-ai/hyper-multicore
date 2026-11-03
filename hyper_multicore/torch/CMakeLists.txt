@@ -12,7 +12,7 @@ if(NOT HP_MULTICORE_VENDOR_ROOT OR
         "hyper_multicore_nn vendor")
 endif()
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
 hp_detect_torch_build_contract("${Python3_EXECUTABLE}" TORCH)
 hp_detect_op_plugin_version("${TORCH_PACKAGE_ROOT}" "${TORCH_NPU_PACKAGE_ROOT}" TORCH_OP_PLUGIN_VERSION)

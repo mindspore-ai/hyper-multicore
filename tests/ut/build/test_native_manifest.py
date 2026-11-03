@@ -24,8 +24,9 @@ from unittest.mock import patch
 import pytest
 
 from hyper_multicore import _loader
-from hyper_multicore._native_manifest import check_integrity, read_manifest, resource_path, select_variant
+from hyper_multicore._native_manifest import check_integrity, file_sha256, read_manifest, release, resource_path, select_variant
 from tests.ut.build.test_artifacts import _payload_fixture
+from tests.ut.build._build_test_support import load_module
 
 
 @pytest.fixture(name="payload")
@@ -35,13 +36,34 @@ def _payload(tmp_path):
     return tmp_path, info, read_manifest(tmp_path)
 
 
-@pytest.mark.parametrize("pta", ["2.12.0", "2.12.0.post99+local"])
+@pytest.mark.parametrize("pta", ["2.12.0", "2.12.0.post99+local", "2.12.0.dev20261005+git42"])
 def test_same_branch_has_no_build_version_floor(payload, pta):
     """Earlier and later post versions select the same branch without hash or CANN gates."""
     _, _, manifest = payload
     actual = {"torch_version": "2.12.0+cpu", "pta_version": pta, "python_abi": "cp310",
               "host_arch": "aarch64", "torch_cxx11_abi": True, "cann_version": "unknown"}
     assert select_variant(manifest, actual)["id"] == "fixture"
+
+
+def test_opaque_framework_labels_preserve_provenance_and_safe_names(payload):
+    """Custom labels survive payload validation without being guessed into a release branch."""
+    root, info, manifest = payload
+    helper = load_module("artifacts")
+    versions = {"torch_version": "private torch/42", "pta_version": "internal pta/42"}
+    selector = {"torch_release": release(versions["torch_version"]), "pta_release": release(versions["pta_version"])}
+    info["variants"][0].update(versions, **selector)
+    manifest["variants"][0].update(versions, **selector)
+    (root / "adapters/manifest.json").write_text(json.dumps(manifest))
+    info["payload_sha256"]["adapters/manifest.json"] = file_sha256(root / "adapters/manifest.json")
+    info.update(versions, artifact_version=helper.artifact_version(versions["pta_version"]))
+    helper.validate_payload(root, info)
+    manifest = read_manifest(root)
+    actual = {**versions, "python_abi": "cp310", "host_arch": "aarch64", "torch_cxx11_abi": True}
+    assert select_variant(manifest, actual)["id"] == "fixture"
+    slot = load_module("build_workspace").framework_slot({**actual, **selector})
+    assert "/" not in slot and " " not in slot and len(slot) < 255
+    with pytest.raises(ValueError, match="found 0"):
+        select_variant(manifest, {**actual, "pta_version": "2.12.0"})
 
 
 @pytest.mark.parametrize("relative", ["../outside", "/tmp/outside"])
@@ -100,13 +122,13 @@ def test_shared_registration_lock_and_terminal_failure():
 
 
 def test_pta_absence_and_import_error_have_distinct_causes():
-    """Missing distribution metadata is distinguished from a broken installed backend."""
+    """Missing package code is distinguished from a broken installed backend."""
     _loader.load_torch_npu.cache_clear()
-    with patch.object(_loader.metadata, "version", side_effect=_loader.metadata.PackageNotFoundError("torch-npu")):
+    with patch.object(_loader, "framework_package", side_effect=ModuleNotFoundError("torch_npu")):
         with pytest.raises(_loader.NativeComponentUnavailableError, match="PTA-NOT-INSTALLED"):
             _loader.load_torch_npu()
     error = OSError("libascendcl.so not found")
-    with patch.object(_loader.metadata, "version", return_value="2.12.0"), patch.object(_loader.importlib, "import_module", side_effect=error):
+    with patch.object(_loader, "framework_package", return_value={"version": "unknown"}), patch.object(_loader.importlib, "import_module", side_effect=error):
         with pytest.raises(_loader.NativeComponentUnavailableError, match="PTA-IMPORT-FAILED.*libascendcl") as caught:
             _loader.load_torch_npu()
         assert caught.value.__cause__ is error

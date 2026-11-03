@@ -40,8 +40,6 @@ def development_inputs(paths, cann, digest):
         for path in sorted(directory.rglob("*")):
             if path.is_file():
                 files[str(path)] = digest(path)
-    library = Path(paths["python_library"])
-    files[str(library)] = digest(library)
     return files
 
 
@@ -195,6 +193,9 @@ def ensure_probe(work, key, args, python, env, run, version, digest, guard, root
         run(
             ["cmake", "--build", str(work), "--parallel", str(args.jobs)], label=f"preflight-compile-{version}", env=env
         )
+        run([str(python), "-c", "import ctypes,os,sys,torch; ctypes.CDLL(sys.argv[1], mode=os.RTLD_NOW)",
+             str(work / "libhyper_multicore_framework_probe.so")],
+            label=f"preflight-load-{version}", env=env, capture=True)
         verify_configured_tools(work, contract, digest)
         complete_probe(work, key, digest, env, run, version, started, guard, write_json)
     except BaseException:

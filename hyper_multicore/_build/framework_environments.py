@@ -123,14 +123,20 @@ def isolated_environment(python: Path) -> dict:
     return env
 
 
-def cann_tool_environment(python: Path) -> dict:
-    """Expose only the selected CANN tool modules to native compiler workers, never to pip."""
-    env = isolated_environment(python)
+def build_environment(python: Path, *, isolated=False) -> dict:
+    """Use the caller's development environment unless a matrix venv is selected."""
+    env = isolated_environment(python) if isolated else dict(os.environ)
+    env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    return env
+
+
+def cann_tool_environment(python: Path, *, isolated=False) -> dict:
+    """Add available toolkit modules without replacing developer search paths."""
+    env = build_environment(python, isolated=isolated)
     cann = Path(env["ASCEND_HOME_PATH"]).resolve()
     paths = [cann / "python/site-packages", cann / "opp/built-in/op_impl/ai_core/tbe"]
-    if not all(path.is_dir() for path in paths):
-        raise ValueError(f"Missing installed CANN compiler Python paths: {paths}")
-    env["PYTHONPATH"] = os.pathsep.join(map(str, paths))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [env.get("PYTHONPATH", ""),
+                                                   *(str(p) for p in paths if p.is_dir())]))
     env["HI_PYTHON"] = str(python)
     return env
 

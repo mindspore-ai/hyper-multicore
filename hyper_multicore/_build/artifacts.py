@@ -17,11 +17,12 @@
 from __future__ import annotations
 import argparse
 import hashlib
-from importlib import metadata, util
+from importlib import metadata
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import sysconfig
@@ -29,6 +30,7 @@ import time
 from contextlib import contextmanager
 from packaging.version import Version
 from ._bootstrap import load_module
+from .build_utils import version_label
 
 COMPONENT_VERSION = "0.1.0.dev0"
 _MANIFEST = load_module("native_manifest")
@@ -57,16 +59,25 @@ def artifact_version(pta_version: str) -> str:
         pta_version: Full installed torch-npu version, preserving post releases.
 
     Returns:
-        PEP 440 artifact version. A PTA local version is flattened into local-label segments.
-
-    Raises:
-        ValueError: If the version is empty or cannot be represented.
+        Component version with a safe local label; the original PTA version remains in metadata.
     """
-    if not pta_version.strip():
-        raise ValueError("torch-npu version is required for native artifacts")
-    parsed = Version(pta_version)
-    label = str(parsed).replace("+", ".").replace("!", ".")
-    return str(Version(f"{COMPONENT_VERSION}+pt.{label}"))
+    return str(Version(f"{COMPONENT_VERSION}+pt.{version_label(pta_version)}"))
+
+
+def torch_op_plugin_version(torch_root: Path) -> str:
+    """Read the compiled Torch interface version independently of its distribution label."""
+    header = torch_root / "include/torch/csrc/api/include/torch/version.h"
+    contents = header.read_text()
+    if re.search(r"^#include <torch/headeronly/version.h>", contents, re.MULTILINE):
+        header = torch_root / "include/torch/headeronly/version.h"
+        contents = header.read_text()
+    numbers = []
+    for component in ("MAJOR", "MINOR"):
+        values = re.findall(rf"^#define TORCH_VERSION_{component} ([0-9]+)", contents, re.MULTILINE)
+        if len(values) != 1:
+            raise RuntimeError(f"Missing or ambiguous Torch {component} definition in {header}")
+        numbers.append(values[0])
+    return f"V{numbers[0]}R{numbers[1]}"
 
 
 def _sha256(path: Path) -> str:
@@ -156,27 +167,27 @@ def header_digest(directory, digest_file):
     return digest.hexdigest()
 
 
-def framework_versions(expected, timings):
+def verify_package_versions(expected: dict, timings: dict) -> None:
+    """Check recorded matrix packages without imposing local release requirements."""
     with identity_phase(timings, "package_versions"):
         actual = {name: metadata.version(name) for name in expected}
         if actual != expected:
             raise RuntimeError(f"Framework environment changed: {actual!r} != {expected!r}")
-        return metadata.version("torch"), metadata.version("torch-npu")
 
 
 def build_identity(root: Path, soc_list: str, *, source=None, timings=None, expected_versions=None) -> dict:
     """Collect the original identity with per-call shared inputs and separate diagnostics."""
     timings = {} if timings is None else timings
-    if not (3, 10) <= sys.version_info[:2] < (3, 13):
-        raise RuntimeError("Native builds require Python >=3.10,<3.13")
-    torch_version, pta_version = framework_versions(expected_versions or {}, timings)
+    if sys.version_info[:2] < (3, 10):
+        raise RuntimeError("Native builds require Python >=3.10")
+    verify_package_versions(expected_versions or {}, timings)
+    pta = _MANIFEST.framework_package("torch_npu")
+    pta_version = pta["version"]
     with identity_phase(timings, "framework_import"):
         import torch
-    spec = util.find_spec("torch_npu")
-    if spec is None or spec.origin is None:
-        raise RuntimeError("torch_npu package is required")
-    pta_root = Path(spec.origin).resolve().parent
+    pta_root = Path(pta["root"])
     torch_root = Path(torch.__file__).resolve().parent
+    torch_version = str(getattr(torch, "__version__", "unknown"))
     headers_root = pta_root / "include" / "third_party" / "op-plugin"
     if not (headers_root / "op_plugin/include/npu_cpp_extension.h").is_file():
         raise RuntimeError(f"Missing installed op-plugin header: {headers_root}")
@@ -208,50 +219,46 @@ def build_identity(root: Path, soc_list: str, *, source=None, timings=None, expe
     return info
 
 
-def identity_metadata(root, soc_list, torch, torch_version, pta_version, headers, source):
-    cann_root = Path(os.environ["ASCEND_HOME_PATH"])
+def cann_identity(cann_root: Path) -> dict:
+    """Record local toolkit facts without requiring a particular version or version file."""
     cann_version = cann_root / "opp/version.info"
-    parsed = Version(torch_version)
+    contents = cann_version.read_text() if cann_version.is_file() else ""
+    versions = [line.partition("=")[2].strip() for line in contents.splitlines()
+                if line.partition("=")[0].strip() == "Version"]
+    return {
+        "cann_root": str(cann_root.resolve()),
+        "cann_version": ", ".join(versions) or "unknown",
+        "cann_version_info": contents,
+        "cann_version_sha256": _sha256(cann_version) if cann_version.is_file() else None,
+    }
+
+
+def identity_metadata(root, soc_list, torch, torch_version, pta_version, headers, source):
     return {
         "schema_version": 1,
         "component_version": COMPONENT_VERSION,
         "artifact_version": artifact_version(pta_version),
         "pta_version": pta_version,
         "torch_version": torch_version,
-        "op_plugin_version": f"V{parsed.major}R{parsed.minor}",
+        "op_plugin_version": torch_op_plugin_version(Path(torch.__file__).resolve().parent),
         "torch_commit": getattr(torch.version, "git_version", None),
         "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
         "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
         "host_arch": platform.machine(),
         "soc_list": soc_list.split(","),
-        "cann_root": str(cann_root.resolve()),
-        "cann_version_info": cann_version.read_text(),
-        "cann_version_sha256": _sha256(cann_version),
+        **cann_identity(Path(os.environ["ASCEND_HOME_PATH"])),
         "op_plugin_headers_sha256": hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest(),
         "dependency_lock_sha256": _sha256(root / "hyper_multicore/_build/dependencies.lock.json"),
         **source,
     }
 
 
-def python_development_library():
-    """Conda may advertise a removed static archive while shipping CMake's shared library."""
-    directory = Path(sysconfig.get_config_var("LIBDIR"))
-    version = sysconfig.get_config_var("LDVERSION") or sysconfig.get_config_var("VERSION")
-    candidates = [directory / f"libpython{version}.so", directory / sysconfig.get_config_var("LDLIBRARY")]
-    for path in candidates:
-        if path.is_file():
-            return path.resolve()
-    raise RuntimeError(f"Missing Python development library; checked {candidates}")
-
-
 def probe_details():
     """Return build-only development paths without changing the framework identity schema."""
     import torch
 
-    library = python_development_library()
     return {
         "python_include": sysconfig.get_paths()["include"],
-        "python_library": str(library.resolve()),
         "torch_cmake": str(Path(torch.__file__).resolve().parent / "share/cmake"),
     }
 

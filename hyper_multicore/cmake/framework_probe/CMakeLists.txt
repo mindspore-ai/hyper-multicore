@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(hyper_multicore_framework_probe LANGUAGES CXX)
 include(${CMAKE_CURRENT_LIST_DIR}/../torch_compat.cmake)
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 hp_detect_torch_build_contract("${Python3_EXECUTABLE}" TORCH)
 hp_detect_op_plugin_version("${TORCH_PACKAGE_ROOT}" "${TORCH_NPU_PACKAGE_ROOT}" TORCH_OP_PLUGIN_VERSION)
 add_library(hyper_multicore_framework_probe SHARED probe.cpp)
@@ -17,6 +17,3 @@ target_include_directories(hyper_multicore_framework_probe PRIVATE
 target_link_libraries(hyper_multicore_framework_probe PRIVATE
     ${TORCH_PACKAGE_ROOT}/lib/libc10.so ${TORCH_PACKAGE_ROOT}/lib/libtorch.so
     ${TORCH_PACKAGE_ROOT}/lib/libtorch_cpu.so ${TORCH_NPU_PACKAGE_ROOT}/lib/libtorch_npu.so)
-
-target_link_libraries(hyper_multicore_framework_probe PRIVATE Python3::Python)
-target_link_options(hyper_multicore_framework_probe PRIVATE -Wl,--no-undefined)

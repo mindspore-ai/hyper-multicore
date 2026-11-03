@@ -4,7 +4,6 @@
 #include <c10/core/StorageImpl.h>
 #include <torch/torch.h>
 #include "cached_op_api.h"
-#include "aclnnop/aclnn_silu.h"
 #include "torch_npu/csrc/aten/common/from_blob.h"
 #include "torch_npu/csrc/core/npu/NPUFunctions.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
@@ -25,5 +24,7 @@ void hyper_multicore_framework_probe(at::Tensor tensor) {
   storage->set_data_ptr(at::DataPtr(nullptr, nullptr, nullptr, tensor.device()));
   storage->set_nbytes(0);
   (void)at_npu::native::from_blob(nullptr, {0}, [](void *) {}, tensor.options(), c10::optional<c10::Device>(tensor.device()));
-  HYPER_EXEC_NPU_CMD_EXT(aclnnSilu, tensor, tensor);
+  int64_t num_out_tokens = 0;
+  bool padded_mode = false;
+  HYPER_EXEC_NPU_CMD_EXT(aclnnMoeTokenPermute, tensor, tensor, num_out_tokens, padded_mode, tensor, tensor);
 }
