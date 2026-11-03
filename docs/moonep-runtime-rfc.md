@@ -64,7 +64,7 @@
 | 可维护性 | 公共规划位于 hyper_multicore/moonep 的 placement、allocator、render 模块；native、precision、execution 管理 native 路径；mega_moe、shmem_transfer 和 csrc 管理融合路径。变更放置策略时，两后端须通过同一套路由守恒检查。 |
 | 能力边界 | 当前构建包含面向 Ascend A3 的设备内核。INT32 路由范围、EP 拓扑和输入计数均需满足约束。MegaMoE 当前拒绝 stream capture。估算常数在其他设备上的适用性需要单独标定。 |
 
-**评审待决事项。** 第一，是否以当前 A3 代价模型作为首版启发式，并将其他设备的标定单独验收。第二，EP4/EP8 多次前向后的 BF16 累积梯度应采用何种参考与判据。原 PR 记录过该压力场景存在偏差；本次迁移的通过项不能证明该问题已关闭。[原 PR 的验证说明](https://github.com/mindspore-ai/hyper-parallel/pull/1393)
+**评审待决事项。** 是否以当前 A3 代价模型作为首版启发式，并将其他设备的标定单独验收。
 
 ## 相关的RFCs和API
 
@@ -88,3 +88,18 @@
 ## 其他补充说明
 
 本轮 A3 构建生成含分配器、SHMEM bridge 和传输内核的 hyper-multicore wheel。规划及 MegaMoE 相关单测 90/90 通过。已安装 wheel 的双卡 push 14/14、pull 7/7 通过。以上是迁移后的功能验证。原 PR 中每卡 4,096 token 热点场景约 2.45–2.48 倍的前反向加速来自迁移前的模块基准，本轮未重新测量训练吞吐。[原 PR 基准配置与结果](https://github.com/mindspore-ai/hyper-parallel/pull/1393)
+
+### EP4 / EP8 连续反传的 BF16 权重梯度
+
+在 CANN 9.1 上用 HP `06f3e9b7` 和 HyperMulticore `30ae689` 的 Python 实现配合已有原生二进制复测。保留 5 个不等长前向图并逆序反传时，MegaMoE + MoonEP 在 EP4、EP8 的 push 和 pull 模式下均有少量专家权重梯度元素超差。EIO、EOI 两种权重布局均可复现。相同输入下，普通 MegaMoE 通过。借用路径的前向输出、输入梯度和路由权重梯度也通过。
+
+以 EP4 push 的 rank 0、第二层 gate/up 权重梯度坐标 `[1, 257, 74]` 为例，两条路径的 1154 对乘数逐项、逐序相同。在同一张 NPU 上用同一个 FP32 梯度算子 `npu_grouped_matmul_add_` 重放，只改变归约分组。
+
+| 同一组乘数的归约方式 | FP32 结果 | 转为 BF16 |
+| --- | ---: | ---: |
+| 1154 行一次归约 | 2.195312738418579 | 2.203125 |
+| 两组各 577 行分别归约，再以 FP32 相加 | 2.1953125 | 2.1875 |
+
+分片结果恰好位于两个相邻 BF16 值的中点，按最近偶数舍入到较低值。整段归约结果稍高于中点，舍入到较高值。用实测单步梯度重放 BF16 累加，第 3 次反传时该元素在借用路径为 `1.03125`，参考路径为 `1.0625`。绝对差 `0.03125` 超过该元素的阈值 `0.002 + 0.02 × 1.0625 = 0.02325`。
+
+本轮验证接受上述已定位的归约舍入差异，压力用例按原容差记录为失败。EP4 单次前向加反向对照的 36 个通过配置单独计数。[HP 接入与验证](https://github.com/mindspore-ai/hyper-parallel/pull/1393)
