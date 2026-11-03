@@ -152,6 +152,8 @@ class _MegaMoeExecutionResources:
                 self.workspace = MegaMoeWorkspace(shared=shared)
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
+                self.spec = self.heap_manager.workspace_spec(self.workspace)
+                self._token_capacity = self.spec.local_num_tokens
 
             _collective.collective_call(
                 construct, stage="MegaMoe resource construction", group=self.heap_manager.root_group,
@@ -217,12 +219,13 @@ class _MegaMoeExecutionResources:
         if any(value != manifests[0] for value in manifests):
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
-    def plan_for_tokens(self, tokens: int, device: Any) -> Any:
+    def plan_for_tokens(self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
             tokens: EP group maximum input rows, already aligned to 128.
             device: Execution device used for the parameters and workspace.
+            weight_grad_dtype: Optional FP32 output for gradients reduced across borrowed experts.
 
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
@@ -231,13 +234,16 @@ class _MegaMoeExecutionResources:
             raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
                                f"requested={tokens}, capacity={self._token_capacity}")
         bucket = 1 << (max(128, tokens) - 1).bit_length()
-        plan = self._plans.get(bucket)
+        key = bucket if weight_grad_dtype is None else (bucket, weight_grad_dtype)
+        plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             schedule_tokens = min(bucket, self._token_capacity)
-            plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
+            options = {} if weight_grad_dtype is None else {"weight_grad_dtype": weight_grad_dtype}
+            plan = build_mega_moe_plan(
+                replace(self.spec, schedule_tokens=schedule_tokens), device, **options)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
-            self._plans[bucket] = plan
+            self._plans[key] = plan
         return plan
 
     def close(self) -> None:
@@ -336,6 +342,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
+        enable_hot_replica: bool = False,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -360,6 +367,7 @@ class MegaMoeExperts(MulticoreModule):
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
+            enable_hot_replica: Enable MoonEP placement for this module.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
                 ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
@@ -369,8 +377,9 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
-        specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+        if not isinstance(enable_hot_replica, bool):
+            raise TypeError("enable_hot_replica must be a boolean")
+        configuration = {
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
@@ -385,7 +394,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        specification["auto_tokens"] = True
+        specification = {"local_num_tokens": _COMMUNICATION_SPLIT, **configuration, "auto_tokens": True}
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -395,6 +404,17 @@ class MegaMoeExperts(MulticoreModule):
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self._initialize_module_state(specification, create_parameters=create_parameters)
+        self._moonep = None
+        if enable_hot_replica:
+            from hyper_multicore.moonep.mega_moe import MoonEPExecution
+
+            self._moonep = MoonEPExecution(configuration)
+
+    def close(self) -> None:
+        """Release borrowed-expert resources before the native execution group."""
+        if self._moonep is not None:
+            self._moonep.close()
+        super().close()
 
     def _initialize_module_state(
         self, specification: Mapping[str, Any], *, create_parameters: bool,
@@ -621,6 +641,13 @@ class MegaMoeExperts(MulticoreModule):
         )
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
+        if self._moonep is not None:
+            if self.ep_size > 1:
+                return self._moonep.forward(self, hidden_states, hidden_flat, topk_ids, topk_weights,
+                                            tokens_per_expert, weights)
+            with torch.inference_mode(False), torch.no_grad():
+                engine = self._get_execution_resources(hidden_flat)
+                engine.workspace.ensure(engine.spec, hidden_flat.dtype, hidden_flat.device)
         resources = self._get_execution_resources(hidden_flat)
         route_options = {"autograd_mask": (
             int(torch.is_grad_enabled()) | (int(hidden_flat.requires_grad) << 1)

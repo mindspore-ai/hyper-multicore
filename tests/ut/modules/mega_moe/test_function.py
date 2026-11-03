@@ -15,6 +15,7 @@
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
 import unittest
+from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +24,7 @@ from unittest.mock import Mock, PropertyMock, patch
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
+from hyper_multicore.moonep import shmem_transfer
 from hyper_multicore.diagnostics import MegaKernelDiagnostics
 from hyper_multicore.modules.mega_moe import function as function_module
 from hyper_multicore.modules.mega_moe.function import _MegaMoeFunction
@@ -104,6 +106,48 @@ class TestMegaMoeFunction(unittest.TestCase):
                              msg=f"Gradient stride: expected={weight.stride()}, actual={gradient.stride()}")
             self.assertEqual(torch.count_nonzero(gradient).item(), 0,
                              msg=f"Empty-expert gradients: expected=0, actual={gradient}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fp32_return_reuses_odd_sized_weight_banks(self) -> None:
+        """Preserve unquantized partials without another symmetric allocation."""
+        banks = (torch.zeros(4, 3, 5, dtype=torch.bfloat16), torch.zeros(4, 5, 7, dtype=torch.bfloat16))
+        gradients = tuple(torch.arange(bank.numel(), dtype=torch.float32).reshape(bank.shape) / 257
+                          for bank in banks)
+        pool = SimpleNamespace(weights=banks, local_experts=2, rank=0, blocks=1,
+                               statistics={"gradient_returns": 0, "remote_gradient_returns": 0})
+        bridge = Mock()
+        with patch.object(shmem_transfer, "load_bridge", return_value=bridge), \
+             patch.object(shmem_transfer, "_ordered_transfers", return_value=nullcontext()):
+            owners = shmem_transfer.SharedExpertPool.return_generated_gradients(
+                pool, gradients, torch.tensor([[-1, -1], [0, -1]], dtype=torch.int32))
+        self.assertEqual(bridge.reduce.call_count, 2)
+        for bank, gradient, owner, call in zip(banks, gradients, owners, bridge.reduce.call_args_list):
+            slots = call.args[2]
+            self.assertEqual(slots.dtype, torch.float32)
+            self.assertEqual(slots.data_ptr(), bank.data_ptr())
+            torch.testing.assert_close(slots, gradient[2:], rtol=0, atol=0)
+            torch.testing.assert_close(owner, gradient[:2], rtol=0, atol=0)
+            self.assertEqual(bank.dtype, torch.bfloat16)
+        self.assertIsNone(pool.cache_generation)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fp32_weight_gradients_preserve_activation_dtype(self) -> None:
+        """Keep borrowed partial dW unquantized without promoting activation scratch."""
+        spec = SimpleNamespace(hidden_size=4, intermediate_size=3)
+        for shapes in (((2, 4, 6), (2, 3, 4)), ((2, 6, 4), (2, 4, 3))):
+            with self.subTest(shapes=shapes):
+                weights = tuple(torch.empty(shape, dtype=torch.bfloat16) for shape in shapes)
+                gradients = function_module._allocate_backward_intermediates(
+                    spec, 8, torch.empty(8, 4, dtype=torch.bfloat16), *weights,
+                    weight_grad_dtype=torch.float32)
+                for weight, gradient in zip(weights, (gradients.grad_weight1, gradients.grad_weight2)):
+                    self.assertEqual(gradient.shape, weight.shape)
+                    self.assertEqual(gradient.dtype, torch.float32)
+                    self.assertEqual(torch.count_nonzero(gradient).item(), 0)
+                for value in (gradients.act_grad, gradients.swiglu_grad, gradients.gate_dx):
+                    self.assertEqual(value.dtype, torch.bfloat16)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -213,7 +257,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False)
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)

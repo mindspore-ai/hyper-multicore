@@ -243,7 +243,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        nullptr, nullptr, grouped_list_real, nullptr,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
-                       getTransposeData(task_desc.inputs[1].transpose_flag));
+                       getTransposeData(task_desc.inputs[1].transpose_flag),
+                        task_desc.outputs[0].data_type == sizeof(float));
       }
       return;
     }

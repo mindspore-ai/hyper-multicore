@@ -290,6 +290,17 @@ def _cmake_pair(
                 ["ctest", "--test-dir", str(work), "--output-on-failure"], label=f"ctest-{identifier}", env=env
             )
         run.commands(["cmake", "--install", str(work)], label=f"install-{identifier}-{kind}", env=env)
+    if "ascend910_93" in args.soc_list.split(","):
+        output = payload / "moonep"
+        standard = (directory / "torch/torch_cxx_standard.txt").read_text().strip()
+        run.commands(
+            [str(python), str(ROOT / "hyper_multicore/moonep/build.py"), "--shared",
+             "--sdk-root", str(sdk / "shmem"), "--cxx-standard", standard, "--output-dir", str(output)],
+            label=f"compile-{identifier}-moonep", env=env,
+        )
+        link_env = {**env, "LD_LIBRARY_PATH": os.pathsep.join([str(output), env["LD_LIBRARY_PATH"]])}
+        for name in ("_a3_allocator.so", "_moonep_shared_bridge.so", "libhp_moonep_shared_kernels.so"):
+            validate_elf(output / name, identity["host_arch"], run.commands, link_env)
     for name in ("libhyper_multicore_torch.so", "hyper_multicore_shmem_torch.so"):
         validate_elf(payload / name, identity["host_arch"], run.commands, env)
     record = {
@@ -778,6 +789,7 @@ def build_adapters(
     adapter_source = fingerprint_files(
         (
             "hyper_multicore/torch/csrc",
+            "hyper_multicore/moonep/csrc",
             "hyper_multicore/shmem/ccsrc/runtime",
             "hyper_multicore/shmem/ccsrc/cann",
             "hyper_multicore/shmem/ccsrc/bindings",
@@ -786,6 +798,7 @@ def build_adapters(
         ),
         (
             "hyper_multicore/torch/CMakeLists.txt",
+            "hyper_multicore/moonep/build.py",
             "hyper_multicore/shmem/ccsrc/CMakeLists.txt",
             "hyper_multicore/cmake/torch_compat.cmake",
             "hyper_multicore/cmake/hardening.cmake",

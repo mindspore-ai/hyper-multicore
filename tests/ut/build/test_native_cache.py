@@ -273,7 +273,8 @@ def test_development_trees_are_content_inputs(tmp_path):
         path.write_text(original, encoding="utf-8")
 
 
-def test_adapter_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeypatch):
+@pytest.mark.parametrize("soc_list", ["ascend910b", "ascend910_93"])
+def test_adapter_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeypatch, soc_list):
     """Restoring A must rebuild instead of reusing the rejected B output."""
     identity = {"pta_version": "2.12.0", "torch_version": "2.12.0+cpu", "python_abi": "cp310",
         "torch_cxx11_abi": True, "host_arch": "aarch64", "build_commit": "original-build",
@@ -287,7 +288,15 @@ def test_adapter_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeyp
             data = "B" if state["mutate"] else "A"
             put(directory / "payload/libhyper_multicore_torch.so", data)
             put(directory / "payload/hyper_multicore_shmem_torch.so", data)
+            put(directory / "torch/torch_cxx_standard.txt", "17")
             state["source"] = data
+        if "--sdk-root" in command:
+            assert command[0] == sys.executable
+            assert command[command.index("--sdk-root") + 1] == str(tmp_path / "shmem")
+            assert command[command.index("--cxx-standard") + 1] == "17"
+            output = Path(command[command.index("--output-dir") + 1])
+            for name in ("_a3_allocator.so", "_moonep_shared_bridge.so", "libhp_moonep_shared_kernels.so"):
+                put(output / name, state["source"])
     monkeypatch.setattr(BUILD, "NATIVE", tmp_path)
     monkeypatch.setattr(BUILD, "adapter_environment", lambda _, **_kw: {})
     monkeypatch.setattr(BUILD, "validate_elf", lambda *_: None)
@@ -296,13 +305,14 @@ def test_adapter_pollution_is_rejected_then_rebuilt_and_reused(tmp_path, monkeyp
     context.commands = _worker
     def _build():
         return BUILD.cmake_pair(Path(sys.executable), identity, tmp_path, tmp_path, key,
-            SimpleNamespace(clean=False, jobs=1), context, inputs={}, probe_inputs={})
+            SimpleNamespace(clean=False, jobs=1, soc_list=soc_list), context, inputs={}, probe_inputs={})
     with pytest.raises(RuntimeError, match="changed"):
         _build()
     assert not (directory / "complete.json").exists()
     state.update(source="A", mutate=False)
     payload, record = _build()
     assert (payload / "libhyper_multicore_torch.so").read_text() == "A"
+    assert (payload / "moonep/_a3_allocator.so").exists() == (soc_list == "ascend910_93")
     assert BUILD.cache_valid(directory, key)
     commands.clear()
     assert _build()[1]["native_build_identity"] == record["native_build_identity"]
