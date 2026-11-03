@@ -13,8 +13,9 @@ private SHMEM communication resources.
 
 ## Quick start
 
-Use a Linux environment with an Ascend NPU, Python >=3.10,<3.13, matching
-Torch/torch-npu, and CANN toolkit/ops >=9.1.0. See the
+Use Linux with an Ascend NPU, Python/CPU architecture matching the wheel tags, and mutually compatible
+Torch/torch-npu, CANN and driver installations. Source builds require CANN 9.2.0.
+Runtime selection does not impose a PTA post-release floor or a CANN version pairing. See the
 [build and installation guide](docs/build.md) for prerequisites and source builds.
 
 Install a wheel built for that environment. Replace the paths below with your
@@ -24,6 +25,7 @@ CANN installation and the exact wheel printed by the build command:
 source /path/to/cann/set_env.sh
 python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<abi>-<platform>.whl"
 source "$(command -v hyper_multicore_set_env.bash)"
+hyper_multicore_build_info
 ```
 
 To run the two-NPU MoE example against the installed package, copy the example

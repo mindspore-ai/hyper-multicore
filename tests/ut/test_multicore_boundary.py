@@ -142,7 +142,7 @@ if sys.argv[1] == "backward":
     backward = importlib.import_module("hyper_multicore.modules.mega_mhc_grad.function")
     assert callable(backward.hyper_mega_mhc_grad)
 from hyper_multicore import MegaGate, MegaMhc, MegaMoeExperts
-from hyper_multicore._loader import load_torch_npu
+from hyper_multicore._loader import load_torch_npu, NativeComponentUnavailableError
 assert MegaGate.__name__ == "MegaGate"
 assert MegaMhc.__name__ == "MegaMhc"
 assert MegaMoeExperts.__name__ == "MegaMoeExperts"
@@ -163,8 +163,10 @@ assert "torch_npu" not in sys.modules
 for initialize in (ops._load_native,):
     try:
         initialize()
-    except ImportError as error:
+    except NativeComponentUnavailableError as error:
+        assert "PTA-IMPORT-FAILED" in str(error)
         assert "libhccl.so" in str(error)
+        assert isinstance(error.__cause__, ImportError)
     else:
         raise AssertionError("Backend registration must fail when HCCL is unavailable")
 assert load_torch_npu.cache_info().currsize == 0
@@ -304,7 +306,7 @@ hp_apply_torch_cxx_standard(probe "${STACK_CXX_STANDARD}")
     def test_torch_native_targets_use_shared_build_contract(self):
         """Feature: Torch native build compatibility.
         Description: Inspect adapter and SHMEM CMake integration boundaries.
-        Expectation: Torch targets share the probe, host code stays C++17, no Torch version probing.
+        Expectation: Torch targets share the probe, host code stays C++17, op-plugin follows installed headers.
         """
         root = Path(multicore.__file__).parent
         sources = {name: (root / name).read_text(encoding="utf-8") for name in (
@@ -321,9 +323,10 @@ hp_apply_torch_cxx_standard(probe "${STACK_CXX_STANDARD}")
         adapter = sources["torch/CMakeLists.txt"]
         definitions = re.findall(r"CURRENT_VERSION=([^\s)]+)", adapter)
         self.assertEqual(
-            definitions, ["VERSION_NEWEST"],
-            msg=f"Expected one VERSION_NEWEST definition, actual={definitions}",
+            definitions, ["${TORCH_OP_PLUGIN_VERSION}"],
+            msg=f"Expected the installed Torch branch selector, actual={definitions}",
         )
+        self.assertIn("hp_detect_op_plugin_version(", adapter)
         for forbidden in ("torch.__version__", "torch.__config__.show()"):
             present = [name for name, source in sources.items() if forbidden in source]
             self.assertEqual(present, [], msg=f"Expected no {forbidden} consumer, actual={present}")

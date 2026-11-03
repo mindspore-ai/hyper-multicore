@@ -61,7 +61,7 @@ AdamW 使用 FP32 master 参数。无需 `torchrun`，多 rank 启动会在设�
 
 JSON 记录两个后端的完整本地 optimizer-step 样本、median 和比值。验证/预热不作稳态耗时；
 性能顺序为 common → mega，正式比较需固定源/制品、形状与精度并排除设备污染。
-该 dense 模型与旧 MoE+mHC 组合模型结构不同，旧模型结果不能直接视为本例的精度/性能结论。
+精度及性能结果仅适用于对应的模型结构、形状、dtype 和运行环境。
 
 CPU 训练及隔离测试见 [test_mhc_model.py](../../tests/ut/examples/mhc/test_mhc_model.py)。
 CPU 用例用独立数学 oracle 替代原生边界，验证接线、梯度和优化器；真实 NPU 数值及性能仍需单独执行。

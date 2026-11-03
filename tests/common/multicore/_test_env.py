@@ -56,19 +56,19 @@ def multicore_test_environment_is_active() -> bool:
 
 
 def multicore_adapter_is_available() -> bool:
-    """Return whether the active payload contains the shared Torch adapter.
+    """Return whether an activated payload advertises its native adapter inventory.
 
-    An existing adapter is considered available even when it is empty. The
+    An existing manifest is considered available even when it is empty. The
     worker then loads the payload and reports corruption instead of turning a
     broken build into a skip.
 
     Returns:
-        Whether any active multicore payload contains the shared adapter.
+        Whether any active multicore payload advertises native build resources.
 
     """
     for vendor_root in _active_multicore_vendor_roots():
-        adapter = vendor_root.parents[1] / "framework" / "torch" / "libhyper_multicore_torch.so"
-        if adapter.is_file():
+        payload = vendor_root.parents[2]
+        if (payload / "adapters/manifest.json").is_file() or (payload / "build_info.json").is_file():
             return True
     return False
 

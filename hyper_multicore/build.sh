@@ -13,18 +13,17 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 source "${PROJECT_ROOT}/scripts/native/cann_version.sh"
-HP_MINIMUM_CANN_VERSION="9.1.0"
+HP_MINIMUM_CANN_VERSION="9.2.0"
 BUILD_DIR="${PROJECT_ROOT}/build"
 NATIVE_ROOT="${BUILD_DIR}/native"
-WORK_ROOT="${NATIVE_ROOT}/work/multicore"
-COMPONENT_ROOT="${NATIVE_ROOT}/components/multicore/hyper_multicore"
+WORK_ROOT="${HP_NATIVE_WORK_ROOT:-${NATIVE_ROOT}/work/multicore}"
+COMPONENT_ROOT="${HP_COMPONENT_ROOT:-${NATIVE_ROOT}/components/multicore/hyper_multicore}"
 OUTPUT_ROOT="${COMPONENT_ROOT}/lib"
 SOC_LIST="ascend910b,ascend910_93"
 NATIVE_JOBS="$(nproc)"
 CLEAN="off"
-STAGE_ONLY="off"
 CURRENT_REASON_CODE="MULTICORE_BUILD_FAILED"
-PYTHON_BIN=python
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 function show_help() {
     cat <<EOF
@@ -47,15 +46,6 @@ function fail() {
     echo "HP_NATIVE_REASON_CODE=${reason_code}"
     echo "ERROR: ${message}" >&2
     exit "${exit_code}"
-}
-
-function require_cache_key() {
-    local key_name=$1
-    local key_value=$2
-    if [[ ! "${key_value}" =~ ^[0-9a-f]{16}$ ]]; then
-        fail "FRAMEWORK_CACHE_KEY_INVALID" \
-            "${key_name} cache identity must be one 16-character hexadecimal digest." 5
-    fi
 }
 
 function report_unhandled_error() {
@@ -99,7 +89,6 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --stage-only)
-            STAGE_ONLY="on"
             shift
             ;;
         --clean)
@@ -314,6 +303,11 @@ function validate_multicore_vendor() {
     echo "INFO: validated multicore vendor ${vendor_root} for ${soc_list}"
 }
 
+if [[ "${HP_NATIVE_STAGE:-}" != "common" ]]; then
+    exec "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/build_native.py" --native-only "$@" \
+        --soc-list "${SOC_LIST}" --jobs "${NATIVE_JOBS}" $(if [[ "${CLEAN}" == "on" ]]; then echo --clean; fi)
+fi
+
 cd "${PROJECT_ROOT}"
 if [[ "${CLEAN}" == "on" ]]; then
     rm -rf "${WORK_ROOT}" "${COMPONENT_ROOT}"
@@ -332,7 +326,7 @@ if [[ -z "${ASCEND_HOME_PATH:-}" || ! -d "${ASCEND_HOME_PATH}" ]]; then
 fi
 CANN_VERSION_FILE="${ASCEND_HOME_PATH}/opp/version.info"
 CANN_VERSION=$(hp_read_cann_version "${ASCEND_HOME_PATH}")
-if ! hp_cann_version_at_least "${CANN_VERSION}" "${HP_MINIMUM_CANN_VERSION}"; then
+if [[ "${CANN_VERSION}" != "9.2.0" ]]; then
     fail "UNSUPPORTED_CANN_VERSION" \
         "CANN >= ${HP_MINIMUM_CANN_VERSION} is required, found " \
         "'${CANN_VERSION:-unknown}' under ${ASCEND_HOME_PATH}." 3
@@ -343,11 +337,6 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
         "The selected Python executable is unavailable: ${PYTHON_BIN}." 4
 fi
 PYTHON_BIN=$(command -v "${PYTHON_BIN}")
-IDENTITY_FILE="${WORK_ROOT}/identity.json"
-BUILD_FINGERPRINT=$(TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${PYTHON_BIN}" \
-    "${PROJECT_ROOT}/hyper_multicore/_build/artifacts.py" --prepare \
-    --soc-list "${CANN_SOC_LIST}" --output "${IDENTITY_FILE}")
-WORK_ROOT="${WORK_ROOT}/build-${BUILD_FINGERPRINT}"
 required_tools=(awk asc_opc bash cmake find gcc g++ git grep ld ldd make nm readelf readlink)
 required_tools+=(sed sha256sum sort tee)
 for required_tool in "${required_tools[@]}"; do
@@ -355,8 +344,6 @@ for required_tool in "${required_tools[@]}"; do
         fail "BUILD_TOOL_NOT_FOUND" "Required multicore build tool not found on PATH: ${required_tool}." 4
     fi
 done
-PYTHON_CACHE_TAG=$("${PYTHON_BIN}" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
-FRAMEWORK_WORK_ROOT="${WORK_ROOT}/framework/${PYTHON_CACHE_TAG}"
     if ! TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${PYTHON_BIN}" -c '
 from importlib.util import find_spec
 import torch
@@ -383,7 +370,7 @@ OPS_TRANSFORMER_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loa
 
 CURRENT_REASON_CODE="SHMEM_SDK_HANDOFF_FAILED"
 # SHMEM publishes this before the vendor work root is fingerprinted.
-SHMEM_SDK_MANIFEST="${NATIVE_ROOT}/work/multicore/shmem/sdk.json"
+SHMEM_SDK_MANIFEST="${HP_SHMEM_HANDOFF:-${NATIVE_ROOT}/work/multicore/shmem/sdk.json}"
 SHMEM_INSTALL_ROOT=$("${PYTHON_BIN}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["install_root"])' \
     "${SHMEM_SDK_MANIFEST}")
 HP_SHMEM_TOOLCHAIN_KEY=$("${PYTHON_BIN}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["toolchain_key"])' \
@@ -579,99 +566,8 @@ CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
 validate_multicore_vendor "${VENDOR_ROOT}" "${CANN_SOC_LIST}"
 cp "${PROJECT_ROOT}/hyper_multicore/set_env.bash" "${OUTPUT_ROOT}/set_env.bash"
 
-export HP_MULTICORE_VENDOR_ROOT="${VENDOR_ROOT}"
-export CANN_VENDOR_LIBDIR="${VENDOR_ROOT}/op_api/lib"
-BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
-CURRENT_REASON_CODE="TORCH_ADAPTER_BUILD_FAILED"
-TORCH_SOURCE="${PROJECT_ROOT}/hyper_multicore/torch"
-TORCH_CACHE_KEY=$("${PYTHON_BIN}" -c '
-import hashlib
-from importlib.metadata import version
-from importlib.util import find_spec
-torch_spec = find_spec("torch")
-npu_spec = find_spec("torch_npu")
-torch_version = version("torch")
-npu_version = version("torch-npu")
-torch_origin = torch_spec.origin if torch_spec else "missing"
-npu_origin = npu_spec.origin if npu_spec else "missing"
-identity = f"{torch_version}|{torch_origin}|{npu_version}|{npu_origin}"
-print(hashlib.sha256(identity.encode()).hexdigest()[:16])
-')
-require_cache_key "Torch" "${TORCH_CACHE_KEY}"
-TORCH_BUILD="${FRAMEWORK_WORK_ROOT}/torch-${TORCH_CACHE_KEY}"
-TORCH_OUTPUT="${OUTPUT_ROOT}/framework/torch"
-rm -rf "${TORCH_BUILD}" "${TORCH_OUTPUT}"
-mkdir -p "${TORCH_BUILD}" "${TORCH_OUTPUT}"
-cmake -S "${TORCH_SOURCE}" \
-    -B "${TORCH_BUILD}" \
-    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-    -DCMAKE_INSTALL_PREFIX="${TORCH_OUTPUT}" \
-    -DHP_MULTICORE_VENDOR_ROOT="${VENDOR_ROOT}" \
-    -DPython3_EXECUTABLE="${PYTHON_BIN}"
-cmake --build "${TORCH_BUILD}" --parallel "${NATIVE_JOBS}"
-cmake --install "${TORCH_BUILD}"
-if [[ ! -s "${TORCH_OUTPUT}/libhyper_multicore_torch.so" ]]; then
-    fail "TORCH_ADAPTER_ARTIFACT_MISSING" \
-        "PyTorch multicore adapter was not installed under ${TORCH_OUTPUT}." 13
-fi
-
-CURRENT_REASON_CODE="HOST_ELF_VALIDATION_FAILED"
-case "$(uname -m)" in
-    aarch64|arm64)
-        EXPECTED_ELF_MACHINE="AArch64"
-        ;;
-    x86_64|amd64)
-        EXPECTED_ELF_MACHINE="Advanced Micro Devices X86-64"
-        ;;
-    *)
-        fail "UNSUPPORTED_HOST_ARCHITECTURE" \
-            "Unsupported multicore host architecture: $(uname -m)." 14
-        ;;
-esac
-while IFS= read -r adapter_library; do
-    dynamic_section=$(readelf -d "${adapter_library}")
-    elf_machine=$(readelf -h "${adapter_library}" | awk -F: '/Machine:/{sub(/^[[:space:]]+/, "", $2); print $2}')
-    if [[ "${elf_machine}" != "${EXPECTED_ELF_MACHINE}" ]]; then
-        fail "HOST_ELF_ARCHITECTURE_MISMATCH" \
-            "Host adapter machine '${elf_machine}' does not match '${EXPECTED_ELF_MACHINE}': ${adapter_library}." 15
-    fi
-    if grep -Eq '(RPATH|RUNPATH)' <<< "${dynamic_section}"; then
-        fail "RUNPATH_FOUND" \
-            "Host adapter must not contain RPATH/RUNPATH: ${adapter_library}." 16
-    fi
-    if grep -E '\(NEEDED\).*libcust_opapi\.so' <<< "${dynamic_section}" >/dev/null; then
-        fail "GENERIC_VENDOR_DT_NEEDED_FOUND" \
-            "Host adapter directly depends on generic libcust_opapi.so: ${adapter_library}." 18
-    fi
-    mapfile -t unresolved_libraries < <(ldd "${adapter_library}" | awk '/not found/{print $1}')
-    for unresolved_library in "${unresolved_libraries[@]}"; do
-        case "${unresolved_library}" in
-            libtorch*.so|libc10*.so)
-                ;;
-            *)
-                fail "HOST_ELF_DEPENDENCY_NOT_FOUND" \
-                    "Host adapter dependency is unavailable outside framework import: ${unresolved_library}." 19
-                ;;
-        esac
-    done
-done < <(find "${OUTPUT_ROOT}/framework" -type f -name '*.so' -print)
-
 while IFS= read -r packaged_library; do
     validate_shared_library_security "${packaged_library}"
 done < <(find "${COMPONENT_ROOT}" -type f -name '*.so' -print)
-
-trap - ERR
-"${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/artifacts.py" \
-    --output "${COMPONENT_ROOT}" --finalize "${IDENTITY_FILE}"
-echo "INFO: multicore build completed"
-echo "  framework: torch"
-echo "  vendor: ${VENDOR_ROOT}"
-echo "  framework payload: ${OUTPUT_ROOT}/framework"
-echo "  component: ${COMPONENT_ROOT}"
-
-if [[ "${STAGE_ONLY}" == "off" ]]; then
-    PAYLOAD_COMPONENT="${NATIVE_ROOT}/payload/hyper_multicore"
-    rm -rf "${PAYLOAD_COMPONENT}"
-    mkdir -p "${PAYLOAD_COMPONENT}"
-    cp -a "${COMPONENT_ROOT}/." "${PAYLOAD_COMPONENT}/"
-fi
+echo "INFO: common multicore resources completed: ${COMPONENT_ROOT}"
+exit 0

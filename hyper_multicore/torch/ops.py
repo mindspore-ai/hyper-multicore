@@ -44,8 +44,6 @@ __all__ = [
     "moe_token_permute_out",
 ]
 
-from functools import lru_cache
-
 import torch
 
 from hyper_multicore._loader import (
@@ -53,6 +51,7 @@ from hyper_multicore._loader import (
     load_torch_npu,
     get_multicore_paths,
     preload_vendor_library,
+    native_loading, native_context, native_ready,
 )
 from hyper_multicore.diagnostics import MegaKernelDiagnostics
 
@@ -68,28 +67,32 @@ def _launch_diagnostic_out(
                         *outputs, *attributes)
 
 
-@lru_cache(maxsize=1)
 def _load_native() -> None:
     """Register the ABI-specific native adapter once on first operation."""
+    if native_ready("torch"):
+        return
     load_torch_npu()
     vendor_root, adapter_path = get_multicore_paths()
-    preload_vendor_library(vendor_root)
-    try:
-        torch.ops.load_library(str(adapter_path))
-        if torch.ops.hyper_multicore.mega_moe_transport_version() != 1:
-            raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
-        # Torch exposes operator alias metadata through this private schema attribute.
-        schema = torch.ops.hyper_multicore.mega_moe_grad.default._schema  # pylint: disable=protected-access
-        dispatch_alias = schema.arguments[0].alias_info.before_set
-        input_grad_alias = schema.arguments[12].alias_info.before_set
-        if not dispatch_alias or dispatch_alias != input_grad_alias:
-            raise RuntimeError("adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter")
-    except (AttributeError, OSError, RuntimeError) as error:
-        raise NativeComponentUnavailableError(
-            "[HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore framework=torch "
-            f"library={adapter_path} error={error}. "
-            "Check the Python/Torch/torch_npu/CANN version combination and rebuild the Torch adapter."
-        ) from error
+    with native_loading("torch") as needed:
+        if not needed:
+            return
+        preload_vendor_library(vendor_root)
+        try:
+            torch.ops.load_library(str(adapter_path))
+            if torch.ops.hyper_multicore.mega_moe_transport_version() != 1:
+                raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
+            # Torch exposes operator alias metadata through this private schema attribute.
+            schema = torch.ops.hyper_multicore.mega_moe_grad.default._schema  # pylint: disable=protected-access
+            dispatch_alias = schema.arguments[0].alias_info.before_set
+            input_grad_alias = schema.arguments[12].alias_info.before_set
+            if not dispatch_alias or dispatch_alias != input_grad_alias:
+                raise RuntimeError("adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter")
+        except (AttributeError, OSError, RuntimeError) as error:
+            raise NativeComponentUnavailableError(
+                "[HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore framework=torch "
+                f"library={adapter_path} error={error}; {native_context()}. "
+                "Check the Python/Torch/torch_npu/CANN version combination and rebuild the Torch adapter."
+            ) from error
 
 
 # ---------------------------------------------------------------------------

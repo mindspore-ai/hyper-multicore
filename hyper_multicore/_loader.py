@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import ctypes
-import hashlib
 from importlib import metadata, util
 import json
 from functools import lru_cache
@@ -27,12 +26,46 @@ from pathlib import Path
 import platform
 import sys
 from types import ModuleType
+from contextlib import contextmanager
+from threading import RLock
+
+from hyper_multicore._native_manifest import check_integrity, read_manifest, resource_path, select_variant
 
 _VENDOR_NAME = "hyper_multicore_nn"
+_NATIVE_LOCK = RLock()
+_selection = None
+_native_failure = None
+_loaded_kinds = set()
 
 
 class NativeComponentUnavailableError(RuntimeError):
     """Report an unavailable or incorrectly activated multicore component."""
+
+
+def diagnostic_context() -> str:
+    """Read best-effort environment/build metadata without importing either framework."""
+    actual = {"python": sys.executable, "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+              "host_arch": platform.machine(), "cann_version": "unknown"}
+    for package in ("torch", "torch-npu"):
+        try:
+            actual[package] = metadata.version(package)
+        except Exception:  # Diagnostics must not replace the original import/load failure.
+            actual[package] = "unavailable"
+    try:
+        for line in (Path(os.environ["ASCEND_HOME_PATH"]) / "opp/version.info").read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "Version":
+                actual["cann_version"] = value.strip()
+                break
+    except Exception:
+        pass
+    try:
+        info = json.loads((_component_root().parent / "build_info.json").read_text())
+        matrix = [{key: variant.get(key) for key in ("id", "torch_version", "pta_version", "torch_cxx11_abi")}
+                  for variant in info.get("variants", [])]
+    except Exception:
+        matrix = "unavailable"
+    return f"runtime={actual} packaged_matrix={matrix}"
 
 
 @lru_cache(maxsize=1)
@@ -42,7 +75,19 @@ def load_torch_npu() -> ModuleType:
     Import errors propagate so an unusable backend cannot masquerade as successful
     native initialization. Failed imports are not cached and may be retried.
     """
-    return importlib.import_module("torch_npu")
+    try:
+        metadata.version("torch-npu")
+    except metadata.PackageNotFoundError as error:
+        raise NativeComponentUnavailableError(
+            f"[HYPER-MULTICORE-PTA-NOT-INSTALLED] Python={sys.executable}; install torch-npu "
+            f"for your Torch/CANN environment. Inspect hyper_multicore_build_info for packaged branches. {diagnostic_context()}"
+        ) from error
+    try:
+        return importlib.import_module("torch_npu")
+    except (ImportError, OSError, RuntimeError) as error:
+        raise NativeComponentUnavailableError(
+            f"[HYPER-MULTICORE-PTA-IMPORT-FAILED] {diagnostic_context()}: {error}"
+        ) from error
 
 
 def require_multicore_environment() -> Path:
@@ -83,50 +128,95 @@ def require_multicore_environment() -> Path:
 def get_multicore_paths() -> tuple[Path, Path]:
     """Return the vendor root and shared Torch adapter after ABI validation."""
     vendor_root = require_multicore_environment()
-    adapter = _component_root() / "framework" / "torch" / "libhyper_multicore_torch.so"
-    vendor_library = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
-    if not vendor_library.is_file() or not adapter.is_file():
-        raise NativeComponentUnavailableError(
-            "[HP-NATIVE-FRAMEWORK-TARGET-UNAVAILABLE] component=multicore framework=torch "
-            f"root={_component_root()}. The current wheel/PYTHONPATH payload does not include an adapter for this "
-            "framework; rebuild with bash build.sh and inspect the build log."
-        )
-    validate_native_compatibility()
-    return vendor_root, adapter.resolve()
+    selected = validate_native_compatibility()
+    return vendor_root, resource_path(selected["root"], selected["variant"]["torch_so"])
 
 
-def validate_native_compatibility() -> None:
-    """Reject a native build made for a different Torch/PTA, Python or C++ ABI.
-
-    Reads the selected payload's generated identity without modifying the environment.
-    Called before adapter or SHMEM binding loading, not at plain package import.
-
-    Raises:
-        NativeComponentUnavailableError: If identity is missing or incompatible.
-    """
-    info_path = _component_root().parent / "build_info.json"
+def _runtime_identity() -> dict:
+    """Read branch and ABI selectors without comparing external binary fingerprints."""
     try:
-        info = json.loads(info_path.read_text(encoding="utf-8"))
-        actual = {"torch_version": metadata.version("torch"), "pta_version": metadata.version("torch-npu"),
-                  "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
-                  "host_arch": platform.machine()}
-        import torch  # Native boundary only; interrogate the framework selected for this process.
+        pta = metadata.version("torch-npu")
+    except metadata.PackageNotFoundError as error:
+        raise NativeComponentUnavailableError(
+            f"[HYPER-MULTICORE-PTA-NOT-INSTALLED] Python={sys.executable}; "
+            "install matching Torch/PTA/CANN; inspect hyper_multicore_build_info."
+        ) from error
+    import torch
 
-        actual["torch_cxx11_abi"] = bool(torch._C._GLIBCXX_USE_CXX11_ABI)
-        actual["torch_commit"] = getattr(torch.version, "git_version", None)
-        spec = util.find_spec("torch_npu")
-        if spec is None or spec.origin is None:
-            raise RuntimeError("torch_npu package is unavailable")
-        library = Path(spec.origin).resolve().parent / "lib/libtorch_npu.so"
-        actual["libtorch_npu_sha256"] = hashlib.sha256(library.read_bytes()).hexdigest()
+    actual = {"torch_version": metadata.version("torch"), "pta_version": pta,
+              "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+              "host_arch": platform.machine(), "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+              "cann_version": "unknown"}
+    try:
         version_file = Path(os.environ["ASCEND_HOME_PATH"]) / "opp/version.info"
-        actual["cann_version_sha256"] = hashlib.sha256(version_file.read_bytes()).hexdigest()
-        mismatches = {key: {"built": info.get(key), "actual": value}
-                      for key, value in actual.items() if key not in info or info[key] != value}
-        if mismatches:
-            raise RuntimeError(f"Native environment identity mismatch: {mismatches}")
-    except (OSError, ValueError, KeyError, RuntimeError, metadata.PackageNotFoundError) as error:
-        raise NativeComponentUnavailableError(f"[HYPER-MULTICORE-ABI-MISMATCH] {info_path}: {error}") from error
+        for line in version_file.read_text().splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip() == "Version":
+                actual["cann_version"] = value.strip()
+                break
+    except (OSError, KeyError):
+        pass
+    return actual
+
+
+def validate_native_compatibility() -> dict:
+    """Choose one internally validated adapter pair; external post/CANN values do not gate it."""
+    global _selection
+    actual = _runtime_identity()  # Import the framework outside our native-registration lock.
+    with _NATIVE_LOCK:
+        if _selection is not None:
+            return _selection
+        root = _component_root().parent
+        try:
+            info = json.loads((root / "build_info.json").read_text(encoding="utf-8"))
+            manifest = read_manifest(root)
+            check_integrity(root, info, manifest)
+            variant = select_variant(manifest, actual)
+        except (OSError, ValueError, KeyError, RuntimeError) as error:
+            raise NativeComponentUnavailableError(
+                f"[HYPER-MULTICORE-ABI-MISMATCH] root={root} runtime={actual}: {error}"
+            ) from error
+        _selection = {"root": root, "variant": variant, "actual": actual, "build_info": info}
+        return _selection
+
+
+def native_ready(kind: str) -> bool:
+    """Check terminal state even when a previously loaded adapter takes its fast path."""
+    with _NATIVE_LOCK:
+        if _native_failure is not None:
+            raise NativeComponentUnavailableError(
+                f"[HYPER-MULTICORE-INITIALIZATION-FAILED] Restart the process: {_native_failure}"
+            ) from _native_failure
+        return kind in _loaded_kinds
+
+
+@contextmanager
+def native_loading(kind: str):
+    """Serialize initial registration and make partial native initialization failures terminal."""
+    global _native_failure
+    with _NATIVE_LOCK:
+        if _native_failure is not None:
+            raise NativeComponentUnavailableError(
+                f"[HYPER-MULTICORE-INITIALIZATION-FAILED] Restart the process: {_native_failure}"
+            ) from _native_failure
+        if kind in _loaded_kinds:
+            yield False
+            return
+        try:
+            yield True
+        except BaseException as error:
+            _native_failure = error
+            raise
+        else:
+            _loaded_kinds.add(kind)
+
+
+def native_context() -> str:
+    """Describe the fixed adapter and runtime without hiding the original loader failure."""
+    if _selection is None:
+        return diagnostic_context()
+    record = next(v for v in _selection["build_info"]["variants"] if v["id"] == _selection["variant"]["id"])
+    return f"runtime={_selection['actual']} adapter={_selection['variant']} built={record}"
 
 
 def preload_vendor_library(vendor_root: Path) -> None:
@@ -139,7 +229,7 @@ def preload_vendor_library(vendor_root: Path) -> None:
         ctypes.CDLL(str(library_path), mode=ctypes.RTLD_LOCAL)
     except OSError as error:
         raise NativeComponentUnavailableError(
-            f"[HP-NATIVE-VENDOR-LOAD-FAILED] library={library_path} error={error}."
+            f"[HP-NATIVE-VENDOR-LOAD-FAILED] library={library_path} {native_context()} error={error}."
         ) from error
 
 

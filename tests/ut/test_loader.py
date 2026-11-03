@@ -15,6 +15,7 @@
 """Unit tests for unified multicore payload lookup and OPP diagnostics."""
 
 import ctypes
+import json
 import os
 import re
 import shutil
@@ -50,7 +51,8 @@ class TestMulticoreNative(unittest.TestCase):
         adapter.write_bytes(b"adapter")
         self.shmem_root = self.native_root.parent / "shmem" / "lib"
         (self.shmem_root / "shmem").mkdir(parents=True)
-        identity = patch.object(_loader, "validate_native_compatibility")
+        identity = patch.object(_loader, "validate_native_compatibility", return_value={
+            "root": self.native_root.parent, "variant": {"torch_so": "adapters/test/libhyper_multicore_torch.so"}})
         identity.start()
         self.addCleanup(identity.stop)
 
@@ -68,6 +70,27 @@ class TestMulticoreNative(unittest.TestCase):
                     self.assertIs(raised.exception.__cause__, error)
                     self.assertIn(str(library), str(raised.exception))
                 load.assert_called_once_with(str(library), mode=ctypes.RTLD_LOCAL)
+
+    def test_backend_import_failure_keeps_cause_and_metadata_context(self):
+        """Broken PTA imports still expose the runtime and packaged matrix without another framework import."""
+        (self.native_root.parent / "build_info.json").write_text(json.dumps({"variants": [
+            {"id": "built-fixture", "torch_version": "2.7.1+cpu", "pta_version": "2.7.1.post11", "torch_cxx11_abi": True}]}))
+        cann = self.root / "cann/opp"
+        cann.mkdir(parents=True)
+        (cann / "version.info").write_text("Version=9.2.0\n")
+        error = ImportError("missing libhccl.so")
+        _loader.load_torch_npu.cache_clear()
+        self.addCleanup(_loader.load_torch_npu.cache_clear)
+        with patch.object(_loader, "_component_root", return_value=self.native_root), patch.dict(
+            os.environ, {"ASCEND_HOME_PATH": str(cann.parent)}
+        ), patch.object(_loader.metadata, "version", side_effect=lambda name: {"torch": "2.7.1+cpu", "torch-npu": "2.7.1.post11"}[name]), patch.object(
+            _loader.importlib, "import_module", side_effect=error
+        ) as imports, self.assertRaisesRegex(NativeComponentUnavailableError, "PTA-IMPORT-FAILED") as raised:
+            _loader.load_torch_npu()
+        self.assertIs(raised.exception.__cause__, error)
+        for expected in ("2.7.1.post11", "9.2.0", "built-fixture", "missing libhccl.so"):
+            self.assertIn(expected, str(raised.exception))
+        imports.assert_called_once_with("torch_npu")
 
     def test_component_paths_accept_sourced_environment_without_modifying_it(self):
         """Lookup accepts the sourced vendor paths without changing the process environment."""

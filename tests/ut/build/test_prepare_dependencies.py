@@ -29,7 +29,8 @@ import unittest
 from unittest.mock import patch
 
 
-ROOT = Path(__file__).resolve().parents[2]
+from tests.ut.build._build_test_support import ROOT
+
 HELPER_PATH = ROOT / "hyper_multicore/_build/prepare_dependencies.py"
 
 

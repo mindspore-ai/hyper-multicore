@@ -163,3 +163,41 @@ function(hp_apply_torch_cxx_standard target_name torch_cxx_standard)
     target_compile_features(${target_name} PRIVATE
         "cxx_std_${torch_cxx_standard}")
 endfunction()
+
+function(hp_detect_op_plugin_version torch_root torch_npu_root output_name)
+    set(torch_version_header
+        "${torch_root}/include/torch/csrc/api/include/torch/version.h")
+    set(plugin_version_header
+        "${torch_npu_root}/include/third_party/op-plugin/op_plugin/utils/Version.h")
+    foreach(required_header IN ITEMS "${torch_version_header}" "${plugin_version_header}")
+        if(NOT EXISTS "${required_header}")
+            message(FATAL_ERROR "Missing framework version header: ${required_header}")
+        endif()
+    endforeach()
+    file(STRINGS "${torch_version_header}" forwarded_version
+        REGEX "^#include <torch/headeronly/version.h>")
+    if(forwarded_version)
+        set(torch_version_header "${torch_root}/include/torch/headeronly/version.h")
+        if(NOT EXISTS "${torch_version_header}")
+            message(FATAL_ERROR "Missing forwarded Torch version header: ${torch_version_header}")
+        endif()
+    endif()
+    foreach(component IN ITEMS MAJOR MINOR)
+        file(STRINGS "${torch_version_header}" definition
+            REGEX "^#define TORCH_VERSION_${component} [0-9]+")
+        list(LENGTH definition definition_count)
+        if(NOT definition_count EQUAL 1)
+            message(FATAL_ERROR "Unrecognized Torch ${component} version in ${torch_version_header}")
+        endif()
+        string(REGEX REPLACE "^#define TORCH_VERSION_${component} ([0-9]+).*" "\\1"
+            torch_${component} "${definition}")
+    endforeach()
+    set(symbol "V${torch_MAJOR}R${torch_MINOR}")
+    file(STRINGS "${plugin_version_header}" definition
+        REGEX "^#define ${symbol} [0-9]+")
+    if(NOT definition)
+        message(FATAL_ERROR "Installed op-plugin has no version selector ${symbol}")
+    endif()
+    message(STATUS "HyperMulticore op-plugin version: ${symbol}")
+    set(${output_name} "${symbol}" PARENT_SCOPE)
+endfunction()

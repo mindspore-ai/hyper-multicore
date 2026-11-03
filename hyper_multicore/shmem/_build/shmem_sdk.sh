@@ -15,7 +15,7 @@ if ! declare -F hp_cann_version_at_least >/dev/null; then
     source "${_HP_NATIVE_SCRIPT_DIR}/../../../scripts/native/cann_version.sh"
 fi
 unset _HP_NATIVE_SCRIPT_DIR
-HP_MINIMUM_CANN_VERSION="9.1.0"
+HP_MINIMUM_CANN_VERSION="9.2.0"
 
 function hp_prepare_shmem_sdk() {
     local project_root=$1
@@ -23,7 +23,7 @@ function hp_prepare_shmem_sdk() {
     local native_jobs=$3
     local clean_sdk=${4:-off}
     local native_root="${project_root}/build/native"
-    local python_bin=python
+    local python_bin="${PYTHON_BIN:-python}"
     local locked_source_dir
     local locked_commit
     local prepared_dependency
@@ -117,7 +117,7 @@ print(hashlib.sha256(encoded).hexdigest())
         echo "ERROR: Cannot derive a stable SHMEM CANN toolchain identity." >&2
         return 4
     fi
-    work_root="${native_root}/work/multicore/shmem/toolchain-${toolchain_key}"
+    work_root="${HP_SHMEM_WORK_ROOT:-${native_root}/work/multicore/shmem}/toolchain-${toolchain_key}"
     source_dir="${work_root}/shmem-source"
     build_dir="${work_root}/shmem"
     install_root="${work_root}/shmem-install"

@@ -24,14 +24,16 @@ hyper_multicore/_build/dependencies.lock.json):
 Framework headers incorporated by compiling the Torch/SHMEM adapters:
 - PyTorch and torch-npu headers come from the selected framework installation.
 - pybind11 headers are supplied by Torch's include/pybind11 tree, not selected
-  from a separately installed pybind11 package. The header version is 3.0.1 in
-  Torch 2.12.0; its BSD license text is reproduced below. Other framework builds
-  must be checked against their supplied headers and licenses.
+  from a separately installed pybind11 package. The initial seven-framework
+  matrix supplies header versions 2.13.6, 3.0.1, 3.0.4 and 3.1.0 through the
+  corresponding Torch wheels; the primary BSD license is reproduced below.
+  Actual framework build identities are recorded per adapter in build_info.json.
 
 External runtime dependencies, not bundled as complete distributions:
 - PyTorch and torch-npu shared libraries: the actual framework versions and ABI
-  are recorded in build_info.json. Native wheel metadata pins the actual Torch
-  build; this notice does not fix every build to one framework version.
+  are recorded per adapter in build_info.json. Single-framework wheel metadata
+  pins its actual Torch build; full-matrix wheels retain a general Torch
+  dependency and select a branch-specific adapter at runtime.
 - NumPy (numpy>=1.26,<2): Python runtime dependency, provided separately.
 - CANN toolkit/ops, Ascend driver and system libraries: supplied by the runtime
   environment, separate from the locked CANN source repositories listed above.

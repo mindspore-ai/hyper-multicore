@@ -15,6 +15,7 @@ endif()
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 hp_detect_torch_build_contract("${Python3_EXECUTABLE}" TORCH)
+hp_detect_op_plugin_version("${TORCH_PACKAGE_ROOT}" "${TORCH_NPU_PACKAGE_ROOT}" TORCH_OP_PLUGIN_VERSION)
 
 set(TORCH_INCLUDE_ROOT "${TORCH_PACKAGE_ROOT}/include")
 set(TORCH_NPU_INCLUDE_ROOT "${TORCH_NPU_PACKAGE_ROOT}/include")
@@ -55,7 +56,7 @@ hp_apply_torch_cxx_standard(
 # Match the active op-plugin compatibility headers.
 target_compile_definitions(hyper_multicore_torch PRIVATE
     _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI}
-    CURRENT_VERSION=VERSION_NEWEST)
+    CURRENT_VERSION=${TORCH_OP_PLUGIN_VERSION})
 target_include_directories(hyper_multicore_torch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${Python3_INCLUDE_DIRS}

@@ -450,8 +450,8 @@ event capacity 至少为 1024，并覆盖无融合图、ready/completion 事件�
 
 grouped-matmul 的各 AIC scratch 按 128 字节对齐，每核步长为 `ceil(local_experts × 8 / 128) × 128` 字节。
 `group_list_bytes = max(4096, 24 × 每核步长 + 128)`，包含首地址对齐余量，完整 cache line 写回不会覆盖相邻核。
-每 rank 不再有固定的 16 专家上限；Host 分配、序列化与 Device 偏移均使用实际专家数。
-16 个以内保持原布局大小，更多专家按需扩大 scratch，仍受 uint32 偏移与实际内存限制。
+每 rank 的专家数决定 Host 分配、序列化与 Device 偏移。
+16 个以内使用固定 scratch 大小，更多专家按需扩大 scratch，受 uint32 偏移与实际内存限制。
 
 ### 6.1 正向
 
@@ -543,7 +543,7 @@ Multicore 组件入口负责依赖准备、私有 SHMEM、分 SoC vendor、vendo
 RPATH/RUNPATH 和依赖边界。动态库搜索路径由 `set_env.bash` 在启动 Python 前统一配置。
 
 MegaMoE、MegaGate 和 MegaMHC 通过 `torch/ops.py` 共用一个延迟加载入口，
-首次调用时加载 `lib/framework/torch/libhyper_multicore_torch.so` 并执行 ABI 检查。
+首次调用时按框架分支及 ABI 选择适配对，加载 `adapters/<variant-id>/libhyper_multicore_torch.so`。
 Torch adapter 是由 CMake 构建、通过 `torch.ops.load_library()` 加载的 dispatcher 共享库，不生成
 `PyInit_*` 入口，也不链接 `libpython` 或 `libtorch_python`。adapter 运行时按组件相对路径定位并绝对加载
 自带 vendor；`set_env.bash` 按 CANN custom OPP 契约设置 vendor 的 OPP 与动态库搜索路径。

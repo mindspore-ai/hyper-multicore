@@ -69,7 +69,7 @@ diagnostics/
 plan：只创建 normal RuntimeConfig image
     │
 每次调用检查 diagnostics.is_active
-    ├─ False：直接调用原 native wrapper → mode=0 → ProcessFast
+    ├─ False：直接调用普通 native wrapper → mode=0 → ProcessFast
     └─ True：通用 launch → 唯一活动 session.prepare_call(context)
                                │
                    profiler 首次使用该 plan：
@@ -99,7 +99,7 @@ plan：只创建 normal RuntimeConfig image
 
 | 配置 | 准备时机 | 关键内容 |
 |---|---|---|
-| normal | plan 构造 | diagnostic_mode=0；原有 task/queue 数据 |
+| normal | plan 构造 | diagnostic_mode=0；普通 task/queue 数据 |
 | profiler 私有配置 | 首次选中 WARMUP/RECORD/RECORD_AND_SAVE | diagnostic_mode=1；trace ID、owner 与每核容量 |
 | L1 dump 私有配置 | 每次选中 L1 调用 | diagnostic_mode=2；不使用 profiler 的 trace ID/容量 |
 
@@ -108,7 +108,7 @@ plan：只创建 normal RuntimeConfig image
 关闭或 action=NONE 时，业务直接走普通 wrapper，不进入 diagnostic launch，不创建诊断句柄。
 
 首次选中 profiler 时，`_PreparedProfileRuntime` 复制 Host 配置，在副本中编码 trace 描述符、owner，
-计算容量并上传独立的 profile image。普通 Host/Device 配置均保持不变。
+计算容量并上传独立的 profile image。普通 Host/Device 配置不受 profiler 私有配置影响。
 session 按公共 runtime 对象缓存 profiler 配置，退出时释放该 session 的缓存。
 
 公共 owner 是 `GraphDiagnosticMetadata.task_owner_ids`；`profile_owner_id` 只是 profiler 在私有配置中的
@@ -135,7 +135,7 @@ EP 大于 1 时，尾部还保存跨调用持续递增的 ready generation。每
 generation。
 进入采集 action 后，Torch profiler 按 `(device_id, buffer_size)` 从 session 私有池取得普通 NPU
 `diagnostic_buffer`。每个尚未 drain 的 invocation 独占一块 buffer，因此同一 step 的多层正反向调用不会互相
-覆盖；Device 直接把 record 写入最终 buffer，不再创建 D2D snapshot。
+覆盖；Device 直接把 record 写入最终 buffer。
 
 D2H 和解析只发生在：
 
@@ -201,8 +201,8 @@ heap。
 `diagnostic_buffer` 是 profiling 与 L1 Tensor dump 平等使用的公共诊断入参；当前两种工具的 session 互斥。
 profiling 模式写入 cycle trace，L1 dump 模式写入 Tensor 快照，普通执行与 L0 dump 不读取其诊断内容。
 它通过内部 native ABI 传递：正反向 OpProto、OpDef、ACLNN GetWorkspaceSize、L0 和 Device
-kernel 的输入列表都显式传递它，但 Python 公共 `mega_moe()`、`mega_moe_grad()` 和
-`MegaMoeExperts` 签名保持不变。普通调用通过私有 adapter 补齐参数；profiling 关闭时用原
+kernel 的输入列表都显式传递它。Python 公共 `mega_moe()`、`mega_moe_grad()` 和
+`MegaMoeExperts` 不要求调用者传入诊断 buffer，由私有 adapter 提供该参数。profiling 关闭时使用
 `all_event_counters` 作为未读取的占位 tensor，不产生新的申请、切片或数据搬运。
 
 ### 4.3 容量计算
@@ -307,7 +307,7 @@ task 仍使用 task type 兜底名称。
 
 MegaMoe 的阶段顺序和 TaskDesc 区间直接取自生成 RuntimeConfig 的正反向 `ComputeGraph`。每个
 `OperatorNode` 可就地设置 `diagnostic_name`；GMM1、GMM2、DispatchGrad 等业务名称与对应算子定义放在
-一起。公共 metadata 在首次采集时按拓扑顺序解析；profiler 将 descId 写入自己的配置副本，不再通过 `task_type`、tiling position 或 input position 反向猜测阶段。
+一起。公共 metadata 在首次采集时按拓扑顺序解析；profiler 将 descId 写入自己的配置副本，阶段信息直接来自图节点。
 
 `modules/mega_moe/diagnostics.py` 只保留 `Expert` owner label 和全局 expert ID resolver。resolver 同时接收
 `OperatorNode` 与其 TaskDesc，因此 Dispatch/Combine 等同类型算子可按节点身份区分。公共 GMM、SwiGLU 和
@@ -639,11 +639,11 @@ multicore_profiler.merge_chrome_traces(
    `validate_mega_kernel_diagnostic_contract()` 检查图/task/ABI；诊断 metadata 与 profile image 自动惰性准备；
 6. 在内部 OpProto、OpDef、ACLNN、L0、Device kernel 和框架 adapter 中贯通 `diagnostic_buffer` 输入，但保持
    模型用户接口不变；
-7. 正反向先检查 `diagnostics.is_active`；关闭时直接走原 wrapper，开启时通过
+7. 正反向先检查 `diagnostics.is_active`；关闭时直接走普通 wrapper，开启时通过
    `with diagnostics.launch(...)` 提供完整参数并管理完成/取消；
 8. 增加布局、metadata、Torch session、导出、merge 和真实 NPU 测试。
 
-图节点是阶段身份的唯一来源，不再另建 TaskDesc 字段匹配表。若某个 builder 不能保证“按图拓扑顺序、每个
+图节点是阶段身份的唯一来源，无需额外的 TaskDesc 字段匹配表。若某个 builder 不能保证“按图拓扑顺序、每个
 节点连续写入 task”，应先在通用构图/填充层显式记录每个节点的 task ID 区间，再应用图 metadata，不能退回
 依赖 tiling 或输入槽位猜测。公共 task builder 不得写具体模型的 owner 语义。
 
@@ -678,8 +678,8 @@ worker 在自己的 token 行分片上执行同一组 task ID，没有调度事�
 L1 按 `(task_id, worker_id)` 分配 record/slot，并由 Device 检查 worker ID，防止不同核写入同一份快照。
 广播目录使用 `task_<id>_worker_<id>`，普通队列仍使用 `task_<id>`。
 
-MHC 在 Torch wrapper 分配原有输出之后、发射之前绑定真实 ABI Tensor。MegaGate 正向在诊断开启时通过
-`mega_gate_route_out` 预分配同样的 5 个输出；关闭时仍调用原 native wrapper。地址列表只在 Device L1 分支
+MHC 在 Torch wrapper 分配输出之后、发射之前绑定真实 ABI Tensor。MegaGate 正向在诊断开启时通过
+`mega_gate_route_out` 预分配同样的 5 个输出；关闭时调用普通 native wrapper。地址列表只在 Device L1 分支
 临时构造，不给普通 worker 增加诊断地址数组或初始化工作。
 
 | MegaKernel | L0 | L1 范围与边界 |
@@ -741,7 +741,7 @@ Device 等待原依赖后采 before，执行计算并完成 barrier 后采 after
 
 ---
 
-## 12. 测试与验收
+## 12. 测试
 
 ### 12.1 CPU 单元测试
 
@@ -779,7 +779,7 @@ pytest -v tests/torch/test_mega_moe_profiling.py
 
 ### 12.4 当前回归结果
 
-验收应覆盖各 MegaKernel 的普通正反向结果、Profiler trace 完整性、L0 原始 dtype/硬链接、L1 task/worker
+测试覆盖各 MegaKernel 的普通正反向结果、Profiler trace 完整性、L0 原始 dtype/硬链接、L1 task/worker
 隔离和 payload 数值，以及失败清理、调用计数器和缓存 plan 的隔离。CPU 模拟的规划/解码测试不能替代 NPU
 执行；功能回归也不替代关闭态性能 A/B。
 

@@ -80,7 +80,7 @@ bash examples/moe/run_benchmark.sh \
 例如 `--mega-kernels gate` 仍运行相同 EP 大小的 MoE 网络，只改变 Router 的实现；
 common 后端使用普通 Router/EP，两个后端保持相同的普通残差结构。
 多机使用 `NNODES`、`NPROC_PER_NODE`、`NODE_RANK`、`MASTER_ADDR`、`MASTER_PORT`，
-EP 为 `NNODES × NPROC_PER_NODE`，不再单独传入 EP 参数。
+EP 为 `NNODES × NPROC_PER_NODE`，由启动进程数确定。
 也可直接用 `torchrun --nproc-per-node=4 -m examples.moe.benchmark` 启动，
 运行前须自行激活环境并设置 SHMEM bootstrap endpoint。
 `ASCEND_RT_VISIBLE_DEVICES` 选择本机设备，省略时默认 `0,...,NPROC_PER_NODE-1`；

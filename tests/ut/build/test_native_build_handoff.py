@@ -23,12 +23,14 @@ import tempfile
 import unittest
 
 
+from tests.ut.build._build_test_support import ROOT
+
 class TestNativeBuildHandoff(unittest.TestCase):
     """The SDK manifest belongs to the producer, not the vendor fingerprint."""
 
     def test_sdk_handoff_survives_vendor_work_root_fingerprinting(self) -> None:
         """Read the real handoff with an independently fingerprinted work root."""
-        root = Path(__file__).resolve().parents[2]
+        root = ROOT
         script = (root / "hyper_multicore/build.sh").read_text(encoding="utf-8")
         handoff = script.split('CURRENT_REASON_CODE="SHMEM_SDK_HANDOFF_FAILED"\n', 1)[1]
         handoff = handoff.split('if [[ ! -f "${SHMEM_INSTALL_ROOT}', 1)[0]

@@ -13,8 +13,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 NATIVE_ROOT="${PROJECT_ROOT}/build/native"
-WORK_ROOT="${NATIVE_ROOT}/work/multicore/shmem"
-COMPONENT_ROOT="${NATIVE_ROOT}/components/multicore/hyper_multicore"
+WORK_ROOT="${HP_SHMEM_WORK_ROOT:-${NATIVE_ROOT}/work/multicore/shmem}"
+COMPONENT_ROOT="${HP_COMPONENT_ROOT:-${NATIVE_ROOT}/components/multicore/hyper_multicore}"
 SOC_LIST="ascend910b,ascend910_93"
 NATIVE_JOBS="$(nproc)"
 CLEAN="off"
@@ -103,7 +103,7 @@ fi
 
 
 CURRENT_REASON_CODE="SHMEM_BUILD_FAILED"
-PYTHON_BIN=python
+PYTHON_BIN="${PYTHON_BIN:-python}"
 function report_unhandled_error() {
     local exit_code=$?
     trap - ERR
@@ -156,23 +156,6 @@ export SHMEM_SOURCE_DIR
 
 OPS_INSTALL_DIR="${COMPONENT_ROOT}/shmem"
 
-TORCH_CACHE_KEY=$("${PYTHON_BIN}" -c '
-import hashlib
-from importlib.metadata import version
-from importlib.util import find_spec
-torch_spec = find_spec("torch")
-npu_spec = find_spec("torch_npu")
-torch_version = version("torch")
-npu_version = version("torch-npu")
-torch_origin = torch_spec.origin if torch_spec else "missing"
-npu_origin = npu_spec.origin if npu_spec else "missing"
-identity = f"{torch_version}|{torch_origin}|{npu_version}|{npu_origin}"
-print(hashlib.sha256(identity.encode()).hexdigest()[:16])
-')
-require_cache_key "Torch" "${TORCH_CACHE_KEY}"
-TORCH_INSTALL_DIR="${COMPONENT_ROOT}/shmem/lib/framework/torch"
-rm -rf "${TORCH_INSTALL_DIR}"
-
 # Build the SHMEM ops kernel library, then the HP SHMEM Runtime with its Torch bindings.
 CCSRC_OPS_BUILD_DIR="${SHMEM_WORK_ROOT}/ccsrc-ops"
 CURRENT_REASON_CODE="SHMEM_OPS_BUILD_FAILED"
@@ -188,21 +171,41 @@ if [[ ! -s "${SHMEM_OPS_LIB}" ]]; then
         "SHMEM ops kernel library was not installed: ${SHMEM_OPS_LIB}." 9
 fi
 
-CCSRC_TORCH_BUILD_DIR="${FRAMEWORK_WORK_ROOT}/ccsrc-torch-${TORCH_CACHE_KEY}"
-CURRENT_REASON_CODE="CCSRC_TORCH_BINDING_BUILD_FAILED"
-cmake -S "${PROJECT_ROOT}/hyper_multicore/shmem/ccsrc" \
-    -B "${CCSRC_TORCH_BUILD_DIR}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="${TORCH_INSTALL_DIR}" \
-    -DSHMEM_OPS_LIB="${SHMEM_OPS_LIB}" \
-    -DPython3_EXECUTABLE="${PYTHON_BIN}"
-cmake --build "${CCSRC_TORCH_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
-ctest --test-dir "${CCSRC_TORCH_BUILD_DIR}" --output-on-failure
-cmake --install "${CCSRC_TORCH_BUILD_DIR}"
-CCSRC_TORCH_MODULE="${TORCH_INSTALL_DIR}/hyper_multicore_shmem_torch.so"
-if [[ ! -s "${CCSRC_TORCH_MODULE}" ]]; then
-    fail "EXPECTED_ARTIFACT_MISSING" \
-        "SHMEM Torch binding module was not installed: ${CCSRC_TORCH_MODULE}." 9
+if [[ "${HP_NATIVE_STAGE:-}" != "common" ]]; then
+    TORCH_CACHE_KEY=$("${PYTHON_BIN}" -c '
+import hashlib
+from importlib.metadata import version
+from importlib.util import find_spec
+torch_spec = find_spec("torch")
+npu_spec = find_spec("torch_npu")
+torch_version = version("torch")
+npu_version = version("torch-npu")
+torch_origin = torch_spec.origin if torch_spec else "missing"
+npu_origin = npu_spec.origin if npu_spec else "missing"
+identity = f"{torch_version}|{torch_origin}|{npu_version}|{npu_origin}"
+print(hashlib.sha256(identity.encode()).hexdigest()[:16])
+    ')
+    require_cache_key "Torch" "${TORCH_CACHE_KEY}"
+    TORCH_INSTALL_DIR="${COMPONENT_ROOT}/shmem/lib/framework/torch"
+    rm -rf "${TORCH_INSTALL_DIR}"
+
+    CCSRC_TORCH_BUILD_DIR="${FRAMEWORK_WORK_ROOT}/ccsrc-torch-${TORCH_CACHE_KEY}"
+    CURRENT_REASON_CODE="CCSRC_TORCH_BINDING_BUILD_FAILED"
+    cmake -S "${PROJECT_ROOT}/hyper_multicore/shmem/ccsrc" \
+        -B "${CCSRC_TORCH_BUILD_DIR}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${TORCH_INSTALL_DIR}" \
+        -DSHMEM_OPS_LIB="${SHMEM_OPS_LIB}" \
+        -DPython3_EXECUTABLE="${PYTHON_BIN}"
+    cmake --build "${CCSRC_TORCH_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
+    ctest --test-dir "${CCSRC_TORCH_BUILD_DIR}" --output-on-failure
+    cmake --install "${CCSRC_TORCH_BUILD_DIR}"
+    CCSRC_TORCH_MODULE="${TORCH_INSTALL_DIR}/hyper_multicore_shmem_torch.so"
+    if [[ ! -s "${CCSRC_TORCH_MODULE}" ]]; then
+        fail "EXPECTED_ARTIFACT_MISSING" \
+            "SHMEM Torch binding module was not installed: ${CCSRC_TORCH_MODULE}." 9
+    fi
+
 fi
 
 CURRENT_REASON_CODE="SHMEM_ELF_VALIDATION_FAILED"
@@ -243,7 +246,7 @@ done < <(find "${OPS_INSTALL_DIR}" -type f -name '*.so' -print)
 trap - ERR
 "${PYTHON_BIN}" -c 'import json,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps({
     "install_root": sys.argv[2], "toolchain_key": sys.argv[3]}))' \
-    "${WORK_ROOT}/sdk.json" "${HP_SHMEM_INSTALL_ROOT}" "${HP_SHMEM_TOOLCHAIN_KEY}"
+    "${HP_SHMEM_HANDOFF:-${WORK_ROOT}/sdk.json}" "${HP_SHMEM_INSTALL_ROOT}" "${HP_SHMEM_TOOLCHAIN_KEY}"
 echo "INFO: SHMEM build completed"
 echo "  framework: torch"
 echo "  component: ${COMPONENT_ROOT}"

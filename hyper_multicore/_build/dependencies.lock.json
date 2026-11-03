@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "release_baseline": {
-    "cann": ">=9.1.0",
+    "cann": "9.2.0",
     "glibc_policy": "runtime must satisfy the version requirements recorded by the release-built ELF payload",
     "host_arches": [
       "aarch64",
@@ -14,13 +14,13 @@
     ],
     "frameworks": {
       "torch": "not pinned by the native build",
-      "torch_npu": "must match the installed torch and selected CANN >=9.1.0",
+      "torch_npu": "build: installed Torch pairing and CANN 9.2.0; runtime: branch/ABI selection without CANN version gating",
       "torch_cxx11_abi": "reported by the active torch package"
     }
   },
   "local_compatibility": {
     "cann": [
-      ">=9.1.0"
+      "9.2.0"
     ]
   },
   "components": {

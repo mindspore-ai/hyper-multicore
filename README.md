@@ -12,8 +12,8 @@ HyperMulticore 为 MegaMoE、MegaGate 和 MegaMHC 提供 Ascend 多核算子及 
 
 ## 快速开始
 
-需要 Linux、Ascend NPU、Python >=3.10,<3.13、相互配套的 Torch/torch-npu，
-以及 CANN toolkit/ops >=9.1.0。完整环境要求和源码构建方法见[构建与安装指南](docs/build.md)。
+需要 Linux、Ascend NPU、与制品标签匹配的 Python/CPU 架构，以及彼此兼容的 Torch/torch-npu、CANN 和驱动。
+源码构建要求 CANN 9.2.0；运行时不强制 PTA post 下限或 CANN 版本配对。完整环境要求和源码构建方法见[构建与安装指南](docs/build.md)。
 
 安装与当前环境匹配的 wheel。将下面的路径替换为实际 CANN 安装路径及构建命令打印的 wheel 路径：
 
@@ -21,6 +21,7 @@ HyperMulticore 为 MegaMoE、MegaGate 和 MegaMHC 提供 Ascend 多核算子及 
 source /path/to/cann/set_env.sh
 python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<abi>-<platform>.whl"
 source "$(command -v hyper_multicore_set_env.bash)"
+hyper_multicore_build_info
 ```
 
 将源码仓或解包后的 sdist 中的示例复制到独立目录，使用已安装包运行双卡 MoE 示例：

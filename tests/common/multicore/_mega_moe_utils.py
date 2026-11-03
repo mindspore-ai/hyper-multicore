@@ -16,7 +16,6 @@
 
 import gc
 import hashlib
-import importlib.util
 import json
 import os
 import platform
@@ -27,7 +26,7 @@ import torch.distributed as dist
 import torch_npu
 
 from hyper_multicore import shmem
-from hyper_multicore._loader import get_multicore_paths
+from hyper_multicore._loader import get_multicore_paths, validate_native_compatibility
 from tests.common.multicore._evidence_helpers import source_revision
 from tests.common.port_utils import allocate_port
 
@@ -80,10 +79,9 @@ def environment_identity() -> dict:
         for path in version_files if path.is_file()
     }
     native_files = [adapter, *vendor.rglob("*.so"), *vendor.rglob("*.o")]
-    binding_spec = importlib.util.find_spec("hyper_multicore_shmem_torch")
-    if binding_spec is None or binding_spec.origin is None:
-        raise RuntimeError("hyper_multicore_shmem_torch native module is not importable.")
-    native_files.extend(Path(binding_spec.origin).parents[2].rglob("*.so"))
+    selected = validate_native_compatibility()
+    native_files.append(selected["root"] / selected["variant"]["shmem_so"])
+    native_files.extend((selected["root"] / "shmem/lib").rglob("*.so"))
     return {
         **source_revision(root),
         "worker_sha256": {

@@ -21,6 +21,7 @@
 ### 目录约定
 
 - `ut/test_*.py`、`ut/modules/`、`ut/torch/` 和 `ut/shmem/` 放置 CPU 单测，可直接由 pytest 执行。
+- `ut/build/` 集中放置构建、打包、依赖准备、构建缓存及适配矩阵相关单测和夹具。
 - `common/` 放置共用工具和参考实现，不单独作为测试入口。
 
 NPU 用例位于 `torch/`：
@@ -52,7 +53,8 @@ C++ runtime ABI reader 检查需要支持 C++17 的 G++。部分用例读取仓�
 
 ### NPU 系统测试
 
-需要 Linux、与制品匹配的 Python/Torch/PTA/CANN 环境、pytest，以及已构建的 native payload。
+需要 Linux、匹配制品标签的 Python/CPU 架构与 Torch/PTA 分支、彼此兼容的 CANN/驱动、pytest，以及已构建的 native payload。
+使用 `hyper_multicore_build_info` 查看安装包构建矩阵；构建 PTA post 和 CANN 版本不作为运行时版本门禁。
 安装和构建步骤见[构建与安装指南](../docs/build.md)。
 
 先激活 CANN，然后选择一种运行方式：
@@ -93,11 +95,28 @@ source "$(command -v hyper_multicore_set_env.bash)"
 # 查看 CPU 用例，执行全部单测，或只运行一个文件。
 python -m pytest tests/ut --collect-only -q
 python -m pytest tests/ut -q
-python -m pytest tests/ut/test_artifacts.py -q
+python -m pytest tests/ut/build/test_artifacts.py -q
 ```
 
 可以用 `::test_name` 选择函数；对于 unittest 类，使用 `::ClassName::test_name`。
 具体节点以 collect 输出为准。CPU 单测的 traceback 直接出现在当前 pytest 输出中。
+
+### 构建系统定向回归
+
+构建相关测试统一位于 `ut/build/`，按框架环境、wheel/解析快照、native 缓存与输入、发布、工作区与命令、
+适配加载和 CLI 七类职责维护。它们使用临时目录、合成 wheel 和明确的 worker 替身，
+不下载框架、不创建真实 venv、不编译 native 或启动 NPU 计算。
+
+```bash
+python -m pytest tests/ut/build tests/ut/test_loader.py -q
+```
+
+新增测试优先覆盖可观察行为：缓存复用与失效、失败不认证、制品提交边界、目录保护和加载选择。
+同一契约保留主要调用链上的代表性回归；不在多个层级重复模拟同一异常，
+不为每个路径或异常类型展开笛卡尔积，也不固定内部计时字段、调用次数和日志措辞。
+共享环境与依赖夹具放在 `ut/build/_build_test_support.py`；payload 布局夹具统一复用 `ut/build/test_artifacts.py`。
+构建测试调整后集中运行这组 CPU 回归，失败修正仅重测受影响范围。
+只有实际修改 native 输入、环境准备或运行行为时，才补对应的构建或设备验证。
 
 ### NPU 用例执行
 
@@ -243,3 +262,11 @@ export HP_MEGA_MOE_EVIDENCE_DIR="$PWD/logs/moe-results"
 
 判断通过应同时检查 pytest 结果和所需 worker/rank 是否完整执行。skip、超时、进程崩溃或
 缺失结果都不算通过；计时 smoke 通过只说明其断言满足，不代表性能达到某个发布门槛。
+
+## 多框架制品回归
+
+全量 wheel 在框架矩阵配置的每组环境分别安装同一个文件并核对 SHA256。
+每组 CPU 从源码根目录运行完整 `tests/ut`；NPU 按上文复制完整 `tests/` 到源码外，使用安装态制品串行运行完整 `tests/torch`。
+测试结果包括实际收集数量、退出码、JUnit 和 worker 日志。
+默认单分支 wheel 另在实际构建环境完整回归，确认默认入口和功能保持可用。
+验证环境差异和结果分别记录；构建矩阵描述构建输入，运行兼容性通过对应环境中的测试检查。
