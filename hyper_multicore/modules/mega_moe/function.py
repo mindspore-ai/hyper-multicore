@@ -152,10 +152,11 @@ def _allocate_backward_intermediates(
     weight1: Any,
     weight2: Any,
     reusable_dispatch: Any | None = None,
+    *, weight_grad_dtype: torch.dtype | None = None,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    grad_weight1 = torch.zeros_like(weight1)
-    grad_weight2 = torch.zeros_like(weight2)
+    grad_weight1 = torch.zeros_like(weight1, dtype=weight_grad_dtype)
+    grad_weight2 = torch.zeros_like(weight2, dtype=weight_grad_dtype)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -237,6 +238,7 @@ def _prepare_backward_execution(
             saved.weight1,
             saved.weight2,
             dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
+            weight_grad_dtype=plan.weight_grad_dtype,
         ),
     )
 
