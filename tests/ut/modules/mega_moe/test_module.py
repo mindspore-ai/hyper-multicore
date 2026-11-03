@@ -58,6 +58,22 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_fp32_weight_gradient_plan_has_a_separate_cache_entry(self) -> None:
+        """Borrowed gradient plans cannot change a retained ordinary BF16 plan."""
+        resources = self._cache_resources(256, automatic=True)
+        def build(spec, device, **options):
+            return SimpleNamespace(spec=spec, weight_grad_dtype=options.get("weight_grad_dtype"))
+        with patch.object(mega_moe_module, "build_mega_moe_plan", side_effect=build) as builder:
+            ordinary = resources.plan_for_tokens(128, "cpu")
+            precise = resources.plan_for_tokens(128, "cpu", weight_grad_dtype=torch.float32)
+            self.assertIs(resources.plan_for_tokens(128, "cpu"), ordinary)
+            self.assertIs(resources.plan_for_tokens(128, "cpu", weight_grad_dtype=torch.float32), precise)
+        self.assertIsNone(ordinary.weight_grad_dtype)
+        self.assertEqual(precise.weight_grad_dtype, torch.float32)
+        self.assertEqual(builder.call_count, 2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_automatic_constructor_accepts_shapes_without_token_arguments(self) -> None:
         """Feature: Automatic token API.
         Description: Construct both transports without predicting token counts and reject removed keywords.
