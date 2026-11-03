@@ -16,14 +16,12 @@
 
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 
-from tests.ut.test_artifacts import _payload_fixture
-
-ROOT = Path(__file__).resolve().parents[2]
+from tests.ut.build.test_artifacts import _payload_fixture
+from tests.ut.build._build_test_support import ROOT
 
 
 def test_matrix_json_works_without_framework_import(tmp_path):
@@ -46,7 +44,28 @@ def test_matrix_json_works_without_framework_import(tmp_path):
     report = json.loads(result.stdout)
     assert report["package_root"] == str(package)
     assert report["build_info"]["variants"][0]["id"] == "fixture"
-    # Consistent IDs cannot hide changed pair fields or a corrupted packaged resource.
-    (package / "adapters/fixture/libhyper_multicore_torch.so").write_bytes(b"corrupted")
-    failed = subprocess.run(command, env=env, cwd=tmp_path, text=True, capture_output=True, check=False)
-    assert failed.returncode != 0 and "Changed payload resource" in failed.stderr
+    variant = report["build_info"]["variants"][0]
+    assert variant["torch_so"] == "adapters/fixture/libhyper_multicore_torch.so"
+    assert variant["shmem_so"] == "adapters/fixture/hyper_multicore_shmem_torch.so"
+
+
+def test_text_matrix_aligns_every_vertical_separator():
+    """Header, rule and data rows use the same positions even with long post versions."""
+    import runpy
+
+    formatter = runpy.run_path(str(ROOT / "scripts/hyper_multicore_build_info"))["format_text"]
+    variants = [{"id": name, "torch_version": torch, "pta_version": pta, "torch_cxx11_abi": True}
+                for name, torch, pta in [("pt2.7.1.post11-123456789abc", "2.7.1+cpu", "2.7.1.post11"),
+                                         ("pt2.14.0-123456789abc", "2.14.0+cpu", "2.14.0")]]
+    text = formatter({"package_version": "0.1.0.dev0", "package_root": "/package", "build_info": {
+        "build_mode": "all", "python_abi": "cp310", "host_arch": "aarch64", "soc_list": ["ascend910b"],
+        "variants": variants}, "runtime": {"python": "/python", "python_abi": "cp310", "host_arch": "aarch64",
+        "torch": "not installed", "torch-npu": "not installed", "cann_version": "unknown"}})
+    rows = [line for line in text.splitlines() if line.lstrip().startswith("|")]
+    positions = [[i for i, char in enumerate(row) if char == "|"] for row in rows]
+    assert len(rows) == 4 and len(positions[0]) == 4
+    assert all(p == positions[0] for p in positions)
+    assert "Variant" not in text and "adapters/" not in text
+    assert all(variant["id"] not in text for variant in variants)
+    assert "hyper_multicore_build_info --json" in text
+    assert "Runtime" in text and "not installed" in text

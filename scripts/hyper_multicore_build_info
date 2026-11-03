@@ -25,7 +25,61 @@ import runpy
 import sys
 
 
-def main():
+def fields(values: list[tuple[str, str]]) -> list[str]:
+    """Align metadata while keeping long filesystem paths on their own rows."""
+    width = max(len(key) for key, _ in values)
+    return [f"  {key:<{width}}  {value}" for key, value in values]
+
+
+def format_text(result: dict) -> str:
+    """Display the framework matrix without internal adapter IDs or library paths."""
+    info, actual = result["build_info"], result["runtime"]
+    rows = [[v["torch_version"], v["pta_version"], str(int(v["torch_cxx11_abi"]))] for v in info["variants"]]
+    table = [["Torch", "PTA", "C++ ABI"], *rows]
+    widths = [max(len(row[i]) for row in table) for i in range(3)]
+    lines = [
+        f"HyperMulticore {result['package_version']}",
+        *fields([("Mode", f"{info['build_mode']} ({len(rows)} adapter pairs)"), ("Location", result["package_root"])]),
+        "",
+        "Build",
+        *fields(
+            [
+                ("Python ABI", info["python_abi"]),
+                ("Architecture", info["host_arch"]),
+                ("CANN", info.get("cann_version", "unknown")),
+                ("SoC", ", ".join(info["soc_list"])),
+            ]
+        ),
+        "",
+        "Adapters",
+    ]
+    for index, row in enumerate(table):
+        lines.append("  | " + " | ".join(f"{value:<{width}}" for value, width in zip(row, widths)) + " |")
+        if index == 0:
+            lines.append("  |-" + "-|-".join("-" * width for width in widths) + "-|")
+    lines.extend(
+        [
+            "",
+            "Runtime",
+            *fields(
+                [
+                    ("Python", actual["python"]),
+                    ("Python ABI", actual["python_abi"]),
+                    ("Architecture", actual["host_arch"]),
+                    ("Torch", actual["torch"]),
+                    ("PTA", actual["torch-npu"]),
+                    ("CANN", actual["cann_version"]),
+                ]
+            ),
+            "",
+            "Adapter IDs and library paths: hyper_multicore_build_info --json",
+            "Build records describe inputs; runtime compatibility depends on your installed environment.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def main() -> None:
     """Print actual packaged adapter identities and best-effort environment metadata."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", dest="as_json")
@@ -40,8 +94,12 @@ def main():
         helpers = runpy.run_path(str(root / "_native_manifest.py"))
         manifest = helpers["read_manifest"](root)
         helpers["check_integrity"](root, info, manifest)
-        actual = {"python": sys.executable, "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
-                  "host_arch": platform.machine(), "cann_version": "unknown"}
+        actual = {
+            "python": sys.executable,
+            "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "host_arch": platform.machine(),
+            "cann_version": "unknown",
+        }
         for package in ("torch", "torch-npu"):
             try:
                 actual[package] = metadata.version(package)
@@ -55,18 +113,18 @@ def main():
                     break
         except (OSError, KeyError):
             pass
-        result = {"schema_version": 1, "package_version": distribution.version,
-                  "package_root": str(root), "build_info": info, "manifest": manifest, "runtime": actual}
+        result = {
+            "schema_version": 1,
+            "package_version": distribution.version,
+            "package_root": str(root),
+            "build_info": info,
+            "manifest": manifest,
+            "runtime": actual,
+        }
         if args.as_json:
             print(json.dumps(result, indent=2))
         else:
-            print(f"HyperMulticore {distribution.version} mode={info['build_mode']} root={root}")
-            print(f"Built: Python={info['python_abi']} arch={info['host_arch']} CANN={info.get('cann_version', 'unknown')} SoC={info['soc_list']}")
-            print("Variant | Torch build | PTA build | C++ ABI | Torch SO | SHMEM SO")
-            for variant in info["variants"]:
-                print(" | ".join(str(variant[k]) for k in ("id", "torch_version", "pta_version", "torch_cxx11_abi", "torch_so", "shmem_so")))
-            print("Runtime: " + json.dumps(actual))
-            print("Build records describe inputs, not a runtime version whitelist or a compatibility guarantee.")
+            print(format_text(result))
     except (OSError, ValueError, KeyError, metadata.PackageNotFoundError) as error:
         parser.exit(1, f"Cannot read installed HyperMulticore build matrix: {error}\n")
 

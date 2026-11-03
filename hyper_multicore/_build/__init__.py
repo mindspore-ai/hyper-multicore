@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Multicore component package; import APIs from their defining modules."""
+"""Private standalone build helpers; entrypoints use the framework-free bootstrap."""
