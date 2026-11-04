@@ -537,7 +537,7 @@ Multicore 组件入口负责依赖准备、私有 SHMEM、分 SoC vendor、vendo
 [构建与交付](build.md)，源码态与 wheel 安装态的 CANN custom OPP 激活方式统一见
 [独立组件安装指南](../README.md)。
 
-每个 SoC 的 CANN 构建同时生成 `HyperMegaMoe` 和 `HyperMegaMoeGrad`。组件会校验新构建及缓存 vendor，
+每个 SoC 的 CANN 构建同时生成 `HyperMegaMoe` 和 `HyperMegaMoeGrad`。组件会校验新构建的 vendor，
 并在合并后再次校验四个 `aclnnHyperMegaMoe*` API、kernel object/metadata、SONAME 和运行时依赖。
 私有 SHMEM 库会校验专属 SONAME；所有随包 host 共享库均校验 ELF 架构、安全链接属性、无
 RPATH/RUNPATH 和依赖边界。动态库搜索路径由 `set_env.bash` 在启动 Python 前统一配置。

@@ -21,7 +21,7 @@
 ### 目录约定
 
 - `ut/test_*.py`、`ut/modules/`、`ut/torch/` 和 `ut/shmem/` 放置 CPU 单测，可直接由 pytest 执行。
-- `ut/build/` 集中放置构建、打包、依赖准备、构建缓存及适配矩阵相关单测和夹具。
+- `ut/build/` 集中放置构建、打包、依赖准备、环境复用及适配矩阵相关单测和夹具。
 - `common/` 放置共用工具和参考实现，不单独作为测试入口。
 
 NPU 用例位于 `torch/`：
@@ -103,15 +103,15 @@ python -m pytest tests/ut/build/test_artifacts.py -q
 
 ### 构建系统定向回归
 
-构建相关测试统一位于 `ut/build/`，按框架环境、wheel/解析快照、native 缓存与输入、发布、工作区与命令、
-适配加载和 CLI 七类职责维护。它们使用临时目录、合成 wheel 和明确的 worker 替身，
+构建相关测试统一位于 `ut/build/`，按框架环境、native 编译调度、发布、工作区与命令、
+适配加载和 CLI 等职责维护。它们使用临时目录、合成 wheel 和明确的 worker 替身，
 不下载框架、不创建真实 venv、不编译 native 或启动 NPU 计算。
 
 ```bash
 python -m pytest tests/ut/build tests/ut/test_loader.py -q
 ```
 
-新增测试优先覆盖可观察行为：缓存复用与失效、失败不认证、制品提交边界、目录保护和加载选择。
+新增测试优先覆盖可观察行为：venv/vendor 复用、SDK/ops 和适配对重编、失败不发布、制品提交边界、目录保护和加载选择。
 同一契约保留主要调用链上的代表性回归；不在多个层级重复模拟同一异常，
 不为每个路径或异常类型展开笛卡尔积，也不固定内部计时字段、调用次数和日志措辞。
 共享环境与依赖夹具放在 `ut/build/_build_test_support.py`；payload 布局夹具统一复用 `ut/build/test_artifacts.py`。

@@ -13,7 +13,7 @@ HyperMulticore 为 MegaMoE、MegaGate 和 MegaMHC 提供 Ascend 多核算子及 
 ## 快速开始
 
 需要 Linux、Ascend NPU、与制品标签匹配的 Python/CPU 架构，以及彼此兼容的 Torch/torch-npu、CANN 和驱动。
-默认源码构建使用当前激活的 CANN，`--all` 要求 CANN 9.2.0；运行时不强制 PTA post 下限或 CANN 版本配对。完整环境要求和源码构建方法见[构建与安装指南](docs/build.md)。
+源码构建使用当前激活的 CANN；矩阵中的参考 CANN 仅用于提示和追溯；运行时不强制 PTA post 下限或 CANN 版本配对。完整环境要求和源码构建方法见[构建与安装指南](docs/build.md)。
 
 安装与当前环境匹配的 wheel。将下面的路径替换为实际 CANN 安装路径及构建命令打印的 wheel 路径：
 
