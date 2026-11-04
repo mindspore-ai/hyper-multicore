@@ -37,7 +37,10 @@ SCRIPTS = (
     "cmake/hardening.cmake",
     "shmem/_build/shmem_sdk.sh",
 )
-SOURCE_TREES = ("ops", "cmake/vendor", "shmem/cmake/shmem_wrapper", "shmem/_build/patches")
+SOURCE_TREES = (
+    "ops", "cmake/vendor", "shmem/cmake/shmem_wrapper", "shmem/_build/patches",
+    "shmem/ccsrc/cann", "shmem/ccsrc/data_plane",
+)
 ENVIRONMENT = (
     "PATH", "LD_LIBRARY_PATH", "PYTHONPATH", "ASCEND_HOME_PATH", "CC", "CXX", "CFLAGS", "CXXFLAGS",
     "CPPFLAGS", "LDFLAGS", "CMAKE_BUILD_TYPE", "CMAKE_GENERATOR", "CMAKE_PREFIX_PATH",

@@ -170,14 +170,22 @@ def test_vendor_snapshot_commit_hit_corruption_and_clean(vendor_fixture):
     assert not Path(second["directory"]).exists()
 
 
-@pytest.mark.parametrize("change", ["source", "sdk", "tool", "flags"])
+@pytest.mark.parametrize("change", ["source", "shmem_header", "shmem_file", "sdk", "tool", "flags"])
 def test_vendor_consumed_inputs_change(vendor_fixture, monkeypatch, change):
     root, sdk, candidate, request, tool = vendor_fixture
+    header = root / "hyper_multicore/shmem/ccsrc/data_plane/rma.h"
+    if change == "shmem_header":
+        put(header, "header A")
     vendor_prepare(vendor_fixture)
     VENDOR.built(request, candidate, time.time())
     VENDOR.publish(root, [json.loads(request.read_text())])
+    assert vendor_prepare(vendor_fixture)["reused"]
     if change == "source":
         put(root / "hyper_multicore/ops/new.cpp")
+    elif change == "shmem_header":
+        put(header, "header B")
+    elif change == "shmem_file":
+        put(root / "hyper_multicore/shmem/ccsrc/cann/new.h")
     elif change == "sdk":
         put(sdk / "src/device/input", "new device header")
     elif change == "tool":

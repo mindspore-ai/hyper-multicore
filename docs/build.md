@@ -208,6 +208,8 @@ pip 按当前 Python 和平台从各自索引选择准确框架 wheel，再解�
 输入摘要覆盖锁定源码及补丁、vendor 构建脚本、SDK 头文件和链接库、CANN 实际路径及版本记录、
 所选工具、调用者 Python 和有效环境参数；`--jobs` 不参与缓存身份。
 仅切换构建模式而保持这些输入不变时可直接复用。
+本仓通信源码按 `shmem/ccsrc/cann/` 和 `shmem/ccsrc/data_plane/` 目录整体取摘要，
+目录内文件新增、删除或修改均触发 vendor 重编，包括未被当前 vendor 使用的文件。
 
 命中时核对完整文件集合、SHA256 和 vendor 校验。输入失配、文件缺失、损坏或无法采集必要身份时重编。
 新快照仅在制品提交成功并复核输入后原子发布。`build_info.json` 的 `vendor_sources` 区分原始 vendor 来源
