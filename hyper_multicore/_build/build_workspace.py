@@ -28,9 +28,6 @@ from .build_utils import atomic_json, version_label
 from .command_runner import message
 
 
-FRAMEWORK_SLOT = re.compile(r"cp[0-9]+-[A-Za-z0-9_]+-torch[A-Za-z0-9_.-]+-pt[A-Za-z0-9_.-]+-abi[01]\Z")
-
-
 def safe_component(value):
     value = str(value).replace("+", ".")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
@@ -76,13 +73,18 @@ def check_workspace(directory, root):
         raise ValueError(f"Foreign native workspace; refusing replacement: {directory}")
 
 
-def framework_directory(native: Path, kind: str) -> Path:
-    """Keep framework storage together and reject redirected managed roots."""
-    if kind not in ("envs", "resolutions", "wheels"):
-        raise ValueError(f"Unknown framework directory: {kind}")
-    parent = native / "framework"
-    directory = parent / kind
-    if parent.is_symlink() or directory.is_symlink():
+def reset_workspace(directory, root):
+    """Replace only an attributed native workspace; never follow redirected data."""
+    check_workspace(directory, root)
+    if directory.exists():
+        shutil.rmtree(directory)
+    claim_workspace(directory, root)
+
+
+def environment_directory(native: Path) -> Path:
+    """Locate reusable framework environments without following redirected roots."""
+    directory = native / "envs"
+    if directory.is_symlink():
         raise ValueError(f"Refusing symlinked framework storage: {directory}")
     return directory
 

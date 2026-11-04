@@ -48,6 +48,30 @@ class TestNativeBuildHandoff(unittest.TestCase):
             self.assertEqual(result.stdout.splitlines(), [sdk, "fixture"])
 
 
+    def test_common_shmem_does_not_require_framework(self) -> None:
+        """Run the actual shell preflight with a Python that rejects framework imports."""
+        script = (ROOT / "hyper_multicore/shmem/build.sh").read_text()
+        preflight = 'if ! command -v "${PYTHON_BIN}"' + script.split('if ! command -v "${PYTHON_BIN}"', 1)[1]
+        preflight = preflight.split('source "${PROJECT_ROOT}/hyper_multicore/shmem/_build/shmem_sdk.sh"', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            python = Path(directory) / "python"
+            python.write_text(f"#!{sys.executable}\nimport os, sys\n"
+                              "if 'import torch' in sys.argv[-1]:\n"
+                              "    if os.environ.get('ALLOW_FRAMEWORK') == '1':\n"
+                              "        compile(sys.argv[-1], '<probe>', 'exec')\n"
+                              "        raise SystemExit(0)\n"
+                              "    raise SystemExit(86)\n"
+                              f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n")
+            python.chmod(0o755)
+            command = 'fail() { printf "%s\\n" "$1"; exit "$3"; };\n' + preflight
+            for stage, available, expected in (("common", "0", 0), ("binding", "0", 4), ("binding", "1", 0)):
+                env = dict(os.environ, PYTHON_BIN=str(python), HP_NATIVE_STAGE=stage, ALLOW_FRAMEWORK=available)
+                result = subprocess.run(["bash", "-euc", command], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("TORCH_BUILD_DEPENDENCY_NOT_FOUND", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
 

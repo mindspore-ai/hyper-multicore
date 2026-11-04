@@ -132,13 +132,15 @@ for required_tool in cmake find gcc g++ grep make readelf readlink sed; do
     fi
 done
 PYTHON_CACHE_TAG=$("${PYTHON_BIN}" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
-if ! TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${PYTHON_BIN}" -c '
+if [[ "${HP_NATIVE_STAGE:-}" != "common" ]]; then
+    if ! TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${PYTHON_BIN}" -c '
 from importlib.util import find_spec
 import torch
 raise SystemExit(0 if find_spec("torch_npu") is not None else 1)
 ' >/dev/null 2>&1; then
-    fail "TORCH_BUILD_DEPENDENCY_NOT_FOUND" \
-        "The active Python environment must provide matching torch and torch_npu packages." 4
+        fail "TORCH_BUILD_DEPENDENCY_NOT_FOUND" \
+            "The active Python environment must provide matching torch and torch_npu packages." 4
+    fi
 fi
 
 source "${PROJECT_ROOT}/hyper_multicore/shmem/_build/shmem_sdk.sh"
@@ -157,6 +159,7 @@ OPS_INSTALL_DIR="${COMPONENT_ROOT}/shmem"
 # Build the SHMEM ops kernel library, then the HP SHMEM Runtime with its Torch bindings.
 CCSRC_OPS_BUILD_DIR="${SHMEM_WORK_ROOT}/ccsrc-ops"
 CURRENT_REASON_CODE="SHMEM_OPS_BUILD_FAILED"
+rm -rf "${CCSRC_OPS_BUILD_DIR}"
 cmake -S "${PROJECT_ROOT}/hyper_multicore/shmem/ccsrc/ops" \
     -B "${CCSRC_OPS_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -188,6 +191,7 @@ print(hashlib.sha256(identity.encode()).hexdigest()[:16])
     rm -rf "${TORCH_INSTALL_DIR}"
 
     CCSRC_TORCH_BUILD_DIR="${FRAMEWORK_WORK_ROOT}/ccsrc-torch-${TORCH_CACHE_KEY}"
+    rm -rf "${CCSRC_TORCH_BUILD_DIR}"
     CURRENT_REASON_CODE="CCSRC_TORCH_BINDING_BUILD_FAILED"
     cmake -S "${PROJECT_ROOT}/hyper_multicore/shmem/ccsrc" \
         -B "${CCSRC_TORCH_BUILD_DIR}" \

@@ -339,17 +339,6 @@ for required_tool in "${required_tools[@]}"; do
         fail "BUILD_TOOL_NOT_FOUND" "Required multicore build tool not found on PATH: ${required_tool}." 4
     fi
 done
-    if ! TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${PYTHON_BIN}" -c '
-from importlib.util import find_spec
-import torch
-raise SystemExit(0 if find_spec("torch_npu") is not None else 1)
-' \
-        >/dev/null 2>&1; then
-        fail "TORCH_BUILD_DEPENDENCY_NOT_FOUND" \
-            "The selected Python must provide matching torch and torch_npu packages." 5
-    fi
-
-
 MULTICORE_VENDOR_CMAKE="${PROJECT_ROOT}/hyper_multicore/cmake/vendor"
 
 CURRENT_REASON_CODE="MULTICORE_DEPENDENCY_PREPARATION_FAILED"
@@ -475,6 +464,11 @@ function calculate_vendor_fingerprint() {
 }
 
 COMMON_HOST_INPUT_IDENTITY=$(calculate_vendor_fingerprint "common-host-input")
+function vendor_cache() {
+    "${PYTHON_BIN}" -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from _hyper_multicore_bootstrap import load_module; load_module("vendor_cache").main()' \
+        "${PROJECT_ROOT}/hyper_multicore/_build" "$@"
+}
+
 declare -a PER_SOC_VENDOR_INPUTS=()
 declare -a PER_SOC_HOST_INPUT_IDENTITIES=()
 for cann_soc in "${CANN_SOCS[@]}"; do
@@ -484,24 +478,25 @@ for cann_soc in "${CANN_SOCS[@]}"; do
     VENDOR_STAGE_ROOT="${VENDOR_BUILD_ROOT}/stage"
     VENDOR_CANDIDATE="${VENDOR_STAGE_ROOT}/packages/vendors/hyper_multicore_nn"
     KERNEL_LOG="${WORK_ROOT}/logs/cann-vendor-build-${cann_soc}.log"
-    CACHE_ROOT="${WORK_ROOT}/vendor-cache/${cann_soc}"
-    SNAPSHOT_VENDOR="${CACHE_ROOT}/hyper_multicore_nn"
-    FINGERPRINT_FILE="${CACHE_ROOT}/fingerprint.sha256"
-    HOST_INPUT_IDENTITY_FILE="${CACHE_ROOT}/common-host-input-identity.sha256"
-    VENDOR_FINGERPRINT=$(calculate_vendor_fingerprint "${cann_soc}")
-    if [[ -f "${FINGERPRINT_FILE}" \
-          && -f "${HOST_INPUT_IDENTITY_FILE}" \
-          && "$(<"${FINGERPRINT_FILE}")" == "${VENDOR_FINGERPRINT}" \
-          && "$(<"${HOST_INPUT_IDENTITY_FILE}")" == "${COMMON_HOST_INPUT_IDENTITY}" \
-          && -d "${SNAPSHOT_VENDOR}" ]]; then
-        CURRENT_REASON_CODE="CANN_VENDOR_CACHE_VALIDATION_FAILED"
-        validate_multicore_vendor "${SNAPSHOT_VENDOR}" "${cann_soc}"
-        echo "INFO: reusing cached ${cann_soc} multicore vendor"
-        PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${SNAPSHOT_VENDOR}")
-        PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${COMMON_HOST_INPUT_IDENTITY}")
-        continue
+    VENDOR_REQUEST="${WORK_ROOT}/vendor-request-${cann_soc}.json"
+    REUSED_VENDOR="${WORK_ROOT}/vendor-reuse-${cann_soc}/hyper_multicore_nn"
+    if [[ -n "${HP_VENDOR_CACHE_ROOT:-}" ]]; then
+        CACHE_ARGS=(prepare --root "${PROJECT_ROOT}" --native "${HP_VENDOR_CACHE_ROOT}"
+                    --soc "${cann_soc}" --sdk "${SHMEM_INSTALL_ROOT}/shmem" --request "${VENDOR_REQUEST}")
+        if [[ "${HP_VENDOR_CACHE_CLEAN:-}" == "1" ]]; then
+            CACHE_ARGS+=(--clean)
+        fi
+        vendor_cache "${CACHE_ARGS[@]}"
+        if [[ -d "${REUSED_VENDOR}" ]]; then
+            if (validate_multicore_vendor "${REUSED_VENDOR}" "${cann_soc}"); then
+                PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${REUSED_VENDOR}")
+                PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${COMMON_HOST_INPUT_IDENTITY}")
+                continue
+            fi
+            echo "WARN: cached ${cann_soc} vendor failed validation; rebuilding"
+        fi
     fi
-
+    VENDOR_STARTED=${EPOCHREALTIME}
     rm -rf "${ASSEMBLY_ROOT}" "${VENDOR_BUILD_ROOT}"
     CURRENT_REASON_CODE="MULTICORE_SOURCE_ASSEMBLY_FAILED"
     "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/assemble_multicore_source.py" \
@@ -542,12 +537,10 @@ for cann_soc in "${CANN_SOCS[@]}"; do
     fi
     CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
     validate_multicore_vendor "${VENDOR_CANDIDATE}" "${cann_soc}" "${KERNEL_LOG}"
-    rm -rf "${CACHE_ROOT}"
-    mkdir -p "${CACHE_ROOT}"
-    cp -a "${VENDOR_CANDIDATE}" "${SNAPSHOT_VENDOR}"
-    printf '%s\n' "${VENDOR_FINGERPRINT}" > "${FINGERPRINT_FILE}"
-    printf '%s\n' "${COMMON_HOST_INPUT_IDENTITY}" > "${HOST_INPUT_IDENTITY_FILE}"
-    PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${SNAPSHOT_VENDOR}")
+    if [[ -n "${HP_VENDOR_CACHE_ROOT:-}" ]]; then
+        vendor_cache built --request "${VENDOR_REQUEST}" --candidate "${VENDOR_CANDIDATE}" --started "${VENDOR_STARTED}"
+    fi
+    PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${VENDOR_CANDIDATE}")
     PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${COMMON_HOST_INPUT_IDENTITY}")
 done
 

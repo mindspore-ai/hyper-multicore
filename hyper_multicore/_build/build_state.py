@@ -14,12 +14,11 @@
 # ============================================================================
 """Explicit per-build state and results, separate from the tool process runner."""
 
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from .artifacts import ProbeHashes
-from .native_cache import CacheDiagnostics
 from .command_runner import Commands
-from .native_inputs import NativeInputs
 
 
 @dataclass
@@ -28,9 +27,7 @@ class PreparedFramework:
 
     python: Path
     identity: dict
-    development: dict
-    tools: dict = field(default_factory=dict)
-    preflight: dict = field(default_factory=dict)
+    packages: list = field(default_factory=list)
 
 
 @dataclass
@@ -51,12 +48,10 @@ class BuildContext:
         """Collect task state without adding it to the command executor."""
         self.root, self.native = root, native
         self.directory = native / "logs"
+        self.run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
         self.events = []
-        self.commands = Commands(self.directory, root=root, events=self.events)
+        self.commands = Commands(self.directory, root=root, events=self.events,
+                                 scratch=native / "staging" / self.run_id / "tool-output")
         self.frameworks = {}
-        self.common_inputs = {}
+        self.vendor_requests = []
         self.isolated = False
-        self.common_cacheable = True
-        self.preflight_hashes = ProbeHashes()
-        self.native_inputs = NativeInputs(self.preflight_hashes)
-        self.diagnostics = CacheDiagnostics(native, self.events)

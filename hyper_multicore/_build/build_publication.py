@@ -27,6 +27,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import zipfile
+from . import artifacts
 from .command_runner import Commands
 from ._bootstrap import load_module
 
@@ -158,3 +159,30 @@ def validate_wheel_payload(archive, names, payload, info):
     for name in ("build_info.json", "adapters/manifest.json"):
         if archive.read("hyper_multicore/" + name) != (payload / name).read_bytes():
             raise ValueError(f"Wheel identity mismatch: {name}")
+
+
+class SourceGuard:
+    """Reject mixed repository sources before and after formal publication."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.frozen = self.observe()
+
+    def observe(self):
+        """Record content and file generations, including edit-and-restore changes."""
+        paths = []
+        for name in ("hyper_multicore", "scripts"):
+            paths.extend(p for p in (self.root / name).rglob("*")
+                         if p.is_file() and not {"lib", "__pycache__"}.intersection(p.relative_to(self.root).parts))
+        paths.extend(self.root / name for name in
+                     ("setup.py", "MANIFEST.in", "build.sh", "requirements.txt", "tests/ut/shmem/native_log_test.cpp"))
+        generations = {}
+        for path in paths:
+            if path.is_file():
+                stat = path.stat()
+                generations[str(path)] = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        return artifacts._source_identity(self.root), generations
+
+    def check_source(self):
+        if self.observe() != self.frozen:
+            raise RuntimeError("Source inputs changed during build; refusing mixed-source payload")

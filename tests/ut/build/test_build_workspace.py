@@ -14,6 +14,7 @@
 # ============================================================================
 """Workspaces, locks, bounded cleanup and observable command execution."""
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
 import os
@@ -32,7 +33,6 @@ BUILD = load_module("build_controller")
 RUNNER = load_module("command_runner")
 ENV = BUILD.FRAMEWORK
 LAYOUT = BUILD.WORKSPACE
-LIFECYCLE = load_module("preflight_cache")
 RUN_ID = "20261102-143349-732599"
 
 
@@ -42,7 +42,7 @@ def test_latest_replaces_only_generated_logs_and_scratch(tmp_path):
     staged = put(tmp_path / "staging" / RUN_ID / "wheel.whl")
     orphan = put(tmp_path / "payload" / f".payload-{RUN_ID}" / "lib.so")
     protected = [put(tmp_path / name / "sentinel") for name in (
-        "framework/envs", "framework/resolutions", "deps", "common", "variants", "preflight",
+        "envs", "deps", "common", "variants",
         "payload/hyper_multicore", "dist", "logs/manual", "staging/manual")]
     external = put(tmp_path / "external/keep")
     latest = WORKSPACE.prepare_logs(tmp_path)
@@ -54,7 +54,7 @@ def test_latest_replaces_only_generated_logs_and_scratch(tmp_path):
 
 @pytest.mark.parametrize("directory, cleanup", [
     ("logs", WORKSPACE.prepare_logs),
-    ("framework", lambda native: ENV.prune_environments(native, [], set())),
+    ("envs", lambda native: ENV.prune_environments(native, [], set())),
 ])
 def test_cleanup_refuses_redirected_roots(tmp_path, directory, cleanup):
     external = tmp_path / "external"
@@ -148,13 +148,13 @@ def test_distribution_rotation_refuses_external_symlink(tmp_path):
 
 def test_success_prunes_only_owned_old_environments(tmp_path):
     """Retain current and latest successful rollback; never touch external symlinks."""
-    base = tmp_path / "framework/envs"
+    base = tmp_path / "envs"
     base.mkdir(parents=True)
-    current = base / "current"
+    current = base / ("current-" + "a" * 20)
     for name, timestamp in (("current", 3), ("rollback", 2), ("older", 1), ("removed-branch", 5)):
-        directory = base / name
+        directory = base / (name + "-" + "a" * 20)
         (directory / "bin").mkdir(parents=True)
-        (directory / "ready.json").write_text(json.dumps({"pta_release": "2.8.0" if name == "removed-branch" else "2.12.0",
+        (directory / "ready.json").write_text(json.dumps({"environment_key": "a" * 64, "request": {}, "pta_release": "2.8.0" if name == "removed-branch" else "2.12.0",
                                                          "last_successful_build": timestamp}))
     abandoned = base / ("failed-" + "f" * 20)
     abandoned.mkdir()
@@ -162,12 +162,18 @@ def test_success_prunes_only_owned_old_environments(tmp_path):
         "environment_key": "f" * 64, "pta_release": "2.12.0"}))
     unknown = base / "manual"
     unknown.mkdir()
+    (unknown / "ready.json").write_text("{}")
+    redirected = base / ("redirected-" + "a" * 20)
+    redirected.mkdir()
+    (redirected / "ready.json").symlink_to(current / "ready.json")
+    sentinel = put(redirected / "manual")
     external = tmp_path / "external"
     external.mkdir()
     (base / "external-link").symlink_to(external, target_is_directory=True)
     removed = ENV.prune_environments(tmp_path, [current / "bin/python"], {"2.12.0"})
-    assert {Path(p).name for p in removed} == {"older", "removed-branch", abandoned.name}
-    assert current.exists() and (base / "rollback").exists() and external.exists() and unknown.exists()
+    assert {Path(p).name for p in removed} == {"older-" + "a" * 20, "removed-branch-" + "a" * 20, abandoned.name}
+    assert current.exists() and (base / ("rollback-" + "a" * 20)).exists() and external.exists() and unknown.exists()
+    assert sentinel.exists() and (redirected / "ready.json").is_symlink()
 
 
 def test_interruption_kills_grandchild_before_controller_returns(tmp_path):
@@ -205,6 +211,36 @@ def test_interruption_kills_grandchild_before_controller_returns(tmp_path):
                     pass
 
 
+def test_failed_tool_cleans_up_descendants_and_preserves_diagnostic(tmp_path):
+    """A failed parent must not leave its TERM-resistant descendants outside cancellation."""
+    pidfile = tmp_path / "descendant.pid"
+    descendant = (
+        "import os,signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(120)"
+    )
+    parent = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        f"subprocess.Popen([sys.executable,'-c',{descendant!r}])\n"
+        f"while not Path({str(pidfile)!r}).exists(): time.sleep(0.02)\n"
+        "print('error: initiating compiler failure',flush=True); raise SystemExit(2)"
+    )
+    run = RUNNER.Commands(tmp_path / "logs")
+    try:
+        with pytest.raises(RuntimeError, match="initiating compiler failure"):
+            run([sys.executable, "-c", parent], label="compile-fixture")
+        stat = Path("/proc") / pidfile.read_text() / "stat"
+        assert not stat.exists() or stat.read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        record = json.loads((run.directory / "stages.json").read_text())[-1]
+        assert record["exit_code"] == 2 and record["status"] == "failed"
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 def test_tool_output_is_visible_before_child_exits(tmp_path):
     """The terminal receives actual installer/compiler output while the tool is running."""
     gate = tmp_path / "release"
@@ -235,7 +271,7 @@ def test_merged_log_ranges_keep_errors_and_private_json_separate(tmp_path, capsy
     run([sys.executable, "-c", "print('error: earlier stage'); print('Building CXX object earlier.o')"], label="fixture")
     assert run([sys.executable, "-c", "print('JSON-ONLY')"], label="metadata", capture=True) == "JSON-ONLY\n"
     with pytest.raises(RuntimeError) as caught:
-        run([sys.executable, "-c", "print('error: current linker failure'); raise SystemExit(2)"], label="preflight-compile-fixture")
+        run([sys.executable, "-c", "print('error: current linker failure'); raise SystemExit(2)"], label="compile-fixture")
     assert "current linker failure" in str(caught.value) and "earlier stage" not in str(caught.value)
     assert list(tmp_path.glob("*.log")) == [tmp_path / "tools.log"]
     records = json.loads((tmp_path / "stages.json").read_text())
@@ -243,46 +279,6 @@ def test_merged_log_ranges_keep_errors_and_private_json_separate(tmp_path, capsy
     assert chunks[1] == "JSON-ONLY\n" and "JSON-ONLY" not in chunks[2]
     assert "JSON-ONLY" not in capsys.readouterr().out
     assert records[-1]["status"] == "failed"
-
-
-def workspace(native, key, root=ROOT):
-    directory = native / "preflight" / ("cp310-aarch64-torch2.12.0-pt2.12.0." + key[0] + "-abi1")
-    directory.mkdir(parents=True)
-    (directory / "CMakeCache.txt").write_text(f"CMAKE_HOME_DIRECTORY:INTERNAL={root / 'hyper_multicore/cmake/framework_probe'}\n")
-    return directory
-
-
-def success(native, mode, *keys):
-    events = [{"fingerprint": key[0] * 64 if key.startswith("cp") else key, "directory": key, "preflight_cache_hit": True} for key in keys]
-    LIFECYCLE.finish(native, ROOT, mode, events)
-    return events[-1]
-
-
-def test_full_and_default_protect_each_other_and_collect_only_old_owned_workspaces(tmp_path):
-    old, full, default = (workspace(tmp_path, key * 64) for key in ("a", "b", "c"))
-    foreign = workspace(tmp_path, "d" * 64, tmp_path / "other-project")
-    unknown = full.parent / "manual"
-    unknown.mkdir()
-    linked = full.parent / "external-link"
-    linked.symlink_to(foreign, target_is_directory=True)
-    success(tmp_path, "current", default.name)
-    event = success(tmp_path, "all", full.name)
-    assert not old.exists() and full.exists() and default.exists()
-    assert event["removed"] == [old.name]
-    assert foreign.exists() and unknown.exists() and linked.is_symlink()
-    success(tmp_path, "current", default.name)
-    success(tmp_path, "all", full.name)
-    assert full.exists() and default.exists()
-
-
-@pytest.mark.parametrize("value", ["bad JSON"])
-def test_corrupt_index_never_authorizes_deletion(tmp_path, value):
-    old, full = (workspace(tmp_path, key * 64) for key in ("a", "b"))
-    index = full.parent / "index.json"
-    index.write_text(value)
-    event = success(tmp_path, "all", full.name)
-    assert event["status"] == "invalid-index" and old.exists()
-    assert index.read_text() == value
 
 
 def test_unknown_and_redirected_fixed_slots_cannot_be_replaced(tmp_path):
@@ -301,33 +297,134 @@ def test_unknown_and_redirected_fixed_slots_cannot_be_replaced(tmp_path):
         LAYOUT.check_workspace(linked, ROOT)
 
 
-@pytest.mark.parametrize("diagnostic, language_error", [
+@pytest.mark.parametrize("diagnostic,language_error", [
     ("error: C++20 or later compatible compiler is required to use PyTorch", True),
-    ("ld: undefined reference to aclnnExample", False),
-])
-def test_preflight_failure_preserves_cause_and_offers_applicable_remedy(tmp_path, diagnostic, language_error):
-    """A redirected compiler diagnostic must reach the top-level failure message."""
-    commands = RUNNER.Commands(tmp_path / "logs")
-    def _replay(_command, **kwargs):
-        if kwargs["label"].startswith("preflight-compile-"):
-            return commands([sys.executable, "-c", f"print({diagnostic!r}); raise SystemExit(2)"], **kwargs)
-        return None
-    identity = {"torch_version": "2.14.0+cpu", "pta_version": "2.14.0", "python_abi": "cp310", "host_arch": "aarch64", "torch_cxx11_abi": 1}
-    compiler = {"command": ["/usr/bin/g++"], "version": "g++ (GCC) 10.3.1\nCopyright\n"}
+    ("ld: undefined reference to aclnnExample", False)])
+def test_real_compile_failure_preserves_diagnostic(tmp_path, monkeypatch, diagnostic, language_error):
     context = BUILD.BuildContext(ROOT, tmp_path)
-    context.commands = _replay
-    context.frameworks[str(Path(sys.executable))] = BUILD.PreparedFramework(Path(sys.executable), identity, {})
-    context.native_inputs.enrich_tools = lambda contract, *args: contract
-    function = BUILD.preflight_frameworks
-    with patch.multiple(module_for(function), **{'preflight_inputs': lambda *_: {'fixture': True, 'compiler': None}, 'NATIVE': tmp_path}):
-        with pytest.raises(RuntimeError) as caught:
-            function(SimpleNamespace(all=True, clean=False, soc_list="ascend910b", jobs=24), context, [Path(sys.executable)], [identity], compiler)
+    def fail(_python, _identity, _common, _sdk, selected, run):
+        assert selected.jobs == 3
+        run.commands([sys.executable, "-c", f"print({diagnostic!r}); raise SystemExit(2)"],
+                     label="compile-pt2.14.0-torch")
+    monkeypatch.setattr(BUILD, "cmake_pair", fail)
+    identity = {"torch_version": "2.14.0+cpu", "pta_version": "2.14.0"}
+    args = SimpleNamespace(all=True, soc_list="ascend910b", jobs=24)
+    with pytest.raises(RuntimeError) as caught:
+        BUILD.build_adapter(0, 7, Path(sys.executable), identity, 3, args, context, tmp_path, tmp_path,
+                            SimpleNamespace(check_source=lambda: None))
     message = str(caught.value)
-    assert diagnostic in message
-    assert "2.14.0+cpu" in message and "/usr/bin/g++" in message and "10.3.1" in message
-    assert "tools.log" in message and "preflight-compile-2.14.0" in message
+    assert diagnostic in message and "tools.log" in message and "2.14.0+cpu" in message
+    assert ("HYPER_MULTICORE_FRAMEWORK_CXX=" in message) == language_error
     if language_error:
-        assert "HYPER_MULTICORE_FRAMEWORK_CXX=" in message
         assert "--all --soc-list ascend910b --jobs 24" in message
-    else:
-        assert "C++20" not in message
+
+
+def test_parallel_output_has_exclusive_raw_ranges_and_live_context(tmp_path, capsys):
+    logs = tmp_path / "logs"
+    scratch = tmp_path / "staging/output"
+    commands = RUNNER.Commands(logs, scratch=scratch)
+    def invoke(name):
+        code = (f"import time; print('partial-{name}-',end='',flush=True); time.sleep(0.1); "
+                f"print('done'); print('last-{name}',end='',flush=True)")
+        with commands.scope(name):
+            commands([sys.executable, "-c", code], label="compile-fixture")
+    with RUNNER.capture_log(logs / "build.log"):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(invoke, ("left", "right")))
+        assert commands([sys.executable, "-c", "print('{\"private\": true}')"],
+                        label="metadata", capture=True) == '{"private": true}\n'
+    visible = capsys.readouterr().out
+    assert '[left] partial-left-done' in visible and '[right] partial-right-done' in visible
+    assert '[left] last-left' in visible and '[right] last-right' in visible
+    assert '"private"' not in visible
+    records = json.loads((logs / "stages.json").read_text())
+    previous = 0
+    for record in records:
+        assert record["log_start"] == previous
+        previous = record["log_end"]
+        raw = RUNNER.read_log_range(commands.log, record["log_start"], record["log_end"])
+        if record["context"]:
+            assert record["context"] in raw
+            assert ("right" if record["context"] == "left" else "left") not in raw
+    assert previous == commands.log.stat().st_size
+    assert sorted(p.name for p in logs.iterdir()) == ["build.log", "stages.json", "tools.log"]
+    assert not list(scratch.iterdir())
+
+
+def parallel_driver(tmp_path, failure):
+    """Run the actual adapter scheduler around real child groups and the output transaction."""
+    return f'''import os,signal,subprocess,sys,time
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0,{str(ROOT / "hyper_multicore/_build")!r})
+from _hyper_multicore_bootstrap import load_module
+build=load_module('build_controller')
+root=Path({str(tmp_path)!r})
+run=build.BuildContext(Path({str(ROOT)!r}),root/'native')
+started=[]
+def pair(python,identity,common,sdk,args,context):
+ index=int(identity['pta_version'])
+ started.append(index)
+ if index==1 and {failure!r}:
+  deadline=time.monotonic()+8
+  while not (root/'grandchild-0.pid').exists():
+   if time.monotonic()>deadline:raise RuntimeError('fixture child did not start')
+   time.sleep(0.02)
+  context.commands([sys.executable,'-c',"print('fatal error: originating compile failure'); raise SystemExit(7)"],label='compile-origin')
+ else:
+  pid=root/f'grandchild-{{index}}.pid'
+  grandchild="import os,signal,time; from pathlib import Path; signal.signal(signal.SIGTERM,signal.SIG_IGN); Path(%r).write_text(str(os.getpid())); time.sleep(120)" % str(pid)
+  parent="import subprocess,sys,time; from pathlib import Path; subprocess.Popen([sys.executable,'-c',%r]); p=Path(%r)\\nwhile not p.exists(): time.sleep(0.02)\\nprint('WORKER_READY %d',flush=True); time.sleep(120)" % (grandchild,str(pid),index)
+  context.commands([sys.executable,'-c',parent],label='compile-worker')
+ return root/str(index),identity
+build.cmake_pair=pair
+signal.signal(signal.SIGTERM,lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+output=build.WORKSPACE.BuildOutputs(root/'dist',root/'payload')
+try:
+ with output:
+  build.build_adapters(SimpleNamespace(all=True,jobs=8),run,[Path(sys.executable)]*7,
+    [{{'pta_version':str(i),'torch_version':'fixture'}} for i in range(7)],root,root,
+    SimpleNamespace(check_source=lambda:None))
+except BaseException as error:
+ print('RESULT',type(error).__name__,str(error),flush=True)
+ (root/'started.json').write_text(__import__('json').dumps(started))
+ raise SystemExit(130 if isinstance(error,KeyboardInterrupt) else 9)
+'''
+
+
+@pytest.mark.parametrize("interrupt", [None, signal.SIGINT, signal.SIGTERM])
+def test_parallel_failure_and_signals_stop_all_groups_before_output_cleanup(tmp_path, interrupt):
+    """An originating failure or user signal cannot leave siblings, descendants or partial outputs."""
+    script = put(tmp_path / "driver.py", parallel_driver(tmp_path, interrupt is None))
+    put(tmp_path / "dist/old.whl")
+    put(tmp_path / "payload/old.so")
+    log = tmp_path / "driver.log"
+    with log.open("w", encoding="utf-8") as output:
+        controller = subprocess.Popen([sys.executable, str(script)], stdout=output, stderr=subprocess.STDOUT)
+        try:
+            if interrupt is not None:
+                wait_text(log, "WORKER_READY 1", controller)
+                controller.send_signal(interrupt)
+            controller.wait(timeout=25)
+            text = log.read_text()
+            assert controller.returncode == (9 if interrupt is None else 130), text
+            assert not list((tmp_path / "dist").iterdir()) and not (tmp_path / "payload").exists()
+            assert sorted(json.loads((tmp_path / "started.json").read_text())) == [0, 1]
+            assert ("RESULT RuntimeError" if interrupt is None else "RESULT KeyboardInterrupt") in text
+            if interrupt is None:
+                assert "originating compile failure" in text
+            records = json.loads((tmp_path / "native/logs/stages.json").read_text())
+            assert any(r.get("status") == "cancelled" for r in records)
+            assert not list((tmp_path / "native/staging").rglob("*.tmp"))
+            for marker in tmp_path.glob("grandchild-*.pid"):
+                stat = Path("/proc") / marker.read_text() / "stat"
+                assert not stat.exists() or stat.read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        finally:
+            if controller.poll() is None:
+                controller.kill()
+                controller.wait(timeout=5)
+            for marker in tmp_path.glob("grandchild-*.pid"):
+                try:
+                    os.kill(int(marker.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
