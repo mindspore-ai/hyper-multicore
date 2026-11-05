@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import copy
+from queue import Queue, Empty
 import re
 import json
 import os
@@ -25,69 +28,30 @@ import shutil
 import shlex
 import signal
 import sys
+import threading
 import time
 from . import artifacts as HELPERS, framework_environments as FRAMEWORK
+from . import vendor_cache as VENDOR
 from . import command_runner as CONSOLE, build_workspace as WORKSPACE
-from . import preflight_cache as PREFLIGHT
 from ._bootstrap import load_module
 from .command_runner import message
 from .build_utils import atomic_json as write_json, measured, version_label
 from .build_state import BuildContext, BuildResult, PreparedFramework
-from .native_inputs import NativeInputs, compiler_identity, tool_inputs
-from .native_cache import CacheTransaction, cache_valid, hashes, CACHE_SCHEMA_VERSION
-from .build_publication import publish_wheel, publish_payload, validate_elf, validate_wheel
+from .build_publication import SourceGuard, publish_wheel, publish_payload, validate_elf, validate_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "build/native"
 
 MANIFEST = load_module("native_manifest")
 
-COMMON_DIRECTORIES = (
-    "hyper_multicore/ops",
-    "hyper_multicore/cmake/vendor",
-    "hyper_multicore/shmem/ccsrc/ops",
-    "hyper_multicore/shmem/ccsrc/data_plane",
-    "hyper_multicore/shmem/cmake",
-)
-COMMON_EXTRA_INPUTS = (
-    "hyper_multicore/shmem/ccsrc/cann/device.h",
-    "hyper_multicore/shmem/ccsrc/cann/signal.h",
-    "hyper_multicore/build.sh",
-    "hyper_multicore/set_env.bash",
-    "hyper_multicore/shmem/build.sh",
-    "hyper_multicore/shmem/_build/shmem_sdk.sh",
-    "hyper_multicore/_build/assemble_multicore_source.py",
-    "hyper_multicore/_build/merge_multicore_vendors.py",
-    "hyper_multicore/_build/prepare_dependencies.py",
-    "hyper_multicore/_build/dependencies.lock.json",
-    "hyper_multicore/cmake/hardening.cmake",
-    "scripts/native/cann_version.sh",
-)
-
-
-def common_source_fingerprint() -> str:
-    """Include every consumed common source, including the packaged activation script."""
-    return fingerprint_files(COMMON_DIRECTORIES, COMMON_EXTRA_INPUTS)
-
-
-def fingerprint_files(directories, extra=()) -> str:
-    """Hash only consumed inputs rather than the entire framework matrix/source tree."""
-    paths = set()
-    for relative in directories:
-        path = ROOT / relative
-        paths.update(p for p in path.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
-    paths.update(ROOT / p for p in extra)
-    return FRAMEWORK.digest_json({p.relative_to(ROOT).as_posix(): MANIFEST.file_sha256(p) for p in sorted(paths)})
-
-
 def probe_identity(python: Path, socs: str, run: BuildContext, *, source=None, expected=None) -> dict:
-    """Collect identity, package checks and development paths in one target process."""
+    """Collect framework identity and installed versions in the target process."""
     code = (
         "import json,sys; from pathlib import Path; sys.path.insert(0,str(Path(sys.argv[1]).parent)); "
         "from _hyper_multicore_bootstrap import load_module; h=load_module('artifacts'); timings={}; "
         "info=h.build_identity(Path(sys.argv[2]),sys.argv[3],source=json.loads(sys.argv[4]),"
         "timings=timings,expected_versions=json.loads(sys.argv[5])); "
-        "print(json.dumps({'identity':info,'timings':timings,'paths':h.probe_details()}))"
+        "print(json.dumps({'identity':info,'timings':timings,'packages':h.installed_packages()}))"
     )
     result = run.commands(
         [
@@ -105,7 +69,7 @@ def probe_identity(python: Path, socs: str, run: BuildContext, *, source=None, e
         capture=True,
     )
     data = json.loads(result)
-    run.frameworks[str(python)] = PreparedFramework(python, data["identity"], data["paths"])
+    run.frameworks[str(python)] = PreparedFramework(python, data["identity"], data["packages"])
     run.events[-1]["identity_timings"] = data["timings"]
     write_json(run.directory / "stages.json", run.events)
     identity = data["identity"]
@@ -122,199 +86,76 @@ def adapter_environment(python: Path, *, isolated=False) -> dict:
     return env
 
 
-def compiler_inputs(env: dict) -> dict:
-    """Include effective compile, header, library and tool-Python search settings in task keys."""
-    return {
-        key: env.get(key)
-        for key in (
-            "CC",
-            "CXX",
-            "CFLAGS",
-            "CXXFLAGS",
-            "CPPFLAGS",
-            "LDFLAGS",
-            "CMAKE_BUILD_TYPE",
-            "CMAKE_PREFIX_PATH",
-            "CPATH",
-            "CPLUS_INCLUDE_PATH",
-            "LIBRARY_PATH",
-            "LD_LIBRARY_PATH",
-            "PYTHONPATH",
-        )
-    }
-
-
-def preflight_fingerprint(identity: dict, python: Path, compiler: dict, env: dict) -> str:
-    """Reuse interface probes when their actual inputs, rather than unrelated commits, match."""
-    return FRAMEWORK.digest_json(
-        {
-            "framework": {
-                k: identity[k]
-                for k in (
-                    "torch_version",
-                    "pta_version",
-                    "torch_cxx11_abi",
-                    "python_abi",
-                    "host_arch",
-                    "torch_headers_sha256",
-                    "pta_headers_sha256",
-                    "torch_libraries_sha256",
-                    "libtorch_npu_sha256",
-                    "cann_root",
-                    "cann_version_sha256",
-                )
-            },
-            "source": fingerprint_files(
-                ("hyper_multicore/cmake/framework_probe",),
-                ("hyper_multicore/cmake/torch_compat.cmake", "hyper_multicore/torch/csrc/cached_op_api.h"),
-            ),
-            "python": str(python),
-            "compiler": compiler,
-            "flags": {
-                k: env.get(k)
-                for k in (
-                    "CXX",
-                    "CXXFLAGS",
-                    "CPPFLAGS",
-                    "LDFLAGS",
-                    "CMAKE_PREFIX_PATH",
-                    "CPATH",
-                    "CPLUS_INCLUDE_PATH",
-                    "LIBRARY_PATH",
-                    "LD_LIBRARY_PATH",
-                )
-            },
-        }
-    )
-
-
-def cmake_pair(
-    python: Path,
-    identity: dict,
-    common: Path,
-    sdk: Path,
-    key: str,
-    args,
-    run: BuildContext,
-    transaction=None,
-    *,
-    inputs=None,
-    probe_inputs=None,
-) -> tuple[Path, dict]:
-    """Guard both standalone stage calls and the encompassing build transaction."""
-    if transaction is not None:
-        return _cmake_pair(python, identity, common, sdk, key, args, run, transaction, inputs, probe_inputs)
-    with CacheTransaction() as guard:
-        return _cmake_pair(python, identity, common, sdk, key, args, run, guard, inputs, probe_inputs)
-
-
-def _cmake_pair(
-    python: Path,
-    identity: dict,
-    common: Path,
-    sdk: Path,
-    key: str,
-    args,
-    run: BuildContext,
-    transaction: CacheTransaction,
-    inputs,
-    probe_inputs,
-) -> tuple[Path, dict]:
-    """Build one binding/runtime and one unified adapter with exactly the target framework."""
+def cmake_pair(python, identity, common, sdk, args, run):
+    """Compile both framework libraries in fresh, attributed workspaces."""
     directory = NATIVE / "variants" / WORKSPACE.framework_slot(identity)
-    WORKSPACE.check_workspace(directory, ROOT)
-    if args.clean and directory.exists():
-        shutil.rmtree(directory)
-    identifier = "pt" + version_label(identity["pta_version"]) + "-" + key[:12]
-    paths = {
-        "torch_so": f"adapters/{identifier}/libhyper_multicore_torch.so",
-        "shmem_so": f"adapters/{identifier}/hyper_multicore_shmem_torch.so",
-    }
-    transaction.scopes[directory] = run.native_inputs.scope({"native": inputs, "probe": probe_inputs})
-    with measured(run.events, "adapter-output-validation"):
-        cached = run.common_cacheable and cache_valid(directory, key)
-    run.events.append({"stage": identifier, "cache_hit": cached, "fingerprint": key})
-    if cached:
-        previous = json.loads((directory / "identity.json").read_text())
-        if previous.get("task_fingerprint") != key or previous.get("id") != identifier:
-            raise ValueError(f"Changed cached adapter identity: {directory}")
-        report_native_cache(f"adapter {identity['pta_version']}", True)
-        return directory / "payload", {
-            **identity,
-            **paths,
-            "id": identifier,
-            "task_fingerprint": key,
-            "native_build_identity": previous["native_build_identity"],
-        }
-    report_native_cache(f"adapter {identity['pta_version']}", False)
-    transaction.prepare(directory)
+    WORKSPACE.reset_workspace(directory, ROOT)
+    identifier = "pt" + version_label(identity["pta_version"]) + "-" + identity["build_fingerprint"][:12]
+    paths = {"torch_so": f"adapters/{identifier}/libhyper_multicore_torch.so",
+             "shmem_so": f"adapters/{identifier}/hyper_multicore_shmem_torch.so"}
     payload = directory / "payload"
-    payload.mkdir(parents=True, exist_ok=True)
+    payload.mkdir()
     env = adapter_environment(python, isolated=run.isolated)
     env.update(SHMEM_HOME_PATH=str(sdk), SHMEM_SOURCE_DIR=str(sdk / "shmem"))
     env["LD_LIBRARY_PATH"] = os.pathsep.join(
-        [str(common / "shmem/lib"), str(common / "shmem/lib/shmem"), env.get("LD_LIBRARY_PATH", "")]
-    )
-    for kind, source, extra in (
-        (
-            "shmem",
-            "hyper_multicore/shmem/ccsrc",
-            [f"-DSHMEM_OPS_LIB={common / 'shmem/lib/libhyper_multicore_shmem_ops.so'}"],
-        ),
-        ("torch", "hyper_multicore/torch", [f"-DHP_MULTICORE_VENDOR_ROOT={common / 'lib/vendors/hyper_multicore_nn'}"]),
-    ):
-        work = directory / kind
-        run.commands(
-            [
-                "cmake",
-                "-S",
-                str(ROOT / source),
-                "-B",
-                str(work),
-                "-DCMAKE_BUILD_TYPE=Release",
-                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-                f"-DPython3_EXECUTABLE={python}",
-                f"-DCMAKE_INSTALL_PREFIX={payload}",
-                *extra,
-            ],
-            label=f"configure-{identifier}-{kind}",
-            env=env,
-        )
-        run.commands(
-            ["cmake", "--build", str(work), "--parallel", str(args.jobs), "--verbose"],
-            label=f"compile-{identifier}-{kind}",
-            env=env,
-        )
-        if kind == "shmem":
-            run.commands(
-                ["ctest", "--test-dir", str(work), "--output-on-failure"], label=f"ctest-{identifier}", env=env
-            )
-        run.commands(["cmake", "--install", str(work)], label=f"install-{identifier}-{kind}", env=env)
-    for name in ("libhyper_multicore_torch.so", "hyper_multicore_shmem_torch.so"):
-        validate_elf(payload / name, identity["host_arch"], run.commands, env)
-    record = {
-        **identity,
-        **paths,
-        "id": identifier,
-        "task_fingerprint": key,
-        "native_build_identity": {k: identity[k] for k in ("build_commit", "source_sha256", "build_fingerprint")},
-    }
+        [str(common / "shmem/lib"), str(common / "shmem/lib/shmem"), env.get("LD_LIBRARY_PATH", "")])
+    compile_pair(python, directory, payload, common, args, run, env, identifier)
+    with run.commands.scope("Load"):
+        load_pair(python, payload, common, run, env, identifier)
+    with run.commands.scope("ELF"):
+        for name in ("libhyper_multicore_torch.so", "hyper_multicore_shmem_torch.so"):
+            validate_elf(payload / name, identity["host_arch"], run.commands, env)
+    record = {**identity, **paths, "id": identifier,
+              "native_build_identity": {k: identity[k] for k in ("build_commit", "source_sha256", "build_fingerprint")}}
     write_json(directory / "identity.json", record)
-    completion = {"fingerprint": key, "hashes": hashes(payload), "inputs": inputs}
-    if run.common_cacheable:
-        transaction.complete(directory, completion)
+    run.commands.add_event({"stage": "adapter", "pta_version": identity["pta_version"],
+                            "compiled": True, "compiler_jobs": args.jobs})
     return payload, record
 
 
-def validate_toolchain(*, full_matrix=False) -> None:
+def compile_pair(python, directory, payload, common, args, run, env, identifier):
+    """Build the real SHMEM binding/runtime and Torch targets, not separate probes."""
+    for kind, source, extra in (
+        ("shmem", "hyper_multicore/shmem/ccsrc",
+         [f"-DSHMEM_OPS_LIB={common / 'shmem/lib/libhyper_multicore_shmem_ops.so'}"]),
+        ("torch", "hyper_multicore/torch",
+         [f"-DHP_MULTICORE_VENDOR_ROOT={common / 'lib/vendors/hyper_multicore_nn'}"]),
+    ):
+        with run.commands.scope(kind.title()):
+            work = directory / kind
+            run.commands(["cmake", "-S", str(ROOT / source), "-B", str(work),
+                          "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                          f"-DPython3_EXECUTABLE={python}", f"-DCMAKE_INSTALL_PREFIX={payload}", *extra],
+                         label=f"configure-{identifier}-{kind}", env=env)
+            run.commands(["cmake", "--build", str(work), "--parallel", str(args.jobs), "--verbose"],
+                         label=f"compile-{identifier}-{kind}", env=env)
+            if kind == "shmem":
+                run.commands(["ctest", "--test-dir", str(work), "--output-on-failure"],
+                             label=f"ctest-{identifier}", env=env)
+            run.commands(["cmake", "--install", str(work)], label=f"install-adapter-{identifier}-{kind}", env=env)
+
+
+def load_pair(python, payload, common, run, env, identifier):
+    """Resolve real adapter symbols using the selected interpreter, without device work."""
+    code = (
+        "import ctypes,sys,torch,torch_npu; "
+        "ctypes.CDLL(sys.argv[1],mode=ctypes.RTLD_GLOBAL); "
+        "torch.ops.load_library(sys.argv[2]); "
+        "ctypes.CDLL(sys.argv[3],mode=ctypes.RTLD_GLOBAL)"
+    )
+    run.commands([str(python), "-c", code,
+                  str(common / "shmem/lib/libhyper_multicore_shmem_ops.so"),
+                  str(payload / "libhyper_multicore_torch.so"),
+                  str(payload / "hyper_multicore_shmem_torch.so")], label=f"load-{identifier}", env=env)
+
+
+def validate_toolchain() -> None:
     """Reject unavailable common build inputs before preparing any framework environment."""
     cann = os.environ.get("ASCEND_HOME_PATH", "")
     if not cann or not Path(cann).is_dir():
         raise ValueError("ASCEND_HOME_PATH must identify a toolkit directory; source the CANN set_env.sh before building")
     identity = HELPERS.cann_identity(Path(cann))
     message(f"CANN: {identity['cann_version']}; toolkit {identity['cann_root']}")
-    if full_matrix and identity["cann_version"] != "9.2.0":
-        raise ValueError(f"--all builds require CANN 9.2.0, found {identity['cann_version']}")
     required = ("cmake", "ctest", "gcc", "g++", "make", "git", "bisheng", "asc_opc", "readelf", "ldd", "ld")
     missing = [name for name in required if shutil.which(name) is None]
     if missing:
@@ -322,33 +163,35 @@ def validate_toolchain(*, full_matrix=False) -> None:
 
 
 def build(args, publication) -> Path:
-    """Validate staged work, publish, then commit once before optional maintenance."""
+    """Publish only unchanged source builds; maintenance cannot undo a commit."""
     run = BuildContext(ROOT, NATIVE)
-    with CacheTransaction() as transaction:
-        result = _build(args, run, transaction)
+    transaction = SourceGuard(ROOT)
+    result = _build(args, run, transaction)
+    transaction.check_source()
     publication.committed = True
-    run.events.extend(transaction.metrics.values())
-    run.events.extend(run.native_inputs.metrics.values())
     finish_maintenance(args, run, result)
     return result.payload
 
 
-def _build(args, run: BuildContext, transaction: CacheTransaction) -> BuildResult:
-    """Coordinate task phases without duplicating cache, validation or publication policy."""
+def _build(args, run: BuildContext, transaction: SourceGuard) -> BuildResult:
+    """Compile common resources once and each requested pair from fresh workspaces."""
     started = time.monotonic()
-    validate_toolchain(full_matrix=args.all)
-    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
-    transaction.input_checks.append(run.native_inputs.validate)
+    validate_toolchain()
+    run_id = run.run_id
     with measured(run.events, "framework-preparation"):
-        targets, pythons, identities, host_cxx = prepare_frameworks(args, run, transaction)
-    with measured(run.events, "common-input-collection"):
-        common_key, common_env = common_inputs(args, run, pythons[0], identities[0])
-    common, sdk = build_common(args, run, pythons[0], common_key, common_env, transaction)
-    outputs, records = build_adapters(args, run, pythons, identities, common_key, common, sdk, transaction)
+        targets, pythons, identities = prepare_frameworks(args, run)
+    with measured(run.events, "common-compilation"):
+        common, sdk = build_common(args, run, Path(sys.executable).absolute())
+    transaction.check_source()
+    with measured(run.events, "adapter-phase"):
+        outputs, records = build_adapters(args, run, pythons, identities, common, sdk, transaction)
     with measured(run.events, "payload-assembly-validation"):
-        payload, info = assemble_payload(args, run_id, identities, outputs, records, common, common_key)
+        payload, info = assemble_payload(args, run_id, identities, outputs, records, common)
+    if run.vendor_requests:
+        info["vendor_sources"] = [{k: r[k] for k in ("soc", "origin", "reused")} for r in run.vendor_requests]
+        write_json(payload / "build_info.json", info)
     wheel = None if args.native_only else package_wheel(pythons[0], run, payload, info, transaction)
-    transaction.check()
+    transaction.check_source()
     if wheel is not None:
         destination = ROOT / "dist" / wheel.name
         publish_wheel(wheel, destination)
@@ -365,11 +208,12 @@ def finish_maintenance(args, run: BuildContext, result: BuildResult):
     pythons, branches, pairs, started = result.pythons, result.branches, result.pairs, result.started
     maintenance_started = time.monotonic()
     try:
-        run.diagnostics.publish()
+        VENDOR.publish(ROOT, run.vendor_requests)
+        run.events.extend({"stage": "vendor-cache-publication", "soc": r["soc"], "elapsed_seconds": r["publish_seconds"]}
+                          for r in run.vendor_requests if "publish_seconds" in r)
         if args.all:
             removed = FRAMEWORK.prune_environments(NATIVE, pythons, branches)
             run.events.append({"stage": "prune-framework-environments", "removed": removed})
-        PREFLIGHT.finish(NATIVE, ROOT, "all" if args.all else "current", run.events)
         WORKSPACE.clear_temporary_outputs(NATIVE)
     except (Exception, KeyboardInterrupt) as error:
         detail = str(error) or type(error).__name__
@@ -383,47 +227,43 @@ def finish_maintenance(args, run: BuildContext, result: BuildResult):
     build_progress_summary(args, run, pairs, time.monotonic() - started)
 
 
-def prepare_frameworks(args, run: BuildContext, transaction=None):
-    """Resolve the target interpreters and validate their actual identities and interfaces."""
+def prepare_frameworks(args, run: BuildContext):
+    """Only matrix mode selects exact pairs; local builds use the caller's environment."""
     run.isolated = args.all
-    targets = FRAMEWORK.load_targets(ROOT / "hyper_multicore/_build/frameworks.lock.json") if args.all else []
+    config = ROOT / "hyper_multicore/_build/frameworks.lock.json"
+    targets = FRAMEWORK.load_targets(config) if args.all else []
     base = Path(sys.executable).absolute()
     mode = f"full framework matrix: {len(targets)} targets" if args.all else "locally installed framework"
-    message(
-        f"Building {mode}; Python cp{sys.version_info.major}{sys.version_info.minor}, "
-        f"{platform.machine()}, SoC {args.soc_list}, jobs {args.jobs}"
-    )
-    started = time.monotonic()
+    message(f"Building {mode}; Python cp{sys.version_info.major}{sys.version_info.minor}, "
+            f"{platform.machine()}, SoC {args.soc_list}, jobs {args.jobs}")
     source = HELPERS._source_identity(ROOT)
-    run.events.append({"stage": "shared-source-identity", "elapsed_seconds": time.monotonic() - started})
     if args.all:
-        for target in targets:
-            FRAMEWORK.validate_target(target)
+        reference = json.loads(config.read_text()).get("reference_cann")
+        report_cann_reference(reference, HELPERS.cann_identity(Path(os.environ["ASCEND_HOME_PATH"]))["cann_version"])
         pythons, identities = prepare_matrix_environments(targets, run, base, args.soc_list, source)
+        for python, identity in zip(pythons, identities):
+            identity["reference_cann"] = reference
+            environment = json.loads((python.parent.parent / "ready.json").read_text())
+            identity["framework_environment"] = {
+                "request": environment["request"],
+                "installed_packages": run.frameworks[str(python)].packages,
+                "installation": environment.get("installation"),
+            }
     else:
         report_local_framework(base)
         pythons = [base]
-        message("Checking framework build identity, headers and libraries")
         identities = [probe_identity(base, args.soc_list, run, source=source)]
-    attach_framework_environments(args, pythons, identities)
-    host_cxx = compiler_identity(
-        os.environ.get("HYPER_MULTICORE_FRAMEWORK_CXX", os.environ.get("CXX", "c++")),
-        run.commands,
-        "selected-framework-cxx-version",
-    )
-    for identity in identities:
-        identity["host_cxx"] = host_cxx
-    if args.all:
-        for target, identity in zip(targets, identities):
-            if (
-                identity["torch_version"] != target["torch_version"]
-                or identity["pta_version"] != target["pta_build_version"]
-            ):
-                raise ValueError(f"Target framework identity changed: {target['id']}")
-            if identity["cann_version"] != "9.2.0":
-                raise ValueError(f"--all builds require CANN 9.2.0, found {identity['cann_version']}")
-    preflight_frameworks(args, run, pythons, identities, host_cxx, transaction)
-    return targets, pythons, identities, host_cxx
+    return targets, pythons, identities
+
+
+def report_cann_reference(reference, actual):
+    """The matrix reference is informational, never an environment admission gate."""
+    if reference:
+        message(f"CANN reference: {reference}; actual: {actual}")
+        if actual != reference:
+            message("CANN differs from the matrix reference or is unknown; continuing with the installed toolkit", "WARN")
+    else:
+        message(f"CANN actual: {actual}")
 
 
 def report_local_framework(python: Path):
@@ -442,6 +282,7 @@ def prepare_matrix_environments(targets, run, base, socs, source):
 
     def collect(python, expected):
         identities.append(probe_identity(python, socs, run, source=source, expected=expected))
+        return run.frameworks[str(python)].packages
 
     for index, target in enumerate(targets, 1):
         message(
@@ -452,400 +293,142 @@ def prepare_matrix_environments(targets, run, base, socs, source):
 
 
 def build_progress_summary(args, run, pairs: int, elapsed: float):
-    """Summarize completed work rather than requiring users to infer reuse from paths."""
-    cache = [event for event in run.events if "cache_hit" in event]
-    hits = sum(event["cache_hit"] for event in cache)
-    message(
-        f"Build succeeded in {elapsed:.1f}s; adapter pairs {pairs}; native cache hits {hits}, built {len(cache) - hits}"
-    )
+    """Report actual work instead of cross-build cache decisions."""
+    message(f"Build succeeded in {elapsed:.1f}s; built common resources and {pairs} adapter pairs")
+    if run.vendor_requests:
+        reused = sum(r["reused"] for r in run.vendor_requests)
+        message(f"Vendor snapshots: reused {reused}, compiled {len(run.vendor_requests) - reused}; SDK/ops rebuilt")
     if args.all:
         created = sum(event.get("stage", "").startswith("venv-") for event in run.events)
         message(f"Framework environments: created {created}, reused {pairs - created}")
     message(f"Build log: {run.directory / 'build.log'}")
 
 
-def report_native_cache(kind: str, hit: bool) -> None:
-    """Report native cache decisions while detailed identities stay in stage records."""
-    work = (
-        "cache hit; verified outputs reused, no compilation"
-        if hit
-        else "cache miss; no completed matching inputs, building"
-    )
-    message(f"{kind.capitalize()}: {work}")
-
-
-def attach_framework_environments(args, pythons, identities):
-    """Retain automatic dependency provenance separately from framework compatibility."""
-    if args.all:
-        for python, identity in zip(pythons, identities):
-            environment = json.loads((python.parent.parent / "ready.json").read_text())
-            identity["framework_environment"] = {"request": environment["request"], "packages": environment["packages"]}
-
-
-def preflight_failure(identity: dict, compiler: dict, args, error: RuntimeError) -> str:
-    """Explain compiler-standard failures without misdiagnosing unrelated linker errors."""
-    version = compiler["version"].partition("\n")[0]
-    detail = (
-        f"Framework preflight failed: Torch={identity['torch_version']}, PTA={identity['pta_version']}\n"
-        f"Compiler: {shlex.join(compiler['command'])} ({version})\n{error}"
-    )
-    if re.search(
-        r"C\+\+20.*(?:required|support)|cxx_std_20|(?:gnu|c)\+\+20.*(?:invalid|unrecognized)", str(error), re.IGNORECASE
-    ):
-        command = [
-            "bash",
-            "build.sh",
-            *(["--all"] if args.all else []),
-            "--soc-list",
-            args.soc_list,
-            "--jobs",
-            str(args.jobs),
-        ]
-        detail += (
-            "\nThis Torch requires final C++20 (__cplusplus >= 202002L); accepting -std=c++20 alone is insufficient."
-            "\nSelect a compiler compatible with the Torch/op-plugin headers; GCC 12.4 passed the recorded matrix build."
-            "\nRetry from the source root, replacing the compiler path:"
-            f"\n  HYPER_MULTICORE_FRAMEWORK_CXX=/path/to/compatible/g++ {shlex.join(command)}"
-            "\nThe override affects framework preflight/adapters only; keep the CANN vendor/SDK/ops toolchain unchanged."
-            "\nMatching framework environments and native caches are reused automatically."
-        )
-    return detail
-
-
-def preflight_inputs(python, identity, host_cxx, env, run):
-    """Describe all probe inputs separately from native cache keys."""
-    digest = run.preflight_hashes
-    development = PREFLIGHT.development_inputs(
-        run.frameworks[str(python)].development, Path(identity["cann_root"]), digest
-    )
-    return {
-        "contract": preflight_fingerprint(identity, python, host_cxx, env),
-        "framework": {
-            k: identity[k]
-            for k in (
-                "torch_version",
-                "pta_version",
-                "torch_headers_sha256",
-                "pta_headers_sha256",
-                "torch_libraries_sha256",
-                "libtorch_npu_sha256",
-            )
-        },
-        "compiler": tool_inputs(host_cxx, env, digest, run.commands),
-        "development": development,
-        "source": fingerprint_files(
-            ("hyper_multicore/cmake/framework_probe",),
-            ("hyper_multicore/cmake/torch_compat.cmake", "hyper_multicore/torch/csrc/cached_op_api.h"),
-        ),
-        "flags": compiler_inputs(env),
-        "python": str(python),
-        "schema": PREFLIGHT.SCHEMA_VERSION,
-    }
-
-
-def preflight_frameworks(args, run: BuildContext, pythons, identities, host_cxx, transaction=None):
-    """Reuse only certified compile/link probes; never infer success from an existing SO."""
-    for index, (python, identity) in enumerate(zip(pythons, identities), 1):
-        env, version = adapter_environment(python, isolated=run.isolated), identity["pta_version"]
-        env["CXX"] = shlex.join(host_cxx["command"])
-        inputs = preflight_inputs(python, identity, host_cxx, env, run)
-        key = FRAMEWORK.digest_json(inputs)
-        work = NATIVE / "preflight" / WORKSPACE.framework_slot(identity)
-        scope = f"preflight PTA {version}"
-        run.frameworks[str(python)].tools = run.native_inputs.enrich_tools(inputs["compiler"], env, run.commands)
-        run.diagnostics.observe(scope, key, inputs, work)
-        message(f"Framework preflight {index}/{len(identities)}: PTA {version}")
-        try:
-            hit, reason = PREFLIGHT.ensure_probe(
-                work,
-                key,
-                args,
-                python,
-                env,
-                run.commands,
-                version,
-                run.preflight_hashes,
-                transaction,
-                ROOT,
-                write_json,
-                inputs.get("compiler"),
-            )
-        except RuntimeError as error:
-            raise RuntimeError(preflight_failure(identity, host_cxx, args, error)) from error
-        certificate = json.loads((work / "complete.json").read_text())
-        run.frameworks[str(python)].preflight = {"inputs": inputs, "dependencies": certificate["extra_inputs"]}
-        run.events.append(
-            {
-                "stage": f"preflight-{version}",
-                "preflight_cache_hit": hit,
-                "reason": reason,
-                "fingerprint": key,
-                "directory": work.name,
-                "search_path": env.get("PATH"),
-            }
-        )
-        message(f"Framework preflight PTA {version}: {'cache hit' if hit else 'passed'}; {reason}")
-
-
-def cann_python_inputs(python, probe, env, run):
-    """Retain raw help in tools.log and collect CANN modules from the real import probe."""
-    code = (
-        "import json,runpy,sys; from pathlib import Path; "
-        "sys.path.insert(0,str(Path(sys.argv[1]).resolve().parent)); sys.argv=[sys.argv[1], '--help']\n"
-        "try: runpy.run_path(sys.argv[0],run_name='__main__')\n"
-        "except SystemExit as e:\n"
-        " if e.code not in (None,0): raise\n"
-        "files=sorted({str(m.__file__) for m in list(sys.modules.values()) if getattr(m,'__file__',None)})\n"
-        "print('\\nHP_CANN_IMPORT_INPUTS='+json.dumps(files))"
-    )
-    output = run([str(python), "-c", code, str(probe)], label="cann-python-import-probe", env=env, capture=True)
-    return json.loads(output.rsplit("HP_CANN_IMPORT_INPUTS=", 1)[1])
-
-
-def asc_compilation_inputs(cann: Path, env: dict) -> tuple[Path, Path, Path]:
-    """Locate the compilation entry used by the selected ASC CMake configuration."""
-    roots = [Path(env["ASC_DIR"])] if env.get("ASC_DIR") else []
-    roots.extend(Path(p) for p in env.get("CMAKE_PREFIX_PATH", "").split(os.pathsep) if p)
-    roots.append(cann)
-    if any(not root.resolve().is_relative_to(cann.resolve()) for root in roots):
-        raise ValueError("External ASC search paths cannot be fully authenticated")
-    configs = [root / suffix / name for root in roots for suffix in ("", "lib64/cmake", "lib/cmake")
-               for name in ("ASCConfig.cmake", "asc-config.cmake") if (root / suffix / name).is_file()]
-    if not configs:
-        raise ValueError("ASC CMake configuration not located for input authentication")
-    config = configs[0]
-    contents = config.read_text()
-    if "compiler/tikcpp/ascendc_kernel_cmake" not in contents:
-        raise ValueError(f"ASC compilation layout not identified: {config}")
-    custom = env.get("CUSTOM_ASC_CMAKE_PATH")
-    cmake_root = Path(custom) if custom else cann / "compiler/tikcpp/ascendc_kernel_cmake"
-    probe = cmake_root / "fwk_modules/util/ascendc_compile_kernel.py"
-    if not probe.is_file():
-        raise ValueError(f"ASC compiler Python inputs not located: {probe}")
-    return probe, config, cmake_root
-
-
-def compiler_python_inputs(files: list[str], native: NativeInputs) -> dict:
-    """Track imported compiler dependencies at their actual locations, without dist-info."""
-    inputs = {}
-    for name in files:
-        path = Path(name)
-        if not path.is_file():
-            continue
-        if "site-packages" in path.parts:
-            index = path.parts.index("site-packages")
-            package = Path(*path.parts[:index + 2])
-            if package.is_dir():
-                inputs.update(native.tree(package))
-                continue
-        inputs[str(path)] = native.file(path)
-    return inputs
-
-
-def disable_common_cache(run: BuildContext, error: Exception) -> None:
-    """Unknown compiler inputs permit development builds but never certified reuse."""
-    run.common_cacheable = False
-    message(f"CANN input discovery incomplete: {error}; "
-            "common resources and adapters will be rebuilt without cache certification", "WARN")
-
-
-def discover_cann_inputs(args: argparse.Namespace, run: BuildContext, python: Path, cann: Path, env: dict) -> dict:
-    """Unidentified local tool inputs disable reuse; matrix builds require certification."""
-    try:
-        probe, config, cmake_root = asc_compilation_inputs(cann, env)
-        files = cann_python_inputs(python, probe, env, run.commands)
-        inputs = {"config": run.native_inputs.file(config), "modules": run.native_inputs.tree(cmake_root)}
-        inputs["python_modules"] = compiler_python_inputs(files, run.native_inputs)
-        development = run.native_inputs.cann(cann, env, run.commands, files)
-    except (OSError, ValueError, RuntimeError) as error:
-        if args.all:
-            raise
-        disable_common_cache(run, error)
-        return {"asc_configuration": {}, "cann_development": {}}
-    message("CANN Python compiler imports: passed")
-    return {"asc_configuration": inputs, "cann_development": development}
-
-
-def common_inputs(args, run: BuildContext, python: Path, identity: dict):
-    """Collect only source, toolchain and compiler-Python inputs consumed by common tasks."""
-    common_source = common_source_fingerprint()
-    compiler = {
-        name: {
-            "path": str(Path(shutil.which(name)).resolve()),
-            "version": run.commands([name, "--version"], label=f"toolchain-{name}", capture=True),
-        }
-        for name in ("gcc", "g++", "bisheng", "cmake", "ld", "make")
-    }
-    compiler["selected_cxx"] = compiler_identity(
-        os.environ.get("CXX", "c++"), run.commands, "selected-common-cxx-version"
-    )
-    common_env = FRAMEWORK.cann_tool_environment(python, isolated=run.isolated)
-    cann = Path(common_env["ASCEND_HOME_PATH"])
-    inputs = {
-        "cache_schema": CACHE_SCHEMA_VERSION,
-        "source": common_source,
-        "socs": args.soc_list,
-        "cann_root": identity["cann_root"],
-        "cann_sha": identity["cann_version_sha256"],
-        "compiler": compiler,
-        "asc_opc": MANIFEST.file_sha256(Path(shutil.which("asc_opc")).resolve()),
-        "flags": compiler_inputs(common_env),
-    }
-    inputs["tools"] = run.native_inputs.common_tools(compiler, common_env, run.commands)
-    inputs.update(discover_cann_inputs(args, run, python, cann, common_env))
-    common_key = FRAMEWORK.digest_json(inputs)
-    run.common_inputs = inputs
-    return common_key, common_env
-
-
-def build_common(
-    args, run: BuildContext, python: Path, common_key: str, common_env: dict, transaction: CacheTransaction
-):
-    """Prepare one validated common payload and its immutable SDK handoff."""
-    common_dir = NATIVE / "common" / WORKSPACE.common_slot(args.soc_list)
-    WORKSPACE.check_workspace(common_dir, ROOT)
-    if args.clean and common_dir.exists():
-        shutil.rmtree(common_dir)
-    common = common_dir / "payload"
-    run.diagnostics.observe("Shared native resources", common_key, run.common_inputs, common_dir)
-    transaction.scopes[common_dir] = run.native_inputs.scope(run.common_inputs)
-    with measured(run.events, "common-output-validation"):
-        hit = run.common_cacheable and cache_valid(common_dir, common_key)
-    report_native_cache("common resources", hit)
-    run.events.append(
-        {
-            "stage": "common",
-            "cache_hit": hit,
-            "fingerprint": common_key,
-            "directory": common_dir.name,
-            "socs": args.soc_list,
-        }
-    )
-    if not hit:
-        transaction.prepare(common_dir)
-        env = dict(common_env)
-        env.update(
-            PYTHON_BIN=str(python),
-            HP_NATIVE_STAGE="common",
-            HP_COMPONENT_ROOT=str(common),
-            HP_NATIVE_WORK_ROOT=str(common_dir / "work"),
-            HP_SHMEM_WORK_ROOT=str(common_dir / "shmem-work"),
-            HP_SHMEM_HANDOFF=str(common_dir / "sdk.json"),
-        )
-        run.commands(
-            [
-                "bash",
-                str(ROOT / "hyper_multicore/build.sh"),
-                "--stage-only",
-                "--soc-list",
-                args.soc_list,
-                "--jobs",
-                str(args.jobs),
-                *(["--clean"] if args.clean or not run.common_cacheable else []),
-            ],
-            label="common-resources",
-            env=env,
-        )
-        transaction.check(common_dir)
-        if run.common_cacheable:
-            try:
-                run.native_inputs.verify_consumed(common_dir, common_env["ASCEND_HOME_PATH"])
-            except RuntimeError as error:
-                if args.all:
-                    raise
-                disable_common_cache(run, error)
-        sdk_record = json.loads((common_dir / "sdk.json").read_text())
-        if run.common_cacheable:
-            transaction.complete(
-                common_dir,
-                {
-                    "fingerprint": common_key,
-                    "hashes": hashes(common),
-                    "inputs": run.common_inputs,
-                    "sdk_root": sdk_record["install_root"],
-                    "sdk_hashes": hashes(Path(sdk_record["install_root"])),
-                    "sdk_manifest_sha256": MANIFEST.file_sha256(common_dir / "sdk.json"),
-                },
-            )
-    sdk = Path(json.loads((common_dir / "sdk.json").read_text())["install_root"])
+def build_common(args, run: BuildContext, python: Path):
+    """Use caller CANN tools for SDK/ops and cached vendor resources in either mode."""
+    directory = NATIVE / "common" / WORKSPACE.common_slot(args.soc_list)
+    WORKSPACE.reset_workspace(directory, ROOT)
+    common = directory / "payload"
+    env = FRAMEWORK.cann_tool_environment(python, isolated=False)
+    message(f"Common CANN tools: Python {python}; using caller environment")
+    env.update(PYTHON_BIN=str(python), HP_NATIVE_STAGE="common", HP_COMPONENT_ROOT=str(common),
+               HP_NATIVE_WORK_ROOT=str(directory / "work"), HP_SHMEM_WORK_ROOT=str(directory / "shmem-work"),
+               HP_SHMEM_HANDOFF=str(directory / "sdk.json"))
+    origin = HELPERS._source_identity(ROOT)
+    env.update(HP_VENDOR_CACHE_ROOT=str(NATIVE), HP_VENDOR_ORIGIN=json.dumps(origin))
+    if getattr(args, "clean", False):
+        env["HP_VENDOR_CACHE_CLEAN"] = "1"
+    else:
+        env.pop("HP_VENDOR_CACHE_CLEAN", None)
+    run.commands(["bash", str(ROOT / "hyper_multicore/build.sh"), "--stage-only",
+                  "--soc-list", args.soc_list, "--jobs", str(args.jobs)], label="common-resources", env=env)
+    sdk = Path(json.loads((directory / "sdk.json").read_text())["install_root"])
+    run.vendor_requests = [json.loads(p.read_text()) for p in sorted((directory / "work").glob("vendor-request-*.json"))]
+    for request in run.vendor_requests:
+        run.events.append({"stage": "vendor", **{k: request[k] for k in
+                          ("soc", "reused", "lookup_seconds", "compile_seconds") if k in request}})
+    run.events.append({"stage": "common", "compiled": True, "socs": args.soc_list})
     return common, sdk
 
 
-def build_adapters(
-    args, run: BuildContext, pythons, identities, common_key, common, sdk, transaction: CacheTransaction
-):
-    """Build or reuse exactly the requested framework pairs."""
-    adapter_source = fingerprint_files(
-        (
-            "hyper_multicore/torch/csrc",
-            "hyper_multicore/shmem/ccsrc/runtime",
-            "hyper_multicore/shmem/ccsrc/cann",
-            "hyper_multicore/shmem/ccsrc/bindings",
-            "hyper_multicore/shmem/ccsrc/include",
-            "hyper_multicore/shmem/ccsrc/device",
-        ),
-        (
-            "hyper_multicore/torch/CMakeLists.txt",
-            "hyper_multicore/shmem/ccsrc/CMakeLists.txt",
-            "hyper_multicore/cmake/torch_compat.cmake",
-            "hyper_multicore/cmake/hardening.cmake",
-            "tests/ut/shmem/native_log_test.cpp",
-        ),
-    )
-    records, outputs = [], []
-    for index, (python, identity) in enumerate(zip(pythons, identities), 1):
-        message(f"Adapter {index}/{len(identities)}: Torch {identity['torch_version']}, PTA {identity['pta_version']}")
-        transaction.check_source()
-        inputs = {
-            "cache_schema": CACHE_SCHEMA_VERSION,
-            "common": common_key,
-            "source": adapter_source,
-            "python": str(python),
-            "development": run.native_inputs.tree(
-                Path(run.frameworks[str(python)].development["python_include"])
-            ),
-            "compiler": run.frameworks[str(python)].tools,
-            "common_path": str(common),
-            "flags": compiler_inputs(adapter_environment(python, isolated=run.isolated)),
-            "framework": {
-                k: identity[k]
-                for k in (
-                    "torch_version",
-                    "pta_version",
-                    "torch_commit",
-                    "torch_cxx11_abi",
-                    "python_abi",
-                    "host_arch",
-                    "op_plugin_headers_sha256",
-                    "libtorch_npu_sha256",
-                    "torch_headers_sha256",
-                    "pta_headers_sha256",
-                    "torch_libraries_sha256",
-                )
-            },
-        }
-        key = FRAMEWORK.digest_json(inputs)
-        run.diagnostics.observe(
-            f"Adapter PTA {identity['pta_release']}", key, inputs, NATIVE / "variants" / WORKSPACE.framework_slot(identity)
-        )
-        output, record = cmake_pair(
-            python,
-            identity,
-            common,
-            sdk,
-            key,
-            args,
-            run,
-            transaction,
-            inputs=inputs,
-            probe_inputs=run.frameworks[str(python)].preflight,
-        )
-        outputs.append(output)
-        records.append(record)
-    return outputs, records
+def adapter_budgets(count, jobs):
+    """Use serial, two-slot or all-target scheduling without exceeding the compile budget."""
+    workers = count if jobs >= 2 * count else (2 if jobs >= 4 else 1)
+    workers = min(workers, count)
+    quotient, remainder = divmod(jobs, workers)
+    return [quotient + (slot < remainder) for slot in range(workers)]
 
 
-def assemble_payload(args, run_id, identities, outputs, records, common, common_key):
+def build_adapter(index, count, python, identity, jobs, args, run, common, sdk, transaction):
+    """Build one pair with a private argument copy and thread-local diagnostic labels."""
+    selected = copy(args)
+    selected.jobs = jobs
+    started, wall_started = time.monotonic(), time.time()
+    error = None
+    try:
+        with run.commands.scope(f"PTA {identity['pta_version']}"):
+            message(f"Adapter {index + 1}/{count}: Torch {identity['torch_version']}, "
+                    f"PTA {identity['pta_version']}; compiler jobs {jobs}")
+            transaction.check_source()
+            try:
+                return cmake_pair(python, identity, common, sdk, selected, run)
+            except CONSOLE.CommandCancelled:
+                raise
+            except RuntimeError as cause:
+                raise RuntimeError(framework_failure(identity, args, python, cause)) from cause
+    except BaseException as caught:
+        error = caught
+        raise
+    finally:
+        run.commands.add_event({"stage": f"adapter-compilation-{identity['pta_version']}",
+                                "elapsed_seconds": time.monotonic() - started,
+                                "started_at": wall_started, "ended_at": time.time(),
+                                "status": CONSOLE.command_status(0, error), "compiler_jobs": jobs})
+
+
+def parallel_adapters(args, run, pythons, identities, common, sdk, transaction, budgets):
+    """Bind quotas to fixed workers so out-of-order completion cannot oversubscribe jobs."""
+    targets = Queue()
+    for index, (python, identity) in enumerate(zip(pythons, identities)):
+        targets.put((index, python, identity))
+    results = [None] * len(identities)
+    progress = threading.Lock()
+    completed = 0
+
+    def slot(jobs):
+        nonlocal completed
+        while not run.commands.cancelled.is_set():
+            try:
+                index, python, identity = targets.get_nowait()
+            except Empty:
+                return
+            try:
+                result = build_adapter(index, len(identities), python, identity, jobs,
+                                       args, run, common, sdk, transaction)
+                with progress:
+                    results[index] = result
+                    completed += 1
+                    message(f"Adapters completed {completed}/{len(identities)}; PTA {identity['pta_version']}")
+            except BaseException as error:
+                run.commands.cancel(error)
+                raise
+            finally:
+                targets.task_done()
+
+    pool = ThreadPoolExecutor(max_workers=len(budgets), thread_name_prefix="native-adapter")
+    error = None
+    try:
+        futures = [pool.submit(slot, jobs) for jobs in budgets]
+        for future in as_completed(futures):
+            future.result()
+    except BaseException as caught:
+        run.commands.cancel(caught)
+        error = run.commands.failure or caught
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    if error is not None:
+        raise error
+    return results
+
+
+def build_adapters(args, run: BuildContext, pythons, identities, common, sdk, transaction: SourceGuard):
+    """Compile pairs with bounded concurrency, preserving matrix order for publication."""
+    count = len(identities)
+    budgets = adapter_budgets(count, args.jobs) if args.all else [args.jobs]
+    message(f"Adapter schedule: {len(budgets)} concurrent pairs; "
+            f"compiler jobs per slot {', '.join(map(str, budgets))}; total budget {args.jobs}")
+    run.commands.add_event({"stage": "adapter-schedule", "workers": len(budgets),
+                            "worker_jobs": budgets, "total_jobs": args.jobs, "targets": count})
+    if len(budgets) == 1:
+        results = [build_adapter(index, count, python, identity, args.jobs, args, run, common, sdk, transaction)
+                   for index, (python, identity) in enumerate(zip(pythons, identities))]
+    else:
+        results = parallel_adapters(args, run, pythons, identities, common, sdk, transaction, budgets)
+    outputs, records = zip(*results)
+    return list(outputs), list(records)
+
+
+def assemble_payload(args, run_id, identities, outputs, records, common):
     """Assemble and validate one selected payload without changing runtime registration policy."""
     staging = NATIVE / "staging" / run_id
     payload = staging / "hyper_multicore"
@@ -873,7 +456,7 @@ def assemble_payload(args, run_id, identities, outputs, records, common, common_
             HELPERS.COMPONENT_VERSION if args.all else HELPERS.artifact_version(identities[0]["pta_version"])
         ),
         "requested_target_ids": [v["id"] for v in records],
-        "common_fingerprint": common_key,
+        "reference_cann": identities[0].get("reference_cann"),
         "framework_lock_sha256": (
             MANIFEST.file_sha256(ROOT / "hyper_multicore/_build/frameworks.lock.json") if args.all else None
         ),
@@ -885,7 +468,7 @@ def assemble_payload(args, run_id, identities, outputs, records, common, common_
     return payload, info
 
 
-def package_wheel(python: Path, run: BuildContext, payload: Path, info: dict, transaction: CacheTransaction):
+def package_wheel(python: Path, run: BuildContext, payload: Path, info: dict, transaction: SourceGuard):
     """Validate the complete wheel and source state before atomically publishing its path."""
     env = FRAMEWORK.build_environment(python, isolated=run.isolated)
     env["HYPER_MULTICORE_NATIVE_OUTPUT_ROOT"] = str(payload)
@@ -916,7 +499,7 @@ def package_wheel(python: Path, run: BuildContext, payload: Path, info: dict, tr
     return wheels[0]
 
 
-def publish_build_payload(payload: Path, run_id: str, transaction: CacheTransaction) -> Path:
+def publish_build_payload(payload: Path, run_id: str, transaction: SourceGuard) -> Path:
     """Expose a complete selected payload after the final source check."""
     selected = NATIVE / "payload/hyper_multicore"
     selected.parent.mkdir(parents=True, exist_ok=True)
@@ -930,9 +513,11 @@ def publish_build_payload(payload: Path, run_id: str, transaction: CacheTransact
 def main() -> None:
     """Expose default local-framework builds and the explicit complete release matrix."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--all", action="store_true", help="Build every locked framework target; keep native caches")
+    parser.add_argument("--all", action="store_true",
+                        help="Build every configured framework target; adapter concurrency follows --jobs")
     parser.add_argument("--soc-list", default="ascend910b,ascend910_93")
-    parser.add_argument("--jobs", type=int, default=os.cpu_count())
+    parser.add_argument("--jobs", type=int, default=os.cpu_count(),
+                        help="Compiler job budget, shared by concurrent adapters")
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--native-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -995,3 +580,20 @@ def run_locked_build(args, publication=None):
                 if isinstance(error, KeyboardInterrupt):
                     raise
                 raise SystemExit(1) from error
+
+
+def framework_failure(identity: dict, args, python: Path, error: RuntimeError) -> str:
+    """Keep the real compiler diagnostic and an actionable C++20 retry command."""
+    compiler = os.environ.get("HYPER_MULTICORE_FRAMEWORK_CXX", os.environ.get("CXX", "c++"))
+    detail = (f"Framework build/load failed: Torch={identity['torch_version']}, PTA={identity['pta_version']}"
+              f"; Python={python}; compiler={compiler}\n{error}")
+    if re.search(r"C\+\+20.*(?:required|support)|cxx_std_20|(?:gnu|c)\+\+20.*(?:invalid|unrecognized)",
+                 str(error), re.IGNORECASE):
+        command = ["bash", "build.sh", *(["--all"] if args.all else []),
+                   "--soc-list", args.soc_list, "--jobs", str(args.jobs)]
+        detail += (
+            "\nThis Torch requires final C++20 (__cplusplus >= 202002L). Select a compiler compatible with its headers."
+            "\nRetry from the source root, replacing the compiler path:"
+            f"\n  HYPER_MULTICORE_FRAMEWORK_CXX=/path/to/compatible/g++ {shlex.join(command)}"
+            "\nThe override affects framework adapters only; keep the CANN vendor/SDK/ops toolchain unchanged.")
+    return detail

@@ -22,6 +22,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -30,6 +31,7 @@ from pathlib import Path
 from .build_utils import atomic_json as write_json
 
 ROOT = Path(__file__).resolve().parents[2]
+CONSOLE_LOCK = threading.RLock()
 
 
 def format_message(text: str, level="INFO") -> str:
@@ -40,8 +42,9 @@ def format_message(text: str, level="INFO") -> str:
 def message(text: str, level="INFO"):
     """Write one complete message so tool-reader threads cannot split its prefix."""
     stream = sys.stderr if level == "ERROR" else sys.stdout
-    stream.write(format_message(text, level))
-    stream.flush()
+    with CONSOLE_LOCK:
+        stream.write(format_message(text, level))
+        stream.flush()
 
 
 class Transcript:
@@ -80,11 +83,10 @@ def stage_title(label: str) -> str:
     label = re.sub(r"pt([\d.]+(?:post\d+)?)-[0-9a-f]{12}", r"PTA \1", label)
     titles = {
         "package-wheel": "Packaging wheel", "common-resources": "Building shared native resources",
-        "preflight-configure-": "Configuring framework preflight: PTA ",
-        "preflight-compile-": "Checking framework compile/link support: PTA ",
+        "install-adapter-": "Installing adapter: ",
         "venv-": "Creating framework environment: ", "install-": "Installing framework packages: ",
-        "pip-check-": "Checking installed dependencies: ", "download-": "Downloading framework wheels: ",
-        "resolve-": "Resolving framework dependencies: ", "configure-": "Configuring adapter: ",
+        "download-": "Downloading framework wheels: ",
+        "configure-": "Configuring adapter: ",
         "compile-": "Building adapter: ", "ctest-": "Testing SHMEM: ",
     }
     for prefix, title in titles.items():
@@ -123,7 +125,7 @@ def compiler_metrics(output: str) -> dict:
 
 
 def stage_failure(label: str, status: int, log: Path, start=0, end=None) -> str:
-    """Surface the first preflight diagnostic while keeping full output in its log."""
+    """Surface the first tool diagnostic while keeping full output in its log."""
     detail = f"Stage {label} failed ({status}); inspect {log}"
     lines = read_log_range(log, start, end).splitlines()
     errors = [
@@ -132,7 +134,7 @@ def stage_failure(label: str, status: int, log: Path, start=0, end=None) -> str:
         if re.search(r"fatal error:|error:|CMake Error|undefined reference|(?:Error|Exception):", line, re.IGNORECASE)
     ]
     if errors:
-        index = errors[0][0] if label.startswith("preflight-") else errors[-1][0]
+        index = errors[0][0]
         detail += "\nDiagnostic:\n" + "\n".join(line[:600] for line in lines[index : index + 3])
     return detail
 
@@ -140,9 +142,10 @@ def stage_failure(label: str, status: int, log: Path, start=0, end=None) -> str:
 class StageOutput:
     """Mirror tool logs live and report quiet stages without piping or blocking the child."""
 
-    def __init__(self, log: Path, label: str, started: float, *, capture=False, heartbeat=10.0, offset=0):
+    def __init__(self, log: Path, label: str, started: float, *, capture=False, heartbeat=10.0, context=""):
         self.log, self.label, self.started = log, label, started
-        self.capture, self.heartbeat, self.offset = capture, heartbeat, offset
+        self.capture, self.heartbeat, self.context = capture, heartbeat, context
+        self.pending = ""
         self.stopped = threading.Event()
         self.worker = threading.Thread(target=self.follow, name="native-build-output", daemon=True)
 
@@ -158,8 +161,9 @@ class StageOutput:
         """A closed terminal must not leave the log reader alive or lose disk evidence."""
         try:
             if text:
-                sys.stdout.write(text)
-                sys.stdout.flush()
+                with CONSOLE_LOCK:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
             return True
         except (OSError, ValueError):
             return False
@@ -169,11 +173,10 @@ class StageOutput:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         last_output = time.monotonic()
         with self.log.open("rb") as source:
-            source.seek(self.offset)
             while True:
                 data = b"" if self.capture else source.read(8192)
                 if data:
-                    if not self.emit(decoder.decode(data)):
+                    if not self.emit_lines(decoder.decode(data)):
                         return
                     last_output = time.monotonic()
                     continue
@@ -183,44 +186,65 @@ class StageOutput:
                 if now - last_output >= self.heartbeat:
                     if not self.emit(
                         format_message(
+                            f"{self.context + ': ' if self.context else ''}"
                             f"{stage_title(self.label)}: still running ({now - self.started:.0f}s elapsed)"
                         )
                     ):
                         return
                     last_output = now
                 self.stopped.wait(0.1)
-        self.emit(decoder.decode(b"", final=True))
+        self.emit_lines(decoder.decode(b"", final=True), final=True)
+
+    def emit_lines(self, text: str, *, final=False) -> bool:
+        """Keep each contextual line intact even when several children write partial chunks."""
+        if not self.context:
+            return self.emit(text)
+        self.pending += text.replace("\r\n", "\n").replace("\r", "\n")
+        while "\n" in self.pending:
+            line, self.pending = self.pending.split("\n", 1)
+            if not self.emit(f"[{self.context}] {line}\n"):
+                return False
+        if final and self.pending:
+            return self.emit(f"[{self.context}] {self.pending}\n")
+        return True
 
 
-def stop_stage(process) -> None:
-    """Preserve bounded cleanup of the child process group, including surviving grandchildren."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        pass
-    # The leader can exit while a grandchild still holds the process group.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+def signal_groups(processes, number):
+    """Signal every group before waiting for any individual child."""
+    for process in processes:
+        try:
+            os.killpg(process.pid, number)
+        except ProcessLookupError:
+            pass
+
+
+def wait_for_groups(processes):
+    """Bound descendant cleanup by one shared deadline, rather than one per target."""
+    groups = {process.pid for process in processes}
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        remaining = []
+        remaining = False
         for stat in Path("/proc").glob("[0-9]*/stat"):
             try:
                 fields = stat.read_text().rsplit(")", 1)[1].split()
-                if fields[0] != "Z" and int(fields[2]) == process.pid:
-                    remaining.append(stat)
+                remaining |= fields[0] != "Z" and int(fields[2]) in groups
             except (OSError, ValueError, IndexError):
                 continue
         if not remaining:
-            break
+            return
         time.sleep(0.05)
+
+
+def stop_stages(processes) -> None:
+    """Terminate all active groups under common grace periods, including descendants."""
+    signal_groups(processes, signal.SIGTERM)
+    deadline = time.monotonic() + 15
+    while any(process.poll() is None for process in processes) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    signal_groups(processes, signal.SIGKILL)
+    for process in processes:
+        process.wait()
+    wait_for_groups(processes)
 
 
 def read_log_range(path: Path, start=0, end=None) -> str:
@@ -230,85 +254,153 @@ def read_log_range(path: Path, start=0, end=None) -> str:
         return source.read(-1 if end is None else end - start).decode("utf-8", errors="replace")
 
 
-class Commands:
-    """Keep raw tools in one append-only stream with explicit command byte ranges."""
+class CommandCancelled(RuntimeError):
+    """An otherwise valid command was stopped by another failure or user cancellation."""
 
-    def __init__(self, directory: Path, *, root: Path = ROOT, events=None):
+
+class Commands:
+    """Execute concurrent tools while serializing raw-log blocks and stage records."""
+
+    def __init__(self, directory: Path, *, root: Path = ROOT, events=None, scratch=None):
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
         self.log = directory / "tools.log"
         self.log.touch(exist_ok=True)
         self.root = root
         self.events = [] if events is None else events
+        self.scratch = scratch or directory
+        self.cancelled = threading.Event()
+        self.failure = None
+        self._processes = {}
+        self._process_lock = threading.RLock()
+        self._output_lock = threading.RLock()
+        self._local = threading.local()
 
-    def record(self, command, label, started, offset, status, error=None):
-        end = self.log.stat().st_size
+    @contextmanager
+    def scope(self, name):
+        """Attach an opaque output label to one calling thread, without shared environment mutation."""
+        previous = getattr(self._local, "context", "")
+        self._local.context = f"{previous} / {name}" if previous else name
+        try:
+            yield
+        finally:
+            self._local.context = previous
+
+    def add_event(self, record):
+        """Append complete stage metadata and replace JSON under the same writer lock."""
+        with self._output_lock:
+            self.events.append(record)
+            write_json(self.directory / "stages.json", self.events)
+
+    def cancel(self, error):
+        """The first cause wins; no process may start after the cancellation snapshot."""
+        with self._process_lock:
+            if self.cancelled.is_set():
+                return
+            self.failure = error
+            self.cancelled.set()
+            processes = tuple(self._processes.values())
+        if processes:
+            message(f"Stopping {len(processes)} active tool process groups", "WARN")
+            stop_stages(processes)
+
+    def start(self, command, output, env, capture):
+        """Make cancellation and process registration atomic with respect to worker starts."""
+        with self._process_lock:
+            if self.cancelled.is_set():
+                raise CommandCancelled("Build cancelled; no further commands will start")
+            process = subprocess.Popen(
+                command, cwd=self.root, env=env, stdout=subprocess.PIPE if capture else output,
+                stderr=output, text=True, start_new_session=True,
+            )
+            self._processes[process.pid] = process
+            return process
+
+    def record(self, command, label, started, wall_started, spool, status, error=None):
+        """Merge one complete raw block and give it an exclusive byte interval."""
+        text = spool.read_text(encoding="utf-8", errors="replace")
         record = {
-            "stage": label,
-            "elapsed_seconds": time.monotonic() - started,
-            "exit_code": status,
-            "status": (
-                "interrupted"
-                if isinstance(error, KeyboardInterrupt)
-                else ("failed" if error or status else "succeeded")
-            ),
-            "log": str(self.log),
-            "log_start": offset,
-            "log_end": end,
-            "command": list(command),
+            "stage": label, "context": getattr(self._local, "context", ""),
+            "started_at": wall_started, "ended_at": time.time(),
+            "elapsed_seconds": time.monotonic() - started, "exit_code": status,
+            "status": command_status(status, error), "log": str(self.log), "command": list(command),
             "disk_free_bytes": shutil.disk_usage(self.directory).free,
+            **compiler_metrics(text),
         }
-        record.update(compiler_metrics(read_log_range(self.log, offset, end)))
         if error:
             record["error"] = str(error) or type(error).__name__
-        self.events.append(record)
-        write_json(self.directory / "stages.json", self.events)
+        with self._output_lock:
+            with self.log.open("ab") as output, spool.open("rb") as source:
+                record["log_start"] = output.tell()
+                shutil.copyfileobj(source, output)
+                record["log_end"] = output.tell()
+            self.add_event(record)
         return record
 
-    def execute(self, command, label, offset, started, env, capture):
+    def execute(self, command, label, spool, started, env, capture):
+        """Each child owns its output file; only terminal rendering is shared while running."""
         stdout = None
-        with self.log.open("ab", buffering=0) as output:
-            process = subprocess.Popen(
-                command,
-                cwd=self.root,
-                env=env,
-                stdout=subprocess.PIPE if capture else output,
-                stderr=output,
-                text=True,
-                start_new_session=True,
-            )
-            with StageOutput(self.log, label, started, capture=capture, offset=offset):
-                try:
+        with spool.open("wb", buffering=0) as output:
+            process = self.start(command, output, env, capture)
+            try:
+                with StageOutput(spool, label, started, capture=capture,
+                                 context=getattr(self._local, "context", "")):
                     stdout, _ = process.communicate()
-                except BaseException:
-                    message(f"{stage_title(label)}: stopping the stage process group", "WARN")
-                    stop_stage(process)
-                    if capture:
-                        stdout, _ = process.communicate()
-                    raise
-                finally:
-                    if capture and stdout:
-                        output.write(bytes(stdout, "utf-8"))
+            except BaseException as error:
+                self.cancel(error)
+                if capture:
+                    stdout, _ = process.communicate()
+                raise
+            finally:
+                if process.returncode and not self.cancelled.is_set():
+                    stop_stages((process,))
+                with self._process_lock:
+                    self._processes.pop(process.pid, None)
+                if capture and stdout:
+                    output.write(bytes(stdout, "utf-8"))
         return stdout, process.returncode
 
     def __call__(self, command, *, label: str, env=None, capture=False):
-        started, offset = time.monotonic(), self.log.stat().st_size
+        if self.cancelled.is_set():
+            raise CommandCancelled("Build cancelled; no further commands will start")
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=self.scratch, prefix="tool-", suffix=".tmp", delete=False) as file:
+            spool = Path(file.name)
+        started, wall_started = time.monotonic(), time.time()
+        stdout, status, error = None, None, None
         title = stage_title(label)
+        context = getattr(self._local, "context", "")
+        if context:
+            title = f"{context}: {title}"
         visible = visible_stage(label, capture)
         if visible:
             message(title)
         try:
-            stdout, status = self.execute(command, label, offset, started, env, capture)
-        except BaseException as error:
-            self.record(command, label, started, offset, None, error)
-            raise
-        record = self.record(command, label, started, offset, status)
+            try:
+                stdout, status = self.execute(command, label, spool, started, env, capture)
+                if self.cancelled.is_set():
+                    error = CommandCancelled("Stage cancelled after another failure or interruption")
+            except BaseException as caught:
+                error = caught
+            record = self.record(command, label, started, wall_started, spool, status, error)
+        finally:
+            spool.unlink(missing_ok=True)
+        if error is not None:
+            raise error
         if status or visible:
             outcome = "failed" if status else "completed"
-            message(
-                f"{title}: {outcome} in {record['elapsed_seconds']:.1f}s (exit {status})", "ERROR" if status else "INFO"
-            )
+            message(f"{title}: {outcome} in {record['elapsed_seconds']:.1f}s (exit {status})",
+                    "ERROR" if status else "INFO")
         if status:
-            diagnostic = stage_failure(label, status, self.log, offset, record["log_end"])
+            diagnostic = stage_failure(label, status, self.log, record["log_start"], record["log_end"])
             raise RuntimeError(f"{diagnostic}\nCommand executable: {command[0]}")
         return stdout
+
+
+def command_status(status, error):
+    """Keep collateral cancellation distinct from the initiating command failure."""
+    if isinstance(error, KeyboardInterrupt):
+        return "interrupted"
+    if isinstance(error, CommandCancelled):
+        return "cancelled"
+    return "failed" if error or status else "succeeded"

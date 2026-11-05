@@ -45,18 +45,6 @@ def atomic_json(path: Path, value: object) -> None:
 
 
 @contextmanager
-def timed(metrics: dict, name: str) -> Iterator[None]:
-    """Accumulate counters without adding diagnostic data to authentication inputs."""
-    started = time.monotonic()
-    try:
-        yield
-    finally:
-        record = metrics.setdefault(name, {"stage": name, "calls": 0, "elapsed_seconds": 0.0})
-        record["calls"] += 1
-        record["elapsed_seconds"] += time.monotonic() - started
-
-
-@contextmanager
 def measured(events: list, stage: str) -> Iterator[None]:
     """Record one controller phase, including a failed or interrupted phase."""
     started = time.monotonic()

@@ -25,7 +25,6 @@ import platform
 import re
 import subprocess
 import sys
-import sysconfig
 import time
 from contextlib import contextmanager
 from packaging.version import Version
@@ -125,48 +124,6 @@ def identity_phase(timings, name):
         timings[name] = timings.get(name, 0.0) + time.monotonic() - started
 
 
-class ProbeHashes:
-    """Read overlapping inputs once per probe and reject changing file generations."""
-
-    def __init__(self):
-        self.files = {}
-
-    def __call__(self, path):
-        path = Path(path)
-        stat = path.stat()
-        generation = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-        if path in self.files:
-            old, value = self.files[path]
-            if old != generation:
-                raise RuntimeError(f"Framework input changed during identity collection: {path}")
-            return value
-        value = _sha256(path)
-        after = path.stat()
-        if generation != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-            raise RuntimeError(f"Framework input changed during identity collection: {path}")
-        self.files[path] = generation, value
-        return value
-
-    def validate(self):
-        """Keep generation checks even for files read only once at probe start."""
-        for path in self.files:
-            self(path)
-
-    def discard_tree(self, directory):
-        """Discard generated probe files before intentionally recreating their work tree."""
-        self.files = {p: value for p, value in self.files.items() if not p.is_relative_to(directory)}
-
-
-def header_digest(directory, digest_file):
-    """Preserve the original path/content digest algorithm."""
-    digest = hashlib.sha256()
-    for header in sorted(directory.rglob("*")):
-        if header.is_file():
-            digest.update(header.relative_to(directory).as_posix().encode())
-            digest.update(bytes.fromhex(digest_file(header)))
-    return digest.hexdigest()
-
-
 def verify_package_versions(expected: dict, timings: dict) -> None:
     """Check recorded matrix packages without imposing local release requirements."""
     with identity_phase(timings, "package_versions"):
@@ -176,45 +133,18 @@ def verify_package_versions(expected: dict, timings: dict) -> None:
 
 
 def build_identity(root: Path, soc_list: str, *, source=None, timings=None, expected_versions=None) -> dict:
-    """Collect the original identity with per-call shared inputs and separate diagnostics."""
+    """Record the installed framework and actual build inputs without cache certification."""
     timings = {} if timings is None else timings
     if sys.version_info[:2] < (3, 10):
         raise RuntimeError("Native builds require Python >=3.10")
     verify_package_versions(expected_versions or {}, timings)
     pta = _MANIFEST.framework_package("torch_npu")
-    pta_version = pta["version"]
     with identity_phase(timings, "framework_import"):
         import torch
-    pta_root = Path(pta["root"])
-    torch_root = Path(torch.__file__).resolve().parent
-    torch_version = str(getattr(torch, "__version__", "unknown"))
-    headers_root = pta_root / "include" / "third_party" / "op-plugin"
-    if not (headers_root / "op_plugin/include/npu_cpp_extension.h").is_file():
-        raise RuntimeError(f"Missing installed op-plugin header: {headers_root}")
-    digest_file = ProbeHashes()
-    with identity_phase(timings, "headers_hash"):
-        headers = {
-            p.relative_to(headers_root).as_posix(): digest_file(p)
-            for p in sorted(headers_root.rglob("*"))
-            if p.is_file()
-        }
-        header_hashes = {
-            name: header_digest(directory, digest_file)
-            for name, directory in (
-                ("torch_headers_sha256", torch_root / "include"),
-                ("pta_headers_sha256", pta_root / "include"),
-            )
-        }
     with identity_phase(timings, "source_identity"):
         source = _source_identity(root) if source is None else source
-    info = identity_metadata(root, soc_list, torch, torch_version, pta_version, headers, source)
-    info.update(header_hashes)
-    with identity_phase(timings, "libraries_hash"):
-        info["libtorch_npu_sha256"] = digest_file(pta_root / "lib/libtorch_npu.so")
-        info["torch_libraries_sha256"] = {
-            name: digest_file(torch_root / "lib" / name) for name in ("libc10.so", "libtorch.so", "libtorch_cpu.so")
-        }
-    digest_file.validate()
+    info = identity_metadata(root, soc_list, torch, str(getattr(torch, "__version__", "unknown")), pta["version"], source)
+    info["framework_locations"] = {"torch": str(Path(torch.__file__).resolve().parent), "torch_npu": pta["root"]}
     info["build_fingerprint"] = hashlib.sha256(json.dumps(info, sort_keys=True).encode()).hexdigest()
     return info
 
@@ -233,7 +163,7 @@ def cann_identity(cann_root: Path) -> dict:
     }
 
 
-def identity_metadata(root, soc_list, torch, torch_version, pta_version, headers, source):
+def identity_metadata(root, soc_list, torch, torch_version, pta_version, source):
     return {
         "schema_version": 1,
         "component_version": COMPONENT_VERSION,
@@ -247,19 +177,8 @@ def identity_metadata(root, soc_list, torch, torch_version, pta_version, headers
         "host_arch": platform.machine(),
         "soc_list": soc_list.split(","),
         **cann_identity(Path(os.environ["ASCEND_HOME_PATH"])),
-        "op_plugin_headers_sha256": hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest(),
         "dependency_lock_sha256": _sha256(root / "hyper_multicore/_build/dependencies.lock.json"),
         **source,
-    }
-
-
-def probe_details():
-    """Return build-only development paths without changing the framework identity schema."""
-    import torch
-
-    return {
-        "python_include": sysconfig.get_paths()["include"],
-        "torch_cmake": str(Path(torch.__file__).resolve().parent / "share/cmake"),
     }
 
 
@@ -416,6 +335,14 @@ def main() -> None:
         (args.output / "build_info.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
     else:
         validate_payload(args.output, json.loads((args.output / "build_info.json").read_text(encoding="utf-8")))
+
+
+def installed_packages():
+    """Observe actual distributions for provenance, without enforcing a dependency lock."""
+    from packaging.utils import canonicalize_name
+
+    return sorted([{"name": canonicalize_name(d.metadata["Name"]), "version": d.version}
+                   for d in metadata.distributions() if d.metadata["Name"]], key=lambda p: (p["name"], p["version"]))
 
 
 if __name__ == "__main__":

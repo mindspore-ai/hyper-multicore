@@ -14,7 +14,6 @@ function hp_prepare_shmem_sdk() {
     local project_root=$1
     local soc_list=$2
     local native_jobs=$3
-    local clean_sdk=${4:-off}
     local native_root="${project_root}/build/native"
     local python_bin="${PYTHON_BIN:-python}"
     local locked_source_dir
@@ -140,9 +139,7 @@ print(hashlib.sha256(encoded).hexdigest())
     locked_commit=$("${python_bin}" -c 'import json,sys; print(json.loads(sys.argv[1])["shmem"]["commit"])' \
         "${prepared_dependency}") || return 6
 
-    if [[ "${clean_sdk}" == "on" ]]; then
-        rm -rf "${build_dir}" "${install_root}"
-    fi
+    rm -rf "${build_dir}" "${install_root}"
     rm -rf "${source_dir}"
     mkdir -p "${source_dir}" "${build_dir}"
     if ! (set -o pipefail; git -C "${locked_source_dir}" archive --format=tar "${locked_commit}" \

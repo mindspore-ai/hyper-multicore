@@ -59,7 +59,7 @@ def test_text_matrix_aligns_every_vertical_separator():
                                          ("pt2.14.0-123456789abc", "2.14.0+cpu", "2.14.0")]]
     text = formatter({"package_version": "0.1.0.dev0", "package_root": "/package", "build_info": {
         "build_mode": "all", "python_abi": "cp310", "host_arch": "aarch64", "soc_list": ["ascend910b"],
-        "variants": variants}, "runtime": {"python": "/python", "python_abi": "cp310", "host_arch": "aarch64",
+        "variants": variants, "reference_cann": "9.2.0", "cann_version": "9.1.0"}, "runtime": {"python": "/python", "python_abi": "cp310", "host_arch": "aarch64",
         "torch": "not installed", "torch-npu": "not installed", "cann_version": "unknown"}})
     rows = [line for line in text.splitlines() if line.lstrip().startswith("|")]
     positions = [[i for i, char in enumerate(row) if char == "|"] for row in rows]
@@ -69,3 +69,5 @@ def test_text_matrix_aligns_every_vertical_separator():
     assert all(variant["id"] not in text for variant in variants)
     assert "hyper_multicore_build_info --json" in text
     assert "Runtime" in text and "not installed" in text
+    assert "CANN actual" in text and "9.1.0" in text
+    assert "CANN reference" in text and "9.2.0" in text

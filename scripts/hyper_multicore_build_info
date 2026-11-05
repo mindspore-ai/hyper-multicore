@@ -46,7 +46,8 @@ def format_text(result: dict) -> str:
             [
                 ("Python ABI", info["python_abi"]),
                 ("Architecture", info["host_arch"]),
-                ("CANN", info.get("cann_version", "unknown")),
+                ("CANN actual", info.get("cann_version", "unknown")),
+                ("CANN reference", info.get("reference_cann") or "not specified"),
                 ("SoC", ", ".join(info["soc_list"])),
             ]
         ),

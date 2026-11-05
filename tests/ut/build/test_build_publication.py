@@ -25,7 +25,7 @@ import pytest
 from tests.ut.build._build_test_support import ROOT, load_module, put
 
 BUILD = load_module("build_controller")
-CACHE = load_module("native_cache")
+PUBLICATION = load_module("build_publication")
 LAYOUT = BUILD.WORKSPACE
 
 
@@ -50,36 +50,40 @@ def _staged_build(tmp_path, monkeypatch):
     output = BUILD.WORKSPACE.BuildOutputs(tmp_path / "dist", tmp_path / "native/payload/hyper_multicore")
     put(output.payload / "old.so", "old payload")
     put(output.distribution / "old.whl", "old wheel")
-    state = {"checks": 0, "reject_on": None}
+    state = {"checks": 0, "reject_on": None, "snapshots": 0}
     def _validate():
         state["checks"] += 1
         if state["checks"] == state["reject_on"]:
             raise RuntimeError("final input changed")
-    def _prepare(_args, _context, guard):
-        guard.input_checks.append(_validate)
-        return [{"pta_release": "2.12.0"}], [Path(sys.executable)], [{}], {}
+    def _prepare(_args, _context):
+        return [{"pta_release": "2.12.0"}], [Path(sys.executable)], [{}]
+    def _snapshot(*_args):
+        assert output.committed, "Vendor snapshot cannot precede the output commit"
+        state["snapshots"] += 1
+    monkeypatch.setattr(BUILD.VENDOR, "publish", _snapshot)
     replacements = {"ROOT": tmp_path, "NATIVE": tmp_path / "native", "validate_toolchain": lambda **_: None,
-        "prepare_frameworks": _prepare, "common_inputs": lambda *_: ("key", {}),
+        "prepare_frameworks": _prepare,
         "build_common": lambda *_: (tmp_path / "common", tmp_path / "sdk"),
         "build_adapters": lambda *_: ([], [{"pta_version": "2.12.0"}]),
         "assemble_payload": lambda *_: (candidate, {}),
         "package_wheel": lambda *_: put(tmp_path / "staging/candidate.whl", "new wheel")}
     for name, value in replacements.items():
         monkeypatch.setattr(BUILD, name, value)
-    monkeypatch.setattr(CACHE, "source_observation", lambda: {})
+    monkeypatch.setattr(PUBLICATION.SourceGuard, "observe", lambda _: {})
+    monkeypatch.setattr(PUBLICATION.SourceGuard, "check_source", lambda _: _validate())
     return SimpleNamespace(all=False, native_only=False), output, state
 
 
 def test_success_publishes_only_the_new_wheel_and_payload(staged_build):
-    args, output, _ = staged_build
+    args, output, state = staged_build
     with output:
         assert BUILD.build(args, output) == output.payload
-    assert output.committed
+    assert output.committed and state["snapshots"] == 1
     assert [p.name for p in output.distribution.iterdir()] == ["candidate.whl"]
     assert [p.name for p in output.payload.iterdir()] == ["new.so"]
 
 
-@pytest.mark.parametrize("reject_on", [1, 2])
+@pytest.mark.parametrize("reject_on", [2, 4])
 def test_final_input_failure_clears_both_outputs(staged_build, reject_on):
     """Reject before publication and after the visible switch, exercising actual publishers."""
     args, output, state = staged_build
@@ -88,6 +92,7 @@ def test_final_input_failure_clears_both_outputs(staged_build, reject_on):
         BUILD.build(args, output)
     assert not output.committed and not output.payload.exists()
     assert not list(output.distribution.iterdir())
+    assert state["snapshots"] == 0
 
 
 def test_mid_publication_failure_clears_both_outputs(staged_build, monkeypatch):
@@ -159,10 +164,22 @@ from _hyper_multicore_bootstrap import load_module
 controller=load_module('build_controller')
 assert controller.CONSOLE is load_module('command_runner')
 assert controller.WORKSPACE is load_module('build_workspace')
-assert controller.PREFLIGHT is load_module('preflight_cache')
-assert controller.FRAMEWORK.STORE is load_module('framework_store')
-assert controller.CacheTransaction is load_module('native_cache').CacheTransaction
+assert controller.SourceGuard is load_module('build_publication').SourceGuard
 assert controller is load_module('build_controller')
 '''
     result = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_source_guard_rejects_changes_and_restoration(tmp_path):
+    source = put(tmp_path / "hyper_multicore/torch/source.cpp", "original")
+    for name in ("setup.py", "MANIFEST.in", "build.sh", "requirements.txt"):
+        put(tmp_path / name, "fixture")
+    guard = PUBLICATION.SourceGuard(tmp_path)
+    guard.check_source()
+    source.write_text("changed")
+    with pytest.raises(RuntimeError, match="Source inputs changed"):
+        guard.check_source()
+    put(source.with_suffix(".replacement"), "original").replace(source)
+    with pytest.raises(RuntimeError, match="Source inputs changed"):
+        guard.check_source()

@@ -22,7 +22,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 import pytest
-from tests.ut.build._build_test_support import ROOT, load_module, make_target, cached_resolution
+from tests.ut.build._build_test_support import ROOT, load_module, make_target
 ENV = load_module("framework_environments")
 BUILD = load_module("build_controller")
 
@@ -36,11 +36,10 @@ def _local_preparation(monkeypatch, tmp_path):
     monkeypatch.setattr(BUILD.MANIFEST, "framework_package", lambda name: {
         "version": version, "root": str(tmp_path / "installed" / name)})
     monkeypatch.setattr(BUILD.HELPERS, "_source_identity", lambda root: {})
-    monkeypatch.setattr(BUILD, "compiler_identity", lambda *_: {})
     run = BUILD.BuildContext(ROOT, tmp_path / "native")
     def _probe(*_args, **_kwargs):
         run.events.append({"stage": "probe"})
-        return json.dumps({"identity": identity, "paths": {}, "timings": {}})
+        return json.dumps({"identity": identity, "packages": [], "timings": {}})
     run.commands = _probe
     return SimpleNamespace(all=False, soc_list="ascend910b", jobs=1), run, identity
 
@@ -51,82 +50,18 @@ def test_current_framework_ignores_release_matrix(local_preparation, monkeypatch
     def _unavailable(_path):
         raise ValueError("missing or damaged release matrix")
     monkeypatch.setattr(ENV, "load_targets", _unavailable)
-    probed = []
-    monkeypatch.setattr(BUILD, "preflight_frameworks", lambda *values: probed.extend(values[3]))
-    targets, _, identities, _ = BUILD.prepare_frameworks(args, run)
-    assert targets == [] and probed == identities
+    targets, _, identities = BUILD.prepare_frameworks(args, run)
+    assert targets == [] and identities[0]["pta_version"] == identity["pta_version"]
     output = capsys.readouterr().out
     assert identity["pta_version"] in output and "Torch" in output and "torch_npu" in output
     assert "installed/torch" in output and "installed/torch_npu" in output
-
-
-@pytest.mark.parametrize("mismatch", ["framework", "cann"])
-def test_matrix_framework_still_requires_exact_pair(local_preparation, monkeypatch, mismatch):
-    """Matrix preparation cannot substitute the caller's development release for a locked pair."""
-    args, run, _ = local_preparation
-    args.all = True
-    target = ENV.load_targets(ROOT / "hyper_multicore/_build/frameworks.lock.json")[0]
-    monkeypatch.setattr(ENV, "load_targets", lambda _: [target])
-    identity = {"torch_version": target["torch_version"], "pta_version": target["pta_build_version"], "cann_version": "9.2.0"}
-    field = "pta_version" if mismatch == "framework" else "cann_version"
-    identity[field] = "2.15.0.dev20261005+git42" if mismatch == "framework" else "9.1.0"
-    monkeypatch.setattr(BUILD, "prepare_matrix_environments", lambda *_: ([Path(sys.executable)], [identity]))
-    monkeypatch.setattr(BUILD, "attach_framework_environments", lambda *_: None)
-    with pytest.raises(ValueError, match="Target framework identity changed|--all builds require CANN"):
-        BUILD.prepare_frameworks(args, run)
-
-
-def test_install_uses_verified_local_list_and_no_dependency_download(tmp_path):
-    """A cached resolution installs offline without tests or manually pinned transitive inputs."""
-    cache = tmp_path / "framework-packages"
-    cache.mkdir()
-    target = make_target(cache)
-    resolution, record = cached_resolution(target, tmp_path, Path(sys.executable))
-    commands = []
-    def run(command, **_kwargs):
-        commands.append(command)
-        if command[1:3] == ["-m", "venv"]:
-            (Path(command[3]) / "bin").mkdir(parents=True)
-            (Path(command[3]) / "bin/python").write_text("fixture")
-    python = ENV.prepare_environment(target, tmp_path, run, Path(sys.executable))
-    installation = next(c for c in commands if c[1:4] == ["-m", "pip", "install"])
-    assert {"--no-index", "--no-cache-dir", "--no-deps", "--require-hashes", "--only-binary=:all:"} <= set(installation)
-    listing = Path(installation[-1]).read_text()
-    assert "https://" not in listing and "http://" not in listing
-    assert all(str(ENV.STORE.wheel_path(tmp_path, p)) in listing for p in record["packages"])
-    assert not any(c[1:4] == ["-m", "pip", "download"] for c in commands)
-    assert python.parent.parent.joinpath("ready.json").exists()
-    assert not {"pytest", "pybind11"} & {p["name"] for p in record["packages"]}
-    commands.clear()
-    assert ENV.prepare_environment(target, tmp_path, run, Path(sys.executable)) == python
-    assert not any(c[1:4] in (["-m", "pip", "install"], ["-m", "pip", "download"]) for c in commands)
-
-
-def test_environment_creation_failure_never_marks_ready(tmp_path):
-    """A failed install leaves no ready marker and retries from verified local wheels."""
-    cache = tmp_path / "framework-packages"
-    cache.mkdir()
-    target = make_target(cache)
-    cached_resolution(target, tmp_path, Path(sys.executable))
-    failing = True
-    def _run(command, **_kwargs):
-        if command[1:3] == ["-m", "venv"]:
-            (Path(command[3]) / "bin").mkdir(parents=True)
-        elif failing and command[1:4] == ["-m", "pip", "install"]:
-            raise RuntimeError("offline missing dependency")
-    with pytest.raises(RuntimeError, match="offline"):
-        ENV.prepare_environment(target, tmp_path, _run, Path(sys.executable))
-    assert not list(tmp_path.rglob("ready.json"))
-    failing = False
-    python = ENV.prepare_environment(target, tmp_path, _run, Path(sys.executable))
-    assert (python.parent.parent / "ready.json").is_file()
 
 
 def test_environment_isolation_preserves_cann_but_removes_framework_paths():
     """The selected interpreter cannot inherit another framework's CMake or SO paths."""
     with patch.dict(ENV.os.environ, {"PYTHONPATH": "wrong", "Torch_DIR": "wrong",
                     "LD_LIBRARY_PATH": ("/cann/lib64:/old/site-packages/torch/lib:"
-                                        "/old/build/native/framework/envs/other/lib"),
+                                        "/old/build/native/envs/other/lib"),
                     "PIP_EXTRA_INDEX_URL": "https://wrong.invalid", "PIP_FIND_LINKS": "/wrong",
                     "PIP_CACHE_DIR": "/user/cache", "PIP_NO_CACHE_DIR": "1",
                     "ASCEND_HOME_PATH": "/cann", "CMAKE_PREFIX_PATH": "/cann/compiler:/old/site-packages/torch/share/cmake"}, clear=True):
@@ -152,27 +87,17 @@ def test_framework_compiler_override_does_not_change_common_toolchain():
         assert ENV.os.environ["CXX"] == "/system/g++"
 
 
-def test_cann_precheck_only_restricts_the_full_matrix(tmp_path, monkeypatch):
-    """Local toolkits reach capability checks; the full matrix retains its CANN baseline."""
-    function = BUILD.validate_toolchain
-    with patch.dict(BUILD.os.environ, {}, clear=True), pytest.raises(ValueError, match="source the CANN"):
-        function()
-    (tmp_path / "opp").mkdir()
-    version_file = tmp_path / "opp/version.info"
-    version_file.write_text("Version=9.1.0.dev-local\n")
+def test_cann_tool_check_has_no_version_gate(tmp_path, monkeypatch):
+    """Unknown or different versions can compile, while missing tools remain actionable."""
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(tmp_path))
     monkeypatch.setattr(BUILD.shutil, "which", lambda name: f"/tools/{name}")
-    with patch.dict(BUILD.os.environ, {"ASCEND_HOME_PATH": str(tmp_path)}):
-        function()
-        with pytest.raises(ValueError, match="--all builds require CANN 9.2.0"):
-            function(full_matrix=True)
-        version_file.unlink()
-        assert BUILD.HELPERS.cann_identity(tmp_path)["cann_version_sha256"] is None
-        function()
-        version_file.write_text("Version=9.2.0\n")
-        function(full_matrix=True)
-        monkeypatch.setattr(BUILD.shutil, "which", lambda name: None if name == "bisheng" else f"/tools/{name}")
-        with pytest.raises(ValueError, match="Missing native build tools.*bisheng"):
-            function()
+    BUILD.validate_toolchain()
+    (tmp_path / "opp").mkdir()
+    (tmp_path / "opp/version.info").write_text("Version=9.1.0\n")
+    BUILD.validate_toolchain()
+    monkeypatch.setattr(BUILD.shutil, "which", lambda name: None if name == "bisheng" else f"/tools/{name}")
+    with pytest.raises(ValueError, match="Missing native build tools.*bisheng"):
+        BUILD.validate_toolchain()
 
 
 def test_local_environment_preserves_source_paths_and_partial_cann_layout(tmp_path):
@@ -245,7 +170,7 @@ def test_op_plugin_compilation_uses_actual_torch_branch(tmp_path, minor, forward
     module = SimpleNamespace(__file__=str(torch / "__init__.py"),
         version=SimpleNamespace(git_version="fixture"), _C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True))
     with patch.dict(os.environ, ASCEND_HOME_PATH=str(cann)):
-        identity = BUILD.HELPERS.identity_metadata(ROOT, "ascend910b", module, "private torch/42", "custom pta/42", {}, {})
+        identity = BUILD.HELPERS.identity_metadata(ROOT, "ascend910b", module, "private torch/42", "custom pta/42", {})
     assert identity["op_plugin_version"] == f"V2R{minor}" and identity["torch_version"] == "private torch/42"
     plugin.write_text("#define V2R7 6\n#define V2R12 11\n#define V2R14 13\n#define VERSION_NEWEST V2R14\n")
     script = tmp_path / "check.cmake"
@@ -295,23 +220,75 @@ def test_environment_key_separates_architecture_python_and_requirements(tmp_path
     assert ENV.environment_key(target, Path(sys.executable)) != key
 
 
-def test_installed_snapshot_changes_are_rejected():
-    """Version verification compares installed packages with the recorded actual versions."""
-    record = {"packages": [{"name": "packaging", "version": "0.0.0"}]}
-    def run(command, **_kwargs):
-        subprocess.run(command, check=True, capture_output=True)
-    with pytest.raises(subprocess.CalledProcessError):
-        ENV.verify_environment(Path(sys.executable), record, run)
+@pytest.mark.parametrize("reference,actual,warnings", [
+    ("9.2.0", "9.2.0", 0), ("9.2.0", "9.1.0", 1), ("9.2.0", "unknown", 1), (None, "unknown", 0)])
+def test_cann_reference_only_warns(reference, actual, warnings, capsys):
+    BUILD.report_cann_reference(reference, actual)
+    output = capsys.readouterr().out
+    assert actual in output and output.count("WARN") == warnings
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_resolver_report_supports_current_and_legacy_pip_hashes(legacy):
-    """Pip need not be upgraded to consume its installation report."""
-    archive = {"hash": "sha256=" + "a" * 64} if legacy else {"hashes": {"sha256": "a" * 64}}
-    assert ENV.report_digest({"archive_info": archive}) == "a" * 64
+def test_environment_install_and_reuse_only_locks_framework_pair(tmp_path):
+    """The actual manager installs exact roots once, then accepts other package changes."""
+    wheels = tmp_path / "downloads"
+    wheels.mkdir()
+    target = make_target(wheels)
+    commands = []
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if "--dest" in command:
+            import shutil
+            name = command[-1].split("==")[0].replace("-", "_")
+            destination = Path(command[command.index("--dest") + 1])
+            source = wheels / f"{name}-1.0.0-py3-none-any.whl"
+            shutil.copyfile(source, destination / source.name)
+        if "--report" in command:
+            Path(command[command.index("--report") + 1]).write_text(json.dumps({"install": []}))
+    actual = [{"name": "numpy", "version": "1.26.4"}]
+    def probe(_python, expected):
+        assert expected == {"torch": "1.0.0", "torch-npu": "1.0.0"}
+        return actual
+    python = ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable), identity_probe=probe)
+    assert python.parent.parent.parent == tmp_path / "envs"
+    install = next(c for c in commands if "--report" in c)
+    assert "--only-binary=:all:" in install and "--no-deps" not in install
+    assert not list(python.parent.parent.glob("framework-install-*"))
+    actual[0]["version"] = "2.0.0"
+    commands.clear()
+    ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable), identity_probe=probe)
+    assert commands == []
+    record = json.loads((python.parent.parent / "ready.json").read_text())
+    assert record["installed_packages"] == actual
+    with pytest.raises(RuntimeError, match="changed"):
+        ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable),
+                                identity_probe=lambda *_: (_ for _ in ()).throw(RuntimeError("framework changed")))
 
 
-def test_resolver_report_rejects_invalid_hash():
-    """An incomplete report cannot produce a local installation snapshot."""
-    with pytest.raises(ValueError):
-        ENV.report_digest({"archive_info": {"hashes": {"sha256": "bad"}}})
+def test_failed_install_cleans_downloads_without_publishing_ready(tmp_path, monkeypatch):
+    target = {"id": "fixture", "torch_version": "1.0.0", "torch_release": "1.0.0",
+              "pta_build_version": "1.0.0", "pta_release": "1.0.0", "indexes":
+              dict.fromkeys(("torch", "pta", "dependencies"), "https://example.invalid/simple"),
+              "build_requirements": []}
+    monkeypatch.setattr(ENV, "download_roots", lambda *_: [])
+    def runner(command, **_kwargs):
+        if "--report" in command:
+            raise RuntimeError("dependency installation failed")
+    with pytest.raises(RuntimeError, match="installation failed"):
+        ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable))
+    assert not list(tmp_path.rglob("ready.json"))
+    assert not list(tmp_path.rglob("framework-install-*"))
+
+
+def test_matrix_reference_does_not_change_environment_key(tmp_path):
+    path = ROOT / "hyper_multicore/_build/frameworks.lock.json"
+    original = json.loads(path.read_text())
+    target = ENV.load_targets(path)[0]
+    for value in (None, "9.0.0"):
+        original["reference_cann"] = value
+        path = tmp_path / "matrix.json"
+        path.write_text(json.dumps(original))
+        assert ENV.environment_key(ENV.load_targets(path)[0], Path(sys.executable)) == ENV.environment_key(target, Path(sys.executable))
+    original["targets"] = original["targets"][:1]
+    original["targets"][0]["pta_build_version"] = "2.7.1.post12"
+    path.write_text(json.dumps(original))
+    assert len(ENV.load_targets(path)) == 1 and ENV.load_targets(path)[0]["pta_build_version"] == "2.7.1.post12"

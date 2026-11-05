@@ -50,5 +50,6 @@
       "torch_version": "2.14.0+cpu",
       "pta_build_version": "2.14.0"
     }
-  ]
+  ],
+  "reference_cann": "9.2.0"
 }
