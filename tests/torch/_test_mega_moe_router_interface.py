@@ -83,6 +83,7 @@ def test_mega_moe_router_interface() -> None:
     start_shmem_lifetime()
     os.environ.pop("HYPER_MULTICORE_SHMEM_HEAP_SIZE", None)
     mega, common = baseline.new_layers(shape)
+    dispatch_mode = mega._resource_group.specification["dispatch_mode"]  # pylint: disable=protected-access
     try:
         reference = _run_router_layer(common, shape)
         actual = _run_router_layer(mega, shape)
@@ -92,7 +93,7 @@ def test_mega_moe_router_interface() -> None:
         mega.close()
     write_evidence({
         "shape": asdict(shape), "dtype": "bfloat16", "ep_is_whole_world": True,
-        "dispatch_mode": mega.dispatch_mode, "counts_supplied": False, "router_projection_dtype": "float32",
+        "dispatch_mode": dispatch_mode, "counts_supplied": False, "router_projection_dtype": "float32",
         "backend_steps": {"common": 1, "mega_moe": 1},
         "validated_tensors": list(reference), "output_gradient_update_validation": True,
     })

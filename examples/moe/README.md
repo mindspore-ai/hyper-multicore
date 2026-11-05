@@ -61,7 +61,8 @@ bash examples/moe/run_benchmark.sh \
 未设置 `ASCEND_RT_VISIBLE_DEVICES` 时，脚本按 `NPROC_PER_NODE` 生成 `0,...,15`；
 若已设置，保留用户指定的设备顺序，并检查设备 ID 唯一且数量不少于本机进程数。
 逻辑 NPU 数须至少为16；不能在8个逻辑 NPU 上通过重复设备 ID 启动 EP16。
-`--dispatch-mode pull` 可选择 pull，默认 push。JSON 的 `topology` 应为 `world_size=16, tp=1, ep=16`。
+此基准通过内部调优配置支持 `--dispatch-mode pull`，默认 push；这些选项不属于 `MegaMoeExperts`
+的公共接口。JSON 的 `topology` 应为 `world_size=16, tp=1, ep=16`。
 
 ### 参数
 

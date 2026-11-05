@@ -32,6 +32,28 @@ from tests.common.mark_utils import arg_mark
 class TestMulticoreBoundary(unittest.TestCase):
     """Check the component contract without initializing a native runtime."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_private_expert_module_is_lazily_importable(self) -> None:
+        """Feature: Internal expert tuning entry point.
+        Description: Explicitly import the tuned module in a fresh CPU-only process.
+        Expectation: The entry point is a lazy private expert subclass and does not load torch_npu.
+        """
+        code = """
+import sys
+import hyper_multicore
+assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
+from hyper_multicore import MegaMoeExperts, _MegaMoeExperts
+assert issubclass(_MegaMoeExperts, MegaMoeExperts)
+assert '_MegaMoeExperts' not in hyper_multicore.__all__
+assert 'torch_npu' not in sys.modules
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code], check=False, capture_output=True, text=True,
+            env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
     @staticmethod
     def _run_cmake_project(
         cmake_lists: str,

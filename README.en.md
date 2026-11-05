@@ -38,10 +38,10 @@ example_dir=$(mktemp -d)
 cp examples/mega_moe_minimal.py "$example_dir/"
 cd "$example_dir"
 export ASCEND_RT_VISIBLE_DEVICES=0,1
-torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py --dispatch-mode push
+torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py
 ```
 
-Use `--dispatch-mode pull` for pull dispatch. The example runs forward and
+The example runs forward and
 backward and prints its shape, native build identity and elapsed time.
 Use `--warmup` and `--iterations` to increase sampling. The [examples guide](examples/README.md)
 provides complete [MoE](examples/moe/README.md) and [MHC](examples/mhc/README.md)

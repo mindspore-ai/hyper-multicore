@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, _MegaMoeExperts
 from tests.common.multicore.moe_reference import TorchExperts
 
 _RTOL = 2e-2
@@ -237,14 +237,14 @@ def new_layers(
     """
     common_moe = new_common_moe(shape)
     mode = dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
-    mega = MegaMoeExperts(
+    mega = _MegaMoeExperts(
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
+        dispatch_mode=mode,
         initial_capacity_factor=initial_capacity_factor if mode == "push" else None,
         capacity_growth_factor=capacity_growth_factor if mode == "push" else None,
-        dispatch_mode=mode,
         expert_weight_layout=expert_weight_layout,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
@@ -568,13 +568,13 @@ def _new_performance_layer(
         raise ValueError(
             f"HP_MEGA_MOE_PERF_BACKEND must be common or mega_moe, got {backend!r}."
         )
-    return MegaMoeExperts(
+    return _MegaMoeExperts(
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
-        initial_capacity_factor=1.5 if os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push") == "push" else None,
         dispatch_mode=os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
+        initial_capacity_factor=1.5 if os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push") == "push" else None,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(

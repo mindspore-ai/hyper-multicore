@@ -25,7 +25,6 @@ import time
 def main(default_warmup: int = 0, default_iterations: int = 1) -> None:
     """Run under torchrun; defaults choose smoke versus benchmark iteration counts."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--intermediate-size", type=int, default=128)
@@ -60,7 +59,6 @@ def main(default_warmup: int = 0, default_iterations: int = 1) -> None:
         layer = MegaMoeExperts(
             hidden_size=args.hidden_size, intermediate_size=args.intermediate_size,
             num_experts=args.experts, top_k=args.top_k, ep_size=world, ep_group=dist.group.WORLD,
-            dispatch_mode=args.dispatch_mode,
         ).to(device=device, dtype=torch.bfloat16)
         hidden = torch.randn(args.tokens, args.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True)
         ids = (torch.arange(args.tokens * args.top_k, device=device).view(args.tokens, args.top_k)
@@ -86,7 +84,7 @@ def main(default_warmup: int = 0, default_iterations: int = 1) -> None:
         if rank == 0:
             vendor, _ = get_multicore_paths()
             info = json.loads((vendor.parents[2] / "build_info.json").read_text(encoding="utf-8"))
-            result = {"world_size": world, "dispatch_mode": args.dispatch_mode,
+            result = {"world_size": world,
                       "shape": {key: value for key, value in vars(args).items() if key != "result"},
                       "rank_max_fwd_bwd_ms": samples, "median_ms": statistics.median(samples),
                       "build_info": info, "performance_acceptance": False}

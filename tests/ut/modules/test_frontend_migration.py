@@ -89,6 +89,25 @@ class TestFrontendMigration(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_moe_migration_passes_private_tuning_and_rejects_old_keywords(self) -> None:
+        """Feature: MegaMoe migration tuning.
+        Description: Convert source weights with an internal pull configuration and an old public knob.
+        Expectation: The configuration reaches the resource specification and the old keyword is rejected.
+        """
+        source = GroupedExperts(16, 8, 4)
+        converted = moe_module._MegaMoeExperts.from_module(
+            source, top_k=2, dispatch_mode="pull", dispatch_split=256)
+        self.addCleanup(converted.close)
+        self.assertIsInstance(converted, moe_module._MegaMoeExperts)
+        self.assertIsInstance(converted, MegaMoeExperts)
+        specification = converted._resource_group.specification  # pylint: disable=protected-access
+        self.assertEqual((specification["dispatch_mode"], specification["dispatch_split"]), ("pull", 256))
+        self.assertIsNone(specification["initial_capacity_factor"])
+        with self.assertRaisesRegex(TypeError, "dispatch_mode"):
+            MegaMoeExperts.from_module(source, top_k=2, dispatch_mode="pull")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_gate_migration_and_gradient_parity(self) -> None:
         """Feature: MegaKernel frontend migration.
         Description: Gate migration and gradient parity.

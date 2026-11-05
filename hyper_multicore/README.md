@@ -213,22 +213,34 @@ MegaMoe 从实际 forward 输入自动维护容量，无需 token 上限或动�
 调度计划按几何桶缓存，待反向图保留原计划；桶大小不改变真实 token 激活形状。
 初次绑定、进入新桶及扩容有额外成本；稳定容量和已缓存计划可复用。
 
-`dispatch_mode="push"` 为默认值，也可选择 `"pull"`；两者的 combine 都使用 PUT。
-模式须在 EP rank 间一致，不能在同一 workspace 上切换。pull 在容量准备和 claim 后才写 source。
+默认使用 push 分发，接收容量初始及增长倍数均为 `1.25`，内部自动扩容，路由不丢 token。
+通信模式、容量倍数和切分大小由内部管理，不属于 `MegaMoeExperts` 的公共构造参数。
+从旧版本迁移时，须从 `MegaMoeExperts(...)` 和 `from_module(...)` 中移除
+`dispatch_mode`、`initial_capacity_factor`、`capacity_growth_factor`、`dispatch_split` 和
+`combine_split`；直接传入这些关键字会报 `TypeError`。
 
-当前自动 token 模式下，push/pull 均要求 eager 执行，不支持 NPU graph capture；
+需要内部调优时，可以显式导入 `_MegaMoeExperts`。它继承 `MegaMoeExperts`，接受相同的模型参数、
+forward 输入和权重，同时允许指定调优参数：
+
+```python
+from hyper_multicore import _MegaMoeExperts
+
+experts = _MegaMoeExperts(
+    hidden_size=512, intermediate_size=128, num_experts=4, top_k=2,
+    ep_group=dist.group.WORLD,
+    dispatch_mode="pull", dispatch_split=128, combine_split=128,
+)
+```
+
+`dispatch_mode` 默认是 `"push"`，也可选 `"pull"`；push 的两个容量因子必须是有限数且不小于 `1.0`，
+pull 不接受显式容量因子。两个 split 须为 `128` 的正整数倍。`_MegaMoeExperts` 不在 `__all__` 中。
+
+当前自动 token 模式要求 eager 执行，不支持 NPU graph capture；
 即使 token 数和容量已稳定，检测到当前 stream 正在捕获时仍会抛出 `RuntimeError`。
 
-| 参数 | push 默认值 | 作用 |
-| --- | --- | --- |
-| `initial_capacity_factor` | `1.25` | 首次接收容量相对预留 source 路由行数的倍数 |
-| `capacity_growth_factor` | `1.25` | 接收容量增长倍数；`1.0` 仅满足当次需求 |
-
-两个因子须是有限数且不小于1；省略或 `None` 采用默认值。pull 不接受显式容量因子。
-即使 token 数固定，热点也可能触发 push 接收区扩容；路由不丢 token。
+即使 token 数固定，热点也可能触发 push 接收区扩容。
 source 容量、调度行数与实际 owner 接收量分别维护：source/返回区按预留容量，
 计算中间张量及待反向激活按实际接收量分配，空 owner 保留一行 ABI 占位。
-pull 的接收区位于普通 HBM，不属于 SHMEM source/返回区。
 
 扩容可能集体重启同一 SHMEM root 的 runtime，再恢复受管 workspace；外部专家参数不移动。
 `HYPER_MULTICORE_SHMEM_HEAP_SIZE` 可设置固定字节预算；预算不足或不能安全重启时明确失败。
@@ -243,7 +255,9 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.la
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-两条路径支持 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
+共享组内的层必须具有相同的具体类型及配置，不能混合 `MegaMoeExperts` 和 `_MegaMoeExperts`；
+各 EP rank 对应层也必须使用相同的类和配置。
+支持 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
 关闭。模块 GC 仅登记使用权释放，不执行 collective；下一个资源组
 首次 forward 时，所有 SHMEM Root rank 一起核对资源表，只复用各 rank 都无成员且无待反向图的兼容
 workspace，其余可回收的孤儿 workspace 当场释放。此协调不在已绑定模型的每步 forward 中执行。
