@@ -25,7 +25,7 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 
 from examples._layers import SwiGLUMLP
 from examples._native import GroupedExperts
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, _MegaMoeExperts
 from examples.moe.gate import Gate
 
 if TYPE_CHECKING:
@@ -112,14 +112,14 @@ class MoeTransformerBlock(nn.Module):
             hidden_size=config.hidden_size, num_experts=config.num_experts, top_k=config.top_k,
             routed_scaling_factor=config.routed_scaling_factor, use_mega_gate="gate" in mega_kernels,
         )
-        self.experts = MegaMoeExperts(
+        self.experts = _MegaMoeExperts(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             num_experts=config.num_experts,
             top_k=config.top_k,
-            initial_capacity_factor=config.initial_capacity_factor,
             ep_group=ep_group,
             dispatch_mode=config.dispatch_mode,
+            initial_capacity_factor=config.initial_capacity_factor,
             capacity_growth_factor=config.capacity_growth_factor,
         )
         shared_source = nn.Module()

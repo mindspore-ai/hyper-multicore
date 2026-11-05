@@ -28,7 +28,7 @@ import torch_npu  # pylint: disable=unused-import
 from torch.nn import functional
 from torch.utils.checkpoint import checkpoint
 
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, _MegaMoeExperts
 from hyper_multicore.modules.mega_moe import route as route_module
 from tests.common.multicore._evidence_helpers import EXTENDED_LEVEL1
 from tests.common.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
@@ -187,7 +187,7 @@ def _pending_backward_across_restart(weights: tuple, rank: int, world: int, devi
     if world == 1 or os.environ.get("HP_DYNAMIC_DISPATCH", "push") != "push":
         return
     experts, top_k = world * 6, min(world * 6, 6)
-    module = MegaMoeExperts(
+    module = _MegaMoeExperts(
         hidden_size=_HIDDEN,
         intermediate_size=_INTERMEDIATE,
         num_experts=experts,
@@ -195,7 +195,6 @@ def _pending_backward_across_restart(weights: tuple, rank: int, world: int, devi
         ep_size=world,
         ep_group=dist.group.WORLD,
         initial_capacity_factor=1.0,
-        dispatch_mode="push",
     ).to(device=device, dtype=torch.bfloat16)
     with torch.no_grad():
         module.gate_up_weight.copy_(weights[0][rank * 6:(rank + 1) * 6])
@@ -325,13 +324,14 @@ def _configuration_failures(world: int, rank: int, device: torch.device) -> None
     if world == 1:
         return
     for different_split in (False, True):
-        options = ({"dispatch_split": 128 if rank == 0 else 256} if different_split
-                   else {"swiglu_limit": None if rank == 0 else 10.0})
-        module = MegaMoeExperts(**options, hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
-                               num_experts=world * 6, top_k=6, ep_size=world,
-                               ep_group=dist.group.WORLD,
-                               dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
-                               ).to(device=device, dtype=torch.bfloat16)
+        split = 128 if not different_split or rank == 0 else 256
+        swiglu_limit = None if different_split or rank == 0 else 10.0
+        module = _MegaMoeExperts(
+            hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
+            num_experts=world * 6, top_k=6, ep_size=world,
+            ep_group=dist.group.WORLD, swiglu_limit=swiglu_limit, dispatch_split=split,
+            dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
+        ).to(device=device, dtype=torch.bfloat16)
         lengths = [128] * world
         try:
             _forward(module, _inputs(lengths, world * 6, 6), rank, device)
@@ -391,10 +391,11 @@ def _frozen_gradients(mega: MegaMoeExperts, weights: tuple, rank: int, device: t
 
 def _layer(mode: str, weights: tuple, rank: int, world: int, device: torch.device) -> MegaMoeExperts:
     """Construct an automatic-token module without predicting input lengths."""
-    layer = MegaMoeExperts(hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
-                           num_experts=world * 6, top_k=6, ep_size=world,
-                           ep_group=dist.group.WORLD, dispatch_mode=mode).to(
-                               device=device, dtype=torch.bfloat16)
+    layer = _MegaMoeExperts(
+        hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
+        num_experts=world * 6, top_k=6, ep_size=world,
+        ep_group=dist.group.WORLD, dispatch_mode=mode,
+    ).to(device=device, dtype=torch.bfloat16)
     with torch.no_grad():
         layer.gate_up_weight.copy_(weights[0][rank * 6:(rank + 1) * 6])
         layer.down_weight.copy_(weights[1][rank * 6:(rank + 1) * 6])
@@ -481,7 +482,8 @@ def _other_workspace_growth(layer: MegaMoeExperts, weights: tuple, rank: int, wo
     lengths = [17] * world
     inputs = _inputs(lengths, layer.num_experts, layer.top_k)
     pending = _forward(layer, inputs, rank, device)
-    other = _layer("pull" if layer.dispatch_mode == "push" else "push", weights, rank, world, device)
+    mode = layer._resource_group.specification["dispatch_mode"]  # pylint: disable=protected-access
+    other = _layer("pull" if mode == "push" else "push", weights, rank, world, device)
     _verify(other, [769] * world, weights, rank, device)
     layer.zero_grad(set_to_none=True)
     _check_gradients(layer, pending, _rounded_oracle(weights, inputs), lengths, rank)

@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for the model-facing MegaMoe module."""
 
+import inspect
 import struct
 import unittest
 from collections import OrderedDict
@@ -25,7 +26,7 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
-from hyper_multicore import _automatic, _collective
+from hyper_multicore import _automatic, _collective, _MegaMoeExperts
 from hyper_multicore.modules.mega_moe import module as mega_moe_module
 from hyper_multicore.modules.mega_moe.backward.graph import build_backward_graph
 from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank
@@ -65,8 +66,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         """
         for mode in ("push", "pull"):
             with self.subTest(mode=mode):
-                layer = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
-                                       dispatch_mode=mode)
+                layer = mega_moe_module._MegaMoeExperts(
+                    hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, dispatch_mode=mode)
                 self.addCleanup(layer.close)
                 self.assertFalse(hasattr(layer, "local_num_tokens"))
                 self.assertFalse(hasattr(layer, "max_local_num_tokens"))
@@ -266,10 +267,87 @@ class TestMegaMoeExperts(unittest.TestCase):
         experts = MegaMoeExperts(hidden_size=16, intermediate_size=8,
                                  num_experts=4, top_k=2, ep_size=2)
         self.addCleanup(experts.close)
-        self.assertEqual((experts.dispatch_mode, experts.initial_capacity_factor, experts.capacity_growth_factor),
-                         ("push", 1.25, 1.25))
+        specification = experts._resource_group.specification
+        self.assertEqual((specification["dispatch_mode"], specification["initial_capacity_factor"],
+                          specification["capacity_growth_factor"]), ("push", 1.25, 1.25))
         mock_create_parameters.assert_called_once_with(2, 16, 8, "EIO")
         self.assertIsNone(experts.swiglu_limit)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tuning_is_private_and_old_keywords_are_rejected(self) -> None:
+        """Feature: Model-facing MegaMoe interface.
+        Description: Inspect the signature and try the former tuning keywords.
+        Expectation: Tuning knobs are neither public constructor arguments nor public layer attributes.
+        """
+        names = ("dispatch_mode", "initial_capacity_factor", "capacity_growth_factor",
+                 "dispatch_split", "combine_split")
+        layer = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2)
+        self.addCleanup(layer.close)
+        for name in names:
+            with self.subTest(name=name):
+                self.assertNotIn(name, inspect.signature(MegaMoeExperts).parameters)
+                self.assertFalse(hasattr(layer, name))
+                with self.assertRaisesRegex(TypeError, name):
+                    MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **{name: 128})
+        self.assertNotIn("_tuning", inspect.signature(MegaMoeExperts).parameters)
+        self.assertFalse(hasattr(layer, "_tuning"))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_internal_tuning_controls_specification_and_resource_sharing(self) -> None:
+        """Feature: Private execution tuning.
+        Description: Construct tuned push/pull owners and compare each resource compatibility key.
+        Expectation: Every choice reaches the specification and differing choices prevent workspace sharing.
+        """
+        tuning_type = mega_moe_module._MegaMoeExperts
+        default = tuning_type(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2)
+        self.addCleanup(default.close)
+        variants = (
+            ({"dispatch_mode": "pull"}, ("pull", None, None, 128, 128)),
+            ({"initial_capacity_factor": 1.5}, ("push", 1.5, 1.25, 128, 128)),
+            ({"capacity_growth_factor": 2.0}, ("push", 1.25, 2.0, 128, 128)),
+            ({"dispatch_split": 256}, ("push", 1.25, 1.25, 256, 128)),
+            ({"combine_split": 384}, ("push", 1.25, 1.25, 128, 384)),
+        )
+        names = ("dispatch_mode", "initial_capacity_factor", "capacity_growth_factor",
+                 "dispatch_split", "combine_split")
+        for options, values in variants:
+            with self.subTest(options=options):
+                layer = tuning_type(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **options)
+                self.addCleanup(layer.close)
+                for key, value in zip(names, values):
+                    self.assertEqual(layer._resource_group.specification[key], value)
+                with self.assertRaises(ValueError):
+                    MegaMoeExperts.share_execution_resources([default, layer])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_tuned_experts_are_substitutable_and_share_only_with_the_same_type(self) -> None:
+        """Feature: Tuned expert module substitution.
+        Description: Compare model state, type recognition and resource sharing across expert classes.
+        Expectation: The tuned module is an expert and shares only with compatible tuned instances.
+        """
+        options = {"hidden_size": 16, "intermediate_size": 8, "num_experts": 4, "top_k": 2}
+        ordinary = MegaMoeExperts(**options)
+        tuned = mega_moe_module._MegaMoeExperts(**options)
+        peer = mega_moe_module._MegaMoeExperts(**options)
+        for layer in (ordinary, tuned, peer):
+            self.addCleanup(layer.close)
+        self.assertIsInstance(tuned, MegaMoeExperts)
+        self.assertFalse(hasattr(tuned, "_tuning"))
+        self.assertIs(_MegaMoeExperts, mega_moe_module._MegaMoeExperts)
+        self.assertEqual(ordinary._resource_group.specification, tuned._resource_group.specification)
+        self.assertEqual(tuple(ordinary.state_dict()), tuple(tuned.state_dict()))
+        tuned.load_state_dict(ordinary.state_dict())
+        for name, value in ordinary.state_dict().items():
+            torch.testing.assert_close(tuned.state_dict()[name], value)
+        with self.assertRaisesRegex(TypeError, "one concrete module type"):
+            MegaMoeExperts.share_execution_resources([ordinary, tuned])
+        MegaMoeExperts.share_execution_resources([tuned, peer])
+        self.assertIs(tuned._resource_group, peer._resource_group)
+        binding = SimpleNamespace(dtype=torch.bfloat16)
+        self.assertNotEqual(ordinary._resource_signature(binding), tuned._resource_signature(binding))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -393,21 +471,26 @@ class TestMegaMoeExperts(unittest.TestCase):
             ({"capacity_growth_factor": float("inf")}, "capacity_growth_factor"),
             ({"initial_capacity_factor": True}, "initial_capacity_factor"),
             ({"capacity_growth_factor": 1.5, "dispatch_mode": "pull"}, "push"),
+            ({"dispatch_split": 129}, "dispatch_split"),
+            ({"combine_split": 0}, "combine_split"),
+            ({"dispatch_split": True}, "dispatch_split"),
         ):
             with (
                 self.subTest(overrides=overrides),
                 self.assertRaisesRegex(ValueError, message),
             ):
-                MegaMoeExperts(
+                mega_moe_module._MegaMoeExperts(
                     hidden_size=16,
                     intermediate_size=8,
                     num_experts=overrides.get("num_experts", 4),
-                    dispatch_mode=overrides.get("dispatch_mode", "push"),
-                    capacity_growth_factor=overrides.get("capacity_growth_factor"),
                     expert_weight_layout=overrides.get("expert_weight_layout", "EIO"),
                     top_k=2,
-                    initial_capacity_factor=overrides.get("initial_capacity_factor"),
                     ep_size=2,
+                    dispatch_mode=overrides.get("dispatch_mode", "push"),
+                    initial_capacity_factor=overrides.get("initial_capacity_factor"),
+                    capacity_growth_factor=overrides.get("capacity_growth_factor"),
+                    dispatch_split=overrides.get("dispatch_split", 128),
+                    combine_split=overrides.get("combine_split", 128),
                 )
 
         mock_create_parameters.assert_not_called()
@@ -487,7 +570,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False),
+        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False, dispatch_mode="push"),
                                     plan=object(), workspace=object(), ensure_capacity=Mock(),
                                     plan_for_tokens=Mock())
         route = SimpleNamespace(
@@ -542,6 +625,50 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_restore.assert_called_once_with(
             expert_output, route.unpermute_mapping, topk_weights
         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_forward_uses_private_pull_configuration(self) -> None:
+        """Feature: Private pull dispatch.
+        Description: Execute a mocked automatic-token forward with internally configured pull dispatch.
+        Expectation: Prepare and release the pull workspace and pass routing weights to the kernel.
+        """
+        experts = mega_moe_module._MegaMoeExperts(
+            hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+            dispatch_mode="pull",
+        ).to(dtype=torch.bfloat16)
+        self.addCleanup(experts.close)
+        hidden = torch.ones(2, 16, dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+        weights = torch.ones(2, 2)
+        route = SimpleNamespace(metadata=SimpleNamespace(plan_tokens=128))
+        workspace = Mock()
+        resources = SimpleNamespace(
+            spec=SimpleNamespace(auto_tokens=True,
+                                 dispatch_mode=experts._resource_group.specification["dispatch_mode"]),
+            workspace=workspace, prepare_auto_workspace=Mock(), plan_for_tokens=Mock(return_value=object()),
+        )
+
+        def _prepare(*_args: Any, **kwargs: Any) -> Any:
+            """Run the capacity callback as the real route preparation does."""
+            kwargs["prepare_workspace"](128, 4)
+            return route
+
+        with (
+            patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True, create=True),
+            patch.object(torch, "npu", Mock(is_current_stream_capturing=Mock(return_value=False)), create=True),
+            patch.object(experts, "_get_execution_resources", return_value=resources),
+            patch.object(mega_moe_module, "prepare_topk_route", side_effect=_prepare) as mock_prepare,
+            patch.object(mega_moe_module, "execute_mega_moe_with_permutation", return_value=hidden) as mock_execute,
+            patch.object(mega_moe_module, "restore_topk_output") as mock_restore,
+        ):
+            actual = experts(hidden, ids, weights)
+        torch.testing.assert_close(actual, hidden)
+        resources.prepare_auto_workspace.assert_called_once_with(128, 4, mock_prepare.call_args.args[0])
+        self.assertIs(mock_execute.call_args.kwargs["topk_weights"], weights)
+        self.assertTrue(mock_execute.call_args.kwargs["workspace_claimed"])
+        workspace.release.assert_called_once_with()
+        mock_restore.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -615,10 +742,10 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources = Mock()
         input_tensor = SimpleNamespace(device="npu:0", dtype="bfloat16")
 
-        other = MegaMoeExperts(hidden_size=16, intermediate_size=8,
-                               num_experts=4, top_k=2, ep_size=2, dispatch_mode="pull")
+        other = mega_moe_module._MegaMoeExperts(
+            hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, ep_size=2, dispatch_mode="pull")
         self.addCleanup(other.close)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(TypeError, "one concrete module type"):
             MegaMoeExperts.share_execution_resources([layers[0], other])
         other.close()
         MegaMoeExperts.share_execution_resources(layers)

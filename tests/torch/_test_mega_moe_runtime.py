@@ -23,7 +23,7 @@ import torch.distributed as dist
 import torch_npu
 
 from tests.common.multicore.moe_reference import grouped_matmul
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import _MegaMoeExperts
 from hyper_multicore.scheduler.runtime import RUNTIME_HEADER_BYTES
 from tests.torch import _test_mega_moe as baseline
 from tests.common.multicore._mega_moe_utils import (
@@ -123,11 +123,12 @@ def test_mega_moe_subgroups() -> None:
     group = groups[baseline.RANK % 2]
     rank = dist.get_rank(group)
     for mode in ("push", "pull", "grow"):
-        layer = MegaMoeExperts(hidden_size=512, intermediate_size=128,
-                               num_experts=4, top_k=2, ep_size=2, ep_group=group,
-                               create_parameters=False, dispatch_mode="push" if mode == "grow" else mode,
-                               capacity_growth_factor=1.25 if mode == "grow" else None,
-                               initial_capacity_factor=1.0 if mode == "grow" else None)
+        layer = _MegaMoeExperts(
+            hidden_size=512, intermediate_size=128, num_experts=4, top_k=2, ep_size=2, ep_group=group,
+            create_parameters=False, dispatch_mode="push" if mode == "grow" else mode,
+            capacity_growth_factor=1.25 if mode == "grow" else None,
+            initial_capacity_factor=1.0 if mode == "grow" else None,
+        )
         try:
             for step in range(2):
                 torch.manual_seed(123 + step + baseline.RANK % 2)

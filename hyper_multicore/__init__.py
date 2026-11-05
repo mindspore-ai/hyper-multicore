@@ -23,7 +23,7 @@ from hyper_multicore.diagnostics import (
 if TYPE_CHECKING:
     from hyper_multicore.modules.mega_gate.module import MegaGate
     from hyper_multicore.modules.mega_mhc.module import MegaMhc
-    from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
+    from hyper_multicore.modules.mega_moe.module import MegaMoeExperts, _MegaMoeExperts
 
 __all__ = [
     "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaKernelDiagnostics",
@@ -32,7 +32,7 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
-    """Load optional multicore modules only when their public API is requested."""
+    """Load optional multicore modules only when their API is requested."""
     if name == "MegaMhc":
         from hyper_multicore.modules.mega_mhc.module import (  # pylint: disable=import-outside-toplevel
             MegaMhc as value,
@@ -44,6 +44,10 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     elif name == "MegaMoeExperts":
         from hyper_multicore.modules.mega_moe.module import (  # pylint: disable=import-outside-toplevel
             MegaMoeExperts as value,
+        )
+    elif name == "_MegaMoeExperts":
+        from hyper_multicore.modules.mega_moe.module import (  # pylint: disable=import-outside-toplevel
+            _MegaMoeExperts as value,
         )
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -32,10 +32,10 @@ example_dir=$(mktemp -d)
 cp examples/mega_moe_minimal.py "$example_dir/"
 cd "$example_dir"
 export ASCEND_RT_VISIBLE_DEVICES=0,1
-torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py --dispatch-mode push
+torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py
 ```
 
-使用 `--dispatch-mode pull` 可切换为 pull 分发。示例执行前向与反向计算，
+示例执行前向与反向计算，
 并输出形状、native 构建身份及耗时。通过 `--warmup` 和 `--iterations` 可增加采样次数。
 完整网络接入与训练对照见 [examples 指南](examples/README.md)，包括
 [MoE](examples/moe/README.md) 和 [MHC](examples/mhc/README.md)。

@@ -270,7 +270,7 @@ class MegaMoeExperts(MulticoreModule):
                 DTensor local EP shards are accepted; FSDP weights must be materialized first.
             top_k: Experts selected by the existing router for each token.
             ep_group: Explicit EP group owning these local experts, or None for a standalone rank.
-            **execution_options: Advanced MegaMoe options, including num_experts and expert_weight_layout.
+            **execution_options: Additional model-facing options, including num_experts and expert_weight_layout.
 
         Returns:
             Experts with copied, converted Parameters. Optimizer state is not migrated.
@@ -331,11 +331,6 @@ class MegaMoeExperts(MulticoreModule):
         ep_group: Any | None = None,
         create_parameters: bool = True,
         expert_weight_layout: ExpertWeightLayout = "EIO",
-        dispatch_mode: str = "push",
-        initial_capacity_factor: float | None = None,
-        capacity_growth_factor: float | None = None,
-        dispatch_split: int = _COMMUNICATION_SPLIT,
-        combine_split: int = _COMMUNICATION_SPLIT,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -344,17 +339,6 @@ class MegaMoeExperts(MulticoreModule):
             intermediate_size: SwiGLU intermediate dimension per expert.
             num_experts: Global routed-expert count.
             top_k: Experts selected for every token.
-            initial_capacity_factor: Push initial receive rows as a multiple of local routed rows.
-                Defaults to 1.25 for push; omitted for pull. Must be finite and at least 1.0.
-            capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
-                Must be finite and at least 1.0; 1.0 grows only to the current route demand.
-                The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
-            dispatch_mode: Dispatch transport, either "push" (default) or "pull".
-                Construct separate modules to switch modes; sharing requires equal modes.
-            dispatch_split: Dispatch tile rows in forward and backward, default 128.
-                Must be a positive multiple of 128.
-            combine_split: Combine tile rows in forward and backward, with the same
-                constraints and default as dispatch_split. Sharing requires equal splits.
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
@@ -369,18 +353,43 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
+        self._initialize_experts(
+            hidden_size=hidden_size, intermediate_size=intermediate_size, num_experts=num_experts, top_k=top_k,
+            swiglu_limit=swiglu_limit, ep_size=ep_size, ep_group=ep_group, create_parameters=create_parameters,
+            expert_weight_layout=expert_weight_layout,
+        )
+
+    def _initialize_experts(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+        swiglu_limit: float | None,
+        ep_size: int | None,
+        ep_group: Any | None,
+        create_parameters: bool,
+        expert_weight_layout: ExpertWeightLayout,
+        dispatch_mode: str = "push",
+        initial_capacity_factor: float | None = None,
+        capacity_growth_factor: float | None = None,
+        dispatch_split: int = _COMMUNICATION_SPLIT,
+        combine_split: int = _COMMUNICATION_SPLIT,
+    ) -> None:
+        """Initialize the module once for both ordinary and tuned expert constructors."""
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
             "top_k": top_k,
-            "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
             "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
             "dispatch_mode": dispatch_mode,
+            "initial_capacity_factor": initial_capacity_factor,
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
@@ -405,11 +414,6 @@ class MegaMoeExperts(MulticoreModule):
         self.num_experts = specification["num_experts"]
         self.top_k = specification["top_k"]
         self.expert_weight_layout = specification["expert_weight_layout"]
-        self.initial_capacity_factor = specification["initial_capacity_factor"]
-        self.capacity_growth_factor = specification["capacity_growth_factor"]
-        self.dispatch_mode = specification["dispatch_mode"]
-        self.dispatch_split = specification["dispatch_split"]
-        self.combine_split = specification["combine_split"]
         self.swiglu_limit = specification["swiglu_limit"]
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
@@ -627,7 +631,7 @@ class MegaMoeExperts(MulticoreModule):
             | (int(weights[0].requires_grad) << 2) | (int(weights[1].requires_grad) << 3)
             | (int(topk_weights.requires_grad) << 4)
         )}
-        pull = self.dispatch_mode == "pull"
+        pull = resources.spec.dispatch_mode == "pull"
         automatic = resources.spec.auto_tokens
         claimed = False
         def prepare_workspace(tokens: int, received: int) -> None:
@@ -698,4 +702,40 @@ class MegaMoeExperts(MulticoreModule):
             tensor,
             shared=shared,
             active_specifications=active_specifications,
+        )
+
+
+class _MegaMoeExperts(MegaMoeExperts):
+    """Expert module with private execution tuning for benchmarks and advanced users."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+        swiglu_limit: float | None = None,
+        ep_size: int | None = None,
+        ep_group: Any | None = None,
+        create_parameters: bool = True,
+        expert_weight_layout: ExpertWeightLayout = "EIO",
+        dispatch_mode: str = "push",
+        initial_capacity_factor: float | None = None,
+        capacity_growth_factor: float | None = None,
+        dispatch_split: int = _COMMUNICATION_SPLIT,
+        combine_split: int = _COMMUNICATION_SPLIT,
+    ) -> None:
+        """Initialize the same expert module with explicit private execution choices.
+
+        The model-facing options have the same meaning as in ``MegaMoeExperts``.
+        Push capacity factors must be finite and at least 1; pull requires them
+        to be omitted. Communication splits must be positive multiples of 128.
+        """
+        self._initialize_experts(
+            hidden_size=hidden_size, intermediate_size=intermediate_size, num_experts=num_experts, top_k=top_k,
+            swiglu_limit=swiglu_limit, ep_size=ep_size, ep_group=ep_group, create_parameters=create_parameters,
+            expert_weight_layout=expert_weight_layout, dispatch_mode=dispatch_mode,
+            initial_capacity_factor=initial_capacity_factor, capacity_growth_factor=capacity_growth_factor,
+            dispatch_split=dispatch_split, combine_split=combine_split,
         )
