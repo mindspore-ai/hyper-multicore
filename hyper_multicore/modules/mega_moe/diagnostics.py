@@ -16,14 +16,17 @@
 
 __all__ = []
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from typing import Any
 
 from hyper_multicore.scheduler.config import (
+    RuntimeConfigC,
     TaskDescC,
+    TaskType,
     TaskSplitValue,
 )
-from hyper_multicore.scheduler.graph import OperatorNode, OpType
+from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, TensorSpec
 
 
 MEGA_MOE_OWNER_LABEL = "Expert"
@@ -49,19 +52,23 @@ def _resolve_expert_owner(
     operator: OperatorNode,
     task_desc: TaskDescC,
     raw_context: Any,
-) -> int:
+) -> int | None:
     """Resolve the global expert ID from a graph operator and its concrete task."""
     context = _require_diagnostic_context(raw_context)
     topology = context.topology
     rank_owner_base = topology.rank_id * topology.single_rank_expert_num
 
     if operator.op_type == OpType.GMM:
+        if task_desc.extra_value_1 in (2, 3):
+            return None
         return rank_owner_base + task_desc.task_index // context.num_cube_cores
 
     if operator.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD):
         if task_desc.task_split_value == 0:
             raise ValueError("SwiGLU diagnostic owner requires a non-zero task_split_value")
-        num_triggers = topology.per_expert_seq // task_desc.task_split_value
+        num_triggers = (task_desc.task_split_num // topology.single_rank_expert_num
+                        if task_desc.extra_value_1 & 2 else
+                        topology.per_expert_seq // task_desc.task_split_value)
         if num_triggers == 0:
             raise ValueError("SwiGLU diagnostic owner resolved a zero task count per expert")
         return rank_owner_base + task_desc.task_index // num_triggers
@@ -98,3 +105,44 @@ def _mega_moe_owner_options(
         "owner_resolver": _resolve_expert_owner,
         "owner_context": context,
     }
+
+
+def _adapt_mega_moe_diagnostic_graph(graph: ComputeGraph, config: RuntimeConfigC) -> ComputeGraph:
+    """Describe scheduled tasks on a diagnostic-only copy of the native graph."""
+    graph = deepcopy(graph)
+    queues = (config.cube_task_indices, config.vector_task_indices, config.mix_task_indices)
+    scheduled = {int(task_id) for queue, count in zip(queues, config.task_index_num[:3])
+                 for task_id in queue[:count]}
+    mapping, tasks = {}, []
+    start = 0
+    for operator in graph.topological_sort():
+        end = start + operator.task_num
+        kept = [task_id for task_id in range(start, end) if task_id in scheduled]
+        operator.task_num = len(kept)
+        if kept:
+            first = config.all_tasks[kept[0]]
+            if int(first.num_outputs) == len(operator.outputs) + 1 and first.extra_value_1 & 12:
+                aux = first.outputs[first.num_outputs - 1]
+                operand = TensorSpec("probability_workspace", [int(aux.dim[0]), int(aux.dim[1])],
+                                     int(aux.input_position), dtype_size=int(aux.data_type))
+                operator.outputs.append(operand)
+                operator.param_positions.append(operand.param_position)
+                operator.split_spec = replace(
+                    operator.split_spec, split_output_dims=[*operator.split_spec.split_output_dims, -1])
+        for task_id in kept:
+            mapping[task_id] = len(tasks)
+            tasks.append(bytes(config.all_tasks[task_id]))
+        start = end
+    graph_tasks = len(tasks)
+    for task_id in sorted(scheduled - mapping.keys()):
+        if config.all_tasks[task_id].task_type != TaskType.TASK_TERMINATE:
+            raise ValueError("scheduled task has no MegaMoe graph stage")
+        mapping[task_id] = len(tasks)
+        tasks.append(bytes(config.all_tasks[task_id]))
+    for index, raw in enumerate(tasks):
+        config.all_tasks[index] = TaskDescC.from_buffer_copy(raw)
+    for queue, count in zip(queues, config.task_index_num[:3]):
+        for index in range(count):
+            queue[index] = mapping[int(queue[index])]
+    config.task_num = graph_tasks
+    return graph

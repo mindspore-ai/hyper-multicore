@@ -57,21 +57,27 @@ def _runtime_metadata(tensor: torch.Tensor) -> dict:
 
 def test_mega_moe_large_runtime() -> None:
     """Compare complete F+B and SGD with common MoE for an unfused large graph."""
+    from unittest.mock import patch
+    from hyper_multicore.modules.mega_moe import compact
+
     shape = baseline.MoeShape(local_num_tokens=327680, hidden_size=128, intermediate_size=128)
     start_shmem_lifetime()
     hidden, upstream = baseline.make_data(shape)
     ids, weights, counts = baseline.make_balanced_route(shape)
     mega, common = baseline.new_layers(shape)
     try:
-        expected = baseline.run_layer(common, hidden, ids, weights, counts, upstream)
-        actual = baseline.run_layer(mega, hidden, ids, weights, counts, upstream)
-        baseline.assert_results_close(expected, actual)
-        # Inspect private plan ownership only to prove which uploaded queues ran.
-        resources = mega._resource_group.resources  # pylint: disable=protected-access
-        plan = resources.plan_for_tokens(shape.local_num_tokens, baseline.DEVICE)
-        result = {"forward": _runtime_metadata(plan.fwd_runtime_config),
-                  "backward": _runtime_metadata(plan.bwd_runtime_config),
-                  "all_outputs_gradients_updates_match": True, "memory": memory_sample()}
+        # Preserve the uncompressed scheduler-capacity stress with the same shape.
+        # Performance tests keep the normal compaction policy.
+        with patch.object(compact, "compact_graph", return_value=False):
+            expected = baseline.run_layer(common, hidden, ids, weights, counts, upstream)
+            actual = baseline.run_layer(mega, hidden, ids, weights, counts, upstream)
+            baseline.assert_results_close(expected, actual)
+            # Inspect private plan ownership only to prove which uploaded queues ran.
+            resources = mega._resource_group.resources  # pylint: disable=protected-access
+            plan = resources.plan_for_tokens(shape.local_num_tokens, baseline.DEVICE)
+            result = {"forward": _runtime_metadata(plan.fwd_runtime_config),
+                      "backward": _runtime_metadata(plan.bwd_runtime_config),
+                      "compaction_enabled": False, "all_outputs_gradients_updates_match": True, "memory": memory_sample()}
     finally:
         mega.close()
     write_evidence(result)

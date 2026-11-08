@@ -94,8 +94,9 @@ class _BorrowParameters(torch.autograd.Function):
         """Send the original dtypes and return contiguous home-plus-borrowed views."""
         rank, ranks = dist.get_rank(group), dist.get_world_size(group)
         local = weights[0].shape[0]
-        if len(copies) != ranks or any(len(row) != local for row in copies):
-            raise ValueError('Native MoonEP copy extent must match EP and local experts')
+        borrowed = len(copies[0]) if copies else 0
+        if len(copies) != ranks or any(len(row) != borrowed for row in copies) or not 0 <= borrowed <= local:
+            raise ValueError('Native MoonEP copy extent must match EP and the borrowed capacity')
         send = [[expert % local for expert in row if expert >= 0 and expert // local == rank]
                 for row in copies]
         receive = [[slot for slot, expert in enumerate(copies[rank])
@@ -118,11 +119,11 @@ class _BorrowParameters(torch.autograd.Function):
                 width = weight[0].numel()
                 received = incoming[:, offset:offset + width].contiguous().reshape(
                     incoming.shape[0], *weight.shape[1:])
-                borrowed = weight.new_zeros(weight.shape).index_copy(0, receive_slots, received)
-                outputs[index] = torch.cat((weight, borrowed), dim=0)
+                borrowed_weights = weight.new_zeros((borrowed, *weight.shape[1:])).index_copy(0, receive_slots, received)
+                outputs[index] = torch.cat((weight, borrowed_weights), dim=0)
                 offset += width
         ctx.save_for_backward(send_indices, receive_slots)
-        ctx.group, ctx.targets, ctx.local = group, targets, local
+        ctx.group, ctx.targets, ctx.local, ctx.borrowed = group, targets, local, borrowed
         ctx.return_mask = return_mask
         ctx.parameter_requires_grad = tuple(weight.requires_grad for weight in weights)
         ctx.send_counts, ctx.receive_counts, ctx.dtype_groups = send_counts, receive_counts, dtype_groups
@@ -154,7 +155,7 @@ class _BorrowParameters(torch.autograd.Function):
             if not needed:
                 precise.append(None)
             elif gradient is None:
-                precise.append(torch.zeros((2 * shape[0], *shape[1:]), dtype=torch.float32, device=device))
+                precise.append(torch.zeros((shape[0] + ctx.borrowed, *shape[1:]), dtype=torch.float32, device=device))
             else:
                 precise.append(gradient.float() if target is None else target.gradient(gradient))
         results: list[torch.Tensor | None] = [None] * len(gradients)
@@ -182,7 +183,8 @@ def borrow_parameters(weights: tuple[torch.Tensor, ...], copies: tuple[tuple[int
                       group: Any, return_mask: tuple[bool, ...] | None = None
                       ) -> tuple[tuple[torch.Tensor, ...], tuple[GradientTarget | None, ...]]:
     """Create each forward's parameter views and non-Tensor gradient descriptors."""
-    targets = tuple(GradientTarget((2 * weight.shape[0], *weight.shape[1:]), weight.device, weight.requires_grad)
+    borrowed = len(copies[0]) if copies else 0
+    targets = tuple(GradientTarget((weight.shape[0] + borrowed, *weight.shape[1:]), weight.device, weight.requires_grad)
                     if weight.dtype in (torch.bfloat16, torch.float16) or not weight.requires_grad
                     else None for weight in weights)
     if return_mask is None:

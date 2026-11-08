@@ -103,7 +103,7 @@ def cmake_pair(python, identity, common, sdk, args, run):
     with run.commands.scope("MoonEP"):
         standard = (directory / "torch/torch_cxx_standard.txt").read_text().strip()
         output = payload / "moonep"
-        run.commands.run(
+        run.commands(
             [str(python), str(ROOT / "hyper_multicore/moonep/build.py"), "--shared",
              "--sdk-root", str(sdk / "shmem"), "--cxx-standard", standard,
              "--output-dir", str(output)],

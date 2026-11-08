@@ -1,0 +1,224 @@
+diff --git a/activation/swi_glu/op_kernel/swi_glu.cpp b/activation/swi_glu/op_kernel/swi_glu.cpp
+index 409184d..96fe4f3 100644
+--- a/activation/swi_glu/op_kernel/swi_glu.cpp
++++ b/activation/swi_glu/op_kernel/swi_glu.cpp
+@@ -20,7 +20,7 @@
+ 
+ using namespace AscendC;
+ extern "C" inline __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_gm,
+-                                              GM_ADDR workspace, GM_ADDR tiling, float clamp_limit) {
++                                              GM_ADDR workspace, GM_ADDR tiling, float clamp_limit, bool clamp_after_activation) {
+   // ascend910B的Relu不支持int16
+   // ascend910B的Relu/Mul不支持double
+   // ascend910B的Relu/Mul不支持int64
+@@ -30,21 +30,21 @@ extern "C" inline __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_gm,
+   if constexpr (std::is_same_v<DTYPE_Y, bfloat16_t>) {
+     if (tempTilingGm.isDoubleBuffer == 1) {
+       SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+-      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);
++      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit, clamp_after_activation);
+       op.Process();
+     } else {
+       SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+-      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);
++      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit, clamp_after_activation);
+       op.Process();
+     }
+   } else {
+     if (tempTilingGm.isDoubleBuffer == 1) {
+       SwigluSingle<SwigluVectorBF16<half, float, half, 2>, half, half> op;
+-      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);
++      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit, clamp_after_activation);
+       op.Process();
+     } else {
+       SwigluSingle<SwigluVectorBF16<half, float, half, 1>, half, half> op;
+-      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);
++      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit, clamp_after_activation);
+       op.Process();
+     }
+   }
+diff --git a/activation/swi_glu/op_kernel/swi_glu_bf16.hpp b/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
+index f583ced..aaa3a43 100644
+--- a/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
++++ b/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
+@@ -29,6 +29,7 @@ protected:
+ 
+     float beta = 1.0;
+     float clampLimit = 0.0;
++    bool clampAfterActivation = false;
+     TPipe pipe;
+     TQue<QuePosition::VECIN, bufferNum> inQueueA;
+     TQue<QuePosition::VECIN, bufferNum> inQueueB;
+@@ -65,7 +66,7 @@ __aicore__ inline void SwigluVectorBF16<inType, calcType, outType, bufferNum>::C
+     PipeBarrier<PIPE_V>();
+     inQueueA.template FreeTensor(aLocal_);
+ 
+-    if (clampLimit > 0.0f) {
++    if (clampLimit > 0.0f && !clampAfterActivation) {
+         Mins(aLocal, aLocal, clampLimit, curTileLen);
+         PipeBarrier<PIPE_V>();
+     }
+@@ -87,6 +88,10 @@ __aicore__ inline void SwigluVectorBF16<inType, calcType, outType, bufferNum>::C
+     inQueueB.template FreeTensor(bLocal_);
+ 
+     if (clampLimit > 0.0f) {
++        if (clampAfterActivation) {
++            Mins(cLocal, cLocal, clampLimit, curTileLen);
++            PipeBarrier<PIPE_V>();
++        }
+         Mins(bLocal, bLocal, clampLimit, curTileLen);
+         PipeBarrier<PIPE_V>();
+         Maxs(bLocal, bLocal, -clampLimit, curTileLen);
+diff --git a/activation/swi_glu/op_kernel/swi_glu_single.hpp b/activation/swi_glu/op_kernel/swi_glu_single.hpp
+index ca1903e..b3501c0 100644
+--- a/activation/swi_glu/op_kernel/swi_glu_single.hpp
++++ b/activation/swi_glu/op_kernel/swi_glu_single.hpp
+@@ -23,10 +23,10 @@ public:
+     __aicore__ inline SwigluSingle() = default;
+     __aicore__ inline ~SwigluSingle() = default;
+ 
+-    __aicore__ inline void Init(GM_ADDR input_gm, GM_ADDR beta_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f)
++    __aicore__ inline void Init(GM_ADDR input_gm, GM_ADDR beta_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f, bool clamp_after_activation = false)
+     {
+         singleTiling.GetTilingAndOffset(tiling_gm, sizeof(inType));
+-        InitGmBuffer(input_gm, beta_gm, output_gm, clamp_limit);
++        InitGmBuffer(input_gm, beta_gm, output_gm, clamp_limit, clamp_after_activation);
+         this->InitUbBuffer(singleTiling.tileLength);
+     }
+ 
+@@ -42,10 +42,11 @@ public:
+     }
+ 
+ protected:
+-    __aicore__ inline void InitGmBuffer(GM_ADDR input_gm, GM_ADDR beta_gm, GM_ADDR output_gm, float clamp_limit)
++    __aicore__ inline void InitGmBuffer(GM_ADDR input_gm, GM_ADDR beta_gm, GM_ADDR output_gm, float clamp_limit, bool clamp_after_activation)
+     {
+         this->beta = -1.0f;
+         this->clampLimit = clamp_limit;
++        this->clampAfterActivation = clamp_after_activation;
+         // get start index for current core, core parallel
+         this->aGm.SetGlobalBuffer((__gm__ inType*)input_gm, singleTiling.totalBlockLen);
+         this->cGm.SetGlobalBuffer((__gm__ outType*)output_gm, singleTiling.totalBlockLen / 2);
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
+index d7a9d1e..a6bab3e 100644
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
+@@ -18,7 +18,7 @@
+ 
+ using namespace AscendC;
+ extern "C" inline __aicore__ void swi_glu_grad(GM_ADDR gradout_gm, GM_ADDR input_gm, GM_ADDR output_gm,
+-                                                   GM_ADDR workspace, GM_ADDR tiling, float clamp_limit) {
++                                                   GM_ADDR workspace, GM_ADDR tiling, float clamp_limit, bool clamp_after_activation) {
+     // DT_FLOAT = 0,            // float type
+     // DT_FLOAT16 = 1,          // fp16 type
+     // DT_BF16 = 27,            // bf16 type
+@@ -26,21 +26,21 @@ extern "C" inline __aicore__ void swi_glu_grad(GM_ADDR gradout_gm, GM_ADDR input
+     if constexpr (std::is_same_v<DTYPE_DY, bfloat16_t>) {
+       if (tempTilingGm.isDoubleBuffer == 1) {
+         SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+-        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);
++        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit, clamp_after_activation);
+         op.Process();
+       } else {
+         SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 1>, bfloat16_t, bfloat16_t> op;
+-        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);
++        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit, clamp_after_activation);
+         op.Process();
+       }
+     } else {
+       if (tempTilingGm.isDoubleBuffer == 1) {
+         SwiGluGradSingle <SwiGluGradBF16<half, float, half, 2>, half, half> op;
+-        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);
++        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit, clamp_after_activation);
+         op.Process();
+       } else {
+         SwiGluGradSingle <SwiGluGradBF16<half, float, half, 1>, half, half> op;
+-        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);
++        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit, clamp_after_activation);
+         op.Process();
+       }
+   }
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
+index d449d2e..bb93e72 100644
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
+@@ -30,6 +30,7 @@ class SwiGluGradBF16 {
+ 
+     calcType beta = 1.0;
+     float clampLimit = 0.0;
++    bool clampAfterActivation = false;
+     TPipe pipe;
+     TQue<QuePosition::VECIN, bufferNum> inQueueA;
+     TQue<QuePosition::VECIN, bufferNum> inQueueB;
+@@ -160,6 +161,10 @@ __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::Com
+     int64_t alignedCount = (tileLength + kCompareAlign - 1) / kCompareAlign * kCompareAlign;
+     Cast(aLocal, aInput, RoundMode::CAST_NONE, tileLength);
+     PipeBarrier<PIPE_V>();
++    if (clampAfterActivation) {
++        Mul(aLocal, aLocal, sigLocal, tileLength);
++        PipeBarrier<PIPE_V>();
++    }
+     CompareScalar(mask, aLocal, clampLimit, CMPMODE::LE, alignedCount);
+     PipeBarrier<PIPE_V>();
+     Select(mLocal, mask, mLocal, (calcType)0.0, SELMODE::VSEL_TENSOR_SCALAR_MODE, tileLength);
+@@ -183,9 +188,15 @@ __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::Com
+     // Rebuild the clamped gate branch and apply both bounds to dB.
+     Cast(aLocal, aInput, RoundMode::CAST_NONE, tileLength);
+     PipeBarrier<PIPE_V>();
+-    Mins(aLocal, aLocal, clampLimit, tileLength);
+-    PipeBarrier<PIPE_V>();
++    if (!clampAfterActivation) {
++        Mins(aLocal, aLocal, clampLimit, tileLength);
++        PipeBarrier<PIPE_V>();
++    }
+     Mul(nLocal, sigLocal, aLocal, tileLength);
++    if (clampAfterActivation) {
++        PipeBarrier<PIPE_V>();
++        Mins(nLocal, nLocal, clampLimit, tileLength);
++    }
+     ComputeGradN(tileLength);
+     inQueueA.template FreeTensor(aInput);
+     inQueueB.template FreeTensor(bInput);
+@@ -207,7 +218,7 @@ __aicore__ inline void SwiGluGradBF16<inType, calcType, outType, bufferNum>::Com
+         inQueueA.template FreeTensor(aLocal_);
+     }
+ 
+-    if (clampLimit > 0.0f) {
++    if (clampLimit > 0.0f && !clampAfterActivation) {
+         Mins(aLocal, aLocal, clampLimit, tileLength);
+         PipeBarrier<PIPE_V>();
+     }
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp
+index c2b4946..144f3ef 100644
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp
+@@ -22,13 +22,13 @@ class SwiGluGradSingle : public ParentClass {
+ public:
+     __aicore__ inline SwiGluGradSingle() = default;
+     __aicore__ inline ~SwiGluGradSingle() = default;
+-    __aicore__ inline void Init(GM_ADDR grad_gm, GM_ADDR input_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f)
++    __aicore__ inline void Init(GM_ADDR grad_gm, GM_ADDR input_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f, bool clamp_after_activation = false)
+     {
+         // Scalar Select uses scratch at 184 KiB; a 19x256 BF16 tile occupies 190 KiB.
+         constexpr uint32_t kClampedMaxTileRows = 18;
+         singleTiling.GetTilingAndOffset(tiling_gm, sizeof(inType),
+                                        clamp_limit > 0.0f ? kClampedMaxTileRows : 0);
+-        InitGmBuffer(grad_gm, input_gm, output_gm, clamp_limit);
++        InitGmBuffer(grad_gm, input_gm, output_gm, clamp_limit, clamp_after_activation);
+         this->InitUbBuffer(singleTiling.tileLength);
+     }
+ 
+@@ -44,11 +44,12 @@ public:
+ #endif
+     }
+ protected:
+-    __aicore__ inline void InitGmBuffer(GM_ADDR grad_gm, GM_ADDR input_gm, GM_ADDR output_gm, float clamp_limit)
++    __aicore__ inline void InitGmBuffer(GM_ADDR grad_gm, GM_ADDR input_gm, GM_ADDR output_gm, float clamp_limit, bool clamp_after_activation)
+     {
+         // get start index for current core, core parallel
+         this->beta = -1.0f;
+         this->clampLimit = clamp_limit;
++        this->clampAfterActivation = clamp_after_activation;
+         this->aGm.SetGlobalBuffer((__gm__ inType*)input_gm, singleTiling.totalBlockLen);
+         this->lGm.SetGlobalBuffer((__gm__ inType*)grad_gm, singleTiling.totalBlockLen / 2);
+ 

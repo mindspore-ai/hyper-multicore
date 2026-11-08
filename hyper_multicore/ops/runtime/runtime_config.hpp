@@ -186,7 +186,8 @@ struct RuntimeHeader {
   uint32_t aiv_profile_record_capacity;
   uint32_t completion_event;
   uint32_t protocol_version;
-  uint32_t padding[6];
+  uint32_t vector_ready_queue;
+  uint32_t padding[5];
 };
 
 static_assert(sizeof(RuntimeHeader) == 64);

@@ -33,7 +33,6 @@ import torch.distributed as dist
 import torch_npu
 from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
-from hyper_multicore.moonep import placement as placement_module
 from hyper_multicore.diagnostics import profiler as multicore_profiler, schedule as diagnostic_schedule
 from hyper_multicore.diagnostics.profiler.cycle_trace import _records_for_task
 from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
@@ -894,16 +893,17 @@ def test_moonep_hotspot() -> None:
     try:
         expected = reference.run_layer(common, hidden, ids, probs, counts, grad)
         original = reference.run_layer(baseline, hidden, ids, probs, counts, grad)
-        allocate = placement_module.allocate_experts
+        build_plan = moon_module.build_placement
         placements = []
 
-        def recorded_allocate(counts: torch.Tensor, capacity: int) -> list[torch.Tensor]:
-            """Record the real native plan without modifying the native module."""
-            result = allocate(counts, capacity)
-            placements.append(result[-1].cpu().tolist())
+        def recorded_plan(*args, **kwargs):
+            """Observe the completed placement without changing expert assignments."""
+            result = build_plan(*args, **kwargs)
+            if result is not None:
+                placements.append(result.copies.cpu().tolist())
             return result
 
-        with patch.object(placement_module, "allocate_experts", side_effect=recorded_allocate), \
+        with patch.object(moon_module, "build_placement", side_effect=recorded_plan), \
              patch.object(moon_module.MoonEPExecution, "_placement_is_profitable", return_value=True):
             actual = reference.run_layer(moon, hidden, ids, probs, counts, grad)
         assert placements and any(expert >= 0 for plan in placements for row in plan for expert in row), (

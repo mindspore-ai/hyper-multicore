@@ -81,13 +81,17 @@ class NativeDispatchSelection:
 
     def expert_offset(self, physical_offset: int) -> int:
         """Return the first expert ID in this rank's selected layout."""
-        return physical_offset if self.invocation is None else 2 * physical_offset
+        if self.invocation is None:
+            return physical_offset
+        local = self.invocation.local_experts
+        width = local + self.invocation.plan.borrowed_capacity
+        return physical_offset // local * width + physical_offset % local
 
     def order_dispatch(self, states, indices, order, global_experts, *, sort_keys):
         """Group tokens by selected virtual owner while preserving combine indices."""
         if self.invocation is None:
             return states, indices, order
-        perm = sort_keys(self.virtual_ids.reshape(-1), bound=2 * global_experts)
+        perm = sort_keys(self.virtual_ids.reshape(-1), bound=self.invocation.plan.counts_by_source.shape[1])
         return states[perm].contiguous(), self.virtual_ids[perm].contiguous(), order[perm]
 
     def call_experts(self, experts, states, indices, expected_rows):
@@ -110,6 +114,8 @@ def prepare_native_placement(
     cube_cores: int,
     weight_bytes: int,
     projection_flops: int = 6,
+    gradient_bytes: int | None = None,
+    planner: Any = None, resources: Any = None,
 ) -> NativeDispatchSelection:
     """Plan only surviving slots and derive every exchange split from virtual counts.
 
@@ -140,23 +146,28 @@ def prepare_native_placement(
     placement = None
     if maximum_received > target_load and placement_is_profitable(
             maximum_received, target_load, hidden_size, intermediate_size, cube_cores, weight_bytes,
-            projection_flops=projection_flops):
-        placement = build_placement(
-            states, expert_indices.reshape(-1, 1), table.to(dtype=torch.int32), max(1, target_load), rank)
+            projection_flops=projection_flops, ep_size=ranks,
+            local_experts=local_experts, gradient_bytes=gradient_bytes):
+        choose = build_placement if planner is None else planner
+        placement = choose(states, expert_indices.reshape(-1, 1), table.to(dtype=torch.int32),
+                           max(1, target_load), rank, resources=resources, source_rows=tuple(source_rows))
     selected_ids = expert_indices.reshape(-1, 1)
     invocation = None
     if placement is not None:
         virtual_counts = placement.counts_by_source
-        if tuple(virtual_counts.shape) != (ranks, 2 * experts):
+        selected_local_experts = local_experts + placement.borrowed_capacity
+        selected_experts = ranks * selected_local_experts
+        if tuple(virtual_counts.shape) != (ranks, selected_experts):
             raise ValueError("MoonEP virtual count table has an invalid EP/expert extent")
         selected_rows = virtual_counts.tolist()
         if [sum(row) for row in selected_rows] != source_rows:
             raise ValueError("MoonEP selected routing changed a source's surviving slot count")
         if sum(sum(row) for row in selected_rows) != global_rows:
             raise ValueError("MoonEP selected routing changed the global routed row count")
-        selected_local_experts = 2 * local_experts
         rank_counts = [[sum(row[offset:offset + selected_local_experts])
-                        for offset in range(0, 2 * experts, selected_local_experts)] for row in selected_rows]
+                        for offset in range(0, selected_experts, selected_local_experts)] for row in selected_rows]
+        if max(sum(column) for column in zip(*rank_counts)) > placement.receive_capacity:
+            raise ValueError("MoonEP receive capacity does not cover its selected destination loads")
         selected_ids = placement.virtual_ids.reshape(-1, 1).to(dtype=expert_indices.dtype)
         invocation = NativeExpertPlacement(placement, ep_group, local_experts, loads[rank])
     if selected_ids.numel() != states.shape[0]:
@@ -190,4 +201,6 @@ def select_native_route(experts: Any, states: torch.Tensor, expert_indices: torc
         states, expert_indices, local_counts,
         ep_group=ep_group, hidden_size=hidden, intermediate_size=intermediate,
         cube_cores=torch.npu.get_device_limit(states.device.index)["cube_core_num"], weight_bytes=weight_bytes,
-        projection_flops=2 * projections)
+        projection_flops=(4 if experts.training else 2) * projections,
+        gradient_bytes=(weight_bytes // element_size * torch.float32.itemsize if experts.training else 0),
+        planner=getattr(experts, "moonep_planner", None))

@@ -103,7 +103,7 @@ def _initialize_weights(
 
 def _new_layers(
     shape: baseline.MoeShape,
-    swiglu_limit: float | None,
+    swiglu_limit: float | None, *, clamp_after_activation: bool = False,
 ) -> tuple[torch.nn.Module, MegaMoeExperts]:
     """Create reference and MegaMoe layers with identical deterministic weights."""
     common = baseline.new_common_moe(shape)
@@ -113,6 +113,7 @@ def _new_layers(
         num_experts=shape.num_experts,
         top_k=shape.top_k,
         swiglu_limit=swiglu_limit,
+        clamp_after_activation=clamp_after_activation,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=baseline.DEVICE, dtype=torch.bfloat16)
@@ -128,6 +129,7 @@ def _run_reference(
     grad_output: torch.Tensor,
     gate_up_weight: torch.Tensor,
     down_weight: torch.Tensor,
+    *, limit: float = _CLAMP_LIMIT, clamp_after_activation: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Run grouped matmuls around an autograd-visible PyTorch clamp reference."""
     hidden = hidden_states.detach().clone()
@@ -139,8 +141,8 @@ def _run_reference(
     gate_up_output = grouped_matmul(routed, gate_up, group_list=group_list)
     gate, up = gate_up_output.chunk(2, dim=-1)
     activation = (
-        F.silu(gate.float().clamp(max=_CLAMP_LIMIT))
-        * up.float().clamp(min=-_CLAMP_LIMIT, max=_CLAMP_LIMIT)
+        (F.silu(gate.float()).clamp(max=limit) if clamp_after_activation else F.silu(gate.float().clamp(max=limit)))
+        * up.float().clamp(min=-limit, max=limit)
     ).to(hidden.dtype)
     expert_output = grouped_matmul(activation, down, group_list=group_list)
     output = torch_npu.npu_moe_token_unpermute(
@@ -344,6 +346,22 @@ def test_swiglu_clamp_numerics() -> None:
         clamped.close()
 
 
+    # At gate=0.625, gate > 0.5 but SiLU(gate) < 0.5. This distinguishes
+    # the two gradient masks even when both use the same positive limit.
+    limit = 0.5
+    hidden[::2, 0] = 0.625
+    hidden[::2, 1] = 0.25
+    _, post = _new_layers(shape, limit, clamp_after_activation=True)
+    try:
+        actual = _run_mega(post, hidden, topk_ids, topk_weights, tokens_per_expert, grad_output)
+        expected = _run_reference(hidden, topk_ids, topk_weights, tokens_per_expert,
+                                  grad_output, post.gate_up_weight, post.down_weight,
+                                  limit=limit, clamp_after_activation=True)
+        _assert_numerical_results(actual, expected)
+    finally:
+        post.close()
+
+
 def test_swiglu_clamp_input_gradient() -> None:
     """Compare routed input gradients with and without the clamp option."""
     # pylint: disable=protected-access
@@ -391,7 +409,7 @@ def test_swiglu_clamp_ub_scratch() -> None:
     observed_calls = 0
     comparisons = []
 
-    def check_backward(plan: Any, saved: Any, grad_output: Any, execution: Any) -> None:
+    def check_backward(plan: Any, saved: Any, grad_output: Any, execution: Any, *, stream: Any = None) -> None:
         """Compare native clamp derivatives with the saved-input oracle after each backward launch.
 
         Args:
@@ -401,7 +419,7 @@ def test_swiglu_clamp_ub_scratch() -> None:
             execution: Native intermediates containing the computed SwiGLU gradient.
         """
         nonlocal observed_calls
-        original_launch(plan, saved, grad_output, execution)
+        original_launch(plan, saved, grad_output, execution, stream=stream)
         torch.npu.synchronize(baseline.DEVICE)
         rows = int(saved.group_list[-1].item())
         gate, up = saved.up_proj[:rows].detach().cpu().double().chunk(2, dim=-1)

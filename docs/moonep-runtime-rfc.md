@@ -1,93 +1,86 @@
-# [RFC]: 在 HyperMulticore 实现 MoonEP 动态专家借用
+# [RFC]: HyperMulticore 的可选 MoonEP 专家放置与传输接口
 
-| 状态 | 设计评审稿，2026-11-03 |
+| 项目 | 说明 |
 | --- | --- |
-| 实现范围 | hyper-multicore 的可选 MoonEP 运行时，Ascend A3 |
-| 关联议题 | [HP 社区 MoonEP RFC #1128](https://github.com/mindspore-ai/hyper-parallel/issues/1128) |
-| 评审决策 | 是否接受逐次前向规划、两种传输后端共用一份放置计划，以及由原参数所有者归并梯度的设计 |
+| 状态 | 设计评审稿，2026-11-07 |
+| 范围 | Ascend A3；规划、临时专家副本与梯度归还；不改变模型路由或参数所有权 |
+| 关联 | [HP MoonEP RFC #1128](https://github.com/mindspore-ai/hyper-parallel/issues/1128) |
 
 ## 动机（Motivation）
 
-一次 Top-K 路由会为每个 token 选出若干专家。专家并行（EP）按 rank 分片持有专家权重。当同一次前向中的大量路由命中同一分片，耗时取决于最忙 rank 的专家计算。即使下一层的热点完全不同，本层其余 rank 也只能等待。社区议题提出在层执行期间规划 token 去向并预取临时专家副本。本设计具体定义何时值得复制、哪些 token 可以改派，以及训练时如何把梯度还给原参数。[社区 RFC #1128](https://github.com/mindspore-ai/hyper-parallel/issues/1128)
+固定 EP 分片下，一层 MoE 的耗时受最忙 rank 限制。MegaMoE 将激活传输和专家计算组织成细粒度任务以实现重叠，但不会自动消除专家所在 rank 的负载差异。MoonEP 根据本次路由将部分专家计算改派到较空闲的 rank：临时取得专家权重，处理原路由选中的 token，再将参数梯度还给原 owner。
 
-设计的约束来自训练语义。路由器选中的逻辑专家、Top-K 权重及有效路由条目必须保持一致。允许改变的是执行某个专家计算的物理 rank。原参数仍是 checkpoint 和优化器识别的对象，借用副本的生存期仅覆盖相关前向和反向。
+MoonEP 不改变逻辑专家、选中的 Top-K 条目、路由概率、优化器或 checkpoint 的参数身份。均衡负载或预估收益不足时，执行原来的计算后端。
 
-## 目标设计
+## 目标与边界
 
-### 一次派发中的数据契约
+- MegaMoE 与 MoonEP 独立选择。普通专家计算与 MegaMoE 都可以使用同一官方规划实现；关闭 MoonEP 时保留原执行器。
+- 调用方已有的计数协议提供 `[EP, E]` 计数表，不为判断是否搬运再执行一次计数集合通信。
+- 调用方拥有进程组、SHMEM root、模型参数及 autograd；MoonEP provider 不创建第二套独立 SHMEM runtime。
+- 当前官方 provider 要求各源 rank 的有效路由行数相同且非零。空源或不等行数沿用所选后端的无搬运路径（原生 MoE 或普通 MegaMoE）；不通过填充或改写数据假装支持。
+- 官方 provider 与 HMC 原生 provider 是显式依赖选项，不通过修改全局函数切换其他执行器的行为。
 
-设 EP 组有 R 个 rank、E 个全局专家，E 能被 R 整除，每个 rank 持有 B = E/R 个本地专家。下文的“行”指一个有效的 token–expert 配对；同一 token 的两个 Top-K 命中计作两行。
+## 数据契约
 
-| 数据 | 形状与所有者 | 用途 |
-| --- | --- | --- |
-| 来源计数 C | [R, E]，按有序 EP 组排列 | C[s,e] 表示源 rank s 发给逻辑专家 e 的行数 |
-| 借用表 copies | [R, B]，每次前向生成 | 每个借用槽存原全局专家 ID；负值表示空槽 |
-| 虚拟编号 virtual_ids | 对应输入路由条目，保留 token 与 Top-K 位置 | 决定本次计算的目的 rank 和槽位 |
-| 新计数 counts_by_source | [R, 2E] | 计算发送、接收分片长度及虚拟布局所需容量 |
-| ExpertPlacement | 本次调用持有 | 一并保存虚拟编号、来源计数和设备端、主机端借用表 |
+设 R 为 EP 大小，E 为全局专家数，B=E/R 为每个 owner 的本地专家数，b 为本次借用槽宽度，0≤b≤B。一条路由行对应一个 token–expert 配对。
 
-每个 rank 在虚拟编号空间内占用 2B 个槽。前 B 个对应本地专家，后 B 个容纳借来的专家。举例来说，R=2、E=4 时，rank 0 持有 e0、e1，rank 1 持有 e2、e3。假设路由行数为 [80, 0, 20, 0]，目标负载为每卡 50 行，且已通过收益判定。rank 1 可在第一个借用槽装入 e0，把 30 行 e0 的计算改派给自己。此时这些行使用虚拟编号 6，仍使用 e0 的权重和原路由分数。反向时，两卡对 e0 的贡献在 rank 0 汇总。数字仅用于演示映射。
-
-### 收益判定与放置算法
-
-1. **建立当前负载。** Native 后端对容量过滤后的专家计数做一次 all-gather，各 rank 得到相同的 C。MegaMoE 复用当前路由阶段已有的计数表。已知总行数时，目标负载取总行数除以 R 后向上取整；MegaMoE 缺少总数时，使用其计划 token 数乘 Top-K 作为保守目标。
-2. **估算关键路径。** 令 Δ 为最忙 rank 超过目标的行数，H 为隐藏维度，I 为专家中间维度，N 为设备 cube 核数，W 为本地专家权重分片字节数。当前 A3 实现比较下列两个以秒为单位的估计量。系数 k 对带门控的三投影取 6，对双投影取 4。两项相等时沿用原路由。
-
-   ~~~text
-   T_saved    = k × Δ × H × I / (N × 4×10¹²)
-   T_transfer = 0.0008 + 5 × W / (4×10¹¹)
-   仅在 T_saved > T_transfer 时进入分配器
-   ~~~
-
-3. **分派超额工作。** 设备端分配器先统计各专家的全局行数，再按 rank 相对目标的盈亏配对。对每个输出配额，优先从剩余行数较多的本地专家划拨工作。每个接收 rank 至多选择 B 个远端专家副本，并生成渲染路由所需的累计边界。
-4. **渲染并验证。** 路由渲染器根据原专家编号、专家内排列和累计边界生成虚拟编号。每个源 rank 的有效行数以及全组行数守恒；路由分数仍对应原 token 的 Top-K 位置。负载已均衡、估算收益不足或分配结果没有副本时，执行原后端的普通路由。
-
-### 两种传输后端
-
-| 阶段 | Native EP | MegaMoE |
-| --- | --- | --- |
-| 取得权重 | 在原专家模块进入 forward、FSDP 已完成 unshard 后，读取本次实际参数视图 | 执行器接收当前专家权重，按借用表向 SHMEM 专家缓冲区预取 |
-| 运行专家 | 按 dtype 打包，通过变长 all-to-all 交换借用权重；按虚拟槽调用本地专家计算 | 按虚拟路由预留 token workspace 和专家缓冲区；沿用已有 push 或 pull 执行路径 |
-| 返回梯度 | 自定义 autograd 按借用关系反向交换部分梯度，在 owner 侧以 FP32 累加后转换为原参数 dtype | 反向计划请求 FP32 权重梯度，SHMEM 归并远端贡献，返回原形状和 dtype |
-| 释放或复用 | 反向释放本次调用的累加缓冲；保留图再次反向时重新累加 | 用租用状态、代次和 stream event 约束缓冲区复用；反向需要时重取权重 |
-
-梯度归属遵循同一条关系：专家 e 的原参数接收所有执行 rank 对 e 的部分梯度之和。此处不再除以 EP 组大小。数据并行归约和优化器更新继续遵循上层框架已有的并行语义。
-
-## 需要设计评审DFX建议
-
-| 评审维度 | 设计取舍与验收依据 |
+| 对象 | 含义与生存期 |
 | --- | --- |
-| 正确性 | 用相同权重、输入、路由 ID 和路由分数，对比普通执行与借用执行的输出、输入梯度、路由权重梯度和原参数梯度。覆盖空接收方、冻结参数、checkpoint 重算及 retained graph。 |
-| 内存与并发 | 最大借用槽数受 B 限制。MegaMoE 按最终虚拟路由扩容；同一 SHMEM root 上不同缓冲区的传输用 event 排序。评审重点是延迟反向遇到后续前向时的租用与重取。 |
-| 性能 | 固定专家布局没有规划及权重传输开销，适合均衡负载。逐次借用可以处理单层热点，代价包括计数同步、规划、权重传输和梯度返回。应同时测均衡、小负载和热点场景的完整前反向耗时。 |
-| 替代方案 | 长期迁移热点专家能跨层次或跨步摊薄迁移开销，但需要管理持续变化的布局和参数状态。当前方案优先支持瞬时热点，保留所有者，以每次调用重新判断为代价。 |
-| 可维护性 | 公共规划位于 hyper_multicore/moonep 的 placement、allocator、render 模块；native、precision、execution 管理 native 路径；mega_moe、shmem_transfer 和 csrc 管理融合路径。变更放置策略时，两后端须通过同一套路由守恒检查。 |
-| 能力边界 | 当前构建包含面向 Ascend A3 的设备内核。INT32 路由范围、EP 拓扑和输入计数均需满足约束。MegaMoE 当前拒绝 stream capture。估算常数在其他设备上的适用性需要单独标定。 |
+| `counts_by_source[R,E]` | 当前调用的来源计数；所有 rank 使用同一有序 EP 组 |
+| `copies[R,b]` | 每个借用槽对应的原全局专家 ID；负数为空槽 |
+| `virtual_ids[tokens,K]` | 当前输入顺序下的执行位置，仍对应原 token 的 Top-K 槽 |
+| 虚拟计数 `[R,R*(B+b)]` | 供后端计算派发分片、接收容量和专家偏移 |
+| `ExpertPlacement` | 当前调用拥有的路由与副本元数据；反向保持其对应关系 |
+| 对称专家 bank | 临时 home/borrowed 权重和梯度传输槽；不注册为模型参数 |
 
-**评审待决事项。** 是否以当前 A3 代价模型作为首版启发式，并将其他设备的标定单独验收。
+官方 provider 将借用宽度向上取整到受 B 限制的执行档位。工作区使用实际虚拟计数和实际宽度，不能把源 token 行数直接当作每个目的 rank 的接收上限。Top-K、热点、专家借用都会改变目的端的配对行数。
 
-## 相关的RFCs和API
+## 规划与执行流程
 
-| 接口 | 契约 |
+1. 原路由产生专家 ID、概率与计数。MegaMoE 在 `route.py` 的已有计数协议中调用选择回调；普通后端可复用其已收集的计数表。
+2. `placement_is_profitable` 比较预估可减少的最忙 rank 计算量与规划、权重搬运和梯度归还成本。它是 A3 启发式模型，不是针对某个数据集的路由表。均衡或无收益时直接执行普通后端。
+3. 使用官方 provider 时，`OfficialPlanner` 调用 `npu_patch._C.plan_from_counts`，再由 `render.py` 将专家内位置恢复到本次 token 顺序；缺少调用方逆排列信息时使用官方完整规划入口。HMC 自有 provider 的默认 `build_placement` 仍供其原调用方使用；TT 显式选择官方 provider，不串行运行两个分配器。
+4. `OfficialPlanner` 的有界几何缓存只复用完全相同计数表下的专家配额。每次调用仍生成自身 token 顺序对应的虚拟 ID；缓存不持有模型参数或跨调用复用可变 autograd 状态。条目有版本、容量和跨流 event 检查。
+5. 规划成功后一次预留虚拟执行工作区、planner scratch 和专家 bank。`heap_manager.py` 管理对称扩容及重绑，`PlanningWorkspace` 注册其重启分配契约。单纯增加源容量不能替代目的端行数检查。
+6. 专家模块通过正常 forward/FSDP hook 提供本次真实参数视图。provider 预取借用权重；计算后端执行同一逻辑专家计算。原生 grouped GEMM 与 MegaMoE 共用规划语义，但计算调度各自保留。
+7. 反向产生每个执行位置的参数梯度，provider 将远端部分送回原 owner，以 FP32 累加。回传可选择 FP32（默认）或 BF16；BF16 会额外量化部分梯度。最终梯度形状及 dtype 对应原参数，不除以 EP 大小。
+8. bank 租用、代次与同 SHMEM root 的传输 event 防止后续前向或其他流提前覆盖；autograd 保存 owner 参数与本次计划，需要时重新预取，不保存可被后续调用覆写的临时权重视图。
+
+## 模块职责和 API
+
+| 模块 | 职责 |
 | --- | --- |
-| build_placement(hidden, topk_ids, counts_by_source, capacity, rank) | 共享规划入口，输入当前调用的完整计数表，返回 ExpertPlacement 或 None。供后端内部使用。 |
-| select_native_route(experts, states, expert_indices, local_counts, ep_group) | HP native 接入点，返回本次调用的 NativeDispatchSelection；返回对象负责排序、专家偏移和进入专家模块。 |
-| run_local_experts(...) | 启用借用时，在原专家模块 forward 内使用 placement 提供的参数视图执行计算。 |
-| MegaMoeExperts(..., enable_hot_replica=True) 的 forward(..., expert_weights=...) | 融合执行入口，接受外部参数视图；输出沿用已有 token 布局。 |
+| `modules/mega_moe/module.py` | `MegaMoeExperts`，接收外部权重及可选 planner/transfer provider |
+| `moonep/mega_moe.py` | `MoonEPExecution`；普通/虚拟执行选择，保留 MegaMoE 调度 |
+| `moonep/placement.py` | `ExpertPlacement`、共享收益判定、HMC 默认放置入口 |
+| `moonep/official_planner.py` | `OfficialPlanner`、`PlanningScratch`；官方算法与计数/路由契约校验 |
+| `moonep/official_execution.py` | `build_official_placement`、`OfficialTransferBackend`；将官方 API 接到现有 heap 和 lease |
+| `moonep/official_transfer.py` | `ExpertTransfer`；普通 grouped GEMM 使用官方 bank/梯度归还 |
+| `moonep/grouped_experts.py` | `TransferredExperts`；普通专家计算的可微参数与概率边界 |
+| `moonep/shmem_transfer.py` | HMC bank pool、租用、同 root 事件排序和原 provider |
+| 官方 `npu_patch` | 设备分配、prefetch、FP32/BF16 梯度归还 API 与原生内核 |
 
-本篇细化社区议题中的运行时设计。配套《在 HyperParallel 接入 MoonEP》定义模型配置和 HP 侧调用边界。[社区 RFC #1128](https://github.com/mindspore-ai/hyper-parallel/issues/1128) · [社区 RFC 模板](https://github.com/mindspore-ai/hyper-parallel/blob/master/.github/ISSUE_TEMPLATE/003-RFC.yml)
+`MegaMoeExperts(..., enable_hot_replica=True, moonep_planner=..., moonep_transfer_backend=..., moonep_grad_reduce_dtype="fp32")` 是 HMC 执行器接入方式。上层 TT 的用户开关是 `mega_moe` 与 `enable_moonep`，不暴露 HMC 的内部字段名。传输 provider 保存在执行器及 pool key 中；其他执行器继续使用原 provider。
 
-## 完整的反馈期限
+## DFX 与验收
 
-建议自公开征求意见之日起至少 7 天，具体截止日期由发布者填写。
+| 维度 | 要求 |
+| --- | --- |
+| 正确性 | 相同输入、参数、逻辑 ID 和概率，对比输出、输入梯度、概率梯度及 owner 参数梯度；分别报告严格 BF16 和高精度参考结果 |
+| 生命周期 | 覆盖空接收、冷专家、冻结参数、不同几何/流、连续 forward 后 backward、checkpoint、异常恢复与 CPU offload |
+| 性能 | 计入规划、权重搬运与梯度归还；均衡、小负载、热点分别测试；不将强制搬运精度用例当生产收益 |
+| 内存 | 对称扩容前校验全部计划的接收容量和存活 lease；持有的 autograd 图不能引用失效指针 |
+| 兼容性 | provider 可选；关闭 MoonEP 保持原路径；不更换模型参数对象、优化器或 checkpoint 格式 |
 
-## CC List
+当前验证针对 A3、私有 CANN 9.1 和匹配 Torch/PTA ABI；不代表 A2/A5、独立 CUDA/URMA 或全部官方 MoonEP 测试已通过。性能、功能与严格数值结果由对应版本测试报告提供，不在设计文档中合并不同版本的通过数。
 
-建议邀请 HyperMulticore MegaMoE、SHMEM、Ascend 算子以及 HP 专家并行维护者参与评审。
+## 反馈期限与评审参与者
 
-## 其他补充说明
+建议公开征求意见至少 7 天；具体截止日期由发布者填写。建议邀请 HyperMulticore MegaMoE、SHMEM、Ascend 算子、官方 MoonEP 以及上层框架 EP 维护者评审。
 
-本轮 A3 构建生成含分配器、SHMEM bridge 和传输内核的 hyper-multicore wheel。规划及 MegaMoE 相关单测 90/90 通过。已安装 wheel 的双卡 push 14/14、pull 7/7 通过。以上是迁移后的功能验证。原 PR 中每卡 4,096 token 热点场景约 2.45–2.48 倍的前反向加速来自迁移前的模块基准，本轮未重新测量训练吞吐。[原 PR 基准配置与结果](https://github.com/mindspore-ai/hyper-parallel/pull/1393)
+## 已知数值边界
+
+MegaMoE 通过 `apply_probs_before_fc2=True` 支持在 SwiGLU 后、FC2 前乘路由概率，TT 适配器显式选择此模式，与当前原生 `GroupedMLP` 一致。先保留 BF16 激活，再用 FP32 概率相乘并转回 BF16，输出归并不再乘概率；反向在该乘法位置计算概率梯度。概率与其梯度复用现有 dispatch/combine 完成事件，不增加集合通信。每份不可变 plan 按自己的 token 执行上界划分标量缓冲区，扩容后保留的旧 forward 仍使用原来的偏移。HyperMulticore 默认仍在 FC2 后乘概率，兼容原有调用方。乘法位置对齐与以下历史分片归约边界是两个独立问题，须分开验证。
 
 ### EP4 / EP8 连续反传的 BF16 权重梯度
 

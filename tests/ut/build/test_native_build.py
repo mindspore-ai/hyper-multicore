@@ -49,6 +49,7 @@ def test_repeated_native_scheduling_always_compiles(tmp_path, monkeypatch, count
     def compile_pair(_python, directory, payload, common, *_args):
         assert not (directory / "stale.o").exists()
         put(directory / "stale.o")
+        put(directory / "torch/torch_cxx_standard.txt", "20")
         put(payload / "libhyper_multicore_torch.so")
         put(payload / "hyper_multicore_shmem_torch.so")
         assert common == tmp_path / "common" / BUILD.WORKSPACE.common_slot(args.soc_list) / "payload"

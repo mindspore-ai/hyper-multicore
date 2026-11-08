@@ -6,7 +6,7 @@
 #include <ATen/Functions.h>
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
-#include "csrc/cached_op_api.h"
+#include "csrc/cached_moe_op_api.h"
 
 namespace {
 
@@ -32,7 +32,7 @@ at::Tensor moe_token_permute_grad_npu(const at::Tensor &grad, const at::Tensor &
   auto output = allocate_token_gradient(grad, sorted_indices, num_tokens, top_k);
   if (output.numel() != 0) {
     bool padded_mode = false;
-    HYPER_EXEC_NPU_CMD_EXT(aclnnMoeTokenPermuteGrad, grad, sorted_indices, top_k, padded_mode, output);
+    HMC_EXEC_CACHED_MOE_OP(aclnnMoeTokenPermuteGrad, grad, sorted_indices, top_k, padded_mode, output);
   }
   return output;
 }

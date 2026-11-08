@@ -49,6 +49,29 @@ def _native_counts(
     return counts.reshape(ranks, ranks * width), repeats.flatten(), labels.flatten()
 
 
+def render_expert_major(
+    gathered: torch.Tensor,
+    cumulative: torch.Tensor,
+    copies: torch.Tensor,
+    rank: int,
+    extra: int,
+    routes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand count-dependent assignments independently of token order."""
+    ranks, experts = gathered.shape
+    width = experts // ranks + extra
+    def aligned(value: int) -> int:
+        """Align metadata lengths for the native vector scratch layout."""
+        return (value + 7) // 8 * 8
+
+    scratch_bytes = (5 * aligned(ranks * experts) + aligned(experts) + aligned(ranks * width)) * 4
+    if scratch_bytes <= _device_ub_bytes(gathered.device.index) * 3 // 4:
+        counts, repeats, labels = load_allocator().render(gathered, cumulative, copies, rank, width)
+    else:
+        counts, repeats, labels = _native_counts(gathered, cumulative, copies, rank, extra)
+    return torch.repeat_interleave(labels, repeats, output_size=routes), counts
+
+
 def render_route(
     ids: torch.Tensor,
     inverse: torch.Tensor,
@@ -58,18 +81,7 @@ def render_route(
     rank: int,
     extra: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expand expert-major assignments and restore the native token order."""
-    ranks, experts = gathered.shape
-    width = experts // ranks + extra
-    def aligned(value: int) -> int:
-        """Align metadata lengths for the native vector scratch layout."""
-        return (value + 7) // 8 * 8
-
-    scratch_bytes = (5 * aligned(ranks * experts) + aligned(experts) + aligned(ranks * width)) * 4
-    if scratch_bytes <= _device_ub_bytes(ids.device.index) * 3 // 4:
-        counts, repeats, labels = load_allocator().render(gathered, cumulative, copies, rank, width)
-    else:
-        counts, repeats, labels = _native_counts(gathered, cumulative, copies, rank, extra)
-    sorted_ids = torch.repeat_interleave(labels, repeats, output_size=ids.numel())
+    """Expand expert-major assignments and restore the current token order."""
+    sorted_ids, counts = render_expert_major(gathered, cumulative, copies, rank, extra, ids.numel())
     virtual = sorted_ids.index_select(0, inverse.flatten()).reshape_as(ids)
     return virtual, counts

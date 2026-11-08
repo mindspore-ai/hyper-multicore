@@ -528,8 +528,14 @@ def _run_token_matrix(mega: MegaMoeExperts, fixed: MegaMoeExperts, weights: tupl
     return results, fixed_reports
 
 
+def _latest_cached_route(workspace: object) -> object | None:
+    """Inspect the most recently used entry of the bounded descriptor cache."""
+    cache = workspace.route_cache
+    return next(reversed(cache.values()), None) if cache else None
+
+
 def _check_route_cache_admission(cached: object, previous: object, phase: str) -> None:
-    """Check raw-table admission, confirmed descriptors and immutable cache replacement."""
+    """Check bounded descriptor admission, reuse and count-change invalidation."""
     if cached is None or (phase == "flipped" and cached is not previous):
         raise AssertionError(f"descriptor reuse failed: phase={phase}, old={id(previous)}, new={id(cached)}")
     if phase == "shifted" and cached is previous:
@@ -550,7 +556,7 @@ def _warm_route_cache(mega: MegaMoeExperts, inputs: tuple, rank: int, device: to
         mega.zero_grad(set_to_none=True)
         invocation = _forward(mega, inputs, rank, device, supplied_counts=supplied_counts)
         (invocation[2] * invocation[3]).sum().backward()
-        cached = workspace.route_cache
+        cached = _latest_cached_route(workspace)
         eligible = cached is not None and cached.metadata is not None and workspace.route_cache_probe_after == 0
         if eligible and cached is previous:
             return
@@ -577,7 +583,7 @@ def _same_histogram_routes(mega: MegaMoeExperts, weights: tuple, rank: int,
         invocation = _forward(mega, batch, rank, device)
         _check_gradients(mega, invocation, _rounded_oracle(weights, batch),
                          [129 + index for index in range(world)], rank)
-        cached = workspace.route_cache
+        cached = _latest_cached_route(workspace)
         if host_policy:
             _check_route_cache_admission(cached, previous, phase)
         previous = cached
@@ -596,9 +602,11 @@ def _supplied_count_cache_ownership(mega: MegaMoeExperts, weights: tuple, rank: 
         invocation = _forward(mega, inputs, rank, device, supplied_counts=counts)
         _check_gradients(mega, invocation, _rounded_oracle(weights, inputs), lengths, rank)
     workspace = mega._resource_group.resources.workspace  # pylint: disable=protected-access
-    metadata = getattr(workspace.route_cache, "metadata", None)
+    cached = _latest_cached_route(workspace)
+    assert cached is not None and cached.metadata is not None
+    metadata = cached.metadata
     expected = {name: tensor.cpu().clone() for name, tensor in vars(metadata).items()
-                if isinstance(tensor, torch.Tensor)} if metadata is not None else {}
+                if isinstance(tensor, torch.Tensor)}
     counts.zero_()
     for name, tensor in expected.items():
         torch.testing.assert_close(getattr(metadata, name).cpu(), tensor, rtol=0, atol=0)

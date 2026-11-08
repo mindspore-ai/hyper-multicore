@@ -82,16 +82,20 @@ class SharedExpertPool:
         self.local_experts = local_experts
         self.hidden, self.intermediate = spec.hidden_size, spec.intermediate_size
         self.blocks = spec.num_cube_cores
+        from .official_transfer import _transfer_vector_cores
+        self.transfer_blocks = _transfer_vector_cores(hidden.device, self.blocks)
         self.device, self.dtype = hidden.device, hidden.dtype
         self.manager = engine.heap_manager
         self.weights: tuple[torch.Tensor, ...] = ()
         self.completion_event = None
+        self.completion_stream = None
         self.used = False
         self.in_use = False
         self.closed = False
         self.lock = threading.RLock()
         self.cache_token = None
         self.cache_generation = None
+        self.transfer_backend = None
         self.generation = 0
         self.graphs = weakref.WeakSet()
         self.owners = weakref.WeakSet()
@@ -135,6 +139,7 @@ class SharedExpertPool:
         self.weights = ()
         self.cache_token = None
         self.cache_generation = None
+        self.completion_stream = None
 
     def _bank_shapes(self):
         if self.expert_weight_layout == "EOI":
@@ -182,14 +187,22 @@ class SharedExpertPool:
         self.weights = tuple(tensors)
         self.cache_token = None
         self.cache_generation = None
+        # The heap transaction retired the previous bank. Retain its completion
+        # event as a conservative first-use dependency, but forget its stream.
+        self.completion_stream = None
 
     def claim(self) -> None:
         """Order bank reuse after compute and all peer gradient reads."""
         with self.manager.access(), self.lock:
             if self.closed or self.in_use:
                 raise RuntimeError("MoonEP expert banks require serial, open execution")
-            if self.used:
-                torch.npu.current_stream(self.device).wait_event(self.completion_event)
+            stream = torch.npu.current_stream(self.device)
+            # FIFO already orders prior readers on this exact device stream.
+            # Cross-stream reuse still waits on the last recorded completion.
+            if self.used and (self.completion_stream is None
+                              or stream.device != self.completion_stream.device
+                              or stream != self.completion_stream):
+                stream.wait_event(self.completion_event)
             self.in_use = True
 
     def release(self) -> None:
@@ -197,7 +210,9 @@ class SharedExpertPool:
         with self.manager.access(), self.lock:
             if not self.in_use:
                 raise RuntimeError("MoonEP expert banks released without a lease")
-            self.completion_event.record(torch.npu.current_stream(self.device))
+            stream = torch.npu.current_stream(self.device)
+            self.completion_event.record(stream)
+            self.completion_stream = stream
             self.used = True
             self.in_use = False
 
@@ -208,6 +223,8 @@ class SharedExpertPool:
             raise RuntimeError("MoonEP prefetch requires an active bank lease")
         self.cache_token = None
         self.cache_generation = None
+        if self.transfer_backend is not None:
+            return self.transfer_backend.prefetch(self, weights, copies, extra, token=token)
         bridge = load_bridge()
         for bank, weight in zip(self.weights, weights):
             bank[:self.local_experts].copy_(weight)
@@ -224,8 +241,14 @@ class SharedExpertPool:
         return tuple(bank.detach() for bank in self.weights)
 
     def return_generated_gradients(self, gradients: tuple[torch.Tensor, ...],
-                                   copies: torch.Tensor, active: bool = True) -> tuple[torch.Tensor, ...]:
+                                   copies: torch.Tensor, active: bool = True, *,
+                                   output_dtypes: tuple[torch.dtype, ...] | None = None) -> tuple[torch.Tensor, ...]:
         """Sum borrowed gradients into the HP native producer's home gradients."""
+        if self.transfer_backend is not None:
+            typed_return = getattr(self.transfer_backend, "return_gradients_as", None)
+            if output_dtypes is not None and typed_return is not None:
+                return typed_return(self, gradients, copies, active=active, output_dtypes=output_dtypes)
+            return self.transfer_backend.return_gradients(self, gradients, copies, active=active)
         bridge = load_bridge()
         home = []
         with _ordered_transfers(self) if active else nullcontext():
@@ -303,10 +326,12 @@ def get_expert_pool(hidden: torch.Tensor, engine: Any, local_experts: int, owner
     """Select one bank for a compatible ordered EP root and expert geometry."""
     spec = engine.spec
     key = (tuple(shmem.root_members(spec.ep_group)), local_experts, spec.hidden_size,
-           spec.intermediate_size, spec.expert_weight_layout, hidden.dtype, hidden.device)
+           spec.intermediate_size, spec.expert_weight_layout, hidden.dtype, hidden.device,
+           owner.transfer_backend)
     pool = _POOLS.get(key)
     if pool is None or pool.closed:
         pool = SharedExpertPool(hidden, engine, local_experts, reservations)
+        pool.transfer_backend = owner.transfer_backend
         _POOLS[key] = pool
     elif reservations:
         pool.manager.reserve(reservations, allow_resize=True)
@@ -361,7 +386,8 @@ class _TransferContext:
         ):
             # HP may replace the heap during another layer or checkpoint replay.
             # The generation identifies the data; acquire views of the current bank.
-            self.weights = tuple(bank.detach() for bank in self.resources.weights)
+            self.weights = tuple(bank[:self.resources.local_experts+self.extra].detach()
+                                 for bank in self.resources.weights)
             self.resources.statistics["backward_cache_hits"] += 1
         else:
             self.workspace.wait_for_reuse()
@@ -400,22 +426,28 @@ class _FusedTransferFunction(torch.autograd.Function):
         transfer = _TransferContext(ctx, (weight1, weight2), copies, resources, extra, workspace)
         ctx.transfer = transfer
         resources.track_graph(ctx)
-        resources.claim()
         try:
-            weights = resources.prefetch((weight1, weight2), copies, extra, token=transfer.token)
-            return native._MegaMoeFunction.forward(
-                transfer,
-                hidden,
-                *weights,
-                route,
-                plan,
-                workspace,
-                permutation,
-                topk_weights,
-                workspace_claimed,
-            )
-        finally:
-            resources.release()
+            resources.claim()
+            try:
+                weights = resources.prefetch((weight1, weight2), copies, extra, token=transfer.token)
+                return native._MegaMoeFunction.forward(
+                    transfer,
+                    hidden,
+                    *weights,
+                    route,
+                    plan,
+                    workspace,
+                    permutation,
+                    topk_weights,
+                    workspace_claimed,
+                )
+            finally:
+                resources.release()
+        except BaseException:
+            # No autograd output can own a failed forward's graph reservation.
+            # Release the bank lease first; retiring the graph may close its pool.
+            resources.graphs.discard(ctx)
+            raise
 
     @staticmethod
     def backward(ctx: Any, output_gradient: torch.Tensor) -> tuple:
@@ -426,7 +458,8 @@ class _FusedTransferFunction(torch.autograd.Function):
             gradients = native._MegaMoeFunction.backward(transfer, output_gradient)
             # Native backward owns these gradients; accumulate without cloning.
             owners = ctx.transfer_resources.return_generated_gradients(
-                gradients[1:3], transfer.copies, transfer.extra > 0
+                gradients[1:3], transfer.copies, transfer.extra > 0,
+                output_dtypes=ctx.original_dtypes
             )
             # Restore the autograd input dtype only after every peer contribution is summed.
             owners = tuple(
@@ -449,8 +482,9 @@ class _FusedTransferFunction(torch.autograd.Function):
 
 def execute_shared(
     owner: Any, experts: Any, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
-    weights: tuple[torch.Tensor, torch.Tensor], counts: torch.Tensor, copies: torch.Tensor,
-    plan_tokens: int, maximum_received: int,
+    weights: tuple[torch.Tensor, torch.Tensor], counts: torch.Tensor | None, copies: torch.Tensor,
+    plan_tokens: int, maximum_received: int, *, receive_bound: int | None = None,
+    planned_counts: torch.Tensor | None = None, batch_experts: bool = False,
 ) -> torch.Tensor:
     """Use the original HP route preparation, plan, kernels and pull lease order."""
     executor = owner._get_virtual_executor(experts, hidden, plan_tokens, maximum_received)
@@ -461,20 +495,38 @@ def execute_shared(
     with torch.inference_mode(False), torch.no_grad():
         pool = get_expert_pool(flat, engine, experts.local_experts, owner)
     owner._transfer_pool = pool
+    # Official planning uses rank*NvS+row and proves every receive fits NvS.
+    # Original count agreement already validated all source rows and autograd
+    # flags; virtual remapping preserves both. Retain the virtual count exchange
+    # and exact offsets, but avoid a second blocking Host summary readback.
+    summary = ((receive_bound, plan_tokens, receive_bound)
+               if receive_bound is not None else None)
     engine, route, claimed = owner._prepare_native_route(
-        flat, ids, probs, counts, weights, engine)
+        flat, ids, probs, counts, weights, engine, validated_summary=summary, planned_counts=planned_counts)
     pull = experts.dispatch_mode == "pull"
     try:
         plan = engine.plan_for_tokens(
-            route.metadata.plan_tokens, flat.device, weight_grad_dtype=torch.float32)
+            route.metadata.plan_tokens, flat.device,
+            weight_grad_dtype=torch.float32 if owner.grad_reduce_dtype == torch.float32 else None,
+            batch_experts=batch_experts)
+        if not torch.is_grad_enabled():
+            pool.claim()
+            try:
+                prefetched = pool.prefetch(weights, copies, owner._official_borrowed_capacity)
+                return native._execute_mega_moe_without_autograd(
+                    probs, *prefetched, route, plan, engine.workspace,
+                    workspace_claimed=pull).reshape_as(hidden)
+            finally:
+                pool.release()
         output = _FusedTransferFunction.apply(
             flat, weights[0].contiguous(), weights[1].contiguous(), route.metadata,
             plan, engine.workspace, (route.routed_tokens, ids, route.unpermute_mapping),
-            probs if pull else None, pull, copies, pool, experts.local_experts,
+            probs if pull or plan.spec.apply_probs_before_fc2 else None,
+            pull, copies, pool, owner._official_borrowed_capacity,
         )
     finally:
         if claimed:
             engine.workspace.release()
-    if not pull:
+    if not pull and not plan.spec.apply_probs_before_fc2:
         output = restore_topk_output(output, route.unpermute_mapping, probs)
     return output.reshape_as(hidden)

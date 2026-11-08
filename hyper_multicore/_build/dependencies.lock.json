@@ -49,6 +49,11 @@
             "purpose": "add task-configured DeepSeek clipped SwiGLU forward and backward semantics"
           },
           {
+            "path": "hyper_multicore/ops/patches/swi_glu_post_activation.patch",
+            "sha256": "bb9e08f37e91ce6fd389be35c6e9e2c4d96fabba33afeb7f9b3bbb80c396e516",
+            "purpose": "support optional post-SiLU gate clipping in both directions"
+          },
+          {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
             "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
             "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior"

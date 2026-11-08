@@ -25,7 +25,7 @@ def run_local_experts(experts, dispatched_states, local_expert_indices, placemen
                       sort_keys, count_tokens, resolve_swiglu_weights):
     """Compute after the calling model's FSDP hooks have unsharded the local experts."""
     expert_parameters, expert_gradient_targets = placement.parameters(experts)
-    local_expert_count = 2 * experts.local_expert_count
+    local_expert_count = experts.local_expert_count + placement.plan.borrowed_capacity
     token_order = sort_keys(
         local_expert_indices, bound=local_expert_count)
     sorted_states = dispatched_states[token_order]
