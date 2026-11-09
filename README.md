@@ -52,6 +52,10 @@ from hyper_multicore.diagnostics import MegaKernelDiagnostics
 
 ## 开发与测试
 
+需要在原开发机完全不可用后重建 A5 BF16/MXFP8 时，见
+[仅凭公开 Git 源码重建](docs/rebuilding_from_git.md)：源码版本、平台依赖、公开包源及构建输入边界均在仓内，
+不需要历史源码 bundle、实验目录或旧制品。
+
 Python 实现、设备 kernel 和 native binding 位于 `hyper_multicore/`。
 HyperParallel 是下游消费方，构建、测试及使用本包均不依赖它。
 

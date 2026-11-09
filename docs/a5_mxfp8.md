@@ -8,6 +8,10 @@ preserves the upstream automatic-token behavior.
 
 ## Build and activate
 
+For a machine with no former developer workspace or dependency cache, follow
+[the Git-only reconstruction guide](rebuilding_from_git.md). The qualified source
+and its patches are tracked; old runtime archives are not build inputs.
+
 The qualification stack is Python 3.11.10, torch 2.12.0+cpu, torch_npu 2.12.0.post3
 and CANN 9.2.0. Activate that environment before building:
 
