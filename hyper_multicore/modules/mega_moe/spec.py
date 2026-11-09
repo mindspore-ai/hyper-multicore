@@ -24,6 +24,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from hyper_multicore._device import device_core_limit
+
 
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
@@ -50,10 +52,14 @@ class MegaMoeSpec:
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
     swiglu_limit: float | None = None
+    clamp_after_activation: bool = False
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    batch_experts: bool = False
+    nominal_schedule: bool = False
+    apply_probs_before_fc2: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -179,16 +185,7 @@ def bind_mega_moe_spec(
             f"ep_group world size ({group_size}) does not match ep_size ({ep_size})."
         )
 
-    device_index = (
-        device.index if device.index is not None else torch.npu.current_device()
-    )
-    device_limits = torch.npu.get_device_limit(device_index)
-    num_cube_cores = device_limits.get("cube_core_num")
-    if not isinstance(num_cube_cores, int) or num_cube_cores <= 0:
-        raise RuntimeError(
-            "torch.npu.get_device_limit() returned an invalid cube_core_num "
-            f"for NPU {device_index}: {num_cube_cores!r}."
-        )
+    num_cube_cores = device_core_limit(device, "cube_core_num")
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
