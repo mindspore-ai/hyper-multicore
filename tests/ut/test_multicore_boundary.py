@@ -110,7 +110,7 @@ class TestMulticoreBoundary(unittest.TestCase):
         Expectation: The package exports its business modules and diagnostic helpers.
         """
         self.assertCountEqual(multicore.__all__, [
-            "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+            "MegaMhc", "MegaGate", "MegaMoeExperts", "MXFP8MegaMoeExperts", "MegaKernelDiagnostics",
             "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
         ])
         self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))

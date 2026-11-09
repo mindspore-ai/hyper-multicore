@@ -117,7 +117,8 @@ def compile_pair(python, directory, payload, common, args, run, env, identifier)
     """Build the real SHMEM binding/runtime and Torch targets, not separate probes."""
     for kind, source, extra in (
         ("shmem", "hyper_multicore/shmem/ccsrc",
-         [f"-DSHMEM_OPS_LIB={common / 'shmem/lib/libhyper_multicore_shmem_ops.so'}"]),
+         [f"-DSHMEM_OPS_LIB={common / 'shmem/lib/libhyper_multicore_shmem_ops.so'}",
+          "-DHP_SHMEM_SOC_TYPE=" + ("Ascend950" if args.soc_list == "ascend950" else "Ascend910B")]),
         ("torch", "hyper_multicore/torch",
          [f"-DHP_MULTICORE_VENDOR_ROOT={common / 'lib/vendors/hyper_multicore_nn'}"]),
     ):
@@ -526,7 +527,7 @@ def main() -> None:
         args.jobs < 1
         or not socs
         or len(set(socs)) != len(socs)
-        or any(s not in ("ascend910b", "ascend910_93") for s in socs)
+        or any(s not in ("ascend910b", "ascend910_93", "ascend950") for s in socs)
     ):
         parser.error("--jobs must be positive and --soc-list must contain unique supported CANN SoCs")
     if platform.system() != "Linux":

@@ -51,6 +51,10 @@ set(OP_SCHEMA_SOURCES
     ${GATE_HOST}/hyper_mega_gate_route_infershape.cpp
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_def.cpp
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_infershape.cpp
+    ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_def.cpp
+    ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_infershape.cpp
+    ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_def.cpp
+    ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_infershape.cpp
 )
 set(OP_TILING_SOURCES
     ${FWD_HOST}/hyper_mega_moe_tiling.cpp
@@ -62,6 +66,8 @@ set(OP_TILING_SOURCES
     ${MHC_GRAD_TILING}/mhc_pre_sinkhorn_backward_arch22_tiling.cpp
     ${GATE_HOST}/hyper_mega_gate_route_tiling.cpp
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
+    ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.cpp
+    ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.cpp
 )
 
 npu_op_code_gen(
@@ -89,6 +95,8 @@ set(ACLNN_SOURCES
     ${GATE_GRAD_HOST}/op_api/hyper_mega_gate_route_grad.cpp
     ${GATE_GRAD_HOST}/op_api/hyper_mega_gate_route_grad_post.cpp
     ${GATE_GRAD_HOST}/op_api/linear_index/linear_index.cpp
+    ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_host/op_api/hyper_mega_moe_mxfp8.cpp
+    ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8_grad/op_host/op_api/hyper_mega_moe_mxfp8_grad.cpp
 )
 npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)

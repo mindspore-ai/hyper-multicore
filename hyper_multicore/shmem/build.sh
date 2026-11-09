@@ -163,6 +163,7 @@ rm -rf "${CCSRC_OPS_BUILD_DIR}"
 cmake -S "${PROJECT_ROOT}/hyper_multicore/shmem/ccsrc/ops" \
     -B "${CCSRC_OPS_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DHP_SHMEM_SOC_TYPE="$(hp_shmem_soc_type "${SOC_LIST}")" \
     -DCMAKE_INSTALL_PREFIX="${OPS_INSTALL_DIR}"
 cmake --build "${CCSRC_OPS_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
 cmake --install "${CCSRC_OPS_BUILD_DIR}"
@@ -197,6 +198,7 @@ print(hashlib.sha256(identity.encode()).hexdigest()[:16])
         -B "${CCSRC_TORCH_BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${TORCH_INSTALL_DIR}" \
+        -DHP_SHMEM_SOC_TYPE="$(hp_shmem_soc_type "${SOC_LIST}")" \
         -DSHMEM_OPS_LIB="${SHMEM_OPS_LIB}" \
         -DPython3_EXECUTABLE="${PYTHON_BIN}"
     cmake --build "${CCSRC_TORCH_BUILD_DIR}" --parallel "${NATIVE_JOBS}"

@@ -25,7 +25,7 @@ from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan, record_plan_stream
-from .route import PreparedTopKRoute, RouteMetadata
+from .route import PreparedTopKRoute, RouteMetadata, restore_topk_output
 from .workspace import MegaMoeWorkspace
 
 
@@ -620,6 +620,40 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
             )
         finally:
+            workspace.release()
+
+
+def _execute_mega_moe_nograd(
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    route: PreparedTopKRoute,
+    plan: MegaMoePlan,
+    workspace: MegaMoeWorkspace,
+    topk_weights: torch.Tensor,
+    *,
+    workspace_claimed: bool = False,
+) -> torch.Tensor:
+    """Consume borrowed combine rows before releasing their workspace lease."""
+    if torch.is_grad_enabled():
+        raise RuntimeError("MegaMoe no-grad execution requires the outer no-grad context.")
+    if workspace_claimed:
+        if not workspace.in_use:
+            raise RuntimeError("MegaMoe no-grad execution requires the caller-held lease.")
+    else:
+        workspace.ensure(plan.spec, route.routed_tokens.dtype, route.routed_tokens.device)
+        workspace.claim()
+    try:
+        execution = _prepare_forward_execution(
+            workspace, plan, route.routed_tokens, route.metadata.expert_capacity,
+        )
+        _launch_forward_kernel(
+            plan, route.metadata, execution.source, weight1.contiguous(), weight2.contiguous(), execution,
+        )
+        return restore_topk_output(
+            execution.combine[:route.routed_tokens.shape[0]], route.unpermute_mapping, topk_weights,
+        )
+    finally:
+        if not workspace_claimed:
             workspace.release()
 
 

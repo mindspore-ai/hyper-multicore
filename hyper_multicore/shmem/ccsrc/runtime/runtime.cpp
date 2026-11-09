@@ -39,7 +39,11 @@ const char *StateName(State state) {
   return "Unknown";
 }
 
-const char *DataEngineName(DataEngine engine) { return engine == DataEngine::Mte ? "mte" : "unknown"; }
+const char *DataEngineName(DataEngine engine) {
+  if (engine == DataEngine::Mte) return "mte";
+  if (engine == DataEngine::MteUdma) return "mte_udma";
+  return "unknown";
+}
 
 DfxPhase PhaseForDeviceStatus(const Status &status) {
   return status.error_code == ErrorCode::CannError || status.error_code == ErrorCode::Timeout ? DfxPhase::CannCall
@@ -76,11 +80,18 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
     return FailInitialization(DfxPhase::CannCall, root.root_rank, device_identity.error(), __FILE__, __LINE__);
   }
   device_identity_.emplace(device_identity.value());
-  if (device_identity_->model == DeviceModel::kAscend950) {
+  if (!BackendSupportsDevice(device_identity_->model)) {
+    const char *soc_list = device_identity_->model == DeviceModel::kAscend950 ? "ascend950" : "ascend910b,ascend910_93";
     const Status error = MakeError(
       ErrorCode::UnsupportedCapability,
-      "the first Runtime release supports Ascend 910B and 910C, but got soc_name=" + device_identity_->soc_name);
+      std::string("SHMEM backend=") + kBackendSocType + " does not match soc_name=" + device_identity_->soc_name +
+        "; rebuild with: bash build.sh --soc-list " + soc_list);
     return FailInitialization(DfxPhase::Validation, root.root_rank, error, __FILE__, __LINE__);
+  }
+
+  if (config.data_engine == DataEngine::MteUdma && device_identity_->model != DeviceModel::kAscend950) {
+    return FailInitialization(DfxPhase::Validation, root.root_rank,
+      MakeError(ErrorCode::UnsupportedCapability, "MTE/UDMA requires Ascend950"), __FILE__, __LINE__);
   }
 
   allocations_.emplace(device_identity_->device_index, next_allocation_id_);
@@ -348,9 +359,10 @@ Status Runtime::ValidateInitialInput(const RootWorldInfo &root, const Config &co
                      "root_rank must be in [0, root_size) and root_size must be positive, but got root_rank=" +
                        std::to_string(root.root_rank) + ", root_size=" + std::to_string(root.root_size));
   }
-  if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 || config.data_engine != DataEngine::Mte) {
+  if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 ||
+      (config.data_engine != DataEngine::Mte && config.data_engine != DataEngine::MteUdma)) {
     return MakeError(ErrorCode::InvalidConfig,
-                     "Runtime Config requires positive heap/timeout values and the MTE data engine");
+                     "Runtime Config requires positive heap/timeout values and a supported MTE or MTE/UDMA data engine");
   }
   if (config.bootstrap_endpoint_base.empty() || config.bootstrap_endpoint_base.size() > kMaxBootstrapEndpointBytes) {
     return MakeError(ErrorCode::InvalidConfig, "bootstrap_endpoint_base must contain between 1 and " +

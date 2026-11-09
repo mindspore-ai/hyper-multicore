@@ -1,0 +1,248 @@
+{
+  "qualified_source_root": "${OPS_TRANSFORMER_SOURCE}/build/binary/ascend950/src/ascendc/common/blaze",
+  "transformer_commit": "dff221330eecd2132233b1e73ed1072cd8925140",
+  "source_evidence": "records/271 and 281: previously qualified A5 MX branch and resource contracts",
+  "edits": [
+    "Private include prefix only for dependency headers.",
+    "Scheduler accepts explicit logical worker identity.",
+    "Single-expert entry preserves BaseMBalance/ProcessSingleGroup, rotates only TN lanes.",
+    "No call to the full-group Run entry in Mega tasks."
+  ],
+  "files": [
+    {
+      "path": "epilogue/block/block_epilogue_empty.h",
+      "original_sha256": "b952c1e58998cf8b2df22d0ebfe80d7eaa1a9fa034ed03b5fafc7053c84e343f",
+      "adapted_sha256": "b952c1e58998cf8b2df22d0ebfe80d7eaa1a9fa034ed03b5fafc7053c84e343f"
+    },
+    {
+      "path": "epilogue/block/block_epilogue_fixpipe.h",
+      "original_sha256": "ef8fdc7b23928ae7dedd4df5fd40f03024a7edbe51cff3400960aea253f49ee5",
+      "adapted_sha256": "8c3b7ab4a18d63ed1df26120691130b7fa92eb0c3452ecfe4a37665c60757162"
+    },
+    {
+      "path": "epilogue/block/block_epilogue_fmm_with_scale_add.h",
+      "original_sha256": "4f56d26221259ec48d1660ccac5092a477b0087e043c496cbb617de5a64db02f",
+      "adapted_sha256": "c87c9442bcf627479ecc49759e5c906b2c786f49f9cdd6f732aa69a31b5d4fce"
+    },
+    {
+      "path": "epilogue/block/block_epilogue_matmul_streamk.h",
+      "original_sha256": "d8913a4a5cadf5fd5c805836ca8cdc20c544e0609e267c40d58ee49aff3d269b",
+      "adapted_sha256": "764b8d6ca11c07dce7c59b4b4fdded8f43084240436755a7677e84f760c1eecf"
+    },
+    {
+      "path": "epilogue/fusion/default_fusion_op.h",
+      "original_sha256": "47dabaca6e33d4c537ad0917e37709d44750c4046d5a024986043e71738eb7b7",
+      "adapted_sha256": "be91f2d81e961eb047184c1cde9643fdfd7e89152cd65272ae06648f64f77d8b"
+    },
+    {
+      "path": "gemm/block/block_mmad.h",
+      "original_sha256": "a446e9e0f53585d98f284d671c1d6f775844be42a7119d0f42b557aef7c9dcc9",
+      "adapted_sha256": "c2ac0437e5f64d482653317496f850d1d45e42d9f320c05275555db558849483"
+    },
+    {
+      "path": "gemm/block/block_mmad_iterbatch_broadcast.h",
+      "original_sha256": "f17eb63b731fc2eded90bd1f7d1e43d49102c21a9707de7aeee6b1887e60201b",
+      "adapted_sha256": "646d5fecacccca813b1a998e38436fa1bfc0fa2c8f7eb8c598fbca2b91c2ff66"
+    },
+    {
+      "path": "gemm/block/block_mmad_matmul_al1_full_load.h",
+      "original_sha256": "9ee248e7ef9dd6e53f42f7d8bd39c082eaf2b29f8e3a8df693b83610f017e391",
+      "adapted_sha256": "65e9bc57af1cd96dc601bc70e70b9458604a11f485cec38c119dc486202b28a2"
+    },
+    {
+      "path": "gemm/block/block_mmad_matmul_basic.h",
+      "original_sha256": "9b165237dc46f0d585e8b4470163d0e216bb1c133d2f6c681b98505919753afd",
+      "adapted_sha256": "79491219bf60eeceb14acc21969a26869dedda8439f55da0e141b5ae2b657132"
+    },
+    {
+      "path": "gemm/block/block_mmad_matmul_basic_split_k.h",
+      "original_sha256": "5b2725aabc698e6b270e25305ee4710595c17b84ea6b1b16748bbb9a820d900a",
+      "adapted_sha256": "7580a643df4dc820edbac5fd04f553d8fcc37266b47e7075b153107b4e803578"
+    },
+    {
+      "path": "gemm/block/block_mmad_matmul_bl1_full_load.h",
+      "original_sha256": "dca1d2d9667988fbe08c506064e206e03d0dce46a082e76444d9ff9566db860d",
+      "adapted_sha256": "6835246cedd43a70459c0be7fc2a7af64f83241989620cd683b067f8559bcb49"
+    },
+    {
+      "path": "gemm/block/block_mmad_matmul_fixpipe_opti.h",
+      "original_sha256": "910e643821634d33f5f14124a26cfe4aefbae693526f2e7d3d30a02e71ba044b",
+      "adapted_sha256": "469ac919013f6fb919c521f909fda8327e5827744d9218df3ab486f030a2399a"
+    },
+    {
+      "path": "gemm/block/block_mmad_matmul_streamk.h",
+      "original_sha256": "faec1150443b9cfd5bc5a2f03947c08e8a546859af5dffe83499c196a758bca8",
+      "adapted_sha256": "c87cdbb73876f6be977c2d6b016b88c392550cee287c3a44fc8f2eb72db28519"
+    },
+    {
+      "path": "gemm/block/block_mmad_matmul_streamk_split_k.h",
+      "original_sha256": "cd1e5326d442a419c2d0224dc35a96437307d6932860c10c62d20c90261b7bab",
+      "adapted_sha256": "0d547df1795d5ae5ca1679189be911272d1e5a2d3a927072a67f66b4e5df8d7f"
+    },
+    {
+      "path": "gemm/block/block_mmad_qbmm_mx.h",
+      "original_sha256": "71c94fbed413f9a17c449ce621e61e9925c5efa3b1404ddae6d82e3e96f631ca",
+      "adapted_sha256": "4c5111a6ac9a139ca83d77f95b0818be7c50ec5cb08a63ccf32683f253f7391f"
+    },
+    {
+      "path": "gemm/block/block_mmad_qgmm_mx.h",
+      "original_sha256": "d71e3c2080162133e37a116141a5293ed13b56c5dfbcf566744b6b8c6ea58c18",
+      "adapted_sha256": "943d33180d1a5d8a93d3177da0acb2608bf3ce3353d0b1d911b9001ed06f95e2"
+    },
+    {
+      "path": "gemm/block/block_scheduler_gmm_swat_with_tail_split.h",
+      "original_sha256": "c2d0e9432471909138775a8c79a04d5745efa906a65759fe3d6b2222570853bb",
+      "adapted_sha256": "2626f3c21b7c9af9e3c8791c1340128d1b5dff372d7377ec5b2c9bfe6d14ab52"
+    },
+    {
+      "path": "gemm/block/block_scheduler_grouped_matmul.h",
+      "original_sha256": "89462de8c91c8e45c5dd47b85d59716456c2ea43b15324ff8b4dcb4d16de4965",
+      "adapted_sha256": "1f4c6d8289c8fb6d7cd16f607804d848d3f247816c07de61df195114fbf09132"
+    },
+    {
+      "path": "gemm/block/block_scheduler_iterbatch_broadcast.h",
+      "original_sha256": "47f5326015bc4948e17b0a0719e0eb782f7a8febad0a29017b06f9d17a18a6dc",
+      "adapted_sha256": "a74c2d94de5b5b95f2f7822536b4c941a822f8bb4519228ba8aec8349dabcc4e"
+    },
+    {
+      "path": "gemm/kernel/kernel_batch_matmul_broadcast.h",
+      "original_sha256": "93c1c682640c8bc8f322e8d46671be54030dd81346ee9b4b1faa36c3d4edd766",
+      "adapted_sha256": "103a0e541ab9ad081d4ed62d479ea180e618b77622fef1b64f9276e2b56e1a89"
+    },
+    {
+      "path": "gemm/kernel/kernel_batch_matmul_iterbatch_broadcast.h",
+      "original_sha256": "abd26274e654d9000c270a2df518f5a3afafb28d551aa1501be7112c9b9096b2",
+      "adapted_sha256": "0f7cce7abdad402faf395df7520b06611db356ebd57b9e7942e9e5c77cefcf30"
+    },
+    {
+      "path": "gemm/kernel/kernel_grouped_matmul.h",
+      "original_sha256": "f29110ec340c7663513dce7d21407f0339a6ab3cd52fd958fe24eaa25472575d",
+      "adapted_sha256": "01332ad48805cccbb83efec70cf05b9a4cd971f3efc572f73c7195a610764987"
+    },
+    {
+      "path": "gemm/kernel/kernel_matmul_al1_full_load.h",
+      "original_sha256": "dd5fe9d008b875a4f2f64510789c47082dce525157b5761d950917061638e9c0",
+      "adapted_sha256": "14a232b1200f1cae3c953557f44cc47cad38ef67ca099872d6a796ad37fb6d04"
+    },
+    {
+      "path": "gemm/kernel/kernel_matmul_basic.h",
+      "original_sha256": "c29c959093bc32914f5f7ab5db2cdd98ce16ccfd388c8415b8d952a50b2e9862",
+      "adapted_sha256": "189596228bbf200c64617954f14911188291a4200b8fcf4265edad88c44449ef"
+    },
+    {
+      "path": "gemm/kernel/kernel_matmul_bl1_full_load.h",
+      "original_sha256": "346e5c1d94940662d8421b401362c875c718a2eed11b2bb4c1320525c8d9b1c7",
+      "adapted_sha256": "074d70d0fecb35b776dbf74d679e170ede9a477ef96873c61462d7d5fef84216"
+    },
+    {
+      "path": "gemm/kernel/kernel_matmul_fixpipe_opti.h",
+      "original_sha256": "94e88a314a0845cab38706f29022b065226e3c51a6c8f28f3d5d1f3eee76b48f",
+      "adapted_sha256": "7cd55f724b86a85107a87afcf6589cd6338902647bb87f5c82dc691dbba824e3"
+    },
+    {
+      "path": "gemm/kernel/kernel_matmul_streamk.h",
+      "original_sha256": "a82dfaecf145d299677b40df122032ffddf82c242be0e89369f36eeb161e50be",
+      "adapted_sha256": "b470e0621a7b6dab49e863706dae832e24ce6d8d00349d6aabc2878c99c9402a"
+    },
+    {
+      "path": "gemm/kernel/kernel_matmul_with_scale_add.h",
+      "original_sha256": "8f6f00494c7f9c137b057209cd69ee0c2eb1f9000c89275dc8223ed904cbe14c",
+      "adapted_sha256": "42501c64e8eb022598eddc948060d366425776fa066232dae27c034dd6bc25cb"
+    },
+    {
+      "path": "gemm/kernel/kernel_qgmm_mx.h",
+      "original_sha256": "bd8cc2aef867f0f1a073fac1b41a64bdc0d01b6fc46014616a467bbf4b20fa3f",
+      "adapted_sha256": "a4147fd967851c55dcc3f86870cdb94113dbab030640af52b5083fe789876fdb"
+    },
+    {
+      "path": "gemm/kernel/kernel_tbmm_basic.h",
+      "original_sha256": "2ca822e946e48383bca194c733eed7e2dd3da09850dbbfd7c18943e2ca2dbd74",
+      "adapted_sha256": "fff3911872bdc1aac6075c91fce0ab125211e001e16525cf02204054cbb85c5e"
+    },
+    {
+      "path": "gemm/kernel/kernel_tqbmm_mx.h",
+      "original_sha256": "254fed189b880c7d8f9f139a00c99d9f435b3796a7bb1a50a392302b5899e8f4",
+      "adapted_sha256": "5c641ceb34084410c2736f1a5cb953fc16ba73a2790df34c53f332aedf365ade"
+    },
+    {
+      "path": "gemm/kernel/kernel_universal.h",
+      "original_sha256": "d23e3d387e2b27c9de4b46e044333f6de578eee390fb03d02b629344dc2ecda6",
+      "adapted_sha256": "b7f9cb72b375478f41c647cd50ca20732b82927b722f47f8bed12c05af8e7b18"
+    },
+    {
+      "path": "gemm/policy/dispatch_policy.h",
+      "original_sha256": "44cdac5bba997f1bb6d15759c2df6ce0d47cb735c4f293fe1ba9f43efa2f7341",
+      "adapted_sha256": "6ff8a4e5fbd97abfd0dfb3afedad1d6b72e4b00ab05c3916bd549c71b2b9db21"
+    },
+    {
+      "path": "gemm/tile/arch35/copy_gm_to_l1.h",
+      "original_sha256": "83fe19f2459338b209bacf941c2436c35c1ae2f02b7cd5a53e0f1f44036a6768",
+      "adapted_sha256": "6ce95a9952041c65261cd958794b483ef338d7c9e9638f3fff313d12457a1b21"
+    },
+    {
+      "path": "gemm/tile/arch35/copy_gm_to_ub.h",
+      "original_sha256": "bf4daaae38f8d928e279240f9597dae4d3379b2787a0c389fb8b745c54ca693a",
+      "adapted_sha256": "bf4daaae38f8d928e279240f9597dae4d3379b2787a0c389fb8b745c54ca693a"
+    },
+    {
+      "path": "gemm/tile/arch35/copy_mx_scale.h",
+      "original_sha256": "ee60c72869f0711ef7aceb0377d3d0d9a3408411833704cb98c54a0f6b20946b",
+      "adapted_sha256": "924cf8029f2f8f319645a6ad4302e70db15f5f3f5c386e7f72b13e3eb0ddd353"
+    },
+    {
+      "path": "gemm/tile/arch35/copy_weight_ub_to_l1.h",
+      "original_sha256": "14435ee1115e067baa3c9105599b2ac09f7980764941b3c68411671453fb861f",
+      "adapted_sha256": "add3a04586f27d7d9b9058b70f66ea1389f649fd601b166a605011154975c795"
+    },
+    {
+      "path": "gemm/tile/arch35/fill_ub.h",
+      "original_sha256": "0df238cd311079376acbafb381f251cc48c625461d81ff8e94b3a5def1ee8b68",
+      "adapted_sha256": "849deda000786dc1e5ba29f35e06c89fbae1f4b6093085e38620b5bcbce56b24"
+    },
+    {
+      "path": "gemm/tile/arch35/pad_mx_kl1.h",
+      "original_sha256": "5b0b8a8d26cd1cac94d0adc67669bddeb805259aa8dacadc843dcb12af3bb63c",
+      "adapted_sha256": "5b0b8a8d26cd1cac94d0adc67669bddeb805259aa8dacadc843dcb12af3bb63c"
+    },
+    {
+      "path": "gemm/tile/arch35/scale_mx_bias.h",
+      "original_sha256": "02a4856b2a5e80175733a1e4dc9acfa1630f77d058de546f6a11695f22ffe26e",
+      "adapted_sha256": "ec2be0036ed001642ee6fc4254b17e04b4725bb15280448629a53e202695741f"
+    },
+    {
+      "path": "gemm/tile/arch35/shift_w4_to_w8.h",
+      "original_sha256": "6e7af26336dea63ab07276fb8abff802a934e05b9b0c40ee537219af3bd4c1ca",
+      "adapted_sha256": "e8465689a9f478e365316afaf2d7887c8d77303eac61264ef44c7ba4d8b9e3b8"
+    },
+    {
+      "path": "gemm/tile/compute.h",
+      "original_sha256": "3a2d0197a6f769f6514abc1cb0c41a64b2902b8a90ffc5788b154413d4ad1717",
+      "adapted_sha256": "d42937b63e0af093f0331a46653155ebb94a0b8d714eda55717ba3c7284b17c6"
+    },
+    {
+      "path": "gemm/tile/datamove.h",
+      "original_sha256": "0f46d9733b999e0ac1eba30bbfa309ef395349d670c43acce7afd0abeed710ab",
+      "adapted_sha256": "538097f41524529792e63756cd4b1dd6a6b2af2a62f413fb5659df0ee4046b9f"
+    },
+    {
+      "path": "gemm/tile/tile_trait.h",
+      "original_sha256": "c31b33b9213b31f669ea019e36dd24d4b1a3e5f5d7e7c0ac5c595a287a5d1fc4",
+      "adapted_sha256": "c31b33b9213b31f669ea019e36dd24d4b1a3e5f5d7e7c0ac5c595a287a5d1fc4"
+    },
+    {
+      "path": "gemm/utils/buffer_manager.h",
+      "original_sha256": "84ff9c701b19f1fec538c70a005ef1fe3ccea53e4acd1c526d0ec114be885706",
+      "adapted_sha256": "6f81692b8790aa197d5c1b0f177b02f1c156ce31a1eef7f4cbd2dbc983a5eabb"
+    },
+    {
+      "path": "gemm/utils/common_utils.h",
+      "original_sha256": "454e0adcd81e49b95235386b38f78c466b0005e90b0155025b0fe29cc5be0332",
+      "adapted_sha256": "454e0adcd81e49b95235386b38f78c466b0005e90b0155025b0fe29cc5be0332"
+    },
+    {
+      "path": "gemm/utils/layout_utils.h",
+      "original_sha256": "30d6ffd1352141c071ffa22296908013f1485d7e6a44740609b597dda2547ce9",
+      "adapted_sha256": "30d6ffd1352141c071ffa22296908013f1485d7e6a44740609b597dda2547ce9"
+    }
+  ]
+}

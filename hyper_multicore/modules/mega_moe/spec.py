@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 
 _COMMUNICATION_SPLIT = 128
+_SPLIT_ALIGNMENT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
 
 
@@ -48,12 +49,17 @@ class MegaMoeSpec:
     capacity_growth_factor: float | None = _DEFAULT_CAPACITY_FACTOR
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
-    swiglu_split: int = _COMMUNICATION_SPLIT
+    swiglu_split: int = _SPLIT_ALIGNMENT
     swiglu_limit: float | None = None
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    mx_vector_policy: str = "legacy_odd"
+    mx_schedule_dir: str = ""
+    mx_swiglu_row_only: bool = False
+    mx_poll_policy: str = '0'
+    route_count_policy: str = "baseline"
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -79,9 +85,9 @@ class MegaMoeSpec:
 def _align_capacity(capacity: int) -> int:
     """Align receive capacity to the baseline compute tile, independent of communication tiles."""
     return (
-        (capacity + _COMMUNICATION_SPLIT - 1)
-        // _COMMUNICATION_SPLIT
-        * _COMMUNICATION_SPLIT
+        (capacity + _SPLIT_ALIGNMENT - 1)
+        // _SPLIT_ALIGNMENT
+        * _SPLIT_ALIGNMENT
     )
 
 
@@ -212,6 +218,9 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
+        mx_vector_policy=specification.get("mx_vector_policy", "legacy_odd"),
+        mx_schedule_dir=specification.get("mx_schedule_dir", ""),
+        mx_swiglu_row_only=specification.get("mx_swiglu_row_only", False),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
@@ -219,4 +228,6 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        mx_poll_policy=specification.get("mx_poll_policy", "0"),
+        route_count_policy=specification.get("route_count_policy", "baseline"),
     )

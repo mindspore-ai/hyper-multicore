@@ -112,7 +112,9 @@ std::string_view ToString(DeviceModel model) {
   return "unknown";
 }
 
-std::string_view ToString(DataEngine engine) { return engine == DataEngine::Mte ? "mte" : "Unknown"; }
+std::string_view ToString(DataEngine engine) {
+  return engine == DataEngine::Mte ? "mte" : (engine == DataEngine::MteUdma ? "mte_udma" : "Unknown");
+}
 
 std::string_view ToString(DfxOperation operation) {
   switch (operation) {
@@ -654,12 +656,6 @@ void AllGather(const at::Tensor &output, const at::Tensor &input) {
 
   const int32_t root_rank = UnwrapRuntime(Runtime::Instance().RootRank(), kOperation);
   const int32_t root_size = UnwrapRuntime(Runtime::Instance().RootSize(), kOperation);
-  const DeviceModel device_model = UnwrapRuntime(Runtime::Instance().QueryDeviceModel(), kOperation);
-  if (device_model == DeviceModel::kAscend950) {
-    ThrowStatus(Status{ErrorCode::UnsupportedCapability, std::nullopt, "all_gather does not support Ascend 950"},
-                kOperation, DfxPhase::Validation);
-  }
-
   ValidateContiguousNpuTensor(output, "output");
   ValidateContiguousNpuTensor(input, "input");
   if (output.device() != input.device()) {
@@ -764,6 +760,7 @@ py::object AllocationRecordsObject(const std::optional<std::vector<AllocationRec
 py::dict DebugState() {
   const DfxSnapshot snapshot = Runtime::Instance().DebugState();
   py::dict result;
+  result["backend_soc_type"] = kBackendSocType;
   result["state"] = ToString(snapshot.state);
   result["root_rank"] = snapshot.root.has_value() ? py::cast(snapshot.root->root_rank) : py::none();
   result["root_size"] = snapshot.root.has_value() ? py::cast(snapshot.root->root_size) : py::none();

@@ -80,7 +80,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                             torch.empty(1, rows, 16, dtype=torch.bfloat16),
                             torch.zeros(rows, 2, dtype=torch.int32), torch.ones(rows, 2), None, parameters)
                         self.assertEqual(tuple(result.shape), (rows, 16))
-        for keyword in ("local_num_tokens", "max_local_num_tokens"):
+        for keyword in ("max_local_num_tokens",):
             with self.subTest(keyword=keyword), self.assertRaisesRegex(TypeError, keyword):
                 MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **{keyword: 128})
 
@@ -491,7 +491,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                     plan=object(), workspace=object(), ensure_capacity=Mock(),
                                     plan_for_tokens=Mock())
         route = SimpleNamespace(
-            routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
+            routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=None),
             unpermute_mapping=object(), maximum_received_slots=512
         )
         resources.plan_for_tokens.return_value = resources.plan
@@ -528,6 +528,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             workspace=resources.workspace, autograd_mask=13,
         )
         resources.ensure_capacity.assert_called_once_with(512)
+        resources.plan_for_tokens.assert_not_called()
         mock_execute.assert_called_once_with(
             hidden_flat,
             topk_ids,
@@ -672,6 +673,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         manager.close_workspace.side_effect = lambda _workspace: close_order.append("workspace")
 
         with (
+            patch("hyper_multicore.modules.mega_moe.udma_order.validate_device_transport"),
             patch.object(
                 mega_moe_module,
                 "bind_mega_moe_spec",

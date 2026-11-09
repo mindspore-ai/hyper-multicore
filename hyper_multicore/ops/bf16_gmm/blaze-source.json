@@ -1,0 +1,143 @@
+{
+  "source": "${ASCEND_HOME_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/common",
+  "version": "installed CANN9.2 20261015",
+  "license": "CANN Open Software License Agreement Version 2.0, retained in each file",
+  "adaptation": "Only quoted same-component include paths made relative, no math changes",
+  "files": [
+    {
+      "path": "blaze/gemm/block/block_mmad.h",
+      "source_sha256": "a446e9e0f53585d98f284d671c1d6f775844be42a7119d0f42b557aef7c9dcc9",
+      "adapted_sha256": "6a314f1739e467478840031ad9c573ad71b72df9e6ef2919057c5b02fc453425"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_iterbatch_broadcast.h",
+      "source_sha256": "f17eb63b731fc2eded90bd1f7d1e43d49102c21a9707de7aeee6b1887e60201b",
+      "adapted_sha256": "7fc26bebc6e05cefc96207d10af29f673c63f1d82120452b6d37b349c007a264"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_matmul_al1_full_load.h",
+      "source_sha256": "9ee248e7ef9dd6e53f42f7d8bd39c082eaf2b29f8e3a8df693b83610f017e391",
+      "adapted_sha256": "e99b09297d9a8435b349fa3ee2b5e839b77d40a356f389e040f3536ed02b2768"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_matmul_basic.h",
+      "source_sha256": "9b165237dc46f0d585e8b4470163d0e216bb1c133d2f6c681b98505919753afd",
+      "adapted_sha256": "7d63e536733b1624db78ff573662f2a12303012d840f847e4aed75ff5c4b6f80"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_matmul_basic_split_k.h",
+      "source_sha256": "5b2725aabc698e6b270e25305ee4710595c17b84ea6b1b16748bbb9a820d900a",
+      "adapted_sha256": "b0db8c574e927d46b8683c4b1a7e48ea4de8b81691a39884a5787fedee951567"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_matmul_bl1_full_load.h",
+      "source_sha256": "09476a7cf0db0ed64d87b331cea5263d34ad9ea1cbfce57e3e984ab0e5ac08bb",
+      "adapted_sha256": "5c3776cfe79e0b99492f205b4b1ede235e5a10d7561e5dc0be5511c56082740f"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_matmul_fixpipe_opti.h",
+      "source_sha256": "a3fc9d1316606025a5d515277623fe98d12a5facb9ac1ba89c0ed0515351e2f6",
+      "adapted_sha256": "37a4f99b07379e20ce2536a40e10f9d2b996e6908a215b9140c22594e318d818"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_matmul_streamk.h",
+      "source_sha256": "faec1150443b9cfd5bc5a2f03947c08e8a546859af5dffe83499c196a758bca8",
+      "adapted_sha256": "d27bf5acdf8cf205b1b832ecc23f0ed1ada3fe6bb6c50b1574bbb281892e3698"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_matmul_streamk_split_k.h",
+      "source_sha256": "cd1e5326d442a419c2d0224dc35a96437307d6932860c10c62d20c90261b7bab",
+      "adapted_sha256": "7c182761cf501145d1ec2140c921b6949a660b13acc23f815eb2d47421eecfba"
+    },
+    {
+      "path": "blaze/gemm/block/block_mmad_qbmm_mx.h",
+      "source_sha256": "71c94fbed413f9a17c449ce621e61e9925c5efa3b1404ddae6d82e3e96f631ca",
+      "adapted_sha256": "2103416ff258ad3481679e7074afb4ae44c6491bed3eda3d1dae4b00943d02fa"
+    },
+    {
+      "path": "blaze/gemm/block/block_scheduler_grouped_matmul.h",
+      "source_sha256": "89462de8c91c8e45c5dd47b85d59716456c2ea43b15324ff8b4dcb4d16de4965",
+      "adapted_sha256": "59793d4e883df3be3fbd88dce004cbfc76f68e826d16707c347a8fa699bfcd35"
+    },
+    {
+      "path": "blaze/gemm/policy/dispatch_policy.h",
+      "source_sha256": "7bc3fd2d07a75b788c1289e1e2ecce6b7ec52b92e0a7cf381c5dc94d27ad980b",
+      "adapted_sha256": "5b012bbeaac0fecd44eec8b952a2d281019d1aaa4cc7535dd3e7c1351dcb9cbe"
+    },
+    {
+      "path": "blaze/gemm/tile/arch35/copy_gm_to_l1.h",
+      "source_sha256": "83fe19f2459338b209bacf941c2436c35c1ae2f02b7cd5a53e0f1f44036a6768",
+      "adapted_sha256": "38a2f1b782b93835490bb39fd1a6af680a107dc88fdda705fbe95f4eca046c6a"
+    },
+    {
+      "path": "blaze/gemm/tile/arch35/copy_gm_to_ub.h",
+      "source_sha256": "bf4daaae38f8d928e279240f9597dae4d3379b2787a0c389fb8b745c54ca693a",
+      "adapted_sha256": "bf4daaae38f8d928e279240f9597dae4d3379b2787a0c389fb8b745c54ca693a"
+    },
+    {
+      "path": "blaze/gemm/tile/arch35/copy_mx_scale.h",
+      "source_sha256": "ee60c72869f0711ef7aceb0377d3d0d9a3408411833704cb98c54a0f6b20946b",
+      "adapted_sha256": "9b16adf90b7d3131e66600b9d2a6b8e02c84fa336e0ed403109dd500511243f0"
+    },
+    {
+      "path": "blaze/gemm/tile/arch35/copy_weight_ub_to_l1.h",
+      "source_sha256": "14435ee1115e067baa3c9105599b2ac09f7980764941b3c68411671453fb861f",
+      "adapted_sha256": "3c4b744353ae50b153808e43911ce88ee56400413f6b66bdbdaae55d9d63cccb"
+    },
+    {
+      "path": "blaze/gemm/tile/arch35/fill_ub.h",
+      "source_sha256": "0df238cd311079376acbafb381f251cc48c625461d81ff8e94b3a5def1ee8b68",
+      "adapted_sha256": "61af8829db2eae9391e12a1726d259038321906879d74a8f899daf1bcef3f078"
+    },
+    {
+      "path": "blaze/gemm/tile/arch35/pad_mx_kl1.h",
+      "source_sha256": "5b0b8a8d26cd1cac94d0adc67669bddeb805259aa8dacadc843dcb12af3bb63c",
+      "adapted_sha256": "5b0b8a8d26cd1cac94d0adc67669bddeb805259aa8dacadc843dcb12af3bb63c"
+    },
+    {
+      "path": "blaze/gemm/tile/arch35/scale_mx_bias.h",
+      "source_sha256": "02a4856b2a5e80175733a1e4dc9acfa1630f77d058de546f6a11695f22ffe26e",
+      "adapted_sha256": "0c8aee2575d240aa04351d9b44fd46985979a28e02310bb2d1cbd444d8f6a2e4"
+    },
+    {
+      "path": "blaze/gemm/tile/arch35/shift_w4_to_w8.h",
+      "source_sha256": "6e7af26336dea63ab07276fb8abff802a934e05b9b0c40ee537219af3bd4c1ca",
+      "adapted_sha256": "b2ba0212f41c0a3342a0abc3c434483b1d4c23e6999033ec9f9c22ed999a23db"
+    },
+    {
+      "path": "blaze/gemm/tile/compute.h",
+      "source_sha256": "3a2d0197a6f769f6514abc1cb0c41a64b2902b8a90ffc5788b154413d4ad1717",
+      "adapted_sha256": "4243b899d485f4daed694c9d4eec3f4f34e76518844e6570c11c36a396e6b37b"
+    },
+    {
+      "path": "blaze/gemm/tile/datamove.h",
+      "source_sha256": "0f46d9733b999e0ac1eba30bbfa309ef395349d670c43acce7afd0abeed710ab",
+      "adapted_sha256": "bb9abf700391bb1d744be6329b801fa947d72cafbe269f7fef4d754a2ad52180"
+    },
+    {
+      "path": "blaze/gemm/tile/tile_trait.h",
+      "source_sha256": "c31b33b9213b31f669ea019e36dd24d4b1a3e5f5d7e7c0ac5c595a287a5d1fc4",
+      "adapted_sha256": "c31b33b9213b31f669ea019e36dd24d4b1a3e5f5d7e7c0ac5c595a287a5d1fc4"
+    },
+    {
+      "path": "blaze/gemm/utils/buffer_manager.h",
+      "source_sha256": "84ff9c701b19f1fec538c70a005ef1fe3ccea53e4acd1c526d0ec114be885706",
+      "adapted_sha256": "1bd884f7d8fb8f2efc6026ba859389b9c07ac7ffa5e4d03deaa97a6ddafcb618"
+    },
+    {
+      "path": "blaze/gemm/utils/common_utils.h",
+      "source_sha256": "5f2ea35edcca44c5e686033c6623191d23ae319e082876779c31d304174a10b9",
+      "adapted_sha256": "3d804f91ff34d4d242341dfdb03241fdfe366e40ad86b16d982096c6e6494997"
+    },
+    {
+      "path": "blaze/gemm/utils/layout_utils.h",
+      "source_sha256": "30d6ffd1352141c071ffa22296908013f1485d7e6a44740609b597dda2547ce9",
+      "adapted_sha256": "30d6ffd1352141c071ffa22296908013f1485d7e6a44740609b597dda2547ce9"
+    },
+    {
+      "path": "blaze/gemm/utils/sync.h",
+      "source_sha256": "10fb83e458a6f04c62540515a550b7170fb2c8afb0b63d8d860727704fdd3396",
+      "adapted_sha256": "10fb83e458a6f04c62540515a550b7170fb2c8afb0b63d8d860727704fdd3396"
+    }
+  ]
+}

@@ -93,7 +93,7 @@ class _MulticoreResourceManager:
             if reusable is None and all(peer[2][index][1] for peer in peers):
                 reusable = group
             else:
-                self._close_group_collectively(group)
+                self._close_group_automaticly(group)
         if reusable is not None:
             target.resources, reusable.resources = reusable.resources, None
             target.binding, target.binding_id = reusable.binding, reusable.binding_id
@@ -164,9 +164,9 @@ class _MulticoreResourceManager:
         """
         groups = list(self._groups.values() if groups is None else groups)
         bound = self._bound_groups(groups)
-        self._validate_collective_close(bound)
+        self._validate_automatic_close(bound)
         for group in bound:
-            self._close_group_collectively(group)
+            self._close_group_automaticly(group)
         for group in groups:
             if group.resources is None:
                 group.closed = True
@@ -192,7 +192,7 @@ class _MulticoreResourceManager:
         """Order native owners by collective binding rather than local construction."""
         return sorted((group for group in groups if group.resources is not None), key=lambda group: group.binding_id)
 
-    def _validate_collective_close(self, bound: list[_ExecutionResourceGroup]) -> None:
+    def _validate_automatic_close(self, bound: list[_ExecutionResourceGroup]) -> None:
         """Require matching idle resources on every rank before release."""
         manifest = tuple((group.binding_id, group.resources.lifecycle_signature()) for group in bound)
         ready = all(group.resources.can_close() for group in bound)
@@ -202,7 +202,7 @@ class _MulticoreResourceManager:
         if not all(peer[1] for peer in peers):
             raise RuntimeError("multicore cleanup requires idle workspaces and no pending backward graphs")
 
-    def _close_group_collectively(self, group: _ExecutionResourceGroup) -> None:
+    def _close_group_automaticly(self, group: _ExecutionResourceGroup) -> None:
         """Close group resources collectively while retaining ownership on failure."""
         group.closing = True
         _automatic.collective_call(group.resources.close, stage="multicore resource close")

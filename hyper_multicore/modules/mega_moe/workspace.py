@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import os
+
 import math
 import threading
 import weakref
@@ -35,6 +37,7 @@ from hyper_multicore.scheduler.config import (
 from hyper_multicore.shmem import _lifecycle
 
 from .spec import MegaMoeSpec, _resolve_receive_capacity
+from .udma_order import SUBMISSION_ORDER, validate_transport
 
 # The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
 # tensor arguments. Keep non-empty ABI placeholders; native tiling reserves
@@ -129,6 +132,9 @@ class MegaMoeWorkspace:
     route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+
+    def __post_init__(self) -> None:
+        validate_transport()
 
     def describe_restart_allocations(
         self,
@@ -371,6 +377,8 @@ class MegaMoeWorkspace:
                 raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
             if self.used:
                 torch.npu.current_stream().wait_event(self.completion_event)
+            if os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE") == "mte_udma":
+                SUBMISSION_ORDER.claim(torch.npu.current_stream())
             self.in_use = True
 
     def release(self) -> None:
@@ -379,6 +387,8 @@ class MegaMoeWorkspace:
             if not self.in_use:
                 raise RuntimeError("MegaMoe workspace was released without an active lease.")
             self.completion_event.record(torch.npu.current_stream())
+            if os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE") == "mte_udma":
+                SUBMISSION_ORDER.release(torch.npu.current_stream(), self.completion_event)
             self.in_use = False
             self.used = True
 

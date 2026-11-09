@@ -1,0 +1,243 @@
+diff --git a/src/device/gm2gm/engine/shmem_device_udma.hpp b/src/device/gm2gm/engine/shmem_device_udma.hpp
+index a75cccd..26a5402 100644
+--- a/src/device/gm2gm/engine/shmem_device_udma.hpp
++++ b/src/device/gm2gm/engine/shmem_device_udma.hpp
+@@ -226,13 +226,14 @@ ACLSHMEM_DEVICE void aclshmemi_udma_poll_cq_update_info(
+     uint32_t cur_tail, uint32_t entry_idx, __gm__ aclshmemi_udma_cq_ctx_t* cq_ctx_entry,
+     __gm__ aclshmemi_udma_wq_ctx_t* wq_ctx_entry)
+ {
+-    // Ring CQ Doorbell (reference URMA implementation)
+-    auto cq_db_addr = cq_ctx_entry->db_addr;
+-    // For JFC, we write the consumer index (cur_tail) directly
++    // For JFC, we write the consumer index (cur_tail) directly. The doorbell carries cur_tail,
++    // so ring it before updating and flushing the tail mirror.
+     __gm__ uint32_t* db_addr = (__gm__ uint32_t*)cq_ctx_entry->db_addr;
+     st_dev((uint32_t)(cur_tail & 0xFFFFFF), db_addr, 0);
++
+     // Update WQ tail
+     wq_ctx_entry->tail = aclshmemi_udma_unwrap_wq_tail(wq_ctx_entry->tail, entry_idx);
++    dcci_cachelines((__gm__ uint8_t*)wq_ctx_entry, sizeof(aclshmemi_udma_wq_ctx_t));
+ }
+ 
+ ACLSHMEM_DEVICE void aclshmemi_dump_sqe_ctx(__gm__ aclshmemi_sqe_ctx_t* sqe_ctx)
+@@ -891,44 +892,106 @@ ACLSHMEM_DEVICE void aclshmemi_udma_post_send(
+     uint32_t posted_head = cur_head;
+     aclshmemi_udma_fill_post_send_wqe<T, OP_CODE, CONFIG>(
+         qp_ctx_entry, remote_mem_info, remote_addr, local_addr, cur_head, wqe_size, message_len, params);
+-    cur_head += WQE_BB_CNT;
+-    aclshmemi_udma_post_send_update_info(cur_head, qp_ctx_entry);
+     if constexpr (CONFIG.cqe != 0) {
+         cqe_cnt++;
+     }
+     qp_ctx_entry->cqe_cnt = cqe_cnt;
+-    if constexpr (ACLSHMEM_RELAY_SUPPORTED) {
+-        dcci_cachelines((__gm__ uint8_t*)qp_ctx_entry, sizeof(aclshmemi_udma_wq_ctx_t));
+-    }
++    cur_head += WQE_BB_CNT;
++    aclshmemi_udma_post_send_update_info(cur_head, qp_ctx_entry);
+     ACLSHMEM_DEBUG_FUNC(aclshmemi_dump_sq_wqe, qp_ctx_entry, posted_head, wqe_size, (uint32_t)sizeof(T));
+ }
+ 
+-ACLSHMEM_DEVICE void aclshmemi_udma_post_send_update_info(
+-    uint32_t cur_head, __gm__ aclshmemi_udma_wq_ctx_t*& qp_ctx_entry)
++ACLSHMEM_DEVICE void aclshmemi_udma_publish_queue_state(
++    __gm__ aclshmemi_udma_wq_ctx_t* qp_ctx_entry, uint32_t new_head, uint32_t cqe_cnt)
++{
++    qp_ctx_entry->head = new_head;
++    qp_ctx_entry->cqe_cnt = cqe_cnt;
++    dcci_cachelines((__gm__ uint8_t*)qp_ctx_entry, sizeof(aclshmemi_udma_wq_ctx_t));
++}
++
++ACLSHMEM_DEVICE void aclshmemi_udma_ring_sq_doorbell(uint32_t cur_head, __gm__ aclshmemi_udma_wq_ctx_t* qp_ctx_entry)
+ {
+-    // Ring SQ Doorbell (reference udma_update_sq_db in UDMA)
+-    // Note: db address is 64-bit, but we only update 32-bit value
+     __gm__ uint32_t* door_bell_addr = (__gm__ uint32_t*)qp_ctx_entry->db_addr;
+     st_dev(cur_head, door_bell_addr, 0);
+-    qp_ctx_entry->head = cur_head;
+-    return;
+ }
+ 
+-ACLSHMEM_DEVICE void aclshmemi_udma_copy_wqe_from_ub(
++ACLSHMEM_DEVICE void aclshmemi_udma_post_send_update_info(
++    uint32_t cur_head, __gm__ aclshmemi_udma_wq_ctx_t*& qp_ctx_entry)
++{
++    aclshmemi_udma_publish_queue_state(qp_ctx_entry, cur_head, qp_ctx_entry->cqe_cnt);
++    aclshmemi_udma_ring_sq_doorbell(cur_head, qp_ctx_entry);
++}
++
++ACLSHMEM_DEVICE void aclshmemi_udma_copy_wqe_from_ub_async(
+     __gm__ uint8_t* dst_gm, AscendC::LocalTensor<uint8_t>& ub_local, uint32_t copy_len, uint32_t sync_id)
+ {
+     AscendC::GlobalTensor<uint8_t> gm_tensor;
+     gm_tensor.SetGlobalBuffer(dst_gm, copy_len);
+     ub_local.address_.dataLen = copy_len;
+-    AscendC::DataCopyExtParams copyParams{1, copy_len, 0, 0, 0};
++    AscendC::DataCopyExtParams copy_params{1, copy_len, 0, 0, 0};
+ 
+     AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(sync_id);
+     AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(sync_id);
+-    AscendC::DataCopyPad(gm_tensor, ub_local, copyParams);
++    AscendC::DataCopyPad(gm_tensor, ub_local, copy_params);
++}
++
++ACLSHMEM_DEVICE void aclshmemi_udma_wait_wqe_copy_from_ub(uint32_t sync_id)
++{
+     AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(sync_id);
+     AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(sync_id);
+ }
+ 
++template <uint32_t WQE_BB_CNT>
++ACLSHMEM_DEVICE void aclshmemi_udma_copy_wrapped_wqe_from_ub_async(
++    __gm__ aclshmemi_udma_wq_ctx_t* qp_ctx_entry, uint32_t cur_head, __ubuf__ uint8_t* ub_scratch, uint32_t wqe_size,
++    uint32_t sync_id)
++{
++    static_assert(WQE_BB_CNT > 1, "wrapped WQE helper requires a multi-BB WQE");
++    AscendC::LocalTensor<uint8_t> ub_local;
++    ub_local.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
++    aclshmemi_udma_sq_span_t span = aclshmemi_udma_get_sq_span<WQE_BB_CNT>(cur_head);
++    ub_local.address_.bufferAddr = reinterpret_cast<uint64_t>(ub_scratch);
++    aclshmemi_udma_copy_wqe_from_ub_async(
++        aclshmemi_udma_get_sq_wqebb_addr(qp_ctx_entry, cur_head, wqe_size), ub_local, span.first_wqebb_cnt * wqe_size,
++        sync_id);
++}
++
++template <uint32_t WQE_BB_CNT>
++ACLSHMEM_DEVICE void aclshmemi_udma_copy_wqe_from_ub_to_sq_async(
++    __gm__ aclshmemi_udma_wq_ctx_t* qp_ctx_entry, uint32_t cur_head, __ubuf__ uint8_t* ub_scratch, uint32_t wqe_size,
++    uint32_t sync_id)
++{
++    if constexpr (WQE_BB_CNT == 1) {
++        AscendC::LocalTensor<uint8_t> ub_local;
++        ub_local.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
++        ub_local.address_.bufferAddr = reinterpret_cast<uint64_t>(ub_scratch);
++        aclshmemi_udma_copy_wqe_from_ub_async(
++            aclshmemi_udma_get_sq_wqebb_addr(qp_ctx_entry, cur_head, wqe_size), ub_local, wqe_size, sync_id);
++    } else {
++        aclshmemi_udma_copy_wrapped_wqe_from_ub_async<WQE_BB_CNT>(
++            qp_ctx_entry, cur_head, ub_scratch, wqe_size, sync_id);
++    }
++}
++
++template <uint32_t WQE_BB_CNT>
++ACLSHMEM_DEVICE void aclshmemi_udma_wait_wqe_copy_from_ub_to_sq(
++    __gm__ aclshmemi_udma_wq_ctx_t* qp_ctx_entry, uint32_t cur_head, __ubuf__ uint8_t* ub_scratch, uint32_t wqe_size,
++    uint32_t sync_id)
++{
++    aclshmemi_udma_wait_wqe_copy_from_ub(sync_id);
++    if constexpr (WQE_BB_CNT > 1) {
++        aclshmemi_udma_sq_span_t span = aclshmemi_udma_get_sq_span<WQE_BB_CNT>(cur_head);
++        if (span.second_wqebb_cnt != 0) {
++            AscendC::LocalTensor<uint8_t> ub_local;
++            ub_local.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
++            ub_local.address_.bufferAddr = reinterpret_cast<uint64_t>(ub_scratch) + span.first_wqebb_cnt * wqe_size;
++            aclshmemi_udma_copy_wqe_from_ub_async(
++                (__gm__ uint8_t*)qp_ctx_entry->buf_addr, ub_local, span.second_wqebb_cnt * wqe_size, sync_id);
++            aclshmemi_udma_wait_wqe_copy_from_ub(sync_id);
++        }
++    }
++}
++
+ template <uint32_t WQE_BB_CNT>
+ ACLSHMEM_DEVICE void aclshmemi_udma_copy_wqe_from_ub_to_sq(
+     __gm__ aclshmemi_udma_wq_ctx_t* qp_ctx_entry, uint32_t cur_head, __ubuf__ uint8_t* ub_scratch, uint32_t wqe_size,
+@@ -938,18 +1001,21 @@ ACLSHMEM_DEVICE void aclshmemi_udma_copy_wqe_from_ub_to_sq(
+     ub_local.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
+     if constexpr (WQE_BB_CNT == 1) {
+         ub_local.address_.bufferAddr = reinterpret_cast<uint64_t>(ub_scratch);
+-        aclshmemi_udma_copy_wqe_from_ub(
++        aclshmemi_udma_copy_wqe_from_ub_async(
+             aclshmemi_udma_get_sq_wqebb_addr(qp_ctx_entry, cur_head, wqe_size), ub_local, wqe_size, sync_id);
++        aclshmemi_udma_wait_wqe_copy_from_ub(sync_id);
+     } else {
+         aclshmemi_udma_sq_span_t span = aclshmemi_udma_get_sq_span<WQE_BB_CNT>(cur_head);
+         ub_local.address_.bufferAddr = reinterpret_cast<uint64_t>(ub_scratch);
+-        aclshmemi_udma_copy_wqe_from_ub(
++        aclshmemi_udma_copy_wqe_from_ub_async(
+             aclshmemi_udma_get_sq_wqebb_addr(qp_ctx_entry, cur_head, wqe_size), ub_local,
+             span.first_wqebb_cnt * wqe_size, sync_id);
++        aclshmemi_udma_wait_wqe_copy_from_ub(sync_id);
+         if (span.second_wqebb_cnt != 0) {
+             ub_local.address_.bufferAddr = reinterpret_cast<uint64_t>(ub_scratch) + span.first_wqebb_cnt * wqe_size;
+-            aclshmemi_udma_copy_wqe_from_ub(
++            aclshmemi_udma_copy_wqe_from_ub_async(
+                 (__gm__ uint8_t*)qp_ctx_entry->buf_addr, ub_local, span.second_wqebb_cnt * wqe_size, sync_id);
++            aclshmemi_udma_wait_wqe_copy_from_ub(sync_id);
+         }
+     }
+ }
+@@ -960,11 +1026,12 @@ static_assert(
+ static_assert(ACLSHMEM_UDMA_DATA_MOVER_WQE_SIZE == 64, "UDMA aggregate data mover WQE must be one 64B WQEBB");
+ 
+ ACLSHMEM_DEVICE void aclshmemi_udma_poll_before_aggregate_flush(
+-    __gm__ aclshmemi_udma_wq_ctx_t* qp_ctx_entry, uint32_t slot, uint32_t qp_idx, uint32_t staged_bb_cnt)
++    __gm__ aclshmemi_udma_wq_ctx_t* qp_ctx_entry, uint32_t slot, uint32_t qp_idx, uint32_t staged_bb_cnt,
++    uint32_t poll_cqe_cnt)
+ {
+     uint32_t used_after_flush = qp_ctx_entry->head + staged_bb_cnt - qp_ctx_entry->tail;
+     if (used_after_flush + ACLSHMEM_UDMA_AGGREGATE_CREDIT_GUARD >= shm::UDMA_SQ_BASKBLK_CNT) {
+-        (void)aclshmemi_udma_poll_cq(slot, qp_idx, qp_ctx_entry->cqe_cnt);
++        (void)aclshmemi_udma_poll_cq(slot, qp_idx, poll_cqe_cnt);
+     }
+ }
+ 
+@@ -979,6 +1046,8 @@ ACLSHMEM_DEVICE void aclshmemi_udma_flush_aggregate_wqes(
+ 
+     constexpr uint32_t depth = shm::UDMA_SQ_BASKBLK_CNT;
+     constexpr uint32_t max_copy_wqe_cnt = depth - ACLSHMEM_UDMA_AGGREGATE_CREDIT_GUARD;
++    const uint32_t prev_cqe_cnt = qp_ctx_entry->cqe_cnt;
++    const uint32_t batch_cqe_cnt = prev_cqe_cnt + 1U;
+     ACLSHMEM_DEBUG_FUNC(aclshmemi_udma_debug_check_aggregate_batch_size, pending_wqe_cnt);
+     uint32_t cur_head = qp_ctx_entry->head;
+     uint32_t ub_slot = 0;
+@@ -991,7 +1060,7 @@ ACLSHMEM_DEVICE void aclshmemi_udma_flush_aggregate_wqes(
+         if (copy_wqe_cnt > max_copy_wqe_cnt) {
+             copy_wqe_cnt = max_copy_wqe_cnt;
+         }
+-        aclshmemi_udma_poll_before_aggregate_flush(qp_ctx_entry, pe, qp_idx, copy_wqe_cnt);
++        aclshmemi_udma_poll_before_aggregate_flush(qp_ctx_entry, pe, qp_idx, copy_wqe_cnt, prev_cqe_cnt);
+         ACLSHMEM_DEBUG_FUNC(aclshmemi_udma_debug_ensure_sq_capacity, qp_ctx_entry, pe, qp_idx, copy_wqe_cnt);
+ 
+         __gm__ uint8_t* sq_addr = (__gm__ uint8_t*)(qp_ctx_entry->buf_addr + sq_slot * wqe_size);
+@@ -999,14 +1068,16 @@ ACLSHMEM_DEVICE void aclshmemi_udma_flush_aggregate_wqes(
+         AscendC::LocalTensor<uint8_t> ub_local;
+         ub_local.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
+         ub_local.address_.bufferAddr = reinterpret_cast<uint64_t>(ub_wqe);
+-        aclshmemi_udma_copy_wqe_from_ub(sq_addr, ub_local, copy_wqe_cnt * wqe_size, sync_id);
+ 
+         cur_head += copy_wqe_cnt;
++        aclshmemi_udma_copy_wqe_from_ub_async(sq_addr, ub_local, copy_wqe_cnt * wqe_size, sync_id);
++        aclshmemi_udma_publish_queue_state(qp_ctx_entry, cur_head, batch_cqe_cnt);
++        aclshmemi_udma_wait_wqe_copy_from_ub(sync_id);
++        aclshmemi_udma_ring_sq_doorbell(cur_head, qp_ctx_entry);
++
+         ub_slot += copy_wqe_cnt;
+         remaining_wqe_cnt -= copy_wqe_cnt;
+-        aclshmemi_udma_post_send_update_info(cur_head, qp_ctx_entry);
+     }
+-    qp_ctx_entry->cqe_cnt++;
+ }
+ 
+ template <
+@@ -1112,17 +1183,14 @@ ACLSHMEM_DEVICE void aclshmemi_udma_post_send_mte3(
+     // DMA UB -> SQ ring entry. The helper keeps the one-BB path as one copy and
+     // splits only when a multi-BB WQE reaches the ring end.
+     uint32_t posted_head = cur_head;
+-    aclshmemi_udma_copy_wqe_from_ub_to_sq<WQE_BB_CNT>(qp_ctx_entry, cur_head, ub_scratch, wqe_size, sync_id);
+-
+     cur_head += WQE_BB_CNT;
+-    aclshmemi_udma_post_send_update_info(cur_head, qp_ctx_entry);
+     if constexpr (CONFIG.cqe != 0) {
+         cqe_cnt++;
+     }
+-    qp_ctx_entry->cqe_cnt = cqe_cnt;
+-    if constexpr (ACLSHMEM_RELAY_SUPPORTED) {
+-        dcci_cachelines((__gm__ uint8_t*)qp_ctx_entry, sizeof(aclshmemi_udma_wq_ctx_t));
+-    }
++    aclshmemi_udma_copy_wqe_from_ub_to_sq_async<WQE_BB_CNT>(qp_ctx_entry, posted_head, ub_scratch, wqe_size, sync_id);
++    aclshmemi_udma_publish_queue_state(qp_ctx_entry, cur_head, cqe_cnt);
++    aclshmemi_udma_wait_wqe_copy_from_ub_to_sq<WQE_BB_CNT>(qp_ctx_entry, posted_head, ub_scratch, wqe_size, sync_id);
++    aclshmemi_udma_ring_sq_doorbell(cur_head, qp_ctx_entry);
+     ACLSHMEM_DEBUG_FUNC(aclshmemi_dump_sq_wqe, qp_ctx_entry, posted_head, wqe_size, (uint32_t)sizeof(T));
+ }
+ 

@@ -42,6 +42,7 @@ endforeach()
 
 add_library(hyper_multicore_torch SHARED
     csrc/registration.cpp
+    csrc/mxfp8_task_graph.cpp
     csrc/registration_mhc.cpp
     csrc/mega_mhc.cpp
     csrc/mega_moe.cpp

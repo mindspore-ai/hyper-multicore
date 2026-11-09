@@ -28,6 +28,8 @@ import tarfile
 import tempfile
 from typing import Any
 
+from mxfp8_quant_sources import QUANT_SOURCE_PATHS, compose_quant_sources
+
 from prepare_dependencies import dependency_revisions, load_dependency_locks, verify_git_dependency
 
 
@@ -42,7 +44,8 @@ _OPS_NN_PATHS = (
     "norm/rms_norm_grad/op_kernel",
     "index/linear_index/op_host/op_api",
 )
-_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
+_OPS_NN_PATHS += QUANT_SOURCE_PATHS
+_OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel", "gmm/common/cgmct")
 _OPS_TRANSFORMER_MHC_PATHS = (
     "common/include",
     "mhc/mhc_post/op_kernel/arch22",
@@ -126,6 +129,16 @@ def main() -> int:
         transformer_copy,
         transformer_mhc_copy,
     )
+    for name in ("hyper_mega_moe_mxfp8", "hyper_mega_moe_mxfp8_grad"):
+        target = source_root / name
+        shutil.copytree(_MULTICORE_OPS / name, target)
+        kernel = target / "op_kernel"
+        shutil.copytree(_MULTICORE_OPS / "runtime", kernel / "runtime")
+        shutil.copytree(_MULTICORE_OPS / "hyper_mega_moe/op_kernel/put_mem_signal", kernel / "put_mem_signal")
+        shutil.copytree(_MULTICORE_OPS / "mxfp8", kernel / "mxfp8")
+        shutil.copytree(_MULTICORE_OPS / "mxfp8_quant", kernel / "mxfp8_quant")
+        compose_quant_sources(ops_nn_copy, kernel / "mxfp8_quant")
+        shutil.copytree(transformer_copy / "gmm/common/cgmct", kernel / "cgmct")
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0
@@ -257,6 +270,8 @@ def _compose_hyper_multicore_ops(
             )
             continue
         shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
+        shutil.copytree(_MULTICORE_OPS / "bf16_gmm", operator_root / "op_kernel/bf16_gmm")
+        shutil.copytree(transformer_copy / "gmm/common/cgmct", operator_root / "op_kernel/cgmct")
         shutil.copytree(
             ops_nn_copy / "activation" / "swi_glu" / "op_kernel",
             operator_root / "op_kernel" / "swi_glu",
