@@ -520,7 +520,8 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=os.cpu_count(),
                         help="Compiler job budget, shared by concurrent adapters")
     parser.add_argument("--clean", action="store_true")
-    parser.add_argument("--native-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--native-only", action="store_true",
+                        help="Build a source-local native payload without a wheel; activate with source activate.bash")
     args = parser.parse_args()
     socs = args.soc_list.split(",")
     if (

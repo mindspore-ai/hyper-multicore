@@ -7,9 +7,9 @@ import a downstream training framework.
 
 ## Publish and select the qualified source
 
-The A5 BF16/MXFP8 integration is commit
-`19ce41fb7d47430f12a69437af04fb06be8e0f61`. The immutable release ref is
-`refs/tags/a5-mxfp8-20261109`. Maintainers must publish that commit and tag to
+The A5 BF16/MXFP8 mathematical integration originates at commit
+`19ce41fb7d47430f12a69437af04fb06be8e0f61`. The source-build activation release ref is
+`refs/tags/a5-source-build-20261109`. Maintainers must publish that commit and tag to
 `https://github.com/mindspore-ai/hyper-multicore.git` before consumers can fetch it.
 A public default branch that predates the integration does not contain this implementation.
 No source-bundle fallback is part of the reconstruction contract.
@@ -17,9 +17,9 @@ No source-bundle fallback is part of the reconstruction contract.
 ```bash
 git clone https://github.com/mindspore-ai/hyper-multicore.git
 cd hyper-multicore
-git fetch origin refs/tags/a5-mxfp8-20261109
+git fetch origin refs/tags/a5-source-build-20261109
 git checkout --detach FETCH_HEAD
-test "$(git rev-parse HEAD)" = 19ce41fb7d47430f12a69437af04fb06be8e0f61
+git rev-parse HEAD
 ```
 
 ## Prepare platform prerequisites on the new machine
@@ -41,9 +41,8 @@ source "${CANN_ROOT}/set_env.sh"
 python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.12.0+cpu'
 python -m pip install --index-url https://pypi.org/simple 'torch_npu==2.12.0.post3'
 python -m pip install 'numpy>=1.26,<2' setuptools wheel 'packaging>=22' attrs decorator psutil
-bash build.sh --soc-list ascend950 --jobs 8
-python -m pip install --no-deps --force-reinstall dist/hyper_multicore-*.whl
-source "$(command -v hyper_multicore_set_env.bash)"
+bash build.sh --soc-list ascend950 --jobs 8 --native-only
+source activate.bash
 hyper_multicore_build_info --json
 ```
 
@@ -65,14 +64,21 @@ Changing those inputs requires its own qualification; it is not this recorded bu
 - SHMEM's device queue-publication fix is in the committed SDK adapter. A complete
   source build recompiles the consuming Mega entry as well as private host libraries.
 - Generated `build/`, `dist/`, `.o`, `.so`, SDK exports and wheels are outputs, not
-  required tracked inputs. The wheel carries native objects, vendor registration,
-  private SHMEM and the Torch adapter; runtime does not compile them.
+  required tracked source inputs. The complete source-build runtime is in
+  `build/native/payload/hyper_multicore`. Copy the checkout and that directory to the
+  destination, then source its root `activate.bash`. No installation is required.
+  Activation selects the source Python path, private vendor and SHMEM libraries
+  relative to the new checkout location. It never compiles, downloads or creates links.
+  Other SDK/CMake/dependency build caches are not runtime dependencies.
+  Source `setup.py`, Python files, scripts and payload must be retained together.
 - `build_info.json` records source identity, framework/CANN ABI, native payload hashes
   and compiler provenance. Rebuilding in another absolute path need not produce
   a byte-identical wheel; compare the input contract and verify the new payload's
   own hashes rather than assuming an old wheel SHA is a universal release SHA.
 
 An application repository should commit its selected source ref, commit, stack,
-build/deployment instructions and any required adapter code. It can generate a wheel
-and transport archive from those inputs on demand. A pre-existing experiment archive
-must not be an implicit dependency of those instructions.
+build/deployment instructions and any required adapter code. It can source the independent
+checkout at an explicitly configured location; it does not need an installation or a
+second runtime directory. A pre-existing experiment archive must not be an implicit
+dependency of those instructions. Optional wheel publication remains supported for
+existing consumers, but is not required by this source-build deployment workflow.

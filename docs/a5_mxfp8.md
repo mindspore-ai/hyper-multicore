@@ -16,15 +16,17 @@ The qualification stack is Python 3.11.10, torch 2.12.0+cpu, torch_npu 2.12.0.po
 and CANN 9.2.0. Activate that environment before building:
 
 ```bash
-bash build.sh --soc-list ascend950 --jobs 8
-python -m pip install --no-deps --force-reinstall dist/hyper_multicore-*.whl
-source "$(command -v hyper_multicore_set_env.bash)"
+bash build.sh --soc-list ascend950 --jobs 8 --native-only
+source activate.bash
 ```
 
+A source checkout owns its Python code and `build/native/payload` output. Copy both to
+the destination and source its activation file again; no wheel installation or former
+build path is required. Activation never builds, downloads or installs anything.
 A5 and A2/A3 use separate private SHMEM backend families; do not combine them in one
 SDK selection. No system CANN installation is overwritten. Build products stay in
-ignored `build/` and `dist/` directories. The wheel contains the runtime payload and
-selects the matching framework ABI. Importing the Python classes alone is lazy.
+ignored `build/` and `dist/` directories. The source-build payload selects the matching
+framework ABI. Importing the Python classes alone is lazy.
 
 BF16 retains `MegaMoeExperts` and the existing `aclnnHyperMegaMoe`/Grad interface.
 MX uses `MXFP8MegaMoeExperts` with `aclnnHyperMegaMoeMxfp8` and
