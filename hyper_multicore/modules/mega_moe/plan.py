@@ -161,6 +161,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        clamp_after_activation=spec.clamp_after_activation,
         expert_weight_layout=spec.expert_weight_layout,
     )
     from .schedule_policy import (
@@ -184,6 +185,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
+        clamp_after_activation=spec.clamp_after_activation,
         expert_weight_layout=spec.expert_weight_layout,
     )
     if weight_grad_dtype == torch.float32:

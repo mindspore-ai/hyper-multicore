@@ -339,6 +339,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         swiglu_limit: float | None = None,
+        clamp_after_activation: bool = False,
         ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -367,11 +368,13 @@ class MegaMoeExperts(MulticoreModule):
                 Must be a positive multiple of 128.
             combine_split: Combine tile rows in forward and backward, with the same
                 constraints and default as dispatch_split. Sharing requires equal splits.
+            clamp_after_activation: Clip SiLU(gate) instead of clipping the gate input.
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
+            execution: Optional externally composed expert-execution policy.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
                 ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
@@ -381,14 +384,14 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
-        specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+        configuration = {
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
+            "clamp_after_activation": clamp_after_activation,
             "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
@@ -397,7 +400,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        specification["auto_tokens"] = True
+        specification = {"local_num_tokens": _COMMUNICATION_SPLIT, **configuration, "auto_tokens": True}
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -407,6 +410,7 @@ class MegaMoeExperts(MulticoreModule):
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self._initialize_module_state(specification, create_parameters=create_parameters)
+
 
     def _initialize_module_state(
         self, specification: Mapping[str, Any], *, create_parameters: bool,
