@@ -49,10 +49,17 @@ from hyper_multicore.modules.mega_moe.forward.tiling_tables import (
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_multicore.scheduler.config import TaskSplitValue
+from hyper_multicore.scheduler.config import (
+    FAST_DEPENDENCY_POLL_INTERVAL_US,
+    GmmTaskMode,
+    TaskSplitValue,
+    TaskType,
+    TensorDescC,
+    VectorTaskFlags,
+)
 from hyper_multicore.scheduler.graph import ComputeGraph
 
-from .diagnostics import _mega_moe_owner_options
+from .diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
 from .spec import MegaMoeSpec
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
 
@@ -144,6 +151,10 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         swiglu_limit=spec.swiglu_limit,
         expert_weight_layout=spec.expert_weight_layout,
     )
+    from .schedule_policy import (
+        collapse_batched_tasks, compact_graph, pipeline_cube_queue, pipeline_vector_queue,
+    )
+    compact = spec.dispatch_mode == "push" and compact_graph(forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
     forward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(forward_graph)
     forward_data = build_forward_config(
@@ -163,6 +174,8 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         swiglu_limit=spec.swiglu_limit,
         expert_weight_layout=spec.expert_weight_layout,
     )
+    if compact:
+        compact_graph(backward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
     backward_data = build_backward_config(
@@ -187,6 +200,7 @@ def _prepare_diagnostics(
     topology.rank_id = spec.rank_id
     options = {
         "kernel_name": "mega_moe",
+        "graph_adapter": _adapt_mega_moe_diagnostic_graph,
         "device": device,
         "rank": dist.get_rank() if dist.is_initialized() else spec.rank_id,
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
@@ -214,7 +228,8 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     gmm_options = {
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
-        "num_groups": spec.local_experts,
+        "num_groups": (1 if not spec.batch_experts and hasattr(forward_graph.get_op("dispatch"), "compact_lanes")
+                       else spec.local_experts),
         "num_cube_cores": spec.num_cube_cores,
     }
     return MegaMoePlan(
