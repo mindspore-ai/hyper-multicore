@@ -25,7 +25,7 @@ from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
 from .plan import MegaMoePlan, record_plan_stream
-from .route import PreparedTopKRoute, RouteMetadata
+from .route import PreparedTopKRoute, RouteMetadata, restore_topk_output
 from .workspace import MegaMoeWorkspace
 
 
@@ -784,3 +784,48 @@ def execute_mega_moe_with_permutation(
         topk_weights,
         workspace_claimed,
     )
+
+
+def _execute_mega_moe_without_autograd(
+    topk_weights: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    route: PreparedTopKRoute,
+    plan: MegaMoePlan,
+    workspace: MegaMoeWorkspace,
+    *, workspace_claimed: bool = False,
+) -> torch.Tensor:
+    """Restore owned token outputs before releasing inference-only scratch.
+
+    Initial reentrant-checkpoint forwards need neither a backward dispatch copy
+    nor an owned expert-major intermediate. Consume both SHMEM views on their
+    leased stream; only the unpermuted, independently owned output escapes.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError("The no-autograd path requires a no_grad context")
+    if workspace_claimed:
+        if not workspace.in_use:
+            raise RuntimeError("Inference requires the caller-held workspace lease")
+    else:
+        if not plan.spec.auto_tokens:
+            workspace.ensure(plan.spec, route.routed_tokens.dtype, route.routed_tokens.device)
+        workspace.claim()
+    try:
+        execution = _prepare_forward_execution(
+            workspace, plan, route.routed_tokens, route.metadata.expert_capacity)
+        if plan.spec.apply_probs_before_fc2:
+            _stage_probabilities(workspace, route.unpermute_mapping, topk_weights.float().contiguous(), plan.spec)
+        _launch_forward_kernel(
+            plan, route.metadata.for_kernel(plan.spec.hidden_size), execution.source,
+            _native_weight_operand(weight1, plan),
+            _native_weight_operand(weight2, plan), execution, stream=workspace.lease_stream)
+        rows = route.routed_tokens.shape[0]
+        if not rows:
+            return route.routed_tokens.new_empty((0, plan.spec.hidden_size))
+        if plan.spec.apply_probs_before_fc2:
+            return _restore_unweighted_output(execution.combine[:rows], route.unpermute_mapping, plan.spec.top_k)
+        return restore_topk_output(
+            execution.combine[:rows], route.unpermute_mapping, topk_weights)
+    finally:
+        if not workspace_claimed:
+            workspace.release(stream=workspace.lease_stream)

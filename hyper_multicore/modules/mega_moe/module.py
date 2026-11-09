@@ -30,7 +30,7 @@ import torch.distributed as dist
 from hyper_multicore import _collective, shmem
 
 from ..module import MulticoreModule
-from .function import execute_mega_moe_with_permutation
+from .function import execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
@@ -686,6 +686,10 @@ class MegaMoeExperts(MulticoreModule):
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
             plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            if not torch.is_grad_enabled():
+                return _execute_mega_moe_without_autograd(
+                    topk_weights, *weights, route, plan, resources.workspace,
+                    workspace_claimed=pull).reshape_as(hidden_states)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
