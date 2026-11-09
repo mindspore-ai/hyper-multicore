@@ -12,6 +12,7 @@
 #define HYPER_MULTICORE_CORE_MULTICORE_OPS_RUNTIME_RUNTIME_CONFIG_HPP_
 
 #include <cstddef>
+#include <cstdint>
 
 namespace MulticoreRuntime {
 
@@ -44,6 +45,21 @@ constexpr uint32_t RUNTIME_CAPACITY_ALIGNMENT = 16;
 constexpr uint32_t TASK_AICORE_INDEX_TYPE_COUNT = 3;
 
 using TaskId = uint32_t;
+
+// TaskType is the tag: GMM modes are enums; vector tasks use independent bits.
+struct GmmTaskMode {
+  static constexpr uint32_t PER_EXPERT = 0;
+  static constexpr uint32_t SINGLE_GROUP = 1;
+  static constexpr uint32_t BATCHED = 2;
+  static constexpr uint32_t BATCHED_READY = 3;
+};
+
+struct VectorTaskFlags {
+  static constexpr uint32_t CLAMP_AFTER_ACTIVATION = 1;
+  static constexpr uint32_t COMPACT = 2;
+  static constexpr uint32_t APPLY_PROBABILITIES = 4;
+  static constexpr uint32_t RETURN_PROBABILITY_GRADIENTS = 8;
+};
 
 enum class DiagnosticMode : uint32_t {
   NORMAL = 0,
@@ -186,7 +202,8 @@ struct RuntimeHeader {
   uint32_t aiv_profile_record_capacity;
   uint32_t completion_event;
   uint32_t protocol_version;
-  uint32_t padding[6];
+  uint32_t vector_ready_queue;
+  uint32_t padding[5];
 };
 
 static_assert(sizeof(RuntimeHeader) == 64);

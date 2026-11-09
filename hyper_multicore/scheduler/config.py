@@ -63,6 +63,24 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
+class GmmTaskMode(IntEnum):
+    """extra_value_1 modes, interpreted only by grouped-matmul tasks."""
+
+    PER_EXPERT = 0
+    SINGLE_GROUP = 1
+    BATCHED = 2
+    BATCHED_READY = 3
+
+
+class VectorTaskFlags(IntEnum):
+    """extra_value_1 bits for transport and SwiGLU tasks, not GMM modes."""
+
+    CLAMP_AFTER_ACTIVATION = 1
+    COMPACT = 2
+    APPLY_PROBABILITIES = 4
+    RETURN_PROBABILITY_GRADIENTS = 8
+
+
 class TaskAiCoreType(IntEnum):
     """Worker core categories encoded in RuntimeConfig."""
 
@@ -228,7 +246,8 @@ class RuntimeConfigC(ctypes.Structure):
         ("aiv_profile_record_capacity", ctypes.c_uint32),
         ("completion_event", ctypes.c_uint32),
         ("protocol_version", ctypes.c_uint32),
-        ("_padding", ctypes.c_uint32 * 6),
+        ("vector_ready_queue", ctypes.c_uint32),
+        ("_padding", ctypes.c_uint32 * 5),
     ]
 
 

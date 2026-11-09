@@ -99,6 +99,17 @@ extern "C" void read_layout(uint8_t *image, uint32_t *result) {
   result[11] = Runtime::getRuntimeEventCapacity(image);
 }
 
+extern "C" void read_mega_moe_task_flags(uint32_t *result) {
+  result[0] = Runtime::GmmTaskMode::PER_EXPERT;
+  result[1] = Runtime::GmmTaskMode::SINGLE_GROUP;
+  result[2] = Runtime::GmmTaskMode::BATCHED;
+  result[3] = Runtime::GmmTaskMode::BATCHED_READY;
+  result[4] = Runtime::VectorTaskFlags::CLAMP_AFTER_ACTIVATION;
+  result[5] = Runtime::VectorTaskFlags::COMPACT;
+  result[6] = Runtime::VectorTaskFlags::APPLY_PROBABILITIES;
+  result[7] = Runtime::VectorTaskFlags::RETURN_PROBABILITY_GRADIENTS;
+}
+
 extern "C" void read_protocol_profile(uint8_t *image, uint32_t *result) {
   Runtime::ReadyHandshakeMeta meta;
   Runtime::getReadyHandshakeMeta(image, &meta);

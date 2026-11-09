@@ -33,6 +33,7 @@
 #include "l1_tensor_dump.h"
 
 #include "get_mem.h"
+#include "routing_probabilities.h"
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
@@ -114,7 +115,10 @@ class KernelWorkerBase {
     // for operators whose sixth field is not the AIC count (for example mHC).
     this->vector_num = getNumWorkers(this->runtimeConfigPtr);
     this->core_num = this->vector_num / 2;
-    this->active_vector_num = WorkerPolicy == VectorWorkerPolicy::ALL ? this->vector_num : this->vector_num / 2;
+    const auto header = reinterpret_cast<__gm__ RuntimeHeader *>(runtimeConfigPtr);
+    ready_queue_ = header->vector_ready_queue == 1 && getDiagnosticMode(runtimeConfigPtr) == DiagnosticMode::NORMAL;
+    this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_) ?
+                              this->vector_num : this->vector_num / 2;
   }
 
   __aicore__ inline void Process() {
@@ -152,6 +156,10 @@ class KernelWorkerBase {
       block_idx = block_idx + this->core_num;
     } while (1);
 #else
+    if (ready_queue_) {
+      ProcessVectorReady();
+      return;
+    }
     uint32_t block_idx = GetVectorScheduleIndex();
     if (block_idx == INVALID_VECTOR_SCHEDULE_INDEX) {
       return;
@@ -165,6 +173,64 @@ class KernelWorkerBase {
       block_idx = block_idx + this->active_vector_num;
     } while (1);
 #endif
+  }
+
+  __aicore__ inline bool IsQueuedTaskReady(TaskId task_id) {
+    const uint32_t dependent = *reinterpret_cast<__gm__ uint32_t *>(runtimeConfigPtr +
+      getAllTasksOffset(runtimeConfigPtr) + task_id * sizeof(TaskDesc) + offsetof(TaskDesc, dependent_event));
+    if (dependent == EVENT_INVALID_ID) {
+      return true;
+    }
+    if (dependent >= runtime_event_capacity) {
+      AscendC::Trap();
+    }
+    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+      all_event_counters[dependent]);
+    return all_event_counters.GetValue(dependent) >= all_event_num_triggers.GetValue(dependent);
+  }
+
+  __aicore__ inline void ProcessVectorReady() {
+    constexpr uint32_t completion_words = 4;
+    constexpr uint32_t completion_bits = 64 * completion_words;
+    const uint32_t first = GetVectorScheduleIndex();
+    if (first == INVALID_VECTOR_SCHEDULE_INDEX || first >= this->vector_task_num) {
+      return;
+    }
+    const uint32_t slots = (this->vector_task_num - first + this->active_vector_num - 1) / this->active_vector_num;
+    // A rolling window bounds private bookkeeping for arbitrary graph sizes.
+    uint64_t completed[completion_words] = {};
+    uint32_t head = 0;
+    while (head < slots) {
+      const uint32_t head_bit = head % completion_bits;
+      if ((completed[head_bit / 64] & (1ULL << (head_bit % 64))) != 0) {
+        completed[head_bit / 64] &= ~(1ULL << (head_bit % 64));
+        ++head;
+        continue;
+      }
+      bool issued = false;
+      const uint32_t limit = head + completion_bits < slots ? head + completion_bits : slots;
+      for (uint32_t index = head; index < limit; ++index) {
+        const uint32_t bit = index % completion_bits;
+        if ((completed[bit / 64] & (1ULL << (bit % 64))) != 0) {
+          continue;
+        }
+        const TaskId task = GetTaskIndex(first + index * this->active_vector_num);
+        if (!IsQueuedTaskReady(task)) {
+          continue;
+        }
+        ExecuteTaskFast(task);
+        completed[bit / 64] |= 1ULL << (bit % 64);
+        issued = true;
+        break;
+      }
+      if (!issued) {
+        // Do not turn a compute dependency into continuous L2/cache-control traffic.
+        const TaskId task = GetTaskIndex(first + head * this->active_vector_num);
+        const uint32_t dependent = *reinterpret_cast<__gm__ uint32_t *>(runtimeConfigPtr +
+          getAllTasksOffset(runtimeConfigPtr) + task * sizeof(TaskDesc) + offsetof(TaskDesc, dependent_event));
+        WaitForDependency(dependent, 5);
+      }
+    }
   }
 
   __aicore__ inline void ProcessL1Dump() {
@@ -304,6 +370,13 @@ class KernelWorkerBase {
       reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position])[task.inputs[0].base_ptr_offset];
     int64_t source_offset =
       reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[2].input_position])[task.inputs[2].base_ptr_offset];
+    if (task.extra_value_1 & VectorTaskFlags::APPLY_PROBABILITIES) {
+      const auto &aux = task.outputs[task.num_outputs - 1];
+      GM_ADDR buffer = input_list[aux.input_position];
+      PullToLocal<float>(ProbabilityPlane(buffer, aux.dim[1], 1) + (destination_offset + start) / hidden * sizeof(float),
+                         ProbabilityPlane(buffer, aux.dim[1], 0) + (source_offset + start) / hidden * sizeof(float),
+                         elements / hidden, source_pe);
+    }
     PullToLocal<T>(input_list[task.outputs[0].input_position] + (destination_offset + start) * sizeof(T),
                    input_list[task.inputs[1].input_position] + (source_offset + start) * sizeof(T), elements,
                    source_pe);
@@ -313,10 +386,11 @@ class KernelWorkerBase {
 #ifdef __DAV_C220_CUBE__
     WaitForDependency(meta.ready_event);
 #else
-    if (this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
+    if (this->active_vector_num != this->vector_num && this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
       return;
     }
-    if (this->worker_id_ == 1) {
+    const uint32_t leader = this->active_vector_num == this->vector_num ? 0 : 1;
+    if (this->worker_id_ == leader) {
       PublishDeviceReady(meta);
     }
     WaitForDependency(meta.ready_event);
@@ -332,7 +406,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline uint32_t GetVectorScheduleIndex() {
-    if constexpr (WorkerPolicy == VectorWorkerPolicy::ALL) {
+    if (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_) {
       return this->worker_id_ < this->active_vector_num ? this->worker_id_ : INVALID_VECTOR_SCHEDULE_INDEX;
     }
     return this->worker_id_ % 2 == 0 ? INVALID_VECTOR_SCHEDULE_INDEX : this->worker_id_ / 2;
@@ -485,6 +559,7 @@ class KernelWorkerBase {
 
   bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
+  bool ready_queue_ = false;
   uint32_t grouped_matmul_group_list_offset_ = 0;
   uint32_t task_num = 0;
   uint32_t runtime_task_capacity = 0;
