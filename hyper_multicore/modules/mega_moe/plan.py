@@ -149,7 +149,42 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     )
 
 
-def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
+def _attach_probability_workspace(config: Any, spec: MegaMoeSpec, *, backward: bool) -> None:
+    """Declare scalar workspace on existing tasks without changing their DAG.
+
+    The legacy GMM scratch port is unused by composed Cube kernels. This mode
+    supplies four symmetric FP32 planes there: source p, received p, received
+    dp and source dp. An auxiliary output descriptor carries their layout;
+    input limits, task counts and all completion events remain unchanged.
+    """
+    if not spec.apply_probs_before_fc2:
+        return
+    position = 25 if backward else 16
+    for index in config.vector_task_indices[:config.task_index_num[1]]:
+        task = config.all_tasks[index]
+        mode = 0
+        if task.task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
+            mode = VectorTaskFlags.APPLY_PROBABILITIES
+        elif task.task_type in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
+            output = task.outputs[0].input_position
+            mode = (VectorTaskFlags.APPLY_PROBABILITIES if output == 0 else
+                    VectorTaskFlags.RETURN_PROBABILITY_GRADIENTS if backward and output == 13 else 0)
+        if not mode:
+            continue
+        aux = TensorDescC()
+        aux.tensor_type = 0
+        aux.data_type = 4
+        aux.input_position = position
+        aux.dim[0] = 4
+        aux.dim[1] = spec.ep_size * spec.plan_tokens * spec.top_k
+        task.outputs[task.num_outputs] = aux
+        task.num_outputs += 1
+        task.extra_value_1 |= mode
+
+
+def _build_runtime_artifacts(
+    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None,
+) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     task_values = _build_task_values(spec)
     forward_graph = build_forward_graph(
@@ -201,6 +236,30 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.rank_id,
         spec.num_cube_cores,
     )
+    _attach_probability_workspace(forward_data, spec, backward=False)
+    _attach_probability_workspace(backward_data, spec, backward=True)
+    # Producer tiles often finish before the legacy 50/150-us refresh delay.
+    # Apply the existing short polling policy to every MegaMoE schedule.
+    for config in (forward_data, backward_data):
+        queue = list(config.cube_task_indices[:config.task_index_num[0]])
+        queue += list(config.vector_task_indices[:config.task_index_num[1]])
+        for task_id in queue:
+            config.all_tasks[task_id].extra_value_2 = FAST_DEPENDENCY_POLL_INTERVAL_US
+    if spec.batch_experts:
+        for config in (forward_data, backward_data):
+            # Compact dispatch retains its ready queue and all Vector workers.
+            # Collapsing Cube tasks does not change Vector dependency scheduling.
+            config.vector_ready_queue = int(compact)
+            collapse_batched_tasks(config, spec.num_cube_cores)
+    elif compact:
+        for graph, config in ((forward_graph, forward_data), (backward_graph, backward_data)):
+            config.vector_ready_queue = 1
+            pipeline_vector_queue(config, graph, task_values)
+            pipeline_cube_queue(config, graph, task_values, spec.num_cube_cores)
+            # Each Cube descriptor selects exactly one expert. A one-group tiling
+            # avoids scanning the remaining experts inside every local projection.
+            for task_id in config.cube_task_indices[:config.task_index_num[0]]:
+                config.all_tasks[task_id].extra_value_1 = GmmTaskMode.SINGLE_GROUP
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -223,8 +282,10 @@ def _prepare_diagnostics(
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
     }
     return (
-        prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
-        prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, **options),
+        prepare_mega_kernel_diagnostics(
+            forward_graph, forward_config, parameter_count=17 if spec.apply_probs_before_fc2 else 16, **options),
+        prepare_mega_kernel_diagnostics(
+            backward_graph, backward_config, parameter_count=26 if spec.apply_probs_before_fc2 else 20, **options),
     )
 
 

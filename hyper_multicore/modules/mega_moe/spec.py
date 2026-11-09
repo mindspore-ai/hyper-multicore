@@ -209,6 +209,8 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
+        clamp_after_activation=specification.get("clamp_after_activation", False),
+        apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),

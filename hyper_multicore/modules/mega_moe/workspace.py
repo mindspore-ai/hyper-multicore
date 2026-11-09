@@ -66,6 +66,11 @@ def _workspace_allocation_specs(
         ("forward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
         ("backward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
     )
+    if apply_probs_before_fc2:
+        # Cover every lossless destination before expert placement changes rows.
+        allocations += (("probability_workspace", allocation_spec(
+            (4, ep_size * routed_slots), torch.float32, _WORKSPACE_ALIGNMENT)),)
+    return allocations
 
 
 def _spec_workspace_bytes(
@@ -142,6 +147,8 @@ class MegaMoeWorkspace:
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
     gmm_workspace: Any | None = None
+    probability_workspace: Any | None = None
+    probability_views: ProbabilityWorkspace | None = field(default=None, init=False, repr=False)
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
     completion_stream: Any | None = field(default=None, repr=False)
@@ -159,6 +166,18 @@ class MegaMoeWorkspace:
     route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+
+    def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:
+        """Rebind aliases when heap storage or a retained plan's stride changes."""
+        buffer = self.probability_workspace
+        if buffer is None:
+            raise RuntimeError("MegaMoe probability_workspace is not initialized")
+        stride = spec.ep_size * spec.plan_tokens * spec.top_k
+        cached = self.probability_views
+        if cached is None or cached.buffer is not buffer or cached.stride != stride:
+            cached = ProbabilityWorkspace(buffer, stride)
+            self.probability_views = cached
+        return cached
 
     def describe_restart_allocations(
         self,
@@ -238,6 +257,7 @@ class MegaMoeWorkspace:
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
+        self.probability_views = None
         self.source_buffer = None
         self.expert_buffer = None
         for tensor, (field_name, _) in zip(tensors, targets):
@@ -434,10 +454,11 @@ class MegaMoeWorkspace:
 
     def _free_symmetric_tensors(self) -> None:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
+        self.probability_views = None
         if self.closing:
             remaining = tuple(tensor is not None for tensor in (
                 self.source_buffer, self.expert_buffer, self.routed_buffer,
-                self.forward_event_counters, self.backward_event_counters))
+                self.forward_event_counters, self.backward_event_counters, self.probability_workspace))
             peers = _collective.exchange(
                 remaining,
                 group=self._root_group(),
@@ -451,6 +472,7 @@ class MegaMoeWorkspace:
             "routed_buffer",
             "forward_event_counters",
             "backward_event_counters",
+            "probability_workspace",
         ):
             tensor = getattr(self, field_name)
             if tensor is None:
@@ -491,6 +513,7 @@ class MegaMoeWorkspace:
                 self.forward_event_counters,
                 self.backward_event_counters,
                 self.gmm_workspace,
+                self.probability_workspace,
                 self.swiglu_grad_workspace,
                 self.completion_event,
             ))
