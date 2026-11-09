@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -82,6 +82,8 @@ class MegaMoePlan:
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
+    weight_grad_dtype: torch.dtype | None = None
+    _recorded_streams: set = field(default_factory=set, repr=False, compare=False)
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -94,13 +96,23 @@ class MegaMoePlan:
         return self.bwd_diagnostics.runtime_config
 
 
-def record_plan_stream(plan: MegaMoePlan, runtime_config: Any) -> None:
-    """Protect cached tiling and runtime storage from cross-stream eviction."""
-    tensors = [value for value in vars(plan).values() if isinstance(value, torch.Tensor)]
-    tensors.append(runtime_config)
-    for tensor in tensors:
-        if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
-            tensor.record_stream(torch.npu.current_stream(tensor.device))
+def record_plan_stream(plan: MegaMoePlan, runtime_config: Any, *, stream: Any = None) -> None:
+    """Register immutable plan storage once per stream, preserving allocator lifetime."""
+    if not isinstance(runtime_config, torch.Tensor) or runtime_config.device.type != "npu":
+        return
+    if stream is None:
+        stream = torch.npu.current_stream(runtime_config.device)
+    key = (runtime_config.device, stream.npu_stream)
+    if key not in plan._recorded_streams:
+        tensors = [value for value in vars(plan).values() if isinstance(value, torch.Tensor)]
+        tensors.extend((plan.fwd_runtime_config, plan.bwd_runtime_config))
+        for tensor in tensors:
+            if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
+                tensor.record_stream(stream)
+        plan._recorded_streams.add(key)
+    if runtime_config is not plan.fwd_runtime_config and runtime_config is not plan.bwd_runtime_config:
+        # Diagnostic buffers are per invocation and cannot share the ordinary cache.
+        runtime_config.record_stream(stream)
 
 
 def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:

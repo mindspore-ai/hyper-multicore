@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -307,15 +307,16 @@ def _launch_forward_kernel(
     weight1: Any,
     weight2: Any,
     execution: _ForwardExecution,
+    *, stream: Any = None,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
     kernel_parameters = (
         execution.dispatch,
-        metadata.dispatch_target_off * spec.hidden_size,
+        metadata.dispatch_target_off,
         _native_source(routed_tokens),
-        metadata.dispatch_src_off * spec.hidden_size,
-        metadata.dispatch_size * spec.hidden_size,
+        metadata.dispatch_src_off,
+        metadata.dispatch_size,
         weight1,
         metadata.group_list,
         execution.intermediates.up_proj,
@@ -324,12 +325,12 @@ def _launch_forward_kernel(
         metadata.group_list,
         execution.intermediates.down_proj,
         execution.combine,
-        metadata.combine_target_off * spec.hidden_size,
-        metadata.combine_src_off * spec.hidden_size,
-        metadata.combine_size * spec.hidden_size,
+        metadata.combine_target_off,
+        metadata.combine_src_off,
+        metadata.combine_size,
     )
     if not plan.fwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.fwd_runtime_config)
+        record_plan_stream(plan, plan.fwd_runtime_config, stream=stream)
         multicore_ops.mega_moe(
             *kernel_parameters,
             execution.gmm_workspace,
@@ -351,7 +352,7 @@ def _launch_forward_kernel(
         direction="forward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config)
+        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
         multicore_ops.mega_moe_with_diagnostic_buffer(
             *kernel_parameters,
             execution.gmm_workspace,
@@ -374,16 +375,17 @@ def _launch_backward_kernel(
     saved: _SavedBackwardState,
     grad_output: Any,
     execution: _BackwardExecution,
+    *, stream: Any = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
     gradients = execution.intermediates
     kernel_parameters = (
         execution.dispatch,
-        saved.dispatch_target_off * spec.hidden_size,
+        saved.dispatch_target_off,
         _native_source(grad_output),
-        saved.dispatch_src_off * spec.hidden_size,
-        saved.dispatch_size * spec.hidden_size,
+        saved.dispatch_src_off,
+        saved.dispatch_size,
         saved.activation,
         gradients.grad_weight2,
         saved.weight2,
@@ -393,15 +395,15 @@ def _launch_backward_kernel(
         saved.weight1,
         gradients.gate_dx,
         execution.grad_x,
-        saved.combine_target_off * spec.hidden_size,
-        saved.combine_src_off * spec.hidden_size,
-        saved.combine_size * spec.hidden_size,
+        saved.combine_target_off,
+        saved.combine_src_off,
+        saved.combine_size,
         saved.dispatch,
         gradients.grad_weight1,
         saved.group_list,
     )
     if not plan.bwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.bwd_runtime_config)
+        record_plan_stream(plan, plan.bwd_runtime_config, stream=stream)
         multicore_ops.mega_moe_grad(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -426,7 +428,7 @@ def _launch_backward_kernel(
         direction="backward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config)
+        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
         multicore_ops.mega_moe_grad_with_diagnostic_buffer(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -493,12 +495,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             workspace_claimed: Whether the caller owns the forward workspace lease.
 
         Returns:
-            Owned expert-major output rows.
+            Owned token-major rows with integrated unpermutation, otherwise expert-major rows.
         """
         spec = plan.spec
         if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
             raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
-        metadata = route
+        metadata = route.for_kernel(spec.hidden_size)
         permutation_inputs = ()
         if permutation is not None:
             routed_tokens, _, unpermute_mapping = permutation
@@ -561,7 +563,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             return output
         finally:
             if not workspace_claimed:
-                workspace.release()
+                workspace.release(stream=workspace.lease_stream)
 
     @staticmethod
     # pylint: disable-next=arguments-differ
@@ -601,17 +603,16 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             )
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
-            execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
-                execution.intermediates.grad_weight1,
-                execution.intermediates.grad_weight2,
-                None, None, None,
-            ))
-            grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+            grad_weight1 = execution.intermediates.grad_weight1
+            grad_weight2 = execution.intermediates.grad_weight2
+            grad_x = execution.grad_x
+            del execution
+            grad_input = _restore_input_gradient(ctx, grad_x, permutation_inputs)
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
-                execution.intermediates.grad_weight1,
-                execution.intermediates.grad_weight2,
+                grad_weight1,
+                grad_weight2,
                 None,
                 None,
                 None,
@@ -620,7 +621,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
             )
         finally:
-            workspace.release()
+            workspace.release(stream=workspace.lease_stream)
 
 
 def execute_mega_moe(
