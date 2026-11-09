@@ -219,12 +219,14 @@ class _MegaMoeExecutionResources:
         if any(value != manifests[0] for value in manifests):
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
-    def plan_for_tokens(self, tokens: int, device: Any) -> Any:
+    def plan_for_tokens(self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
+                        batch_experts: bool = False, nominal_schedule: bool = False) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
             tokens: EP group maximum input rows, already aligned to 128.
             device: Execution device used for the parameters and workspace.
+            weight_grad_dtype: Optional FP32 output for partial expert weight gradients.
 
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
@@ -233,13 +235,21 @@ class _MegaMoeExecutionResources:
             raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
                                f"requested={tokens}, capacity={self._token_capacity}")
         bucket = 1 << (max(128, tokens) - 1).bit_length()
-        plan = self._plans.get(bucket)
+        key = bucket if weight_grad_dtype is None else (bucket, weight_grad_dtype)
+        if batch_experts:
+            key = (key, "batched_experts")
+        if nominal_schedule:
+            key = (key, "nominal_schedule")
+        plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             schedule_tokens = min(bucket, self._token_capacity)
-            plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
+            options = {} if weight_grad_dtype is None else {"weight_grad_dtype": weight_grad_dtype}
+            plan = build_mega_moe_plan(
+                replace(self.spec, schedule_tokens=schedule_tokens, batch_experts=batch_experts,
+                        nominal_schedule=nominal_schedule), device, **options)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
-            self._plans[bucket] = plan
+            self._plans[key] = plan
         return plan
 
     def close(self) -> None:

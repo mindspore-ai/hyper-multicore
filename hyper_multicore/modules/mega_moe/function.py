@@ -152,10 +152,20 @@ def _allocate_backward_intermediates(
     weight1: Any,
     weight2: Any,
     reusable_dispatch: Any | None = None,
+    *, weight_grad_dtype: torch.dtype | None = None,
+    group_list: torch.Tensor | None = None,
+    all_experts_active: bool = False,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    grad_weight1 = torch.zeros_like(weight1)
-    grad_weight2 = torch.zeros_like(weight2)
+    if group_list is None:
+        # Without count metadata, cold rows cannot be identified; initialize every expert.
+        grad_weight1 = torch.zeros_like(weight1, dtype=weight_grad_dtype)
+        grad_weight2 = torch.zeros_like(weight2, dtype=weight_grad_dtype)
+    else:
+        grad_weight1 = torch.empty_like(weight1, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
+        grad_weight2 = torch.empty_like(weight2, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
+        if not all_experts_active:
+            multicore_ops.zero_empty_expert_gradients(grad_weight1, grad_weight2, group_list)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -216,6 +226,7 @@ def _prepare_backward_execution(
     plan: MegaMoePlan,
     saved: _SavedBackwardState,
     grad_output: Any,
+    *, all_experts_active: bool = False,
 ) -> _BackwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for backward."""
     dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
@@ -237,6 +248,9 @@ def _prepare_backward_execution(
             saved.weight1,
             saved.weight2,
             dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
+            weight_grad_dtype=plan.weight_grad_dtype,
+            group_list=saved.group_list,
+            all_experts_active=all_experts_active,
         ),
     )
 
@@ -273,6 +287,7 @@ def _save_forward_state(
 ) -> None:
     """Save owned forward tensors and route state for backward."""
     ctx.plan = plan
+    ctx.all_experts_active = metadata.all_experts_active
     ctx.workspace = workspace
     ctx.save_for_backward(
         saved_dispatch,
@@ -594,6 +609,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan,
                 saved,
                 grad_output,
+                all_experts_active=ctx.all_experts_active,
             )
             _launch_backward_kernel(
                 plan,
