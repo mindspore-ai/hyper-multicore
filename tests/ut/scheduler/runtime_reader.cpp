@@ -40,6 +40,10 @@ namespace Runtime = MulticoreRuntime;
 static_assert(sizeof(Runtime::TensorDesc) == 64);
 static_assert(sizeof(Runtime::TaskDesc) == 576);
 
+extern "C" uint64_t read_shared_resource(uint8_t *image, uint32_t index) {
+  return reinterpret_cast<uint64_t>(Runtime::getSharedResource(image, index));
+}
+
 extern "C" void read_transport_and_kernel_task_types(uint32_t *result) {
   result[0] = static_cast<uint32_t>(Runtime::TaskType::TASK_SHMEM_GET_MEM);
   result[1] = static_cast<uint32_t>(Runtime::TaskType::TASK_MHC_POST);

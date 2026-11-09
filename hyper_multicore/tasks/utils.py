@@ -21,7 +21,7 @@ the main fill loop.
 """
 from hyper_multicore.scheduler.config import (
     TensorDescC, TaskDescC, RuntimeConfigC,
-    TaskType, DynamicType,
+    TaskType, DynamicType, TaskSplitValue,
     MAX_TENSOR_DIMS,
 )
 
@@ -55,7 +55,7 @@ def make_tensor_desc(
 
 # ── tsv counter helpers ───────────────────────────────────────────────────────
 
-def advance_tsv_vector(tsv, task_num: int, event_group_size: int) -> None:
+def advance_tsv_vector(tsv: TaskSplitValue, task_num: int, event_group_size: int) -> None:
     """Advance counters after a vector op with event grouping."""
     tsv.pre_task_num        += task_num
     tsv.pre_vector_task_num += task_num
@@ -63,7 +63,7 @@ def advance_tsv_vector(tsv, task_num: int, event_group_size: int) -> None:
     tsv.pre_event_num       += event_group_size
 
 
-def advance_tsv_cube(tsv, task_num: int, event_group_size: int) -> None:
+def advance_tsv_cube(tsv: TaskSplitValue, task_num: int, event_group_size: int) -> None:
     """Advance counters after a cube op with event grouping."""
     tsv.pre_task_num      += task_num
     tsv.pre_cube_task_num += task_num
@@ -71,13 +71,13 @@ def advance_tsv_cube(tsv, task_num: int, event_group_size: int) -> None:
     tsv.pre_event_num     += event_group_size
 
 
-def advance_tsv_cube_only(tsv, task_num: int) -> None:
+def advance_tsv_cube_only(tsv: TaskSplitValue, task_num: int) -> None:
     """Advance only task/cube counters (no event update). Used by bwd GMM1."""
     tsv.pre_task_num      += task_num
     tsv.pre_cube_task_num += task_num
 
 
-def advance_tsv_vector_only(tsv, task_num: int) -> None:
+def advance_tsv_vector_only(tsv: TaskSplitValue, task_num: int) -> None:
     """Advance only task/vector counters (no event update). Used by bwd combine."""
     tsv.pre_task_num        += task_num
     tsv.pre_vector_task_num += task_num
@@ -85,7 +85,7 @@ def advance_tsv_vector_only(tsv, task_num: int) -> None:
 
 # ── Post-fill utilities ───────────────────────────────────────────────────────
 
-def add_terminate(cfg: RuntimeConfigC, tsv, trigger_count: int) -> None:
+def add_terminate(cfg: RuntimeConfigC, tsv: TaskSplitValue, trigger_count: int) -> None:
     """
     Append a terminate task to cfg.
 
@@ -105,7 +105,32 @@ def add_terminate(cfg: RuntimeConfigC, tsv, trigger_count: int) -> None:
     cfg.task_index_num[1] += 1
 
 
-def add_dynamic_data(cfg: RuntimeConfigC, tsv, dynamic_input_position: int) -> None:
+def add_terminate_on_event(
+    cfg: RuntimeConfigC,
+    tsv: TaskSplitValue,
+    dependent_event: int,
+    trigger_count: int,
+) -> None:
+    """Append a terminate task that waits on an explicit final event.
+
+    Args:
+        cfg: Runtime receiving the termination task.
+        tsv: Current topology and queue offsets.
+        dependent_event: Event consumed by termination.
+        trigger_count: Required number of producers at the terminal event.
+    """
+    cfg.all_event_num_triggers[dependent_event] = trigger_count
+    task = TaskDescC()
+    task.task_type = TaskType.TASK_TERMINATE
+    task.dependent_event = dependent_event
+    task.trigger_event = dependent_event + 1
+    cfg.all_event_num_triggers[task.trigger_event] = 1
+    cfg.all_tasks[tsv.pre_task_num] = task
+    cfg.vector_task_indices[tsv.pre_vector_task_num] = tsv.pre_task_num
+    cfg.task_index_num[1] += 1
+
+
+def add_dynamic_data(cfg: RuntimeConfigC, tsv: TaskSplitValue, dynamic_input_position: int) -> None:
     """
     Write the dynamic data record into cfg.
 

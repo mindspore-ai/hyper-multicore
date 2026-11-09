@@ -28,7 +28,7 @@
 namespace l0op {
 OP_TYPE_REGISTER(HyperMegaMoeGrad);
 
-const std::array<const aclTensor *, 7> HyperMegaMoeGrad(
+const std::array<const aclTensor *, 8> HyperMegaMoeGrad(
   const aclTensor *dispatch_target, const aclTensor *dispatch_target_off, const aclTensor *dy,
   const aclTensor *dispatch_src_off, const aclTensor *dispatch_size, const aclTensor *hidden,
   const aclTensor *hidden_dw,
@@ -39,33 +39,38 @@ const std::array<const aclTensor *, 7> HyperMegaMoeGrad(
   const aclTensor *combine_size, const aclTensor *permute_out, const aclTensor *gate_dw, const aclTensor *group_list,
   const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w1_grad_tiling,
   const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
-  const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
-  const aclTensor *diagnostic_buffer, int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size,
-  int64_t seq_size, aclOpExecutor *executor) {
+  const aclTensor *runtime_config, const aclTensor *all_event_counters, const aclTensor *permute_src_index,
+  const aclTensor *route_weight, const aclTensor *reduce_route_index, const aclTensor *diagnostic_buffer,
+  int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, aclOpExecutor *executor) {
   L0_DFX(HyperMegaMoeGrad, dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, hidden, hidden_dw,
          weight, y, gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size,
          permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
-         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters,
-         diagnostic_buffer, rankId, ep, expert_num, hidden_size, seq_size);
+         swiglu_grad_tiling, gmm_workspace, runtime_config, all_event_counters, permute_src_index, route_weight,
+         reduce_route_index, diagnostic_buffer, rankId, ep, expert_num, hidden_size, seq_size);
   auto dispatch_target_out = const_cast<aclTensor *>(dispatch_target);
   auto hidden_dw_out = const_cast<aclTensor *>(hidden_dw);
   auto y_out = const_cast<aclTensor *>(y);
   auto grad_gate_out = const_cast<aclTensor *>(grad_gate);
   auto gate_dx_out = const_cast<aclTensor *>(gate_dx);
   auto grad_x_out = const_cast<aclTensor *>(grad_x);
+  auto permute_out_out = const_cast<aclTensor *>(permute_out);
   auto gate_dw_out = const_cast<aclTensor *>(gate_dw);
   auto ret = ADD_TO_LAUNCHER_LIST_AICORE(
     HyperMegaMoeGrad,
     OP_INPUT(dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, hidden, hidden_dw, weight, y,
              gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size, permute_out,
              gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling,
-             gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, diagnostic_buffer),
-    OP_OUTPUT(dispatch_target_out, hidden_dw_out, y_out, grad_gate_out, gate_dx_out, grad_x_out, gate_dw_out),
+             gmm_workspace, runtime_config, all_event_counters, permute_src_index, route_weight, reduce_route_index,
+             diagnostic_buffer),
+    OP_OUTPUT(dispatch_target_out, hidden_dw_out, y_out, grad_gate_out, gate_dx_out, grad_x_out, permute_out_out,
+              gate_dw_out),
     OP_ATTR(rankId, ep, expert_num, hidden_size, seq_size));
   if (ret != ACL_SUCCESS) {
     OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "HyperMegaMoeGrad ADD_TO_LAUNCHER_LIST_AICORE failed.");
-    return {dispatch_target_out, hidden_dw_out, y_out, grad_gate_out, gate_dx_out, grad_x_out, gate_dw_out};
+    return {dispatch_target_out, hidden_dw_out, y_out,           grad_gate_out,
+            gate_dx_out,         grad_x_out,    permute_out_out, gate_dw_out};
   }
-  return {dispatch_target_out, hidden_dw_out, y_out, grad_gate_out, gate_dx_out, grad_x_out, gate_dw_out};
+  return {dispatch_target_out, hidden_dw_out, y_out,           grad_gate_out,
+          gate_dx_out,         grad_x_out,    permute_out_out, gate_dw_out};
 }
 }  // namespace l0op

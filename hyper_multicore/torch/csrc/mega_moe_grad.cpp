@@ -39,7 +39,7 @@ BwdReturn mega_moe_grad_npu(
     const at::Tensor& combine_target_off,     // pos 14
     const at::Tensor& combine_src_off,        // pos 15
     const at::Tensor& combine_size,           // pos 16
-    at::Tensor& permute_out,                  // pos 17 — inplace write (not a declared return)
+    at::Tensor& permute_out,                  // pos 17 — inplace write, declared return
     at::Tensor& gate_dw,                      // pos 18 — inplace write, declared return
     const at::Tensor& group_list,             // pos 19
     const at::Tensor& act_grad_tiling,        // pos 20
@@ -48,10 +48,12 @@ BwdReturn mega_moe_grad_npu(
     const at::Tensor& w2_grad_tiling,         // pos 23
     const at::Tensor& swiglu_grad_tiling,     // pos 24
     const at::Tensor& gmm_workspace,          // pos 25
-    const at::Tensor& swiglu_grad_workspace,  // pos 26
-    const at::Tensor& runtime_config,         // pos 27
-    const at::Tensor& all_event_counters,     // pos 28
-    const at::Tensor& diagnostic_buffer,       // pos 29
+    const at::Tensor& runtime_config,         // pos 26
+    const at::Tensor& all_event_counters,     // pos 27
+    const at::Tensor& permute_src_index,      // pos 28
+    const at::Tensor& route_weight,           // pos 29
+    const at::Tensor& reduce_route_index,     // pos 30
+    const at::Tensor& diagnostic_buffer,      // pos 31
     int64_t rank_id,
     int64_t ep,
     int64_t expert_num,
@@ -63,8 +65,9 @@ BwdReturn mega_moe_grad_npu(
         combine_target_off, combine_src_off, combine_size,
         permute_out, gate_dw, group_list,
         act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
-        swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-        runtime_config, all_event_counters, diagnostic_buffer,
+        swiglu_grad_tiling, gmm_workspace,
+        runtime_config, all_event_counters, permute_src_index, route_weight,
+        reduce_route_index, diagnostic_buffer,
         rank_id, ep, expert_num, hidden_size, seq_size);
     return BwdReturn(dispatch_target, hidden_dw, act_grad_y, grad_gate,
                      gate_dx, grad_x, permute_out, gate_dw);
@@ -100,9 +103,11 @@ BwdReturn mega_moe_grad_meta(
     const at::Tensor& /* w2_grad_tiling */,
     const at::Tensor& /* swiglu_grad_tiling */,
     const at::Tensor& /* gmm_workspace */,
-    const at::Tensor& /* swiglu_grad_workspace */,
     const at::Tensor& /* runtime_config */,
     const at::Tensor& /* all_event_counters */,
+    const at::Tensor& /* permute_src_index */,
+    const at::Tensor& /* route_weight */,
+    const at::Tensor& /* reduce_route_index */,
     const at::Tensor& /* diagnostic_buffer */,
     int64_t /* rank_id */,
     int64_t /* ep */,

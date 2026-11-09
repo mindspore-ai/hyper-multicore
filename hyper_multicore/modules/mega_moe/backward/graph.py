@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MoE-FFN backward compute graph."""
+"""MoE-FFN backward graph with route-aware optional endpoint fusion."""
 
 from typing import Optional
 
@@ -22,7 +22,13 @@ from hyper_multicore.scheduler.graph import (
 )
 from hyper_multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
 from hyper_multicore.tasks.gmm import GmmFillConfig
+from hyper_multicore.tasks.permute import (
+    TopKWeightGradFillConfig,
+    UnpermuteReduceFillConfig,
+    WeightedUnpermuteFillConfig,
+)
 from hyper_multicore.tasks.swiglu import SwiGLUFillConfig
+from ..shared_schedule import add_shared_graph
 
 # Tiling buffer positions in the C++ runtime descriptor array.
 _TILING_POS_ACT_GRAD    = 20
@@ -30,6 +36,11 @@ _TILING_POS_GATE_GRAD   = 21
 _TILING_POS_W1_GRAD     = 22
 _TILING_POS_W2_GRAD     = 23
 _TILING_POS_SWIGLU_GRAD = 24
+
+_POS_PERMUTE_SRC_INDEX = 29
+_POS_ROUTE_WEIGHT = 30
+_POS_REDUCE_ROUTE_INDEX = 31
+_POS_ROUTE_COMBINE = 32
 
 
 def _build_bwd_tensor_specs(
@@ -231,6 +242,192 @@ def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cu
     return gate_grad, combine, w1_grad
 
 
+def _append_remote_write_acquire(
+    graph,
+    tsv,
+    combine,
+    *,
+    output_position,
+    hidden_size,
+    dtype_size,
+    num_cube_cores,
+    topk_weight_grad=None,
+):
+    """Acquire peer Combine writes before an external backward consumer."""
+    combine_out = TensorSpec(
+        "combine_acquire_sentinel",
+        [0, hidden_size],
+        param_position=output_position,
+        dtype_size=dtype_size,
+    )
+    acquire = OperatorNode(
+        name="external_output_acquire",
+        op_type=OpType.REMOTE_WRITE_ACQUIRE,
+        inputs=[],
+        outputs=[combine_out],
+        param_positions=[output_position],
+        split_value=1,
+        split_spec=SplitSpec(
+            split_inputs=None,
+            split_output_dims=[-1],
+            # One descriptor per active AIV is sufficient: every descriptor
+            # performs its acquire before publishing terminal completion.
+            task_num_fn=lambda _tsv: num_cube_cores,
+        ),
+        tiling_position=-1,
+        fill_config=WeightedUnpermuteFillConfig(
+            dependent_event=tsv.all_event_num - 1,
+            trigger_event=tsv.all_event_num,
+            top_k=0,
+            acquire_remote_writes=True,
+        ),
+    )
+    combine.fill_config.trigger_event = tsv.all_event_num - 1
+    graph.add_op(acquire).add_edge(combine, acquire)
+    if topk_weight_grad is not None:
+        graph.add_edge(topk_weight_grad, acquire)
+    return graph
+
+
+def _build_route_backward_tensors(tsv, hidden_size, dtype_size):
+    """Build route-aware tensors that extend the ordinary backward ABI."""
+    local_tokens = getattr(tsv, "local_num_tokens", tsv.seq_size // tsv.tp)
+    expert_output = TensorSpec(
+        "expert_output", [local_tokens * tsv.top_k, hidden_size],
+        param_position=13, dtype_size=dtype_size, tensor_type=1,
+    )
+    reduce_route_index = TensorSpec(
+        "reduce_route_index", [local_tokens, tsv.top_k],
+        param_position=_POS_REDUCE_ROUTE_INDEX, dtype_size=4,
+    )
+    grad_x = TensorSpec(
+        "grad_x", [local_tokens, hidden_size],
+        param_position=13, dtype_size=dtype_size, tensor_type=1,
+    )
+    grad_output = TensorSpec(
+        "grad_output", [local_tokens, hidden_size],
+        param_position=2, dtype_size=dtype_size, tensor_type=1,
+    )
+    grad_topk_weight = TensorSpec(
+        "grad_topk_weight", [local_tokens, tsv.top_k],
+        param_position=_POS_ROUTE_WEIGHT, dtype_size=4, tensor_type=1,
+    )
+    return local_tokens, expert_output, reduce_route_index, grad_x, grad_output, grad_topk_weight
+
+
+def _build_route_backward_base_graph(
+    dispatch, act_grad, w2_grad, swiglu_grad, gate_grad, combine, w1_grad
+):
+    """Connect the shared compute stages of a route-aware backward graph."""
+    graph = ComputeGraph()
+    return (
+        graph.add_op(dispatch).add_op(act_grad).add_op(w2_grad)
+        .add_op(swiglu_grad).add_op(gate_grad).add_op(combine).add_op(w1_grad)
+        .add_edge(dispatch, act_grad).add_edge(dispatch, w2_grad)
+        .add_edge(act_grad, swiglu_grad).add_edge(swiglu_grad, gate_grad)
+        .add_edge(gate_grad, combine).add_edge(gate_grad, w1_grad)
+        .add_edge(w2_grad, combine)
+    )
+
+
+def _append_topk_weight_grad(
+    graph,
+    tsv,
+    combine,
+    *,
+    enabled,
+    local_tokens,
+    topk_grad_sv,
+    route_completion_event,
+    expert_output,
+    grad_output,
+    reduce_route_index,
+    grad_topk_weight,
+):
+    """Optionally append router-weight gradient computation."""
+    if not enabled:
+        return None
+    topk_weight_grad = OperatorNode(
+        name="topk_weight_grad",
+        op_type=OpType.TOPK_WEIGHT_GRAD,
+        inputs=[expert_output, grad_output, reduce_route_index],
+        outputs=[grad_topk_weight],
+        param_positions=[13, 2, _POS_REDUCE_ROUTE_INDEX, _POS_ROUTE_WEIGHT],
+        split_value=topk_grad_sv,
+        split_spec=SplitSpec(
+            split_inputs=None,
+            split_output_dims=[0],
+            task_num_fn=lambda _tsv: max(
+                1, (local_tokens + topk_grad_sv - 1) // topk_grad_sv,
+            ),
+        ),
+        tiling_position=-1,
+        fill_config=TopKWeightGradFillConfig(
+            dependent_event=tsv.all_event_num + 5,
+            trigger_event=route_completion_event,
+            top_k=tsv.top_k,
+        ),
+    )
+    graph.add_op(topk_weight_grad).add_edge(combine, topk_weight_grad)
+    return topk_weight_grad
+
+
+def _append_route_backward_output(
+    graph,
+    tsv,
+    combine,
+    *,
+    integrated_unpermute,
+    local_tokens,
+    unpermute_sv,
+    hidden_size,
+    dtype_size,
+    num_cube_cores,
+    target,
+    reduce_route_index,
+    grad_x,
+    topk_weight_grad,
+):
+    """Append fused unpermute or an acquire for the external consumer."""
+    if not integrated_unpermute:
+        return _append_remote_write_acquire(
+            graph,
+            tsv,
+            combine,
+            output_position=_POS_ROUTE_COMBINE,
+            hidden_size=hidden_size,
+            dtype_size=dtype_size,
+            num_cube_cores=num_cube_cores,
+            topk_weight_grad=topk_weight_grad,
+        )
+    unpermute_grad = OperatorNode(
+        name="unpermute_grad",
+        op_type=OpType.UNPERMUTE_REDUCE_GRAD,
+        inputs=[target, reduce_route_index],
+        outputs=[grad_x],
+        param_positions=[_POS_ROUTE_COMBINE, _POS_REDUCE_ROUTE_INDEX, 13],
+        split_value=unpermute_sv,
+        split_spec=SplitSpec(
+            split_inputs=None,
+            split_output_dims=[0],
+            # Keep the terminal communication dependency even for empty inputs.
+            task_num_fn=lambda _tsv: max(
+                1, (local_tokens + unpermute_sv - 1) // unpermute_sv,
+            ),
+        ),
+        tiling_position=-1,
+        fill_config=UnpermuteReduceFillConfig(
+            dependent_event=tsv.all_event_num - 1,
+            trigger_event=tsv.all_event_num,
+            top_k=tsv.top_k,
+        ),
+    )
+    graph.add_op(unpermute_grad).add_edge(combine, unpermute_grad)
+    if topk_weight_grad is not None:
+        graph.add_edge(topk_weight_grad, unpermute_grad)
+    return graph
+
+
 def build_backward_graph(tsv: TaskSplitValue, *,
                          dispatch_sv:   int = 128,
                          act_grad_sv:   int = 4096,
@@ -244,7 +441,9 @@ def build_backward_graph(tsv: TaskSplitValue, *,
                          dtype_size:        int = 2,
                          num_cube_cores:    int = 24,
                          swiglu_limit:      Optional[float] = None,
-                         expert_weight_layout: str = "EIO") -> ComputeGraph:
+                         expert_weight_layout: str = "EIO",
+                         shared_intermediate_size: int = 0,
+                         fuse_shared_expert: bool = False) -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
     Execution order:
@@ -309,4 +508,106 @@ def build_backward_graph(tsv: TaskSplitValue, *,
           .add_edge(swiglu_grad, gate_grad)
           .add_edge(gate_grad,   combine)
           .add_edge(gate_grad,   w1_grad))
+    if fuse_shared_expert:
+        add_shared_graph(graph, tsv, hidden_size, shared_intermediate_size, num_cube_cores, backward=True)
     return graph
+
+
+def build_route_backward_graph(
+    tsv: TaskSplitValue,
+    *,
+    integrated_permute: bool = True, integrated_unpermute: bool = True,
+    dispatch_sv: int = 128, act_grad_sv: int = 4096,
+    w2_grad_sv: int = 4096, swiglu_sv: int = 128,
+    gate_grad_sv: int = 4096, w1_grad_sv: int = 4096,
+    combine_sv: int = 128, unpermute_sv: int = 8,
+    topk_grad_sv: int = 32, hidden_size: int = 7168,
+    intermediate_size: int = 2048, dtype_size: int = 2,
+    num_cube_cores: int = 24, swiglu_limit: Optional[float] = None,
+    expert_weight_layout: str = "EIO", shared_intermediate_size: int = 0, fuse_shared_expert: bool = False,
+) -> ComputeGraph:
+    """Build backward with independently fused route endpoints.
+
+    ``integrated_permute`` fuses token-order ``dY`` weighting/dispatch and the
+    router-weight gradient. ``integrated_unpermute`` fuses the final
+    expert-major-to-token-order ``dX`` reduction. At least one endpoint must be
+    enabled; the fully external graph is :func:`build_backward_graph`.
+
+    Args:
+        tsv: Expert topology and running event allocation.
+        integrated_permute: Fuse token-gradient weighting and dispatch.
+        integrated_unpermute: Fuse input-gradient reduction into token order.
+    """
+    # Both endpoints use the same route-aware layout. Combine writes expert-major
+    # dX to a separate return buffer; the final reduction writes token-order dX
+    # to parameter 13 when unpermute fusion is enabled.
+    if not integrated_permute and not integrated_unpermute:
+        raise ValueError(
+            "build_route_backward_graph requires at least one integrated endpoint"
+        )
+    tsv.extra_event_num = max(tsv.extra_event_num, 2)
+    if expert_weight_layout not in ("EIO", "EOI"):
+        raise ValueError(f"Invalid expert_weight_layout: {expert_weight_layout!r}")
+    specs = _build_bwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size, expert_weight_layout)
+    dispatch, act_grad, w2_grad, swiglu_grad = _build_bwd_ops_first(
+        tsv, specs, dispatch_sv=dispatch_sv, act_grad_sv=act_grad_sv,
+        w2_grad_sv=w2_grad_sv, swiglu_sv=swiglu_sv,
+        num_cube_cores=num_cube_cores,
+        swiglu_limit=swiglu_limit,
+        expert_weight_layout=expert_weight_layout,
+    )
+    if integrated_permute:
+        dispatch.fill_config.route_index_position = _POS_PERMUTE_SRC_INDEX
+        dispatch.fill_config.route_weight_position = _POS_ROUTE_WEIGHT
+        dispatch.fill_config.route_top_k = tsv.top_k
+        # Keep the route-dispatch barrier separate from the production ready
+        # handshake without shifting all_event_num, which is consumed by
+        # globally-signaling weight-gradient GMMs.
+        dispatch.fill_config.route_completion_event = tsv.all_event_num + 5
+
+    gate_grad, combine, w1_grad = _build_bwd_ops_second(
+        specs,
+        gate_grad_sv=gate_grad_sv,
+        w1_grad_sv=w1_grad_sv,
+        combine_sv=combine_sv,
+        num_cube_cores=num_cube_cores,
+        expert_weight_layout=expert_weight_layout,
+    )
+    target = TensorSpec(
+        "route_combine", [tsv.per_rank_seq, hidden_size],
+        param_position=_POS_ROUTE_COMBINE, dtype_size=dtype_size, tensor_type=1,
+    )
+    (
+        local_tokens, expert_output, reduce_route_index,
+        grad_x, grad_output, grad_topk_weight,
+    ) = _build_route_backward_tensors(tsv, hidden_size, dtype_size)
+    # Combine writes a separate symmetric return buffer. Received dY may then
+    # be reused for gate dX after the existing per-expert reader barrier.
+    combine.outputs = [target]
+    combine.param_positions = [14, 12, 15, 16, _POS_ROUTE_COMBINE]
+    # Both fused unpermute and the external-consumer acquire use the penultimate
+    # event for Combine/route completion and own the final event themselves.
+    route_completion_event = tsv.all_event_num - 1
+    combine.fill_config.trigger_event = route_completion_event
+    graph = _build_route_backward_base_graph(
+        dispatch, act_grad, w2_grad, swiglu_grad, gate_grad, combine, w1_grad
+    )
+    topk_weight_grad = _append_topk_weight_grad(
+        graph, tsv, combine,
+        enabled=integrated_permute, local_tokens=local_tokens,
+        topk_grad_sv=topk_grad_sv, route_completion_event=route_completion_event,
+        expert_output=expert_output, grad_output=grad_output,
+        reduce_route_index=reduce_route_index, grad_topk_weight=grad_topk_weight,
+    )
+    result = _append_route_backward_output(
+        graph, tsv, combine,
+        integrated_unpermute=integrated_unpermute,
+        local_tokens=local_tokens, unpermute_sv=unpermute_sv,
+        hidden_size=hidden_size, dtype_size=dtype_size,
+        num_cube_cores=num_cube_cores, target=target,
+        reduce_route_index=reduce_route_index, grad_x=grad_x,
+        topk_weight_grad=topk_weight_grad,
+    )
+    if fuse_shared_expert:
+        add_shared_graph(result, tsv, hidden_size, shared_intermediate_size, num_cube_cores, backward=True)
+    return result

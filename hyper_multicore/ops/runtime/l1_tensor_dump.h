@@ -53,8 +53,31 @@ struct L1DumpRecord {
 static_assert(sizeof(L1DumpHeader) == 32, "L1DumpHeader ABI must remain 32 bytes");
 static_assert(sizeof(L1DumpRecord) == 64, "L1DumpRecord ABI must remain one 64-byte data-cache line");
 
+template <uint32_t SharedParameterBase = 0, uint32_t SharedParameterCount = 0>
+__aicore__ inline GM_ADDR ResolveL1ParameterAddress(GM_ADDR *parameters, uint32_t position, GM_ADDR shared_table) {
+  if constexpr (SharedParameterCount != 0) {
+    if (position >= SharedParameterBase) {
+      if (position - SharedParameterBase >= SharedParameterCount || shared_table == nullptr) {
+        AscendC::Trap();
+      }
+      // Shared sidecars are logical diagnostic ports, not entries in the native input list.
+      return reinterpret_cast<GM_ADDR>(
+        reinterpret_cast<__gm__ uint64_t *>(shared_table)[position - SharedParameterBase + 1]);
+    }
+  }
+  return parameters[position];
+}
+
+__aicore__ inline bool ShouldSkipL1Record(GlobalTensor<uint32_t> &record_words, uint32_t task_id, uint32_t phase,
+                                         uint32_t worker_id) {
+  return record_words.GetValue(0) != task_id || record_words.GetValue(1) != phase ||
+         record_words.GetValue(7) != L1_DUMP_STATUS_PENDING ||
+         (record_words.GetValue(9) != 0xFFFFFFFF && record_words.GetValue(9) != worker_id);
+}
+
+template <uint32_t SharedParameterBase = 0, uint32_t SharedParameterCount = 0>
 __aicore__ inline void CaptureL1TaskTensors(GM_ADDR buffer, GM_ADDR *parameters, uint32_t task_id, uint32_t phase,
-                                            uint32_t worker_id) {
+                                            uint32_t worker_id, GM_ADDR shared_table = nullptr) {
   __gm__ uint8_t *dump_buffer = (__gm__ uint8_t *)(buffer);
   GlobalTensor<uint32_t> header_words;
   header_words.SetGlobalBuffer((__gm__ uint32_t *)(dump_buffer), sizeof(L1DumpHeader) / sizeof(uint32_t));
@@ -80,9 +103,7 @@ __aicore__ inline void CaptureL1TaskTensors(GM_ADDR buffer, GM_ADDR *parameters,
     record_words.SetGlobalBuffer((__gm__ uint32_t *)(record_address), sizeof(L1DumpRecord) / sizeof(uint32_t));
     DataCacheCleanAndInvalid<uint32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(record_words[0]);
     PipeBarrier<PIPE_ALL>();
-    if (record_words.GetValue(0) != task_id || record_words.GetValue(1) != phase ||
-        record_words.GetValue(7) != L1_DUMP_STATUS_PENDING ||
-        (record_words.GetValue(9) != 0xFFFFFFFF && record_words.GetValue(9) != worker_id)) {
+    if (ShouldSkipL1Record(record_words, task_id, phase, worker_id)) {
       continue;
     }
     uint64_t source_offset =
@@ -97,7 +118,9 @@ __aicore__ inline void CaptureL1TaskTensors(GM_ADDR buffer, GM_ADDR *parameters,
     if (payload_bytes != 0) {
       GlobalTensor<uint8_t> source_bytes;
       GlobalTensor<uint8_t> destination_bytes;
-      source_bytes.SetGlobalBuffer((__gm__ uint8_t *)(parameters[parameter_position]) + source_offset, payload_bytes);
+      GM_ADDR source = ResolveL1ParameterAddress<SharedParameterBase, SharedParameterCount>(
+        parameters, parameter_position, shared_table);
+      source_bytes.SetGlobalBuffer((__gm__ uint8_t *)(source) + source_offset, payload_bytes);
       destination_bytes.SetGlobalBuffer(dump_buffer + record_payload_offset, payload_bytes);
       DataCacheCleanAndInvalid<uint8_t, CacheLine::ENTIRE_DATA_CACHE>(source_bytes);
       PipeBarrier<PIPE_ALL>();

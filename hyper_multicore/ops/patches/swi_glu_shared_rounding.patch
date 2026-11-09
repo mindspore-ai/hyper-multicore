@@ -1,0 +1,96 @@
+diff --git a/activation/swi_glu/op_kernel/swi_glu.cpp b/activation/swi_glu/op_kernel/swi_glu.cpp
+--- a/activation/swi_glu/op_kernel/swi_glu.cpp
++++ b/activation/swi_glu/op_kernel/swi_glu.cpp
+@@ -23 +23 @@
+-                                              GM_ADDR workspace, GM_ADDR tiling, float clamp_limit) {
++                                              GM_ADDR workspace, GM_ADDR tiling, float clamp_limit, bool separate_silu = false) {
+@@ -33 +33 @@
+-      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);
++      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit, separate_silu);
+@@ -37 +37 @@
+-      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);
++      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit, separate_silu);
+@@ -43 +43 @@
+-      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);
++      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit, separate_silu);
+@@ -47 +47 @@
+-      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit);
++      op.Init(input_gm, nullptr, output_gm, tiling, clamp_limit, separate_silu);
+diff --git a/activation/swi_glu/op_kernel/swi_glu_bf16.hpp b/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
+--- a/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
++++ b/activation/swi_glu/op_kernel/swi_glu_bf16.hpp
+@@ -31,0 +32 @@
++    bool separateSilu = false;
+@@ -94,0 +96,7 @@
++    if (separateSilu) {
++        // Match the materialized low-precision SiLU boundary in the dense branch.
++        Cast(cLocal_, cLocal, RoundMode::CAST_RINT, curTileLen);
++        PipeBarrier<PIPE_V>();
++        Cast(cLocal, cLocal_, RoundMode::CAST_NONE, curTileLen);
++        PipeBarrier<PIPE_V>();
++    }
+diff --git a/activation/swi_glu/op_kernel/swi_glu_single.hpp b/activation/swi_glu/op_kernel/swi_glu_single.hpp
+--- a/activation/swi_glu/op_kernel/swi_glu_single.hpp
++++ b/activation/swi_glu/op_kernel/swi_glu_single.hpp
+@@ -26 +26 @@
+-    __aicore__ inline void Init(GM_ADDR input_gm, GM_ADDR beta_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f)
++    __aicore__ inline void Init(GM_ADDR input_gm, GM_ADDR beta_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f, bool separate_silu = false)
+@@ -29,0 +30 @@
++        this->separateSilu = separate_silu;
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
+@@ -21 +21 @@
+-                                                   GM_ADDR workspace, GM_ADDR tiling, float clamp_limit) {
++                                                   GM_ADDR workspace, GM_ADDR tiling, float clamp_limit, bool separate_silu = false) {
+@@ -29 +29 @@
+-        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);
++        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit, separate_silu);
+@@ -33 +33 @@
+-        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);
++        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit, separate_silu);
+@@ -39 +39 @@
+-        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);
++        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit, separate_silu);
+@@ -43 +43 @@
+-        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit);
++        op.Init(gradout_gm, input_gm, output_gm, tiling, clamp_limit, separate_silu);
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp
+@@ -32,0 +33 @@
++    bool separateSilu = false;
+@@ -120,3 +120,0 @@
+-        Mul(mLocal, mLocal, lLocal, tileLength);
+-        PipeBarrier<PIPE_V>();
+-
+@@ -124 +122,12 @@
+-
++        if (separateSilu) {
++            // Mul backward rounds dSiLU before the separate SiLU backward.
++            Mul(bLocal, bLocal, lLocal, tileLength);
++            PipeBarrier<PIPE_V>();
++            Cast(mLocal_, bLocal, downcastRoundMode_, tileLength);
++            PipeBarrier<PIPE_V>();
++            Cast(bLocal, mLocal_, RoundMode::CAST_NONE, tileLength);
++            PipeBarrier<PIPE_V>();
++        } else {
++            Mul(mLocal, mLocal, lLocal, tileLength);
++            PipeBarrier<PIPE_V>();
++        }
+@@ -237,0 +247,7 @@
++    if (separateSilu) {
++        // dUp consumes the same rounded SiLU value as forward.
++        Cast(nLocal_, nLocal, downcastRoundMode_, tileLength);
++        PipeBarrier<PIPE_V>();
++        Cast(nLocal, nLocal_, RoundMode::CAST_NONE, tileLength);
++        PipeBarrier<PIPE_V>();
++    }
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad_single.hpp
+@@ -25 +25 @@
+-    __aicore__ inline void Init(GM_ADDR grad_gm, GM_ADDR input_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f)
++    __aicore__ inline void Init(GM_ADDR grad_gm, GM_ADDR input_gm, GM_ADDR output_gm, GM_ADDR tiling_gm, float clamp_limit = 0.0f, bool separate_silu = false)
+@@ -31,0 +32 @@
++        this->separateSilu = separate_silu;

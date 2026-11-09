@@ -41,6 +41,11 @@ class OpType(Enum):
     MHC_INPUT_MIX = "mhc_input_mix"
     MHC_PIPELINE = "mhc_pipeline"
     RMS_NORM = "rms_norm"
+    UNPERMUTE_REDUCE_GRAD = "unpermute_reduce_grad"
+    TOPK_WEIGHT_GRAD = "topk_weight_grad"
+    WEIGHTED_UNPERMUTE = "weighted_unpermute"
+    REMOTE_WRITE_ACQUIRE = "remote_write_acquire"
+    ADD_RESIDUAL = "add_residual"
 
 
 @dataclass
@@ -142,6 +147,10 @@ class ComputeGraph:
             name: Registered operator name.
         """
         return self._nodes[name]
+
+    def has_op(self, name: str) -> bool:
+        """Return whether an operator node exists."""
+        return name in self._nodes
 
     def topological_sort(self) -> List[OperatorNode]:
         """Kahn's algorithm; insertion order used for tie-breaking."""

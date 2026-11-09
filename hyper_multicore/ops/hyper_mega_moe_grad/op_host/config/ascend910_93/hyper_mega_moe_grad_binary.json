@@ -295,7 +295,7 @@
           "format_match_mode": "FormatDefault"
         },
         {
-          "name": "swiglu_grad_workspace",
+          "name": "runtime_config",
           "index": 26,
           "dtype": "uint8",
           "format": "ND",
@@ -306,7 +306,7 @@
           "format_match_mode": "FormatDefault"
         },
         {
-          "name": "runtime_config",
+          "name": "all_event_counters",
           "index": 27,
           "dtype": "uint8",
           "format": "ND",
@@ -317,9 +317,31 @@
           "format_match_mode": "FormatDefault"
         },
         {
-          "name": "all_event_counters",
+          "name": "permute_src_index",
           "index": 28,
-          "dtype": "uint8",
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "route_weight",
+          "index": 29,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "reduce_route_index",
+          "index": 30,
+          "dtype": "int32",
           "format": "ND",
           "paramType": "required",
           "shape": [
@@ -329,7 +351,7 @@
         },
         {
           "name": "diagnostic_buffer",
-          "index": 29,
+          "index": 31,
           "dtype": "uint8",
           "format": "ND",
           "paramType": "required",
@@ -407,8 +429,19 @@
           "format_match_mode": "FormatDefault"
         },
         {
-          "name": "gate_dw",
+          "name": "permute_out",
           "index": 6,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "gate_dw",
+          "index": 7,
           "dtype": "bfloat16",
           "format": "ND",
           "paramType": "required",

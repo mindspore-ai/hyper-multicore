@@ -210,6 +210,8 @@ class TestRuntimeCppReader(unittest.TestCase):
             cls.reader = ctypes.CDLL(str(library))
         cls.reader.valid_runtime.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
         cls.reader.valid_runtime.restype = ctypes.c_bool
+        cls.reader.read_shared_resource.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        cls.reader.read_shared_resource.restype = ctypes.c_uint64
         cls.reader.valid_ready_runtime.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint32]
         cls.reader.valid_ready_runtime.restype = ctypes.c_bool
         cls.reader.valid_expert_runtime.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
@@ -395,6 +397,17 @@ class TestRuntimeCppReader(unittest.TestCase):
         self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
         struct.pack_into("<I", data, 36, 2)
         self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
+
+    def test_shared_resource_addresses_round_trip(self) -> None:
+        """Shared addresses occupy reserved words without moving runtime arrays."""
+        cfg = allocate_runtime_config(16)
+        cfg.shared_tensor_table = 0x1234567800
+        cfg.shared_tiling = 0xFEDCBA9800
+        image = ctypes.create_string_buffer(serialize_runtime_config(cfg))
+        self.assertEqual(RuntimeConfigC.shared_tensor_table.offset, 40)
+        self.assertEqual(RuntimeConfigC.shared_tiling.offset, 48)
+        self.assertEqual(self.reader.read_shared_resource(image, 0), cfg.shared_tensor_table)
+        self.assertEqual(self.reader.read_shared_resource(image, 1), cfg.shared_tiling)
 
     def test_ready_header_and_persistent_storage_bounds(self) -> None:
         """Read ready metadata without tags and bound the persistent tail."""

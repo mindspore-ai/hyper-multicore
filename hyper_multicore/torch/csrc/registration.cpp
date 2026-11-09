@@ -18,12 +18,12 @@ TORCH_LIBRARY(hyper_multicore, m) {
     "mega_moe_unpermute_grad_out(Tensor permuted_tokens, Tensor grad_output, "
     "Tensor sorted_indices, Tensor probs, Tensor(a!) grad_permuted, Tensor(b!) grad_probs) "
     "-> (Tensor(a!), Tensor(b!))");
-  m.def("mega_moe_transport_version() -> int", []() -> int64_t { return 1; });
+  m.def("mega_moe_transport_version() -> int", []() -> int64_t { return 6; });
   // -------------------------------------------------------------------------
   // mega_moe: MoE-FFN forward operator (wraps aclnnHyperMegaMoe)
   //
   // Output buffers written in-place:
-  //   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target.
+  //   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target, final_out.
   // All buffers must be pre-allocated by the caller.
   // -------------------------------------------------------------------------
   m.def(
@@ -50,13 +50,18 @@ TORCH_LIBRARY(hyper_multicore, m) {
     "  Tensor down_proj_tiling,"
     "  Tensor runtime_config,"
     "  Tensor all_event_counters,"
+    "  Tensor original_x,"
+    "  Tensor permute_src_index,"
+    "  Tensor reduce_route_index,"
+    "  Tensor topk_weights,"
+    "  Tensor(i!) final_out,"
     "  Tensor diagnostic_buffer,"
     "  int rank_id,"
     "  int ep,"
     "  int expert_num,"
     "  int hidden_size,"
     "  int seq_size"
-    ") -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!))");
+    ") -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(i!))");
 
   // -------------------------------------------------------------------------
   // mega_moe_grad: MoE-FFN backward operator (wraps aclnnHyperMegaMoeGrad)
@@ -93,10 +98,12 @@ TORCH_LIBRARY(hyper_multicore, m) {
     "  Tensor w1_grad_tiling,"
     "  Tensor w2_grad_tiling,"
     "  Tensor swiglu_grad_tiling,"
-    "  Tensor gmm_workspace,"
-    "  Tensor swiglu_grad_workspace,"
+    "  Tensor(j!) gmm_workspace,"
     "  Tensor runtime_config,"
     "  Tensor all_event_counters,"
+    "  Tensor permute_src_index,"
+    "  Tensor(k!) route_weight,"
+    "  Tensor reduce_route_index,"
     "  Tensor diagnostic_buffer,"
     "  int rank_id,"
     "  int ep,"

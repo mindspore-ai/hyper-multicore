@@ -33,6 +33,8 @@ before starting the application or framework Python process so CANN can discover
 """
 from __future__ import annotations
 
+from functools import lru_cache
+
 __all__ = [
     "cann_mhc_pre_sinkhorn",
     "cann_mhc_pre_sinkhorn_with_cache",
@@ -79,14 +81,20 @@ def _load_native() -> None:
         preload_vendor_library(vendor_root)
         try:
             torch.ops.load_library(str(adapter_path))
-            if torch.ops.hyper_multicore.mega_moe_transport_version() != 1:
+            if torch.ops.hyper_multicore.mega_moe_transport_version() != 6:
                 raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
             # Torch exposes operator alias metadata through this private schema attribute.
             schema = torch.ops.hyper_multicore.mega_moe_grad.default._schema  # pylint: disable=protected-access
             dispatch_alias = schema.arguments[0].alias_info.before_set
             input_grad_alias = schema.arguments[12].alias_info.before_set
             if not dispatch_alias or dispatch_alias != input_grad_alias:
-                raise RuntimeError("adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter")
+                raise RuntimeError(
+                    "adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter"
+                )
+            for position in (25, 29):
+                alias = schema.arguments[position].alias_info
+                if alias is None or not alias.is_write:
+                    raise RuntimeError("adapter does not declare route output mutation; rebuild the Torch adapter")
         except (AttributeError, OSError, RuntimeError) as error:
             raise NativeComponentUnavailableError(
                 "[HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore framework=torch "
@@ -530,6 +538,79 @@ def mega_moe_unpermute_grad_out(
     )
 
 
+@lru_cache(maxsize=None)
+def _route_abi_placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Keep unused fused-ABI operands non-null without allocating routed vectors."""
+    return torch.empty(1, dtype=dtype, device=device)
+
+
+def _route_native_parameters(parameters: tuple[torch.Tensor, ...], *, forward: bool) -> tuple[torch.Tensor, ...]:
+    """Map logical route ports onto the bounded native operand count.
+
+    Backward uses the otherwise unused byte-workspace operand for its symmetric
+    Combine target; the kernel receives GMM workspace from CANN itself.
+    """
+    if forward:
+        return tuple(parameters[:27])
+    return (*parameters[:25], parameters[32].view(torch.uint8), *parameters[27:32])
+
+
+def _bind_shared_resources(
+    runtime: torch.Tensor, table: torch.Tensor | None, tiling: torch.Tensor | None,
+    tensors: tuple[torch.Tensor, ...] = (),
+) -> None:
+    """Bind indirect resources through the reserved RuntimeConfig header words.
+
+    The managed workspace lease serializes use of this mutable runtime image.
+    Both device resources must stay alive through the launch's current stream.
+    """
+    if table is None and tiling is None:
+        return
+    if table is None or tiling is None:
+        raise ValueError("shared tensor table and tiling must be provided together")
+    addresses = torch.tensor([table.data_ptr(), tiling.data_ptr()], dtype=torch.int64, pin_memory=True)
+    runtime[40:56].copy_(addresses.view(torch.uint8), non_blocking=True)
+    # Indirect payloads are absent from the native schema's allocator tracking.
+    for resource in (table, tiling, *tensors):
+        if resource.device.type == "npu":
+            resource.record_stream(torch.npu.current_stream(resource.device))
+
+
+def launch_route_fused(
+    parameters: tuple[torch.Tensor, ...], attributes: tuple[int, ...],
+    diagnostics: MegaKernelDiagnostics, *, forward: bool,
+) -> None:
+    """Launch a selected route graph through the current diagnostic boundary.
+
+    Args:
+        parameters: Stable device input-list operands including runtime and event storage.
+        attributes: Rank, EP degree, expert count, hidden width and local tokens.
+        diagnostics: Current public diagnostic integration boundary.
+        forward: Select forward or backward native dispatch.
+    """
+    _load_native()
+    runtime_position = 20 if forward else 27
+    event_position = runtime_position + 1
+    direction = "forward" if forward else "backward"
+    operator = torch.ops.hyper_multicore.mega_moe if forward else torch.ops.hyper_multicore.mega_moe_grad
+    events = parameters[event_position]
+    shared_position = 27 if forward else 33
+    shared = parameters[shared_position:shared_position + 2]
+    if not diagnostics.is_active:
+        operands = _route_native_parameters(parameters, forward=forward)
+        if shared:
+            _bind_shared_resources(parameters[runtime_position], *shared, parameters[shared_position + 2:])
+        operator(*operands, events, *attributes)
+        return
+    with diagnostics.launch(parameters, direction=direction, fallback_event_counters=events) as call:
+        operands = list(parameters)
+        operands[runtime_position] = call.runtime_config
+        operands[event_position] = call.event_counters
+        native = _route_native_parameters(tuple(operands), forward=forward)
+        if shared:
+            _bind_shared_resources(call.runtime_config, *shared, parameters[shared_position + 2:])
+        operator(*native, call.diagnostic_buffer, *attributes)
+
 def mega_moe(
     dispatch_target: torch.Tensor,
     dispatch_target_off: torch.Tensor,
@@ -562,16 +643,8 @@ def mega_moe(
     """
     MoE-FFN forward operator.
 
-    Args:
-        dispatch_target: First operator tensor; the detailed ABI is documented below.
-
-    Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
-                        combine_target.
+    Writes dispatch_target, up_proj_y, swiglu_out, down_proj_y and combine_target in-place.
     All output tensors must be pre-allocated with correct shapes.
-
-    Args:
-        dispatch_target: First tensor in the fixed flat forward ABI; the complete parameter groups are documented
-            below and retain their registered schema order.
 
     Parameters
     ----------
@@ -619,6 +692,11 @@ def mega_moe(
         down_proj_tiling,
         runtime_config,
         all_event_counters,
+        dispatch_src,
+        _route_abi_placeholder(dispatch_src.device, torch.int32),
+        _route_abi_placeholder(dispatch_src.device, torch.int32),
+        _route_abi_placeholder(dispatch_src.device, torch.float32),
+        combine_target.reshape(-1)[:1],
         all_event_counters,
         rank_id,
         ep,
@@ -676,6 +754,9 @@ def mega_moe_grad(
         dispatch_target: First tensor in the fixed flat backward ABI; remaining tensor and topology arguments retain
             their registered schema order.
     """
+    # Preserve the public positional API; native deduplicates the two unused
+    # workspace placeholders to stay within CANN's 32-input limit.
+    _ = swiglu_grad_workspace
     _load_native()
     torch.ops.hyper_multicore.mega_moe_grad(
         dispatch_target,
@@ -704,9 +785,11 @@ def mega_moe_grad(
         w2_grad_tiling,
         swiglu_grad_tiling,
         gmm_workspace,
-        swiglu_grad_workspace,
         runtime_config,
         all_event_counters,
+        _route_abi_placeholder(dy.device, torch.int32),
+        _route_abi_placeholder(dy.device, torch.float32),
+        _route_abi_placeholder(dy.device, torch.int32),
         all_event_counters,
         rank_id,
         ep,
@@ -749,16 +832,8 @@ def mega_moe_with_diagnostic_buffer(
     """
     Launch the internal forward ABI with a shared diagnostic-buffer argument.
 
-    Args:
-        dispatch_target: First operator tensor; the detailed ABI is documented below.
-
-    Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
-                        combine_target.
+    Writes dispatch_target, up_proj_y, swiglu_out, down_proj_y and combine_target in-place.
     All output tensors must be pre-allocated with correct shapes.
-
-    Args:
-        dispatch_target: First tensor in the fixed diagnostic-forward ABI; the complete parameter groups are documented
-            below and retain their registered schema order.
 
     Parameters
     ----------
@@ -809,6 +884,11 @@ def mega_moe_with_diagnostic_buffer(
         down_proj_tiling,
         runtime_config,
         all_event_counters,
+        dispatch_src,
+        _route_abi_placeholder(dispatch_src.device, torch.int32),
+        _route_abi_placeholder(dispatch_src.device, torch.int32),
+        _route_abi_placeholder(dispatch_src.device, torch.float32),
+        combine_target.reshape(-1)[:1],
         diagnostic_buffer,
         rank_id,
         ep,
@@ -867,6 +947,9 @@ def mega_moe_grad_with_diagnostic_buffer(
         dispatch_target: First tensor in the fixed diagnostic-backward ABI; remaining tensor and topology arguments
             retain their registered schema order.
     """
+    # Preserve the public positional API; native deduplicates the two unused
+    # workspace placeholders to stay within CANN's 32-input limit.
+    _ = swiglu_grad_workspace
     _load_native()
     torch.ops.hyper_multicore.mega_moe_grad(
         dispatch_target,
@@ -895,9 +978,11 @@ def mega_moe_grad_with_diagnostic_buffer(
         w2_grad_tiling,
         swiglu_grad_tiling,
         gmm_workspace,
-        swiglu_grad_workspace,
         runtime_config,
         all_event_counters,
+        _route_abi_placeholder(dy.device, torch.int32),
+        _route_abi_placeholder(dy.device, torch.float32),
+        _route_abi_placeholder(dy.device, torch.int32),
         diagnostic_buffer,
         rank_id,
         ep,

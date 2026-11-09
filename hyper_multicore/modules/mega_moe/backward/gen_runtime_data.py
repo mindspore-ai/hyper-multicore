@@ -39,6 +39,11 @@ import os
 from hyper_multicore.modules.mega_moe.backward.graph import (
     build_backward_graph,
 )
+from hyper_multicore.tasks.utils import (
+    add_dynamic_data,
+    add_terminate,
+    add_terminate_on_event,
+)
 from hyper_multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
     get_gate_grad_tiling_bytes,
@@ -61,7 +66,6 @@ from hyper_multicore.scheduler.scheduler import (
     revise_gmm_task_queue_bwd,
     revise_task_queue,
 )
-from hyper_multicore.tasks.utils import add_dynamic_data, add_terminate
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,59 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _add_backward_termination(
+    cfg: RuntimeConfigC,
+    graph: ComputeGraph,
+    tsv: TaskSplitValue,
+) -> None:
+    """Append termination after weight gradients and the selected route epilogue."""
+    w1_grad_op = graph.get_op("w1_grad")
+    w2_grad_op = graph.get_op("w2_grad")
+    combine_op = graph.get_op("combine")
+    weight_grad_triggers = w1_grad_op.task_num + w2_grad_op.task_num
+    topk_grad_tasks = (
+        graph.get_op("topk_weight_grad").task_num
+        if graph.has_op("topk_weight_grad")
+        else 0
+    )
+    has_terminal_epilogue = graph.has_op("unpermute_grad") or graph.has_op(
+        "external_output_acquire"
+    )
+    if topk_grad_tasks or has_terminal_epilogue:
+        route_event = (
+            tsv.all_event_num - 1 if has_terminal_epilogue else tsv.all_event_num
+        )
+        cfg.all_event_num_triggers[route_event] = (
+            combine_op.task_num + topk_grad_tasks
+        )
+    if graph.has_op("unpermute_grad"):
+        endpoint_tasks = graph.get_op("unpermute_grad").task_num
+    elif graph.has_op("external_output_acquire"):
+        endpoint_tasks = graph.get_op("external_output_acquire").task_num
+    else:
+        endpoint_tasks = 0
+    if endpoint_tasks:
+        add_terminate_on_event(
+            cfg,
+            tsv,
+            tsv.all_event_num,
+            weight_grad_triggers + endpoint_tasks,
+        )
+    elif topk_grad_tasks:
+        add_terminate_on_event(
+            cfg,
+            tsv,
+            tsv.all_event_num,
+            weight_grad_triggers + combine_op.task_num + topk_grad_tasks,
+        )
+    else:
+        add_terminate(
+            cfg,
+            tsv,
+            weight_grad_triggers + combine_op.task_num // tsv.ep * tsv.ep,
+        )
+
+
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
                           num_cube_cores: int = 24) -> RuntimeConfigC:
     """Build backward RuntimeConfig for a single rank.
@@ -124,14 +181,21 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     dispatch_op    = graph.get_op("dispatch")
     swiglu_grad_op = graph.get_op("swiglu_grad")
     act_grad_op    = graph.get_op("act_grad")
-    w1_grad_op     = graph.get_op("w1_grad")
-    w2_grad_op     = graph.get_op("w2_grad")
     combine_op     = graph.get_op("combine")
 
-    add_terminate(cfg, tsv,
-                  w2_grad_op.task_num + w1_grad_op.task_num
-                  + combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num, combine_op.task_num)
+    _add_backward_termination(cfg, graph, tsv)
+    if tsv.shared_expert:
+        cfg.task_index_num[1] -= 1
+        add_terminate_on_event(
+            cfg, tsv, tsv.shared_completion_event, tsv.shared_completion_count,
+        )
+    revise_task_queue(
+        cfg,
+        tsv,
+        dispatch_op.task_num,
+        swiglu_grad_op.task_num,
+        combine_op.task_num,
+    )
     revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
 

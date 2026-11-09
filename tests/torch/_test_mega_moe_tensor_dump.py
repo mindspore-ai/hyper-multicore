@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -27,6 +28,7 @@ from hyper_multicore import MegaMoeExperts
 from hyper_multicore.diagnostics import schedule
 from hyper_multicore.diagnostics import dump as tensor_dump
 from tests.torch import _test_mega_moe as common
+from tests.torch._test_mega_moe_shared import _route_ids
 
 
 _DUMP_TENSORS = (
@@ -231,6 +233,92 @@ def test_mega_moe_forward_l1_tensor_dump_worker() -> None:
                                            rtol=2e-2, atol=5e-3,
                                            msg=f"rank={common.RANK}: incorrect L1 SwiGLU task snapshot: {task}")
             print(f"MEGA_KERNEL_L1_TENSOR_DUMP={manifest_path}")
+    finally:
+        layer.close()
+    dist.barrier()
+
+
+def _read_shared_tail_dump(path: Path, tokens: int) -> dict:
+    """Require exact one-row tail records in both directions and load their values."""
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    assert manifest["level"] == "L1"
+    assert {value["direction"] for value in manifest["invocations"]} == {"forward", "backward"}
+    result = {}
+    for invocation in manifest["invocations"]:
+        for task in invocation["tasks"]:
+            assert task["stageTaskIndex"] == (tokens - 1) // 128
+            values = {}
+            for item in task["tensors"]:
+                assert item["actualShape"][0] == item["storedShape"][0] == 1, item
+                assert item["sourceOffsetBytes"] == (tokens - 1) * item["actualShape"][1] * 2, item
+                assert not item["truncated"], item
+                tensor = torch.load(path.parent / item["file"], map_location="cpu", weights_only=True)
+                assert torch.isfinite(tensor).all(), item
+                values[item["io"], item["index"]] = tensor
+            result[task["stage"]] = values
+    assert set(result) == {"shared_swiglu", "shared_swiglu_grad", "shared_dx_add"}, result.keys()
+    return result
+
+
+def _check_shared_tail_values(values: dict, expected_up: torch.Tensor, expected_dx: torch.Tensor) -> None:
+    """Check captured intermediates and the exact final shared residual gradient."""
+    forward = values["shared_swiglu"]
+    torch.testing.assert_close(forward["input", 0], expected_up, rtol=2e-2, atol=2e-3)
+    gate, up = forward["input", 0].chunk(2, dim=-1)
+    torch.testing.assert_close(forward["output", 0], torch.nn.functional.silu(gate) * up,
+                               rtol=2e-2, atol=2e-3)
+    backward = values["shared_swiglu_grad"]
+    torch.testing.assert_close(backward["input", 1], forward["input", 0], rtol=0, atol=0)
+    packed = backward["input", 1].detach().requires_grad_()
+    gate, up = packed.chunk(2, dim=-1)
+    expected = torch.autograd.grad(torch.nn.functional.silu(gate) * up, packed, backward["input", 0])[0]
+    torch.testing.assert_close(backward["output", 0], expected, rtol=5e-2, atol=1e-2)
+    residual = values["shared_dx_add"]
+    summed = (residual["input", 0].float() + residual["input", 1].float()).bfloat16()
+    torch.testing.assert_close(residual["output", 0], summed, rtol=0, atol=0)
+    torch.testing.assert_close(residual["output", 0], expected_dx, rtol=0, atol=0)
+
+
+def test_mega_moe_shared_l1_tail_worker() -> None:
+    """Capture full-fusion shared F+B tails for unequal rank lengths 129/257."""
+    tokens = (129, 257)[common.RANK]
+    torch.manual_seed(92700 + common.RANK)
+    source = torch.randn(tokens, 5120, device=common.DEVICE, dtype=torch.bfloat16).requires_grad_()
+    probabilities = torch.full((tokens, 2), 0.5, device=common.DEVICE, requires_grad=True)
+    ids = _route_ids(tokens, 4, 2, common.DEVICE, "balanced")
+    layer = MegaMoeExperts(
+        hidden_size=5120, intermediate_size=128, num_experts=4, top_k=2,
+        shared_intermediate_size=256, ep_size=2, ep_group=dist.group.WORLD, fusion_mode="full",
+        dispatch_mode=os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
+    ).to(device=common.DEVICE, dtype=torch.bfloat16)
+    upstream = torch.randn_like(source) / (5120 ** 0.5)
+    variables = (source, probabilities, layer.gate_up_weight, layer.down_weight,
+                 layer.shared_gate_up_weight, layer.shared_down_weight)
+    selection = tensor_dump.TensorDumpConfig(
+        os.environ["HP_MEGA_MOE_DUMP_RESULT_DIR"], level="L1", kernel_names="mega_moe",
+        stages=("shared_swiglu", "shared_swiglu_grad", "shared_dx_add"),
+        stage_task_indices=(tokens - 1) // 128, device_memory_budget_mb=32,
+    )
+    try:
+        output = layer(source, ids, probabilities)
+        gradients = torch.autograd.grad(output, variables, upstream)
+        expected = tuple(value.detach().cpu().clone() for value in (output, *gradients))
+        with torch.no_grad():
+            expected_up = torch.mm(source, layer.shared_gate_up_weight.t())[-1:].cpu()
+        torch.npu.synchronize()
+        dist.barrier()
+        capture_schedule = schedule(wait=0, warmup=0, active=1, repeat=1)
+        with tensor_dump.tensor_dump(selection, schedule=capture_schedule) as dumper:
+            observed = layer(source, ids, probabilities)
+            actual_gradients = torch.autograd.grad(observed, variables, upstream)
+            torch.npu.synchronize()
+            dumper.step()
+        for actual, reference in zip((observed, *actual_gradients), expected):
+            torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
+        manifest = dumper.last_manifest_paths[0]
+        values = _read_shared_tail_dump(manifest, tokens)
+        _check_shared_tail_values(values, expected_up, expected[1][-1:])
+        print(f"MEGA_MOE_SHARED_L1_PASS rank={common.RANK} tokens={tokens} manifest={manifest}", flush=True)
     finally:
         layer.close()
     dist.barrier()

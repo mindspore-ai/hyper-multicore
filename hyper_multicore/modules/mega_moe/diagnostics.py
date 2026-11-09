@@ -16,8 +16,9 @@
 
 __all__ = []
 
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from hyper_multicore.scheduler.config import (
     TaskDescC,
@@ -27,6 +28,34 @@ from hyper_multicore.scheduler.graph import OperatorNode, OpType
 
 
 MEGA_MOE_OWNER_LABEL = "Expert"
+
+
+def bind_shared_diagnostic_ports(graph: Any, config: Any, *, forward: bool) -> Any:
+    """Bind indirect shared operands to diagnostic-only launch sidecars."""
+    del config
+    graph = deepcopy(graph)
+    base = 29 if forward else 35
+    positions: dict[int, int] = {}
+    for operator in graph.topological_sort():
+        if not operator.name.startswith("shared_"):
+            slot = getattr(operator.fill_config, "shared_output_slot", -1)
+            if slot >= 0:
+                operator.outputs[0].param_position = base + slot
+                operator.outputs[0].tensor_type = 0
+                operator.param_positions[-1] = base + slot
+                operator.diagnostic_host_ports = True
+            continue
+        operator.inputs = [tensor for tensor in operator.inputs if tensor.name != "shared_group_list"]
+        for tensor in operator.inputs + operator.outputs:
+            tensor_id = id(tensor)
+            if tensor_id not in positions:
+                positions[tensor_id] = base + tensor.param_position
+            tensor.param_position = positions[tensor_id]
+            if tensor.name in {"shared_w1", "shared_w2", "shared_dw1", "shared_dw2"}:
+                tensor.shape = tensor.shape[1:]
+        operator.param_positions = [tensor.param_position for tensor in operator.inputs + operator.outputs]
+        operator.diagnostic_host_ports = True
+    return graph
 
 
 @dataclass(frozen=True)
@@ -49,10 +78,12 @@ def _resolve_expert_owner(
     operator: OperatorNode,
     task_desc: TaskDescC,
     raw_context: Any,
-) -> int:
+) -> Optional[int]:
     """Resolve the global expert ID from a graph operator and its concrete task."""
     context = _require_diagnostic_context(raw_context)
     topology = context.topology
+    if operator.name.startswith("shared_"):
+        return None
     rank_owner_base = topology.rank_id * topology.single_rank_expert_num
 
     if operator.op_type == OpType.GMM:
@@ -79,6 +110,10 @@ def _resolve_expert_owner(
             return rank_owner_base + expert_index % topology.single_rank_expert_num
         raise ValueError(f"MegaMoe AllToAll operator has no expert owner rule: {operator.name!r}")
 
+    if operator.op_type in (OpType.WEIGHTED_UNPERMUTE, OpType.REMOTE_WRITE_ACQUIRE,
+                            OpType.UNPERMUTE_REDUCE_GRAD, OpType.TOPK_WEIGHT_GRAD):
+        # Token reductions mix experts; they have no individual expert owner.
+        return None
     raise ValueError(f"MegaMoe operator type has no expert owner rule: {operator.op_type}")
 
 

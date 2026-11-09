@@ -15,12 +15,13 @@
 
 """Unit tests for native Torch adapter registration diagnostics."""
 
+import json
 from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 from hyper_multicore._loader import NativeComponentUnavailableError
@@ -48,12 +49,45 @@ class TestTorchOps(unittest.TestCase):
         _loader._loaded_kinds.clear()
         _loader._native_failure = None
 
+    def test_shared_indirect_payloads_record_launch_stream(self):
+        """Keep every indirect allocation alive on the stream that consumes its address."""
+        stream = object()
+        resources = [Mock(device=SimpleNamespace(type="npu")) for _ in range(5)]
+        for index, resource in enumerate(resources):
+            resource.data_ptr.return_value = 4096 * (index + 1)
+        addresses = ops.torch.zeros(2, dtype=ops.torch.int64)
+        with patch.object(ops.torch, "tensor", return_value=addresses), patch.object(
+                ops.torch.npu, "current_stream", return_value=stream):
+            runtime = ops.torch.zeros(64, dtype=ops.torch.uint8)
+            ops._bind_shared_resources(runtime, resources[0], resources[1], tuple(resources[2:]))
+        for resource in resources:
+            resource.record_stream.assert_called_once_with(stream)
+
+    def test_mega_moe_binary_metadata_matches_native_arity(self):
+        """Diagnostic storage stays an input instead of adding a phantom native output."""
+        root = Path(__file__).resolve().parents[3] / "hyper_multicore" / "ops"
+        schemas = (("hyper_mega_moe", 28, 6), ("hyper_mega_moe_grad", 32, 8))
+        for operator, inputs, outputs in schemas:
+            for soc in ("ascend910b", "ascend910_93"):
+                with self.subTest(operator=operator, soc=soc):
+                    path = root / operator / "op_host" / "config" / soc / f"{operator}_binary.json"
+                    variants = json.loads(path.read_text(encoding="utf-8"))["op_list"]
+                    self.assertTrue(variants)
+                    for variant in variants:
+                        self.assertEqual(len(variant["inputs"]), inputs)
+                        self.assertEqual(len(variant["outputs"]), outputs)
+                        self.assertIn("diagnostic_buffer", {value["name"] for value in variant["inputs"]})
+                        self.assertNotIn("diagnostic_buffer", {value["name"] for value in variant["outputs"]})
+
     @staticmethod
     def _backward_op(alias: str = "a") -> SimpleNamespace:
         """Build a real schema for the mutable receive and expert input-gradient slots."""
-        middle = ", ".join(f"Tensor input_{index}" for index in range(1, 12))
+        operands = ["Tensor(a!) dispatch"]
+        for index in range(1, 32):
+            mutation = alias if index == 12 else ("b" if index in (25, 29) else None)
+            operands.append(f"Tensor({mutation}!) input_{index}" if mutation else f"Tensor input_{index}")
         schema = ops.torch._C.parse_schema(
-            f"mega_moe_grad(Tensor(a!) dispatch, {middle}, Tensor({alias}!) gate_dx) -> ()"
+            f"mega_moe_grad({', '.join(operands)}) -> ()"
         )
         return SimpleNamespace(default=SimpleNamespace(_schema=schema))
 
@@ -84,7 +118,7 @@ class TestTorchOps(unittest.TestCase):
             patch.object(ops, "preload_vendor_library") as preload,
             patch.object(ops.torch.ops, "load_library") as load,
             patch.object(ops.torch.ops.hyper_multicore, "mega_moe_transport_version",
-                         return_value=1, create=True) as version,
+                         return_value=6, create=True) as version,
             patch.object(ops.torch.ops.hyper_multicore, "mega_moe_grad", self._backward_op(), create=True) as backward,
         ):
             ops._load_native()
@@ -106,7 +140,7 @@ class TestTorchOps(unittest.TestCase):
             self.backend.assert_called_once_with()
             preload.assert_called_once_with(Path("vendor"))
             load.assert_called_once_with("good.so")
-            for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):
+            for protocol, alias, message in ((0, "a", "transport ABI"), (6, "e", "storage reuse")):
                 _loader._loaded_kinds.clear()
                 _loader._native_failure = None
                 version.return_value = protocol
