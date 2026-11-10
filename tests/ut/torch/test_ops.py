@@ -127,5 +127,6 @@ with patch.object(torch.ops, 'load_library') as load:
     assert hasattr(ops, '_mega_gate_route') and hasattr(ops, '_mega_gate_route_grad')
     load.assert_not_called()
 """
-        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+        result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[3],
+                                capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

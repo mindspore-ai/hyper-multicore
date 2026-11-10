@@ -1,8 +1,8 @@
 # 测试指南
 
 `tests/` 包含 HyperMulticore 的 CPU 单测、真实 NPU 系统测试和共用测试工具。
-本文说明用例归属、添加方式、执行命令以及失败定位。默认从仓库根目录执行命令；
-仅 NPU 安装态验证在下文所述的源码外测试目录运行。
+本文说明用例归属、添加方式、执行命令以及失败定位。命令示例默认从仓库根目录执行；
+也可在 `tests/` 下使用相对用例路径。NPU 安装态验证在下文所述的源码外测试目录运行。
 
 ## 哪些用例放在这里
 
@@ -21,7 +21,8 @@
 ### 目录约定
 
 - `ut/test_*.py`、`ut/modules/`、`ut/torch/` 和 `ut/shmem/` 放置 CPU 单测，可直接由 pytest 执行。
-- `ut/build/` 集中放置构建、打包、依赖准备、环境复用及适配矩阵相关单测和夹具。
+- `ut/build/check_build.py` 独立执行轻量构建源码检查，不由 pytest 自动收集，详见[构建检查说明](ut/build/README.md)。
+- `ut/test_native_loading.py` 验证安装包的适配选择、完整性和加载状态，不依赖构建源码。
 - `common/` 放置共用工具和参考实现，不单独作为测试入口。
 
 NPU 用例位于 `torch/`：
@@ -34,6 +35,8 @@ NPU 用例位于 `torch/`：
 
 launcher 及其顶层导入必须保持轻量，不导入 Torch、torch-npu 或 HyperMulticore。
 框架和设备初始化放在 worker 中。复用现有组件的 launcher/helper，避免另建启动流程。
+公共 launcher 在 checkout 或安装态测试副本的根目录启动 torchrun，避免 `tests/torch` 遮蔽框架。
+rank 日志仍保存到调用者启动目录下的 `logs/`。
 
 ## 环境准备
 
@@ -48,8 +51,18 @@ python -m pip install --no-deps --no-build-isolation -e .
 ```
 
 CPU 单测不需要分配 NPU 卡；Torch 适配层的导入检查仍使用当前框架环境。
-C++ runtime ABI reader 检查需要支持 C++17 的 G++。部分用例读取仓库内的源码、锁文件和构建资源，
-因此 CPU 单测应在源码根目录运行，不使用下述只复制 `tests/` 的安装态目录。
+C++ runtime ABI reader 检查需要支持 C++17 的 G++。示例模型检查需要配套的 `examples/` 源码。
+构建源码检查单独执行，不要求安装态 UT 具备 native 源码、CMake 配置或仓库检查脚本。
+支持从仓库根目录或 `tests/` 启动，例如：
+
+```bash
+# 仓库根目录
+python -m pytest tests/ut/examples/mhc/test_mhc_model.py -q
+
+# tests/ 目录
+cd tests
+python -m pytest ut/examples/mhc/test_mhc_model.py -q
+```
 
 ### NPU 系统测试
 
@@ -95,7 +108,7 @@ source "$(command -v hyper_multicore_set_env.bash)"
 # 查看 CPU 用例，执行全部单测，或只运行一个文件。
 python -m pytest tests/ut --collect-only -q
 python -m pytest tests/ut -q
-python -m pytest tests/ut/build/test_artifacts.py -q
+python -m pytest tests/ut/test_native_loading.py -q
 ```
 
 可以用 `::test_name` 选择函数；对于 unittest 类，使用 `::ClassName::test_name`。
@@ -103,20 +116,17 @@ python -m pytest tests/ut/build/test_artifacts.py -q
 
 ### 构建系统定向回归
 
-构建相关测试统一位于 `ut/build/`，按框架环境、native 编译调度、发布、工作区与命令、
-适配加载和 CLI 等职责维护。它们使用临时目录、合成 wheel 和明确的 worker 替身，
-不下载框架、不创建真实 venv、不编译 native 或启动 NPU 计算。
+依赖源码的轻量构建检查使用独立入口；安装态适配加载检查由普通 pytest UT 执行。
+用例归属、编写要求和耗时约束见[构建检查规范](ut/build/README.md)。
 
 ```bash
-python -m pytest tests/ut/build tests/ut/test_loader.py -q
+python tests/ut/build/check_build.py
+python -m pytest tests/ut/test_native_loading.py tests/ut/test_loader.py -q
 ```
 
-新增测试优先覆盖可观察行为：venv/vendor 复用、SDK/ops 和适配对重编、失败不发布、制品提交边界、目录保护和加载选择。
-同一契约保留主要调用链上的代表性回归；不在多个层级重复模拟同一异常，
-不为每个路径或异常类型展开笛卡尔积，也不固定内部计时字段、调用次数和日志措辞。
-共享环境与依赖夹具放在 `ut/build/_build_test_support.py`；payload 布局夹具统一复用 `ut/build/test_artifacts.py`。
-构建测试调整后集中运行这组 CPU 回归，失败修正仅重测受影响范围。
-只有实际修改 native 输入、环境准备或运行行为时，才补对应的构建或设备验证。
+构建检查不由 pytest 自动收集，执行普通 UT 不能替代上面的独立命令。
+安装态加载用例使用自包含的 payload 夹具，不要求具备 C++ 源码、CMake 文件或仓库检查脚本。
+实际 native 编译、框架兼容性和设备数值使用对应的构建或设备验收验证。
 
 ### NPU 用例执行
 
@@ -197,21 +207,8 @@ python -m pytest tests/torch -v --junitxml=logs/npu.xml
 5. **定向验证。** 先 collect 新入口，再运行该用例及受影响的组件测试。新增入口改变覆盖或设备需求时，
    同步更新上表；不要通过放宽阈值或无条件 skip 掩盖失败。
 
-例如，给 Gate 添加 worker 函数 `test_mega_gate_new_case` 后，可在已有
-[test_mega_gate.py](torch/test_mega_gate.py) 中复用 `_run_worker` 注册入口：
-
-```python
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level1",
-    card_mark="onecard",
-    essential_mark="essential",
-)
-def test_mega_gate_new_case() -> None:
-    _run_worker("test_mega_gate_new_case")
-```
-
-上例是新增入口模板，使用前必须在 [_test_mega_gate.py](torch/_test_mega_gate.py) 中实现对应 worker。
+Gate 用例参考现有 [launcher](torch/test_mega_gate.py) 的标记和 `_run_worker` 调用方式，
+在对应 [worker](torch/_test_mega_gate.py) 中实现设备计算和断言后注册入口。
 其他组件参考现有 [MoE launcher](torch/test_mega_moe.py) 和 [SHMEM launcher](torch/shmem/test_binding.py)。
 新组件通过 [run_multicore_case](common/multicore/_case_launcher.py) 启动 worker；
 `num_proc` 是进程数，`num_devices` 可声明比进程数更多的设备需求。

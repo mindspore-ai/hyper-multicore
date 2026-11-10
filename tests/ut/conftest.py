@@ -15,15 +15,12 @@
 """Allow multicore Host unit tests to collect without an installed NPU backend."""
 
 import importlib.util
+from pathlib import Path
 import sys
 from types import ModuleType
 from unittest import mock
 
 import pytest
-import torch
-from torch import (
-    Tensor,
-)
 
 
 def _unmocked_npu_call(*args, **kwargs):
@@ -36,6 +33,11 @@ def pytest_configure(config: pytest.Config) -> None:
     Args:
         config: Pytest configuration used to install a fail-closed CPU-only NPU stub.
     """
+    # `python -m pytest` from tests/ must not import tests/torch as the framework.
+    tests_directory = Path(__file__).resolve().parents[1]
+    sys.path[:] = [path for path in sys.path if Path(path or ".").resolve() != tests_directory]
+    torch = importlib.import_module("torch")
+
     if "torch_npu" in sys.modules or importlib.util.find_spec("torch_npu") is not None:
         return
     backend = ModuleType("torch_npu")
@@ -52,6 +54,6 @@ def pytest_configure(config: pytest.Config) -> None:
     npu_patcher = mock.patch.object(torch, "npu", npu, create=True)
     npu_patcher.start()
     config.add_cleanup(npu_patcher.stop)
-    tensor_patcher = mock.patch.object(Tensor, "is_npu", property(lambda tensor: False), create=True)
+    tensor_patcher = mock.patch.object(torch.Tensor, "is_npu", property(lambda tensor: False), create=True)
     tensor_patcher.start()
     config.add_cleanup(tensor_patcher.stop)

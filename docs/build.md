@@ -59,6 +59,17 @@ bash hyper_multicore/build.sh --soc-list ascend910b --jobs 24
 | 公共资源 | 使用调用者 CANN 工具环境 | 使用调用者 CANN 工具环境 |
 | 适配对 | 编译一组 | 按预算并行编译全部配置目标 |
 | wheel | 包含当前 PTA 标签 | 不带单一 PTA 标签 |
+| 构建源码检查 | 默认关闭，`--tests on` 开启 | 默认开启，`--tests off` 关闭 |
+
+`--tests on/off` 控制[轻量构建源码检查](../tests/ut/build/README.md)，显式设置覆盖模式默认值。
+检查使用入口 Python，在获得构建锁、初始化日志和输出事务后执行一次，先于环境准备及 native 编译。
+它不安装测试框架、不执行真实编译或设备操作；失败时停止构建并沿用提交前清理规则。
+关闭该检查不取消实际编译、加载检查或制品完整性校验。
+
+```bash
+bash build.sh --tests on
+bash build.sh --all --tests off
+```
 
 默认路径不读取框架矩阵，也不按框架版本格式、分支或上下限拒绝构建。源码框架无需发行元数据，
 版本不可得时记为 `unknown`。日志展示实际 Python、Torch/PTA 版本和安装位置。
@@ -155,7 +166,8 @@ Python ABI 和 CPU 架构由 wheel 标签约束。
 
 运行时按 Torch/PTA 数字分支、Python ABI、CPU 架构及 C++ ABI 唯一选择一组适配对。
 开发版日期、post 和 local 后缀不作为相等门禁；无法提取数字分支的标识按不透明标识匹配。
-运行 PTA 可早于构建 post，CANN 不必与构建版本相同；实际兼容性取决于运行环境的框架、CANN 和驱动。
+这些选择规则不代表二进制兼容保证。不同 post 的 PTA 仍可能存在执行桥符号差异，
+运行环境须提供所选适配库实际依赖的接口。CANN 版本不要求相等，仍需与框架和驱动兼容。
 内部文件集合、哈希及算子注册仍需匹配，加载失败不会跨分支尝试其他适配对。
 
 vendor 位于 `lib/vendors/`，公共 SHMEM 库位于 `shmem/lib/`，适配对位于 `adapters/<ID>/`。
@@ -190,15 +202,16 @@ python -m pip show -f hyper-multicore
 ```
 
 修改现有文件时保留 `schema_version`、`indexes` 和 `build_requirements`。
-可通过 `indexes.dependencies_extra` 配置依赖安装的额外索引，例如：
+可通过 `indexes.dependencies_extra` 配置框架下载及依赖安装共用的额外索引，例如：
 
 ```json
 "dependencies_extra": ["https://mirrors.huaweicloud.com/repository/pypi/simple"]
 ```
 
-每个地址对应一组 `pip install --extra-index-url`；缺失或空列表时不追加索引。
-主源和额外索引共同参与选包，不按配置顺序作失败回退。该设置仅用于新建 venv 的依赖安装，
-Torch/PTA wheel 仍从各自指定的主源下载。增删额外索引不改变环境身份，已有成功 venv 继续复用；
+每个地址在 Torch/PTA 的 `pip download` 和依赖的 `pip install` 中均对应一组
+`--extra-index-url`；缺失或空列表时不追加索引。Torch、PTA 及依赖分别保留各自配置的主源，
+主源和额外索引共同参与选包，不按配置顺序作失败回退，也不保证优先从额外索引下载。
+准确框架版本要求保持不变。增删额外索引不改变环境身份，已有成功 venv 继续复用；
 `ready.json` 保留创建时的请求和安装来源。默认开发构建不读取该配置。
 
 pip 按当前 Python 和平台从各自索引选择准确框架 wheel，再解析必要依赖；缺少兼容 wheel 时失败，

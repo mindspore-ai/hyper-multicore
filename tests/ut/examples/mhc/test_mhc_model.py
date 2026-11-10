@@ -21,6 +21,7 @@ from contextlib import redirect_stderr
 import importlib
 import io
 import os
+from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ import torch
 from examples._training import build_optimizer
 from examples.mhc import benchmark
 from examples.mhc import mhc as mhc_module
+from examples.mhc.benchmark import _build_workloads, _compare_mhc_component
 from examples.mhc.mhc import MhcBoundary
 from examples.mhc.model import (
     MhcTransformerConfig, MhcTransformerModel, _finish_state, _initialize_state,
@@ -160,7 +162,7 @@ class TestDenseMhcModel(unittest.TestCase):
         with (patch("hyper_multicore.modules.mega_mhc.module.hyper_mega_mhc",
                     side_effect=_native_mhc_reference),
               patch.object(benchmark, "_RTOL", 0), patch.object(benchmark, "_ATOL", 0)):
-            result = benchmark._compare_mhc_component(models, self._config(), 42, torch.device("cpu"))
+            result = _compare_mhc_component(models, self._config(), 42, torch.device("cpu"))
         for backend in ("common", "mega"):
             self.assertEqual(result[f"{backend}_forward"]["tensor_count"], 5)
             self.assertEqual(result[f"{backend}_gradients"]["tensor_count"], 9)
@@ -187,7 +189,7 @@ class TestDenseMhcModel(unittest.TestCase):
         """
         with (patch.dict(os.environ, {"WORLD_SIZE": "8"}), patch.object(torch.npu, "set_device") as select,
               self.assertRaisesRegex(ValueError, "one device")):
-            benchmark._build_workloads(benchmark.parse_args([]))  # pylint: disable=protected-access
+            _build_workloads(benchmark.parse_args([]))
         select.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -203,7 +205,7 @@ class TestDenseMhcModel(unittest.TestCase):
                   patch.object(benchmark, "_resolve_core_counts", return_value=cores),
                   patch.object(benchmark, "MhcTransformerModel") as build,
                   self.assertRaisesRegex(ValueError, f"at least {minimum} tokens")):
-                benchmark._build_workloads(benchmark.parse_args(["--tokens", str(tokens)]))
+                _build_workloads(benchmark.parse_args(["--tokens", str(tokens)]))
             build.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -236,7 +238,8 @@ assert not any(name.startswith('examples.moe') for name in sys.modules)
 assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
 assert not dist.is_initialized()
 """
-        subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+        subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[4],
+                       check=True, capture_output=True, text=True)
 
 
 class TestMhcBoundary(unittest.TestCase):
