@@ -2,8 +2,8 @@
   "schema_version": 2,
   "indexes": {
     "torch": "https://download.pytorch.org/whl/cpu",
-    "pta": "https://pypi.org/simple",
-    "dependencies": "https://pypi.org/simple"
+    "pta": "https://mirrors.huaweicloud.com/repository/pypi/simple",
+    "dependencies": "https://mirrors.huaweicloud.com/repository/pypi/simple"
   },
   "build_requirements": [
     "numpy>=1.26,<2",
