@@ -24,6 +24,7 @@ __all__ = [
 import importlib.util
 import sys
 from pathlib import Path
+import os
 from typing import Any, Final
 
 from hyper_multicore._loader import (
@@ -78,3 +79,11 @@ def _torch_modules() -> tuple[Any, Any]:
     import torch.distributed as dist  # pylint: disable=C0415
 
     return torch, dist
+
+
+def _udma_qps_per_peer() -> int:
+    """Return the configured number of exclusively owned queues per peer."""
+    value = os.environ.get("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM", "32")
+    if value not in ("1", "8", "16", "32"):
+        raise ValueError("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM must be 1, 8, 16 or 32")
+    return int(value)

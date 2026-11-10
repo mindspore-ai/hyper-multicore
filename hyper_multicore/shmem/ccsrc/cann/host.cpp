@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <iomanip>
 #include <iterator>
 #include <sstream>
@@ -195,6 +196,10 @@ runtime::Result<data_op_engine_type_t> DataEngineMask(runtime::DataEngine data_e
   if (data_engine == runtime::DataEngine::Mte) {
     return runtime::Result<data_op_engine_type_t>::Success(ACLSHMEM_DATA_OP_MTE);
   }
+  if (data_engine == runtime::DataEngine::MteUdma) {
+    return runtime::Result<data_op_engine_type_t>::Success(
+        static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA));
+  }
   return runtime::Result<data_op_engine_type_t>::Failure(
     InvalidArgument("data_engine must be a supported Runtime DataEngine value"));
 }
@@ -268,6 +273,36 @@ runtime::Status initialize(const InitOptions &options) {
   const std::string_view tls_detail = config_store_tls_capture.finish();
   if (tls_status != ACLSHMEM_SUCCESS) {
     return CannFailure("aclshmemx_set_conf_store_tls", tls_status, tls_detail);
+  }
+
+  if (options.data_engine == runtime::DataEngine::MteUdma) {
+    uint32_t qp_count = 32;
+    const char *qp_setting = std::getenv("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM");
+    if (qp_setting != nullptr) {
+      if (std::strcmp(qp_setting, "1") == 0) {
+        qp_count = 1;
+      } else if (std::strcmp(qp_setting, "8") == 0) {
+        qp_count = 8;
+      } else if (std::strcmp(qp_setting, "16") == 0) {
+        qp_count = 16;
+      } else if (std::strcmp(qp_setting, "32") != 0) {
+        return InvalidArgument("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM must be 1, 8, 16 or 32");
+      }
+    }
+    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, qp_count);
+    if (qp_status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_set_qp_num", qp_status);
+    }
+    if (qp_setting != nullptr) {
+      uint32_t actual_qps = 0;
+      const int32_t get_status = aclshmemx_get_qp_num(ACLSHMEM_DATA_OP_UDMA, &actual_qps);
+      if (get_status != ACLSHMEM_SUCCESS) {
+        return CannFailure("aclshmemx_get_qp_num", get_status);
+      }
+      if (actual_qps != qp_count) {
+        return InvalidArgument("UDMA QP count does not match the requested configuration");
+      }
+    }
   }
 
   aclshmemx_init_attr_t attributes{};

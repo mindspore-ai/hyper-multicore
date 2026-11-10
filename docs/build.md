@@ -1,7 +1,22 @@
 # 构建与安装
 
-从源码构建 native wheel，或将已有 wheel 安装到配套环境。CPU/NPU 用例的执行和排错见
+源码可直接构建到本仓 build 并激活运行；wheel 作为可选发布方式保留。CPU/NPU 用例的执行和排错见
 [测试指南](../tests/README.md)。
+
+## 源码目录内构建与激活
+
+在已准备 CANN/Torch/PTA 的环境中，于本仓根目录执行：
+
+```bash
+bash build.sh --soc-list ascend950 --jobs 8 --native-only
+source activate.bash
+hyper_multicore_build_info --json
+```
+
+`--native-only` 不生成或安装 wheel，正式制品在 `build/native/payload/hyper_multicore`。
+携带本仓源码及该目录到兼容环境后重新 source 即可；位置可以改变。
+激活脚本不改变工作目录、不下载、不编译、不安装、不创建软链接。
+后续关于 wheel 的章节是保留的可选发布能力，不是上述流程的前提。
 
 ## 环境要求
 

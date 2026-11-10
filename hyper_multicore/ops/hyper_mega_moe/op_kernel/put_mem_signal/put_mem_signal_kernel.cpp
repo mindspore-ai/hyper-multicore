@@ -17,6 +17,7 @@
 #include "data_plane/rma.h"
 #include "data_plane/sync.h"
 #include "kernel_operator.h"
+#include "runtime/transport_credits.h"
 #include "shmem.h"
 
 using namespace AscendC;
@@ -65,7 +66,7 @@ class PutMemSignalKernel {
   __aicore__ inline void Process() {
     // Empty tiles still satisfy remote dependencies without resolving data addresses.
     if (size_ == 0) {
-      shmem_data_plane::fence();
+      aclshmemx_mte_quiet();
       shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
                                signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
                                target_pe_);
@@ -78,6 +79,38 @@ class PutMemSignalKernel {
     if (aiv_idx_ == aiv_num_ - 1) {
       size_per_core = size_ - size_per_core * aiv_idx_;
     }
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    if (target_pe_ != aclshmem_my_pe()) {
+      // The Host queue validates a single owner for each peer/QP pair.
+      const uint32_t worker = AscendC::GetBlockIdx();
+      if (worker % 2 == 0 || worker / 2 >= 32) {
+        AscendC::Trap();
+      }
+      const uint32_t qp_count = aclshmemi_udma_qp_info_fetch()->qp_num;
+      if (qp_count != 1 && qp_count != 8 && qp_count != 16 && qp_count != 32) {
+        AscendC::Trap();
+      }
+      const uint32_t qp = MulticoreRuntime::UdmaQpForWorker(worker, qp_count);
+      AscendC::TBuf<AscendC::TPosition::VECOUT> staging;
+      pipe.InitBuffer(staging, ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE);
+      auto scratch = reinterpret_cast<__ubuf__ uint8_t *>(staging.Get<uint8_t>().GetPhyAddr());
+      uint64_t remaining = size_per_core * sizeof(T);
+      auto destination = reinterpret_cast<__gm__ uint8_t *>(target_ptr);
+      auto source = reinterpret_cast<__gm__ uint8_t *>(src_ptr);
+      while (remaining > 0) {
+        const uint32_t bytes = remaining < (1ULL << 28) ? remaining : (1ULL << 28);
+        aclshmemx_udma_qp_put_nbi<uint8_t>(destination, source, scratch, bytes, target_pe_, qp, 0);
+        aclshmemx_udma_qp_quiet(target_pe_, qp);
+        destination += bytes;
+        source += bytes;
+        remaining -= bytes;
+      }
+      shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
+                               signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
+                               target_pe_);
+      return;
+    }
+#endif
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
     /* CopyUB Config Set */
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
@@ -119,9 +152,9 @@ class PutMemSignalKernel {
     // Write signal after data transfer
     auto signal_ptr = signal_ + signal_offset_;
     if (non_blocking_) {
-      shmem_data_plane::fence();
+      aclshmemx_mte_quiet();
     } else {
-      shmem_data_plane::fence();
+      aclshmemx_mte_quiet();
     }
     // Sync ensure corresponding tasks are done
     if (aiv_num_ > 1) {

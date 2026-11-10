@@ -26,14 +26,16 @@ if TYPE_CHECKING:
     from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
 
 __all__ = [
-    "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaKernelDiagnostics",
+    "MegaGate", "MegaMhc", "MegaMoeExperts", "MXFP8MegaMoeExperts", "MegaKernelDiagnostics",
     "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
 ]
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     """Load optional multicore modules only when their public API is requested."""
-    if name == "MegaMhc":
+    if name == "MXFP8MegaMoeExperts":
+        from hyper_multicore.modules.mega_moe.mxfp8_module import MXFP8MegaMoeExperts as value
+    elif name == "MegaMhc":
         from hyper_multicore.modules.mega_mhc.module import (  # pylint: disable=import-outside-toplevel
             MegaMhc as value,
         )

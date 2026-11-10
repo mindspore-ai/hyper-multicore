@@ -37,6 +37,7 @@ class DiagnosticSpec:
     execution_mode: str = "event_driven"
     vector_worker_stride: int = 2
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None
+    active_vector_workers: int | None = None
 
 
 @dataclass(frozen=True)

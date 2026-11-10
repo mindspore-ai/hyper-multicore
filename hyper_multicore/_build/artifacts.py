@@ -233,7 +233,7 @@ def _validate_vendor_resources(root: Path, soc_list: list[str], host_arch: str) 
     if (
         not isinstance(soc_list, list)
         or not soc_list
-        or any(soc not in {"ascend910b", "ascend910_93"} for soc in soc_list)
+        or any(soc not in {"ascend910b", "ascend910_93", "ascend950"} for soc in soc_list)
     ):
         raise RuntimeError(f"Missing or unsupported payload SoC list: {soc_list}")
     if host_arch not in {"aarch64", "x86_64"}:
@@ -247,7 +247,8 @@ def _validate_vendor_resources(root: Path, soc_list: list[str], host_arch: str) 
     for soc in soc_list:
         indexes = [vendor / f"kernel/config/{soc}/binary_info_config.json"]
         required = [*host_libraries, vendor / f"config/{soc}/aic-{soc}-ops-info.json", *indexes]
-        for operator in _VENDOR_OPERATORS:
+        operators = (*_VENDOR_OPERATORS, "hyper_mega_moe_mxfp8", "hyper_mega_moe_mxfp8_grad") if soc == "ascend950" else _VENDOR_OPERATORS
+        for operator in operators:
             index = vendor / f"kernel/config/{soc}/{operator}.json"
             required.append(index)
             indexes.append(index)

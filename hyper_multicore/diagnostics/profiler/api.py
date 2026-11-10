@@ -44,6 +44,7 @@ class _RawInvocation:
     direction: str
     step: int
     invocation_id: int
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -68,7 +69,7 @@ class _TraceAccumulator:
         shift_us = (metadata["anchorCycle"] - self.global_anchor) / metadata["cycleFrequencyMHz"]
         self.dropped_count += metadata["droppedRecordCount"]
         self.record_count += metadata["recordCount"]
-        self.invocation_metadata.append({
+        invocation_metadata = {
             "invocationId": invocation.invocation_id,
             "step": invocation.step,
             "direction": invocation.direction,
@@ -78,7 +79,13 @@ class _TraceAccumulator:
             "anchorCycle": metadata["anchorCycle"],
             "recordCount": metadata["recordCount"],
             "droppedRecordCount": metadata["droppedRecordCount"],
-        })
+        }
+        for key in ('workerCapacities', 'profileBufferBytes'):
+            if key in metadata:
+                invocation_metadata[key] = metadata[key]
+        if invocation.tags:
+            invocation_metadata['tags'] = dict(invocation.tags)
+        self.invocation_metadata.append(invocation_metadata)
         self._append_events(trace["traceEvents"], invocation, shift_us)
 
     def _append_events(
@@ -102,6 +109,7 @@ class _TraceAccumulator:
                 "invocation_id": invocation.invocation_id,
                 "step": invocation.step,
                 "direction": invocation.direction,
+                "scope": dict(invocation.tags),
             }
             self.trace_events.append(copied_event)
 
@@ -121,7 +129,7 @@ class _ProfileCall(DiagnosticCall):
         profile_buffer_key: tuple[int, int] | None = None,
         direction: str = "",
         step: int = 0,
-        invocation_id: int = 0,
+        invocation_id: int = 0, tags: dict[str, str] | None = None,
     ) -> None:
         """Store launch arguments and optional active-session bookkeeping."""
         super().__init__(LaunchArguments(
@@ -134,6 +142,7 @@ class _ProfileCall(DiagnosticCall):
         self.direction = direction
         self.step = step
         self.invocation_id = invocation_id
+        self.tags = dict(tags or {})
         self.finished = False
 
     def complete(self) -> None:
@@ -284,13 +293,13 @@ class TorchMegaKernelProfiler:
         if runtime is None:
             runtime = _PreparedProfileRuntime(context.runtime)
             self._profile_runtimes[context.runtime] = runtime
-        return self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        return self.acquire_call(runtime, context.fallback_event_counters, context.direction, tags=context.tags)
 
     def acquire_call(
         self,
         runtime: _PreparedProfileRuntime,
         event_counters: Any,
-        direction: str,
+        direction: str, tags: dict[str, str] | None = None,
     ) -> _ProfileCall:
         """Reserve a profiling buffer and register one pending kernel call.
 
@@ -314,7 +323,7 @@ class TorchMegaKernelProfiler:
             direction=direction,
             step=self._step,
             profile_buffer_key=profile_buffer_key,
-            invocation_id=invocation_id,
+            invocation_id=invocation_id, tags=tags,
         )
         self._pending.append(call)
         return call
@@ -406,7 +415,7 @@ class TorchMegaKernelProfiler:
                         data=host_data,
                         direction=call.direction,
                         step=call.step,
-                        invocation_id=call.invocation_id,
+                        invocation_id=call.invocation_id, tags=dict(call.tags),
                     )
                 )
             self._release_profile_buffer(call, cache=True)

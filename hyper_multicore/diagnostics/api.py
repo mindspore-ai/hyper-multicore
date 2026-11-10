@@ -55,6 +55,7 @@ class MegaKernelDiagnostics:
     def launch(
         self, parameters: Sequence[torch.Tensor | None], *, direction: str,
         fallback_event_counters: torch.Tensor | None = None,
+        tags: dict[str, str] | None = None,
     ) -> DiagnosticCall:
         """Select exactly one tool, or return an ordinary no-op context.
 
@@ -65,8 +66,9 @@ class MegaKernelDiagnostics:
             parameters: Complete native ABI bindings for this invocation.
             direction: Forward or backward invocation direction.
             fallback_event_counters: Existing execution-owned event counters, if any.
+            tags: Optional invocation identity such as model layer and recompute phase.
         """
-        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters)
+        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters, tags=tags)
         session = _get_active_session()
         if session is None or not session.is_capture_enabled():
             return DiagnosticCall(context.ordinary_arguments())
@@ -84,6 +86,7 @@ def prepare_mega_kernel_diagnostics(
     owner_context: Any = None,
     execution_mode: str = "event_driven", vector_worker_stride: int = 2,
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None,
+    active_vector_workers: int | None = None,
 ) -> MegaKernelDiagnostics:
     """Prepare only normal execution storage and defer all diagnostic graph work.
 
@@ -102,6 +105,7 @@ def prepare_mega_kernel_diagnostics(
         owner_context: Business context passed unchanged to the owner callback.
         execution_mode: Event-driven queues or a broadcast ``aiv_pipeline``.
         vector_worker_stride: Two for paired MoE workers, one for all AIV workers.
+        active_vector_workers: Optional active AIV count for a partial-worker policy.
         graph_adapter: Optional lazy business-owned binding of graph ports to the
             real native ABI. It receives a private Host config; ordinary storage
             and the caller's graph must remain unchanged.
@@ -134,7 +138,7 @@ def prepare_mega_kernel_diagnostics(
     runtime = PreparedDiagnosticRuntime(
         graph, runtime_config, DiagnosticSpec(
             kernel_name, owner_label, owner_resolver, owner_context,
-            execution_mode, vector_worker_stride, graph_adapter,
+            execution_mode, vector_worker_stride, graph_adapter, active_vector_workers,
         ),
         parameter_count=parameter_count, tensor_factory=tensor_factory, rank=rank, device_id=device_id,
     )

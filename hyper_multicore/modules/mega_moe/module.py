@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = ["MegaMoeExperts"]
 
 import math
+import os
 import struct
 from collections.abc import Mapping
 from dataclasses import replace
@@ -28,16 +29,17 @@ import torch
 import torch.distributed as dist
 
 from hyper_multicore import _collective, shmem
+from hyper_multicore.shmem._runtime import _udma_qps_per_peer
 
 from ..module import MulticoreModule
-from .function import execute_mega_moe_with_permutation
+from .function import _execute_mega_moe_nograd, execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
+from .preprocess import resolve_count_policy, validate_count_policy
 from .route import prepare_topk_route, restore_topk_output
+from .serial_resources import register_serial_executor, share_serial_resources_before_first_use
 from .spec import (
-    _COMMUNICATION_SPLIT,
-    _resolve_capacity_factors,
-    bind_mega_moe_spec,
+    _COMMUNICATION_SPLIT, _SPLIT_ALIGNMENT, _align_capacity, _resolve_capacity_factors, bind_mega_moe_spec,
 )
 from .workspace import MegaMoeWorkspace
 
@@ -118,6 +120,8 @@ def _resolve_ep_size(ep_size: int | None, ep_group: Any | None) -> int:
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
+    _extra_manifest_fields: tuple[str, ...] = ()
+
     def __init__(
         self,
         specification: dict[str, Any],
@@ -127,6 +131,8 @@ class _MegaMoeExecutionResources:
         active_specifications: tuple[Mapping[str, Any], ...],
     ) -> None:
         """Bind resources once to the first NPU tensor."""
+        if _udma_qps_per_peer() != 32:
+            raise ValueError('The 16-QP experiment supports MXFP8 window2, not the BF16 execution plan')
         self.spec = bind_mega_moe_spec(specification, tensor)
         self._token_capacity = self.spec.local_num_tokens
         self._plans = {}
@@ -149,6 +155,8 @@ class _MegaMoeExecutionResources:
                 """Build and bind local resources before converging construction results."""
                 self.plan = (build_mega_moe_plan(self.spec, tensor.device)
                              if not self.spec.dynamic_tokens else None)
+                from .udma_order import validate_device_transport
+                validate_device_transport(tensor)
                 self.workspace = MegaMoeWorkspace(shared=shared)
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
@@ -181,6 +189,7 @@ class _MegaMoeExecutionResources:
             self.spec.expert_weight_layout,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
+            _udma_qps_per_peer(),
         )
 
     def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
@@ -210,7 +219,11 @@ class _MegaMoeExecutionResources:
                   "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16",
-                    tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
+                    tuple(tuple(spec.get(key) for key in fields) for spec in specifications),
+                    _udma_qps_per_peer(),
+                    tuple((spec.get("route_count_policy", "baseline"),
+                           tuple(spec.get(key) for key in self._extra_manifest_fields))
+                          for spec in specifications))
         # Resource groups must have the same order as their symmetric allocations.
         manifests = [None] * self.spec.ep_size
         dist.all_gather_object(manifests, manifest, group=self.spec.ep_group)
@@ -322,6 +335,7 @@ class MegaMoeExperts(MulticoreModule):
     def __init__(
         self,
         *,
+        local_num_tokens: int | None = None,
         hidden_size: int,
         intermediate_size: int,
         num_experts: int,
@@ -340,6 +354,7 @@ class MegaMoeExperts(MulticoreModule):
         """Initialize local expert parameters and a lazy execution owner.
 
         Args:
+            local_num_tokens: Optional fixed local workload; None preserves automatic token sizing.
             hidden_size: Input and output hidden dimension.
             intermediate_size: SwiGLU intermediate dimension per expert.
             num_experts: Global routed-expert count.
@@ -370,7 +385,7 @@ class MegaMoeExperts(MulticoreModule):
                 can be active in SHMEM per process.
         """
         specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+            "local_num_tokens": _COMMUNICATION_SPLIT if local_num_tokens is None else local_num_tokens,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
@@ -385,7 +400,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        specification["auto_tokens"] = True
+        specification["auto_tokens"] = local_num_tokens is None
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -414,6 +429,10 @@ class MegaMoeExperts(MulticoreModule):
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
         self._ep_group = specification["ep_group"]
+        nograd_policy = os.environ.get("HYPER_MULTICORE_BF16_NOGRAD_NO_COPY", "0") if type(self) is MegaMoeExperts else "0"
+        if nograd_policy not in ("0", "1"):
+            raise ValueError("HYPER_MULTICORE_BF16_NOGRAD_NO_COPY must be 0 or 1")
+        self.nograd_no_copy = nograd_policy == "1"
         if create_parameters:
             self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
                 self.local_experts, self.hidden_size, self.intermediate_size, self.expert_weight_layout,
@@ -421,6 +440,14 @@ class MegaMoeExperts(MulticoreModule):
         else:
             self.register_parameter("gate_up_weight", None)
             self.register_parameter("down_weight", None)
+        self._serial_execution_sharing = register_serial_executor(
+            self, os.environ.get("HYPER_MULTICORE_MOE_SHARE_EXECUTION_RESOURCES", "0"))
+
+    def _get_execution_resources(self, tensor: Any) -> Any:
+        """Group compatible serial layers before the first workspace allocation."""
+        if self._serial_execution_sharing:
+            share_serial_resources_before_first_use(self)
+        return super()._get_execution_resources(tensor)
 
     @classmethod
     def _resolve_specification(cls, specification: dict[str, Any]) -> dict[str, Any]:
@@ -432,6 +459,12 @@ class MegaMoeExperts(MulticoreModule):
                 "or 'EOI' ([experts, out_features, in_features]), "
                 f"got {expert_weight_layout!r}."
             )
+        count_policy = resolve_count_policy(os.environ, bf16=cls is MegaMoeExperts)
+        validate_count_policy(count_policy, specification["num_experts"], specification.get("max_local_num_tokens"))
+        if count_policy == "histc" and specification["local_num_tokens"] * specification["top_k"] > 2**24:
+            raise ValueError("Histogram preprocessing requires at most 2**24 local routed slots")
+        if count_policy != "baseline":
+            specification = dict(specification, route_count_policy=count_policy)
         initial_capacity_factor, capacity_growth_factor = _resolve_capacity_factors(
             specification["dispatch_mode"],
             specification["initial_capacity_factor"],
@@ -494,9 +527,9 @@ class MegaMoeExperts(MulticoreModule):
         _validate_swiglu_limit(swiglu_limit)
         for name, split in (("dispatch_split", dispatch_split), ("combine_split", combine_split)):
             if (not isinstance(split, int) or isinstance(split, bool)
-                    or split <= 0 or split % _COMMUNICATION_SPLIT):
+                    or split <= 0 or split % _SPLIT_ALIGNMENT):
                 raise ValueError(
-                    f"{name} must be a positive integer multiple of {_COMMUNICATION_SPLIT}, got {split!r}.")
+                    f"{name} must be a positive integer multiple of {_SPLIT_ALIGNMENT}, got {split!r}.")
             if not auto_tokens and local_num_tokens % split:
                 raise ValueError(f"local_num_tokens ({local_num_tokens}) must be divisible by {name} ({split}).")
 
@@ -612,6 +645,7 @@ class MegaMoeExperts(MulticoreModule):
             rebuild and compare the histogram.
         """
         weights = ((self.gate_up_weight, self.down_weight) if expert_weights is None else expert_weights)
+        nograd_no_copy = self.nograd_no_copy and not torch.is_grad_enabled()
         hidden_flat = self._validate_forward_inputs(
             hidden_states,
             topk_ids,
@@ -661,7 +695,13 @@ class MegaMoeExperts(MulticoreModule):
                 )
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            plan = (resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+                    if resources.spec.dynamic_tokens else resources.plan)
+            if nograd_no_copy:
+                return _execute_mega_moe_nograd(
+                    weights[0], weights[1], route, plan, resources.workspace, topk_weights,
+                    workspace_claimed=pull,
+                ).reshape_as(hidden_states)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,

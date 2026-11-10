@@ -17,6 +17,8 @@ if(ASCEND_COMPUTE_UNIT STREQUAL "ascend910b")
     set(KERNEL_COMPUTE_UNIT ascend910b1)
 elseif(ASCEND_COMPUTE_UNIT STREQUAL "ascend910_93")
     set(KERNEL_COMPUTE_UNIT ascend910_9391)
+elseif(ASCEND_COMPUTE_UNIT STREQUAL "ascend950")
+    set(KERNEL_COMPUTE_UNIT ascend950pr_9599)
 else()
     message(
         FATAL_ERROR
@@ -36,7 +38,10 @@ npu_op_kernel_library(ascendc_kernels
 
 npu_op_kernel_options(ascendc_kernels ALL OPTIONS
     -I${CANN_OP_COMMON_INCLUDE}
+    -I${HP_SHMEM_SDK_ROOT}/src
     -I${HP_SHMEM_SDK_ROOT}/include
+    -I${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_kernel
+    -I${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_kernel/cgmct/utils
     -I${HP_SHMEM_SDK_ROOT}/src/device
     -I${HP_MULTICORE_SOURCE_ROOT}/shmem
     -Wno-macro-redefined
@@ -79,6 +84,22 @@ npu_op_kernel_sources(ascendc_kernels
     KERNEL_FILE hyper_mega_gate_route_grad.cpp
     COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
 )
+
+
+if(ASCEND_COMPUTE_UNIT STREQUAL "ascend950")
+    npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperMegaMoeMxfp8
+        KERNEL_DIR ./hyper_mega_moe_mxfp8/op_kernel
+        KERNEL_FILE hyper_mega_moe_mxfp8.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+    )
+    npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperMegaMoeMxfp8Grad
+        KERNEL_DIR ./hyper_mega_moe_mxfp8_grad/op_kernel
+        KERNEL_FILE hyper_mega_moe_mxfp8_grad.cpp
+        COMPUTE_UNIT ${KERNEL_COMPUTE_UNIT}
+    )
+endif()
 
 npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels

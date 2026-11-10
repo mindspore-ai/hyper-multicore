@@ -45,6 +45,7 @@ _HOST_IDENTITY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _HOST_SOC_PRIORITY = {
     "ascend910_93": 0,
     "ascend910b": 1,
+    "ascend950": 2,
 }
 
 

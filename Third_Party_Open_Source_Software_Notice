@@ -15,6 +15,8 @@ hyper_multicore/_build/dependencies.lock.json):
 - ops-transformer: GMM v9.1.0.pre and the MHC sources selected by the lock file:
   selected GMM/MHC source primitives, with local patches.
   Source: https://gitcode.com/cann/ops-transformer.git
+  Selected A5 Blaze headers additionally come from CANN 9.2.0 (20261015);
+  per-file source/adapted SHA256 and retained licenses accompany the source.
 - CANN SHMEM (source version selected by the lock file):
   private SDK/runtime libraries built with the component's locked patches.
   Source: https://gitcode.com/cann/shmem.git

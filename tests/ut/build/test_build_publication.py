@@ -83,6 +83,17 @@ def test_success_publishes_only_the_new_wheel_and_payload(staged_build):
     assert [p.name for p in output.payload.iterdir()] == ["new.so"]
 
 
+def test_native_only_publishes_payload_without_packaging_a_wheel(staged_build, monkeypatch):
+    args, output, state = staged_build
+    args.native_only = True
+    monkeypatch.setattr(BUILD, "package_wheel", lambda *_: pytest.fail("Native-only build must not package a wheel"))
+    with output:
+        assert BUILD.build(args, output) == output.payload
+    assert output.committed and state["snapshots"] == 1
+    assert not list(output.distribution.iterdir())
+    assert [p.name for p in output.payload.iterdir()] == ["new.so"]
+
+
 @pytest.mark.parametrize("reject_on", [2, 4])
 def test_final_input_failure_clears_both_outputs(staged_build, reject_on):
     """Reject before publication and after the visible switch, exercising actual publishers."""

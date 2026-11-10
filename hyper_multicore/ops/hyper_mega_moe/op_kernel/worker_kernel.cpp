@@ -18,6 +18,10 @@
 #include "kernel_operator.h"
 #include "swi_glu/swi_glu.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+#include "bf16_gmm/cgmct_worker.h"
+#include "bf16_gmm/blaze_worker.h"
+#endif
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
 
@@ -52,7 +56,21 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteMatmul(task_desc);
         break;
       case TaskType::TASK_GROUPED_MATMUL:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+          if (task_desc.extra_value_1 == 1) {
+            MulticoreBf16::ExecuteCgmctTask(task_desc, input_list, this->core_num);
+          } else if (task_desc.extra_value_1 == 2) {
+            MulticoreBf16::ExecuteBlazeTask(task_desc, input_list, this->core_num);
+          } else {
+            ExecuteGroupedMatmul(task_desc);
+          }
+        } else {
+          ExecuteGroupedMatmul(task_desc);
+        }
+#else
         ExecuteGroupedMatmul(task_desc);
+#endif
         break;
       case TaskType::TASK_SWI_GLU:
         ExecuteSwiglu(task_desc);

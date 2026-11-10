@@ -118,6 +118,11 @@ class TaskType(IntEnum):
     TASK_GATE_GRAD_ADD_SELECTED           = 139
     TASK_GATE_GRAD_ZEROS                  = 140
     TASK_SHMEM_GET_MEM              = 141
+    TASK_MX_GROUPED_MATMUL          = 142
+    TASK_MX_QUANT                   = 143
+    TASK_MX_SWIGLU_QUANT            = 145
+    TASK_MX_SWIGLU_GRAD_QUANT       = 146
+    TASK_MX_SWIGLU_ROW_QUANT        = 147
 
 
 class EventType(IntEnum):

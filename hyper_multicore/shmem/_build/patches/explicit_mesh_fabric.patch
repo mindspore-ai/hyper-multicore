@@ -1,0 +1,11 @@
+--- a/src/host/transport/device_udma/device_udma_transport_manager.cpp
++++ b/src/host/transport/device_udma/device_udma_transport_manager.cpp
+@@ -1498,7 +1498,7 @@
+         endpoint.netLayer = rank_addr->levelInfo->netLayer;
+         endpoint.netInstanceId = rank_addr->levelInfo->netInstanceId;
+         endpoint.netType = rank_addr->levelInfo->netType;
+-        endpoint.fabric = ClassifyEndpointFabric(topo_info, rank_addr->ports);
++        endpoint.fabric = endpoint.netType == NetType::Mesh ? TopoFabric::Mesh : ClassifyEndpointFabric(topo_info, rank_addr->ports);
+         endpoint.addrType = rank_addr->addrType;
+         endpoint.planeId = rank_addr->planeId;
+         endpoint.ports = rank_addr->ports;

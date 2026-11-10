@@ -1,0 +1,130 @@
+--- a/quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35/dynamic_mx_quant_with_dual_axis_base.h
++++ b/quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35/dynamic_mx_quant_with_dual_axis_base.h
+@@ -22,7 +22,9 @@
+ #include "kernel_tiling/kernel_tiling.h"
+ #include "../inc/platform.h"
+ #include "../inc/kernel_utils.h"
++#ifndef HYPER_MULTICORE_MX_LOGICAL_VECTOR
+ #include "dynamic_mx_quant_with_dual_axis_struct.h"
++#endif
+ #include "dynamic_mx_quant_with_dual_axis_tilingdata.h"
+ 
+ namespace DynamicMxQuantWithDualAxis {
+@@ -84,8 +86,8 @@
+ class DynamicMxQuantWithDualAxisBase {
+ public:
+     __aicore__ inline DynamicMxQuantWithDualAxisBase(
+-        const DynamicMxQuantWithDualAxisTilingData* tilingData, TPipe* pipe)
+-        : tilingData_(tilingData), pipe_(pipe){};
++        const DynamicMxQuantWithDualAxisTilingData* tilingData, TPipe* pipe, int64_t logicalBlockIndex = -1)
++        : tilingData_(tilingData), pipe_(pipe), logicalBlockIndex_(logicalBlockIndex){};
+     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y1, GM_ADDR mxScale1, GM_ADDR y2, GM_ADDR mxScale2);
+     __aicore__ inline void Process();
+ 
+@@ -187,6 +189,7 @@
+     GlobalTensor<uint8_t> mxScaleGm2_;
+ 
+     // base varible
++    int64_t logicalBlockIndex_ = -1;
+     int64_t blockIdx_ = 0;
+     // 当前
+     int64_t blockOffset_ = 0;
+@@ -224,7 +227,7 @@
+ template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+ __aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::InitParams()
+ {
+-    blockIdx_ = GetBlockIdx();
++    blockIdx_ = logicalBlockIndex_ >= 0 ? logicalBlockIndex_ : GetBlockIdx();
+     int64_t headCoreNum = tilingData_->headCoreNum;
+     if (blockIdx_ < headCoreNum) {
+         loopPerCore_ = tilingData_->blockPerHeadCore;
+--- a/quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35/swiglu_mx_quant_with_dual_axis_regbase.h
++++ b/quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35/swiglu_mx_quant_with_dual_axis_regbase.h
+@@ -28,7 +28,14 @@
+ #include "kernel_tiling/kernel_tiling.h"
+ #include "../inc/platform.h"
+ #include "../inc/kernel_utils.h"
++#ifndef HYPER_MULTICORE_MX_LOGICAL_VECTOR
+ #include "swiglu_mx_quant_with_dual_axis_tiling_key.h"
++#endif
++#ifdef HYPER_MULTICORE_MX_LOGICAL_VECTOR
++#ifndef TPL_MODE_ROTATE
++#define TPL_MODE_ROTATE 0
++#endif
++#endif
+ #include "swiglu_mx_quant_with_dual_axis_tilingdata.h"
+ 
+ namespace SwigluMxQuantWithDualAxis {
+@@ -98,8 +105,8 @@
+     uint64_t isGroupIdx>
+ class SwigluMxQuantWithDualAxisBase {
+ public:
+-    __aicore__ inline SwigluMxQuantWithDualAxisBase(const SwigluMxQuantWithDualAxisTilingData *tilingData, TPipe *pipe)
+-        : tilingData_(tilingData), pipe_(pipe){};
++    __aicore__ inline SwigluMxQuantWithDualAxisBase(const SwigluMxQuantWithDualAxisTilingData *tilingData, TPipe *pipe, int64_t logicalBlockIndex = -1)
++        : tilingData_(tilingData), pipe_(pipe), logicalBlockIndex_(logicalBlockIndex){};
+     __aicore__ inline void Init(GM_ADDR x, GM_ADDR groupIndex, GM_ADDR y1, GM_ADDR mxScale1, GM_ADDR y2,
+         GM_ADDR mxScale2);
+     __aicore__ inline void Process();
+@@ -164,6 +171,7 @@
+     GlobalTensor<uint8_t> mxScaleGm2_;
+ 
+     // base variables
++    int64_t logicalBlockIndex_ = -1;
+     int64_t blockIdx_ = 0;
+     int64_t ubRowLen_ = 0;        // blockW = 256
+     int64_t ubRowLenTail_ = 0;    // dimNTail
+@@ -188,7 +196,7 @@
+ __aicore__ inline void
+ SwigluMxQuantWithDualAxisBase<xDtype, y1Dtype, mode, roundMode, scaleAlg, isGroupIdx>::InitParams()
+ {
+-    blockIdx_ = GetBlockIdx();
++    blockIdx_ = logicalBlockIndex_ >= 0 ? logicalBlockIndex_ : GetBlockIdx();
+     ubRowLen_ = ONCE_ROW_LEN; // 固定256
+     ubRowLenTail_ = tilingData_->dimNTail;
+     ubRowCount_ = DOUBLE_BLOCK_SIZE; // 固定64
+--- a/quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35/swiglu_backward_mx_quant_with_dual_axis_regbase.h
++++ b/quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35/swiglu_backward_mx_quant_with_dual_axis_regbase.h
+@@ -22,7 +22,14 @@
+ #include "kernel_tiling/kernel_tiling.h"
+ #include "../inc/platform.h"
+ #include "../inc/kernel_utils.h"
++#ifndef HYPER_MULTICORE_MX_LOGICAL_VECTOR
+ #include "swiglu_backward_mx_quant_with_dual_axis_tiling_key.h"
++#endif
++#ifdef HYPER_MULTICORE_MX_LOGICAL_VECTOR
++#ifndef TPL_MODE_ROTATE
++#define TPL_MODE_ROTATE 0
++#endif
++#endif
+ #include "swiglu_backward_mx_quant_with_dual_axis_tilingdata.h"
+ 
+ namespace SwigluBackwardMxQuantWithDualAxis {
+@@ -89,8 +96,8 @@
+     uint64_t isGroupIdx>
+ class SwigluBackwardMxQuantWithDualAxisBase {
+ public:
+-    __aicore__ inline SwigluBackwardMxQuantWithDualAxisBase(const SwigluBackwardMxQuantWithDualAxisTilingData *tilingData, TPipe *pipe)
+-        : tilingData_(tilingData), pipe_(pipe){};
++    __aicore__ inline SwigluBackwardMxQuantWithDualAxisBase(const SwigluBackwardMxQuantWithDualAxisTilingData *tilingData, TPipe *pipe, int64_t logicalBlockIndex = -1)
++        : tilingData_(tilingData), pipe_(pipe), logicalBlockIndex_(logicalBlockIndex){};
+     __aicore__ inline void Init(GM_ADDR x, GM_ADDR yGrad, GM_ADDR groupIndex, GM_ADDR y1, GM_ADDR mxScale1, GM_ADDR y2,
+         GM_ADDR mxScale2);
+     __aicore__ inline void Process();
+@@ -155,6 +162,7 @@
+     GlobalTensor<uint8_t> yGm2_;
+     GlobalTensor<uint8_t> mxScaleGm2_;
+ 
++    int64_t logicalBlockIndex_ = -1;
+     int64_t blockIdx_ = 0;
+     int64_t ubRowLen_ = 0;
+     int64_t ubRowLenTail_ = 0;
+@@ -176,7 +184,7 @@
+ __aicore__ inline void
+ SwigluBackwardMxQuantWithDualAxisBase<xDtype, y1Dtype, mode, roundMode, scaleAlg, isGroupIdx>::InitParams()
+ {
+-    blockIdx_ = GetBlockIdx();
++    blockIdx_ = logicalBlockIndex_ >= 0 ? logicalBlockIndex_ : GetBlockIdx();
+     ubRowLen_ = tilingData_->blockW;
+     ubRowLenTail_ = tilingData_->dimNTail;
+     ubRowCount_ = tilingData_->splitBlockH;

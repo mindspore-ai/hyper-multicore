@@ -10,9 +10,38 @@
 # -----------------------------------------------------------------------------------------------------------
 # Private SHMEM SDK preparation for Multicore builds.
 
+function hp_shmem_soc_type() {
+    local soc_list=$1
+    local selected_type=""
+    local requested_soc
+    local soc_type
+    local -a requested_socs=()
+    IFS=',' read -r -a requested_socs <<< "${soc_list}"
+    for requested_soc in "${requested_socs[@]}"; do
+        requested_soc="${requested_soc//[[:space:]]/}"
+        case "${requested_soc}" in
+            ascend910b|ascend910_93) soc_type=Ascend910B ;;
+            ascend950) soc_type=Ascend950 ;;
+            *)
+                echo "ERROR: Unsupported SHMEM SoC '${requested_soc}'." >&2
+                return 10
+                ;;
+        esac
+        if [[ -n "${selected_type}" && "${selected_type}" != "${soc_type}" ]]; then
+            echo "ERROR: Prepare each SHMEM backend separately; cannot use one SDK for ${soc_list}." >&2
+            return 10
+        fi
+        selected_type=${soc_type}
+    done
+    [[ -n "${selected_type}" ]] || return 10
+    printf '%s\n' "${selected_type}"
+}
+
 function hp_prepare_shmem_sdk() {
     local project_root=$1
     local soc_list=$2
+    local soc_type
+    soc_type=$(hp_shmem_soc_type "${soc_list}") || return $?
     local native_jobs=$3
     local native_root="${project_root}/build/native"
     local python_bin="${PYTHON_BIN:-python}"
@@ -80,7 +109,8 @@ print(hashlib.sha256(encoded).hexdigest())
     toolchain_key=$(
         {
             printf '%s\n' \
-                "schema=2" \
+                "schema=3" \
+                "soc_type=${soc_type}" \
                 "cann_root=${cann_root}" \
                 "bisheng=${bisheng_path}" \
                 "host_arch=${host_arch}" \
@@ -117,9 +147,6 @@ print(hashlib.sha256(encoded).hexdigest())
             ascend910b|ascend910_93)
                 ;;
             ascend950)
-                echo "HP_NATIVE_REASON_CODE=SOC_SOURCE_NOT_SUPPORTED"
-                echo "ERROR: The locked SHMEM source does not support ascend950 in this build." >&2
-                return 10
                 ;;
             *)
                 echo "HP_NATIVE_REASON_CODE=UNSUPPORTED_SOC_SELECTION"
@@ -185,12 +212,20 @@ PY
     fi
     rm -rf "${install_root}"
 
+    if [[ "${soc_type}" == Ascend950 ]]; then
+        "${python_bin}" "${project_root}/hyper_multicore/_build/prepare_dependencies.py" \
+            --dependency nlohmann_json
+        mkdir -p "${source_dir}/3rdparty/json/single_include/nlohmann"
+        cp "${native_root}/deps/nlohmann_json/src/single_include/nlohmann/json.hpp" \
+            "${source_dir}/3rdparty/json/single_include/nlohmann/json.hpp"
+    fi
+
     echo "INFO: preparing pinned CANN SHMEM SDK"
     echo "  locked source: ${locked_source_dir}"
     echo "  isolated source: ${source_dir}"
     echo "  CANN toolchain: ${cann_root} (${bisheng_path})"
     echo "  host toolchain: ${host_arch} (${gcc_path}, ${gxx_path})"
-    echo "  soc family: Ascend910B (used by ascend910b and ascend910_93)"
+    echo "  soc family: ${soc_type}"
     echo "  install root: ${install_root}"
 
     cmake -S "${wrapper}" \
@@ -202,7 +237,8 @@ PY
         -DUSE_EXAMPLES=OFF \
         -DBUILD_PYTHON=OFF \
         -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
-        -DSOC_TYPE=Ascend910B
+        -DACLSHMEM_RDMA_SUPPORT=OFF \
+        -DSOC_TYPE="${soc_type}"
     cmake --build "${build_dir}" --parallel "${native_jobs}"
     cmake --install "${build_dir}" --prefix "${install_root}/shmem"
 

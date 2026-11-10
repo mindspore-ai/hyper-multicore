@@ -1,0 +1,140 @@
+--- a/gmm/common/cgmct/block/block_scheduler_gmm_aswt_with_tail_split.h
++++ b/gmm/common/cgmct/block/block_scheduler_gmm_aswt_with_tail_split.h
+@@ -73,6 +73,15 @@
+     {
+     }
+ 
++    __aicore__ inline uint32_t GetWorkerCount() const { return blockNum_; }
++
++    __aicore__ inline void SetLogicalWorkers(uint32_t index, uint32_t count)
++    {
++        blockIdx_ = index;
++        blockNum_ = count;
++        endBlockIdx_ = count - 1;
++    }
++
+     __aicore__ inline void UpdateNextProblem(const TupleShape &problemShape)
+     {
+         k_ = Get<MNK_K>(problemShape);
+@@ -148,7 +157,7 @@
+     __aicore__ inline void UpdateTailTile()
+     {
+         // Calculate the splittable tile count; keep 1 when no split is needed.
+-        int64_t remainTile = (AscendC::GetBlockNum() - endBlockIdx_ - 1) / GetTailTileCnt() + 1;
++        int64_t remainTile = (blockNum_ - endBlockIdx_ - 1) / GetTailTileCnt() + 1;
+         if (remainTile <= 1) {
+             return;
+         }
+--- a/gmm/common/cgmct/kernel/kernel_qgmm_mx.h
++++ b/gmm/common/cgmct/kernel/kernel_qgmm_mx.h
+@@ -126,8 +126,9 @@
+     };
+ 
+ public:
+-    __aicore__ inline void Init(const Params &params);
++    __aicore__ inline void Init(const Params &params, bool rawPointers = false);
+     __aicore__ inline void Run(const Params &params);
++    __aicore__ inline void RunSingleExpert(const Params &params, uint32_t workerIndex, uint32_t workerCount);
+     __aicore__ inline void operator()(const Params &params)
+     {
+         Run(params);
+@@ -177,6 +178,24 @@
+ };
+ 
+ QGMM_MX_KERNEL_CLASS_TEM_PARAMS
++__aicore__ inline void KernelQGmmMx<QGMM_MX_KERNEL_FUN_TEM_PARAMS>::RunSingleExpert(
++    const Params &params, uint32_t workerIndex, uint32_t workerCount)
++{
++    Init(params, true);
++    if (Get<MNK_M>(problemShape_) <= 0 || Get<MNK_K>(problemShape_) <= 0) {
++        return;
++    }
++    BlockSchedulerOp bs(params.gmmParams.baseM, params.gmmParams.baseN, params.gmmParams.baseK);
++    bs.SetLogicalWorkers(workerIndex, workerCount);
++    if constexpr (!transA) {
++        bs.SetTailAlign(1, transB ? AscendC::BLOCK_CUBE : c0Size);
++    }
++    BaseMBalance(bs, Get<MNK_M>(problemShape_), params.gmmParams.baseM);
++    bs.UpdateNextProblem(problemShape_);
++    ProcessSingleGroup<false>(params, bs, 0);
++}
++
++QGMM_MX_KERNEL_CLASS_TEM_PARAMS
+ __aicore__ inline void KernelQGmmMx<QGMM_MX_KERNEL_FUN_TEM_PARAMS>::Run(const Params &params)
+ {
+     Init(params);
+@@ -230,18 +249,23 @@
+ }
+ 
+ QGMM_MX_KERNEL_CLASS_TEM_PARAMS
+-__aicore__ inline void KernelQGmmMx<QGMM_MX_KERNEL_FUN_TEM_PARAMS>::Init(const Params &params)
++__aicore__ inline void KernelQGmmMx<QGMM_MX_KERNEL_FUN_TEM_PARAMS>::Init(const Params &params, bool rawPointers)
+ {
+     const auto &mmadParams = params.mmadParams;
+     const auto &gmmParams = params.gmmParams;
+ 
+-    xTensorPtr_ = GetTensorAddr<AType>(0, mmadParams.aGmAddr);
+-    wTensorPtr_ = GetTensorAddr<BType>(0, mmadParams.bGmAddr);
++    xTensorPtr_ = rawPointers ? reinterpret_cast<__gm__ AType*>(mmadParams.aGmAddr)
++        : GetTensorAddr<AType>(0, mmadParams.aGmAddr);
++    wTensorPtr_ = rawPointers ? reinterpret_cast<__gm__ BType*>(mmadParams.bGmAddr)
++        : GetTensorAddr<BType>(0, mmadParams.bGmAddr);
+     x1ScaleTensorPtr_ = mmadParams.x1ScaleGmAddr;
+-    x2ScaleTensorPtr_ = GetTensorAddr<AscendC::fp8_e8m0_t>(0, mmadParams.x2ScaleGmAddr);
+-    biasTensorPtr_ = GetTensorAddr<BiasType>(0, mmadParams.biasGmAddr);
++    x2ScaleTensorPtr_ = rawPointers ? reinterpret_cast<__gm__ AscendC::fp8_e8m0_t*>(mmadParams.x2ScaleGmAddr)
++        : GetTensorAddr<AscendC::fp8_e8m0_t>(0, mmadParams.x2ScaleGmAddr);
++    biasTensorPtr_ = rawPointers ? reinterpret_cast<__gm__ BiasType*>(mmadParams.biasGmAddr)
++        : GetTensorAddr<BiasType>(0, mmadParams.biasGmAddr);
+     groupListPtr_ = mmadParams.groupListGmAddr;
+-    yTensorPtr_ = GetTensorAddr<CType>(0, mmadParams.cGmAddr);
++    yTensorPtr_ = rawPointers ? reinterpret_cast<__gm__ CType*>(mmadParams.cGmAddr)
++        : GetTensorAddr<CType>(0, mmadParams.cGmAddr);
+ 
+     groupNum_ = gmmParams.groupNum;
+     curBaseM_ = gmmParams.baseM;
+@@ -320,7 +344,7 @@
+ __aicore__ inline bool KernelQGmmMx<QGMM_MX_KERNEL_FUN_TEM_PARAMS>::IfNeedSplit(const BlockSchedulerOp &bs)
+ {
+     // Consider tail split only when at least half of the cores are still available.
+-    return (bs.GetEndBlockIdx() + 1) <= (AscendC::GetBlockNum() >> 1);
++    return (bs.GetEndBlockIdx() + 1) <= (bs.GetWorkerCount() >> 1);
+ }
+ 
+ QGMM_MX_KERNEL_CLASS_TEM_PARAMS
+--- a/gmm/common/cgmct/utils/host_utils.h
++++ b/gmm/common/cgmct/utils/host_utils.h
+@@ -16,6 +16,7 @@
+ #ifndef UTILS_HOST_UTILS_H
+ #define UTILS_HOST_UTILS_H
+ #ifndef __NPU_ARCH__
++#ifndef __NPU_ARCH__
+ #include "tiling/platform/platform_ascendc.h"
+ #endif
+ namespace Cgmct {
+@@ -44,4 +45,5 @@
+ }
+ } // namespace Gemm
+ } // namespace Cgmct
+-#endif
+\ No newline at end of file
++#endif
++#endif
+--- a/gmm/common/cgmct/block/block_scheduler_utils.h
++++ b/gmm/common/cgmct/block/block_scheduler_utils.h
+@@ -88,6 +88,7 @@
+ }
+ 
+ // device -> kernel -> scheduler
++#ifndef __NPU_ARCH__
+ static int64_t DoGetBlockNum(int64_t l1M, int64_t l1N, const MatmulShape &shape)
+ {
+     int maxCoreNum = GetCoreNum();
+@@ -104,6 +105,7 @@
+     }
+     return blockNum;
+ }
++#endif
+ 
+ template <class ProblemShape_>
+ __host_aicore__ static Status DoCheckArgs(const ProblemShape_ &shape, int64_t l1M, int64_t l1N, int64_t l1K,

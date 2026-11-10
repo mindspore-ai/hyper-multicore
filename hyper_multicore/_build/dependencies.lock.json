@@ -39,7 +39,7 @@
         "patches": [
           {
             "path": "hyper_multicore/ops/patches/swi_glu_fusion.patch",
-            "sha256": "feccbab52ed71a33e6423fe039e47d5cd1444eed6b409374e595800779d37f3d",
+            "sha256": "ca4cacfad1299b3b37fffeec43d8047fb6325eb4f0fdccdf475f855f45173bef",
             "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
           },
           {
@@ -50,13 +50,23 @@
           },
           {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
-            "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
-            "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior"
+            "sha256": "d1751299e120709f3a625af9b6d606c1696059fbb55c99ed01788765f1840004",
+            "purpose": "add a logical token-block RMSNorm entry point and non-atomic Ascend950 backward-cache writes"
           },
           {
             "path": "hyper_multicore/ops/patches/rms_norm_grad_worker_fusion.patch",
-            "sha256": "b55856bdaa183684576febdcbf2df01cace97932f00d2a336e54cb7d59ee8964",
-            "purpose": "add a task-local RMSNormGrad entry point and explicit fused-task pipe cleanup"
+            "sha256": "0d6eacd29418c897cd3ac42bd4b62eb331912a62a36fa506a4df80f6fffd1ce2",
+            "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
+          },
+          {
+            "path": "hyper_multicore/ops/mxfp8_quant/logical_vector_worker.patch",
+            "sha256": "a664e97ed9394c5ba376febbcfbce89960437f1a8a67346461787fdb69b12d94",
+            "purpose": "accept a task-local logical vector index while preserving original standalone defaults"
+          },
+          {
+            "path": "hyper_multicore/ops/mxfp8_quant/row_only_logical_worker.patch",
+            "sha256": "7e7e3eaa1aeacfb26d0b48225d693beae1b939bd8cc3868f5dacf58acd8079ff",
+            "purpose": "Expose logical worker index for the unchanged standard row-only SwiGLU primitive."
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -74,8 +84,13 @@
             "patches": [
               {
                 "path": "hyper_multicore/ops/patches/grouped_matmul_fusion.patch",
-                "sha256": "53341da1cb6d8ca1a0bb3a16deaff8a67a2d01a4525fac8a8e529535330e2d9d",
+                "sha256": "f908a2dd909f75cc16b4532c24a2916858324f06034635e51fdab36056384c5c",
                 "purpose": "expose the selected grouped-matmul path as an inline building block"
+              },
+              {
+                "path": "hyper_multicore/ops/mxfp8/mx_gmm_logical_worker.patch",
+                "sha256": "f657cdb4d3d4446ac8ff072af428aadba5b2529462cdbb88599406d0c3392919",
+                "purpose": "expose task-local MX grouped GEMM execution through a logical cube partition"
               }
             ],
             "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -114,19 +129,28 @@
         }
       },
       "shmem": {
-        "version": "d30702bb55d0",
+        "version": "v1.7.0",
         "repository": "https://gitcode.com/cann/shmem.git",
-        "fetch_ref": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
-        "tag_object": null,
-        "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
-        "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
-        "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
-        "resolution": "exact upstream commit with a locked Runtime symbol-loading adapter applied only to an isolated source copy",
+        "tag_object": "9912aa1aaa231a0c6d2e9b80593d4a1a8e654148",
+        "commit": "ecea088d28c057e67181a313cf8abfa1dc777d8a",
+        "tree": "703e460a43ae870d2ddc22ad9f8f038266dd747c",
+        "git_archive_tar_sha256": "6c19650b7f97e435e5e4b2feadb4b0004146ea5d7ecb7ceca21853a58b917c77",
+        "resolution": "Exact v1.7.0 plus runtime, Mesh and maintenance d942c05 device queue publication adapters",
         "patches": [
           {
             "path": "hyper_multicore/shmem/_build/patches/cann_runtime_symbols.patch",
             "sha256": "049d3e85e413dbebc6953aaf0940108b66348e2ff3647aeb11349fd8ead2bc98",
             "purpose": "resolve required rt APIs from libruntime.so when libascendcl.so does not depend on it"
+          },
+          {
+            "path": "hyper_multicore/shmem/_build/patches/explicit_mesh_fabric.patch",
+            "sha256": "367a5e17e2af6ad4095274b95f5fa39699a43fff862f70aa7a20bbce1df2421b",
+            "purpose": "preserve explicit Mesh endpoint classification; retain existing handling of non-Mesh routes"
+          },
+          {
+            "path": "hyper_multicore/shmem/_build/patches/udma_queue_state_flush_v170.patch",
+            "sha256": "b7e8c920158020442363a50021f80de663000256eb76e42ad7ec7f911712d40b",
+            "purpose": "Backport release/v1.7.0 d942c05 device queue state publication before doorbell"
           },
           {
             "path": "hyper_multicore/shmem/_build/patches/cann_shmem_log_api.patch",
@@ -144,11 +168,20 @@
           "reason": "avoid collision with framework-provided libshmem.so in one process",
           "isolated_source_adapted": true
         }
+      },
+      "nlohmann_json": {
+        "version": "v3.11.3",
+        "repository": "https://gitcode.com/GitHub_Trending/js/json.git",
+        "commit": "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+        "tree": "5af76d5aa32f4b473b5dd7f82fb9f2a4257322c6",
+        "git_archive_tar_sha256": "0a59c5f4e31190d4ab72e4adaac69a978199c2da1989bfc6273de21f4dc016e4",
+        "resolution": "SHMEM Ascend950 topology-reader header dependency; copied only to the isolated SDK source",
+        "packaging_policy": "build-only header dependency; not a Python runtime requirement"
       }
     }
   },
   "current_repository_baseline": {
-    "shmem": "d30702bb55d0",
+    "shmem": "v1.7.0 + queue-publication repair",
     "ops_nn": "v9.1.0.pre",
     "ops_transformer": {
       "gmm": "v9.1.0.pre",

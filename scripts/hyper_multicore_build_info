@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Display installed native build records without importing any framework."""
+"""Display activated source or installed native build records without framework imports."""
 
 import argparse
 from importlib import metadata
@@ -86,13 +86,22 @@ def main() -> None:
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
     try:
-        distribution = metadata.distribution("hyper-multicore")
-        root = Path(distribution.locate_file("hyper_multicore")).resolve()
+        source_root = os.environ.get("HYPER_MULTICORE_ROOT")
+        if source_root:
+            source = Path(source_root).resolve()
+            root = source / "build/native/payload/hyper_multicore"
+            helper_path = source / "hyper_multicore/_native_manifest.py"
+            package_version = None
+        else:
+            distribution = metadata.distribution("hyper-multicore")
+            root = Path(distribution.locate_file("hyper_multicore")).resolve()
+            helper_path = root / "_native_manifest.py"
+            package_version = distribution.version
         info = json.loads((root / "build_info.json").read_text())
         manifest = json.loads((root / "adapters/manifest.json").read_text())
         if info.get("schema_version") != 2 or manifest.get("schema_version") != 1:
             raise ValueError("Unsupported build identity or adapter schema")
-        helpers = runpy.run_path(str(root / "_native_manifest.py"))
+        helpers = runpy.run_path(str(helper_path))
         manifest = helpers["read_manifest"](root)
         helpers["check_integrity"](root, info, manifest)
         actual = {
@@ -116,7 +125,7 @@ def main() -> None:
             pass
         result = {
             "schema_version": 1,
-            "package_version": distribution.version,
+            "package_version": package_version or info["artifact_version"],
             "package_root": str(root),
             "build_info": info,
             "manifest": manifest,
@@ -127,7 +136,7 @@ def main() -> None:
         else:
             print(format_text(result))
     except (OSError, ValueError, KeyError, metadata.PackageNotFoundError) as error:
-        parser.exit(1, f"Cannot read installed HyperMulticore build matrix: {error}\n")
+        parser.exit(1, f"Cannot read HyperMulticore build matrix: {error}\n")
 
 
 if __name__ == "__main__":

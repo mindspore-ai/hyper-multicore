@@ -29,6 +29,7 @@ from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
 from .spec import MegaMoeSpec, _align_capacity
+from .preprocess import fixed_route_counts, validate_global_loads
 
 if TYPE_CHECKING:
     from .workspace import MegaMoeWorkspace
@@ -148,6 +149,8 @@ def _resolve_counts(
 ) -> torch.Tensor:
     """Use trusted Router counts or compute them only when omitted."""
     if supplied_counts is None:
+        if spec.route_count_policy == "histc":
+            return fixed_route_counts(flat_ids, spec.num_experts)
         return (
             torch.bincount(flat_ids.to(torch.int64), minlength=spec.num_experts)
             .to(torch.int32)
@@ -216,6 +219,8 @@ def _expert_capacity(
     # One host transfer serves both the coordinated overflow check and local
     # allocation; the existing gathered counts require no extra collective.
     loads = destination_loads.tolist()
+    if spec.route_count_policy == "histc":
+        validate_global_loads(loads, spec.ep_size * spec.routed_slots)
     # Keep a non-null ABI argument on ranks whose experts receive no tokens.
     # Source outputs and symmetric communication buffers retain their own sizes.
     return max(1, loads[spec.rank_id]), max(loads)
