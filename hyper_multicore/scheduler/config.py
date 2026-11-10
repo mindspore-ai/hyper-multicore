@@ -228,7 +228,8 @@ class RuntimeConfigC(ctypes.Structure):
         ("aiv_profile_record_capacity", ctypes.c_uint32),
         ("completion_event", ctypes.c_uint32),
         ("protocol_version", ctypes.c_uint32),
-        ("_padding", ctypes.c_uint32 * 6),
+        ("vector_ready_queue", ctypes.c_uint32),
+        ("_padding", ctypes.c_uint32 * 5),
     ]
 
 

@@ -15,6 +15,7 @@
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
 import unittest
+from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +24,7 @@ from unittest.mock import Mock, PropertyMock, patch
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
+from hyper_multicore.moonep import shmem_transfer
 from hyper_multicore.diagnostics import MegaKernelDiagnostics
 from hyper_multicore.modules.mega_moe import function as function_module
 from hyper_multicore.modules.mega_moe.function import _MegaMoeFunction
@@ -35,11 +37,34 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     # pylint: disable=protected-access
 
+    def test_typed_return_is_optional_for_custom_transfer_backends(self) -> None:
+        """Legacy providers keep their ABI; capable providers receive original dtypes."""
+        gradients = (torch.ones(4, 3, 5), torch.ones(4, 5, 3))
+        copies = torch.full((2, 2), -1, dtype=torch.int32)
+        dtypes = (torch.bfloat16, torch.float32)
+        for typed in (False, True):
+            for request in (None, dtypes):
+                with self.subTest(typed=typed, request=request):
+                    backend = SimpleNamespace(return_gradients=Mock(return_value=gradients))
+                    if typed:
+                        backend.return_gradients_as = Mock(return_value=gradients)
+                    pool = SimpleNamespace(transfer_backend=backend)
+                    result = shmem_transfer.SharedExpertPool.return_generated_gradients(
+                        pool, gradients, copies, False, output_dtypes=request)
+                    self.assertIs(result, gradients)
+                    if typed and request is not None:
+                        backend.return_gradients.assert_not_called()
+                        backend.return_gradients_as.assert_called_once_with(
+                            pool, gradients, copies, active=False, output_dtypes=dtypes)
+                    else:
+                        backend.return_gradients.assert_called_once_with(
+                            pool, gradients, copies, active=False)
+
     def test_ragged_pull_uses_reserved_source_prefix(self) -> None:
         """Forward and backward retain SHMEM addresses while exposing only actual rows."""
         buffer = torch.full((256, 4), float("nan"))
         workspace = SimpleNamespace(source_buffer=buffer)
-        spec = SimpleNamespace(dispatch_mode="pull", hidden_size=4)
+        spec = SimpleNamespace(apply_probs_before_fc2=False, dispatch_mode="pull", hidden_size=4)
         rows = torch.arange(12).reshape(3, 4).float()
         dispatch, source = function_module._dispatch_and_source(spec, workspace, rows, 7)
         self.assertEqual(tuple(dispatch.shape), (7, 4))
@@ -107,6 +132,48 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_fp32_return_reuses_odd_sized_weight_banks(self) -> None:
+        """Preserve unquantized partials without another symmetric allocation."""
+        banks = (torch.zeros(4, 3, 5, dtype=torch.bfloat16), torch.zeros(4, 5, 7, dtype=torch.bfloat16))
+        gradients = tuple(torch.arange(bank.numel(), dtype=torch.float32).reshape(bank.shape) / 257
+                          for bank in banks)
+        pool = SimpleNamespace(transfer_backend=None, weights=banks, local_experts=2, rank=0, blocks=1,
+                               statistics={"gradient_returns": 0, "remote_gradient_returns": 0})
+        bridge = Mock()
+        with patch.object(shmem_transfer, "load_bridge", return_value=bridge), \
+             patch.object(shmem_transfer, "_ordered_transfers", return_value=nullcontext()):
+            owners = shmem_transfer.SharedExpertPool.return_generated_gradients(
+                pool, gradients, torch.tensor([[-1, -1], [0, -1]], dtype=torch.int32))
+        self.assertEqual(bridge.reduce.call_count, 2)
+        for bank, gradient, owner, call in zip(banks, gradients, owners, bridge.reduce.call_args_list):
+            slots = call.args[2]
+            self.assertEqual(slots.dtype, torch.float32)
+            self.assertEqual(slots.data_ptr(), bank.data_ptr())
+            torch.testing.assert_close(slots, gradient[2:], rtol=0, atol=0)
+            torch.testing.assert_close(owner, gradient[:2], rtol=0, atol=0)
+            self.assertEqual(bank.dtype, torch.bfloat16)
+        self.assertIsNone(pool.cache_generation)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fp32_weight_gradients_preserve_activation_dtype(self) -> None:
+        """Keep borrowed partial dW unquantized without promoting activation scratch."""
+        spec = SimpleNamespace(hidden_size=4, intermediate_size=3)
+        for shapes in (((2, 4, 6), (2, 3, 4)), ((2, 6, 4), (2, 4, 3))):
+            with self.subTest(shapes=shapes):
+                weights = tuple(torch.empty(shape, dtype=torch.bfloat16) for shape in shapes)
+                gradients = function_module._allocate_backward_intermediates(
+                    spec, 8, torch.empty(8, 4, dtype=torch.bfloat16), *weights,
+                    weight_grad_dtype=torch.float32)
+                for weight, gradient in zip(weights, (gradients.grad_weight1, gradients.grad_weight2)):
+                    self.assertEqual(gradient.shape, weight.shape)
+                    self.assertEqual(gradient.dtype, torch.float32)
+                    self.assertEqual(torch.count_nonzero(gradient).item(), 0)
+                for value in (gradients.act_grad, gradients.swiglu_grad, gradients.gate_dx):
+                    self.assertEqual(value.dtype, torch.bfloat16)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_backward_unpacks_saved_tensors_once(self) -> None:
         """Feature: MegaKernel diagnostics.
         Description: Checkpoint unpack hooks must only be consumed once per backward call.
@@ -116,6 +183,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
+        context.plan.spec.apply_probs_before_fc2 = False
         execution = function_module._BackwardExecution(
             dispatch=torch.ones(1), grad_x=torch.ones(1), event_counters=Mock(),
             gmm_workspace=None, swiglu_workspace=None,
@@ -135,7 +203,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertIs(result[0], gradient)
         self.assertIs(result[1], execution.intermediates.grad_weight1)
         self.assertIs(result[2], execution.intermediates.grad_weight2)
-        context.workspace.release.assert_called_once_with()
+        context.workspace.release.assert_called_once_with(stream=context.workspace.lease_stream)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -210,10 +278,10 @@ class TestMegaMoeFunction(unittest.TestCase):
     def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True,
                                 vary_tokens: bool = False, replay: bool = False) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
-        spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
+        spec = SimpleNamespace(apply_probs_before_fc2=False, hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False)
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
@@ -235,7 +303,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         down_pointers = []
         backward_capacities = []
 
-        def release_workspace() -> None:
+        def release_workspace(*, stream=None) -> None:
             """Make accidental reads after the lease immediately observable."""
             workspace.expert_buffer.fill_(float("nan"))
             workspace.routed_buffer.fill_(float("nan"))
@@ -280,16 +348,25 @@ class TestMegaMoeFunction(unittest.TestCase):
             for tensor, width in ((args[8], 2), (args[10], 4), (args[12], 4)):
                 self.assertEqual(tuple(tensor.shape), (capacity, width))
             self.assertEqual(tuple(args[13].shape), (8 if vary_tokens else 4, 4))
-            self.assertEqual(torch.count_nonzero(args[6]).item(), 0)
-            self.assertEqual(torch.count_nonzero(args[18]).item(), 0)
+            self.assertEqual(torch.count_nonzero(args[6][0]).item(), 0)
+            self.assertEqual(torch.count_nonzero(args[18][0]).item(), 0)
             args[13].fill_(tag)
             args[6].fill_(tag)
             args[18].fill_(tag)
+
+        def zero_cold(first, second, groups):
+            previous = 0
+            for expert, end in enumerate(groups.tolist()):
+                if end == previous:
+                    first[expert].zero_()
+                    second[expert].zero_()
+                previous = end
 
         capacities = (7, 2, 1, 5)
         outputs = []
         sources = []
         with (
+            patch.object(function_module.multicore_ops, "zero_empty_expert_gradients", side_effect=zero_cold),
             patch.object(MegaKernelDiagnostics, "launch",
                          side_effect=AssertionError("ordinary path must bypass launch")),
             patch.object(
@@ -308,10 +385,9 @@ class TestMegaMoeFunction(unittest.TestCase):
             for tag, capacity in enumerate(capacities, start=1):
                 tokens = (1, 3, 2, 4)[tag - 1] if vary_tokens else 2
                 source = torch.full((tokens if permuted else 4, 4), float(tag), requires_grad=input_grad)
-                route = SimpleNamespace(expert_capacity=capacity, group_list=torch.tensor([0, capacity]))
-                for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size",
-                             "combine_src_off", "combine_target_off", "combine_size"):
-                    setattr(route, name, torch.zeros(4, dtype=torch.int64))
+                route = function_module.RouteMetadata(
+                    *(torch.zeros(4, dtype=torch.int64) for _ in range(6)),
+                    group_list=torch.tensor([0, capacity]), expert_capacity=capacity)
                 output = self._check_deferred_forward(
                     source, weight1, weight2, route, plan, workspace, down_pointers,
                     permuted=permuted, vary_tokens=vary_tokens, replay=replay,

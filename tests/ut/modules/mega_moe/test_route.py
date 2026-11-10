@@ -39,6 +39,62 @@ class TestMegaMoeRoute(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_placement_selection_precedes_growth_and_pull_publication(self) -> None:
+        """Select borrowing before committing symmetric capacity for the original route."""
+        for mode in ("push", "pull"):
+            for selected in (False, True):
+                with self.subTest(mode=mode, selected=selected):
+                    self._selection_precedes_growth(mode, selected)
+
+    def _selection_precedes_growth(self, mode: str, selected: bool) -> None:
+        """Keep the routing table and permutation unchanged across selection decisions."""
+        spec = replace(self._spec(ep_size=2), auto_tokens=True, dispatch_mode=mode)
+        hidden = torch.arange(257 * 4, dtype=torch.float32).reshape(257, 4)
+        ids = torch.tensor([[0, 1]] * 257, dtype=torch.int32)
+        probs = torch.ones(257, 2)
+        payload = torch.tensor([[0, 257, 15, 257, 257, 0, 0], [0, 0, 15, 0, 0, 0, 0]])
+        workspace = Mock(in_use=False, source_buffer=None)
+        staged = hidden.repeat_interleave(2, dim=0)
+        mapping = torch.arange(514, dtype=torch.int32)
+        order = []
+
+        def gather(output: Any, unused_value: Any, **_kwargs: Any) -> Mock:
+            output.copy_(payload.flatten())
+            return Mock(wait=lambda: order.append("wait"))
+
+        def choose(counts: torch.Tensor, tokens: int, maximum: int, total: int | None) -> bool:
+            self.assertEqual(order, ["wait"])
+            torch.testing.assert_close(counts, payload[:, 3:].to(torch.int32))
+            self.assertEqual((tokens, maximum, total), (384, 514, 514))
+            self.assertIsNone(workspace.source_buffer)
+            order.append("choose")
+            return selected
+
+        def grow(tokens: int, received: int) -> None:
+            self.assertEqual(order, ["wait", "choose"])
+            self.assertEqual((tokens, received), (384, 514))
+            workspace.source_buffer = torch.empty(tokens * 2, 4)
+            workspace.in_use = mode == "pull"
+            order.append("grow")
+
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+              patch.object(route_module, "_stage_dynamic_permutation", return_value=None),
+              patch.object(route_module, "_permute_topk_input", return_value=(staged, mapping)),
+              patch.object(route_module, "_permute_topk_input_out", return_value=(staged, mapping))):
+            result = prepare_topk_route(
+                hidden, ids, probs, spec, None, workspace, autograd_mask=15,
+                prepare_workspace=grow, select_route=choose,
+            )
+        self.assertEqual(exchange.call_count, 1)
+        self.assertEqual(order, ["wait", "choose", "grow"] if selected else ["wait", "choose"])
+        torch.testing.assert_close(result.routed_tokens, staged)
+        self.assertEqual(result.metadata.plan_tokens, 384)
+        if not selected:
+            self.assertIsNone(workspace.source_buffer)
+            self.assertFalse(workspace.in_use)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_automatic_route_grows_before_writing_pull_source(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -652,6 +708,8 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                             actual = route_module._host_route_metadata(raw, spec, 32768, torch.device("cpu"))
                             with self.subTest(ep=ep, local=local, rank=rank, mode=mode):
                                 for field, value in vars(expected).items():
+                                    if field in ("_elements", "all_experts_active"):
+                                        continue
                                     observed = getattr(actual, field)
                                     if isinstance(value, torch.Tensor):
                                         expected_dtype = torch.int32 if field.endswith("size") else torch.int64
@@ -662,6 +720,45 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                                         self.assertEqual(offset % 512, 0)
                                     else:
                                         self.assertEqual(observed, value)
+
+                            self.assertEqual(actual.all_experts_active, bool((received.sum(0) > 0).all()))
+                            for field, value in vars(expected.for_kernel(spec.hidden_size)).items():
+                                if isinstance(value, torch.Tensor):
+                                    torch.testing.assert_close(
+                                        getattr(actual.for_kernel(spec.hidden_size), field), value, rtol=0, atol=0)
+
+    def test_moving_route_reuses_summary_but_revalidates_changed_peer_flags(self) -> None:
+        """A summary-only hit saves no device views and cannot skip current agreement."""
+        spec = replace(self._spec(24, rank=1), auto_tokens=True, dispatch_mode="push")
+        hidden = torch.ones(1, 16)
+        ids = torch.tensor([[3, 4]], dtype=torch.int32)
+        payload = self._payload(24, torch.int32)
+        workspace = SimpleNamespace(route_cache=None, wait_for_reuse=lambda *, stream=None: None)
+        grow = Mock();select = Mock(return_value=False)
+
+        def gather(output: torch.Tensor, _value: torch.Tensor, **_kwargs: object) -> Mock:
+            output.copy_(payload.flatten())
+            return Mock()
+
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+              patch.object(route_module, "_stage_dynamic_permutation", return_value=None),
+              patch.object(route_module, "_summarize_host_route", wraps=route_module._summarize_host_route) as summarize):
+            for current_ids in (ids, ids.flip(1)):
+                result = prepare_topk_route(hidden, current_ids, torch.ones(1, 2), spec, None, workspace,
+                    autograd_mask=31, prepare_workspace=grow, select_route=select, discard_rejected=True)
+                self.assertIsNone(result)
+            self.assertEqual(summarize.call_count, 1)
+            self.assertEqual(exchange.call_count, 2)
+            self.assertEqual(select.call_count, 2)
+            grow.assert_not_called()
+            entry = next(reversed(workspace.route_cache.values()))
+            self.assertIsNone(entry.metadata);self.assertIsNone(entry.ready)
+            payload[0, 2] = 0
+            with self.assertRaisesRegex(RuntimeError, "autograd participation"):
+                prepare_topk_route(hidden, ids, torch.ones(1, 2), spec, None, workspace,
+                    autograd_mask=31, prepare_workspace=grow, select_route=select, discard_rejected=True)
+            self.assertEqual(select.call_count, 2)
+            grow.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -685,7 +782,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         probabilities = torch.ones(1, 2)
         payload = self._payload(experts, torch.int32)
         workspace = SimpleNamespace(route_cache=None, in_use=True, source_buffer=torch.empty(1024, 16),
-                                    wait_for_reuse=lambda: None)
+                                    wait_for_reuse=lambda *, stream=None: None)
         observed_ids = []
 
         def gather(output: torch.Tensor, value: torch.Tensor, **_kwargs: object) -> Mock:
@@ -712,24 +809,24 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                             if isinstance(value, torch.Tensor)}
             second = prepare_topk_route(hidden, ids.flip(1), probabilities, spec, None, workspace,
                                         autograd_mask=31, prepare_workspace=grow)
-            self.assertEqual(build.call_count, 2)
-            self.assertNotEqual(first.metadata.dispatch_src_off.data_ptr(),
+            self.assertEqual(build.call_count, 1)
+            self.assertEqual(first.metadata.dispatch_src_off.data_ptr(),
                                 second.metadata.dispatch_src_off.data_ptr())
             again = prepare_topk_route(hidden, ids, probabilities, spec, None, workspace,
                                        autograd_mask=31, prepare_workspace=grow)
-            self.assertEqual(build.call_count, 2)
+            self.assertEqual(build.call_count, 1)
             self.assertEqual(second.metadata.dispatch_src_off.data_ptr(),
                              again.metadata.dispatch_src_off.data_ptr())
             changed_ids = torch.tensor([[4, 5]], dtype=torch.int32)
             payload[1, 3:] = torch.bincount(changed_ids.flatten().long(), minlength=experts).to(torch.int32)
             third = prepare_topk_route(hidden, changed_ids, probabilities, spec, None, workspace,
                                        autograd_mask=31, prepare_workspace=grow)
-            self.assertEqual(build.call_count, 3)
+            self.assertEqual(build.call_count, 2)
             self.assertEqual(exchange.call_count, 4)
             self.assertEqual(grow.call_count, 4)
             host_policy = spec.ep_size * experts <= route_module._HOST_DESCRIPTOR_MAX_COUNTS
-            self.assertEqual(host_build.call_count, 3 if host_policy else 0)
-            self.assertEqual(device_build.call_count, 0 if host_policy else 3)
+            self.assertEqual(host_build.call_count, 2 if host_policy else 0)
+            self.assertEqual(device_build.call_count, 0 if host_policy else 2)
         for observed, expected in zip(observed_ids, (ids, ids.flip(1), ids, changed_ids)):
             torch.testing.assert_close(observed, expected, rtol=0, atol=0)
         counts = payload[:, 3:]
@@ -788,9 +885,10 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         producer, consumer, ready = Mock(), Mock(), Mock()
         consumer.wait_event.side_effect = lambda _event: order.append("wait")
         tensors = [Mock(spec=torch.Tensor, record_stream=Mock(side_effect=lambda _stream: order.append("record")))
-                   for _ in range(7)]
-        metadata = SimpleNamespace(**{f"field{index}": tensor for index, tensor in enumerate(tensors)}, capacity=1)
-        cached = route_module._HostRouteCache((), [], (1, 128, 1), metadata, producer, ready)
+                   for _ in range(14)]
+        native = route_module.RouteMetadata(*tensors[:7], expert_capacity=1)
+        metadata = route_module.RouteMetadata(*tensors[7:], expert_capacity=1, _elements=(16, native))
+        cached = route_module._HostRouteCache((), [], (1, 128, 1), metadata, stream=producer, ready=ready)
         with patch.object(torch, "npu", create=True) as mock_npu:
             mock_npu.current_stream.return_value = consumer
             cached.wait("npu:0")
@@ -824,78 +922,60 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         with patch.object(route_module, "_upload_route_tensor", wraps=route_module._upload_route_tensor) as upload:
             first = route_module._dynamic_header((0, 129, 31), torch.int32, "cpu", workspace)
             again = route_module._dynamic_header((0, 129, 31), torch.int32, "cpu", workspace)
-            self.assertIsNot(again, first)
+            self.assertIs(again, first)
             confirmed = route_module._dynamic_header((0, 129, 31), torch.int32, "cpu", workspace)
             self.assertIs(confirmed, again)
-            self.assertEqual(upload.call_count, 2)
+            self.assertEqual(upload.call_count, 1)
             changed = route_module._dynamic_header((0, 129, 15), torch.int32, "cpu", workspace)
             resized = route_module._dynamic_header((0, 257, 15), torch.int32, "cpu", workspace)
-            self.assertEqual(upload.call_count, 4)
+            self.assertEqual(upload.call_count, 3)
         torch.testing.assert_close(first, torch.tensor([0, 129, 31], dtype=torch.int32), rtol=0, atol=0)
         torch.testing.assert_close(changed, torch.tensor([0, 129, 15], dtype=torch.int32), rtol=0, atol=0)
         torch.testing.assert_close(resized, torch.tensor([0, 257, 15], dtype=torch.int32), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_changed_tables_do_not_create_descriptor_cache_events(self) -> None:
-        """Feature: Automatic MegaMoe descriptor cache admission.
-
-        Description: Continuously changed tables must not pay for unused device cache readiness events.
-        Expectation: Only the first repeated table retains descriptors and records one readiness event.
-        """
-        spec = self._spec()
-        raw = self._payload(24, torch.int32).tolist()
-        changed = [row.copy() for row in raw]
-        changed[1][3 + 3] -= 1
-        changed[1][3 + 5] += 1
-        metadata = route_module._host_route_metadata(raw, spec, 128, torch.device("cpu"))
-        changed_metadata = route_module._host_route_metadata(changed, spec, 128, torch.device("cpu"))
+    def test_route_cache_keeps_owned_descriptors_with_bounded_eviction(self) -> None:
+        """Distinct immutable geometries retain their own descriptors up to the cache bound."""
+        spec = self._spec(384, rank=1)
         workspace = SimpleNamespace(route_cache=None)
-        producer, ready = Mock(), Mock()
-        with (patch.object(torch, "npu", create=True) as mock_npu,
-              patch.object(torch, "device", return_value=SimpleNamespace(type="npu", index=0))):
-            current, event = mock_npu.current_stream, mock_npu.Event
-            current.return_value, event.return_value = producer, ready
-            route_module._cache_host_route(workspace, spec, raw, (1, 128, 1), metadata, "npu:0")
-            self.assertIsNone(workspace.route_cache.metadata)
-            route_module._cache_host_route(workspace, spec, changed, (1, 128, 1), changed_metadata, "npu:0")
-            self.assertIsNone(workspace.route_cache.metadata)
-            current.assert_not_called()
-            event.assert_not_called()
-            route_module._cache_host_route(workspace, spec, changed, (1, 128, 1), changed_metadata, "npu:0")
-            self.assertIs(workspace.route_cache.metadata, changed_metadata)
-            current.assert_called_once()
-            event.assert_called_once()
-            ready.record.assert_called_once_with(producer)
+        first = None
+        for index in range(route_module._HOST_ROUTE_CACHE_ENTRIES + 2):
+            payload = self._payload(384, torch.int32)
+            payload[1, 3:] = 0
+            payload[1, 3 + 3] = 1
+            payload[1, 3 + 5 + index] = 1
+            summary, raw = route_module._read_dynamic_route(payload, spec)
+            metadata = route_module._dynamic_route_metadata(payload[1, 3:], payload, raw, spec, summary[0])
+            route_module._cache_host_route(workspace, spec, raw, summary, metadata, "cpu")
+            self.assertIs(next(reversed(workspace.route_cache.values())).metadata, metadata)
+            self.assertEqual(len(workspace.route_cache), min(index + 1, route_module._HOST_ROUTE_CACHE_ENTRIES))
+            if first is None:
+                first = metadata
+                expected_first = payload[1, 3:].clone()
+        torch.testing.assert_close(first.dispatch_size, expected_first, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_changed_headers_do_not_create_unused_readiness_events(self) -> None:
-        """Feature: Automatic MegaMoe control header cache admission.
-
-        Description: New token lengths upload headers without recording events for unconfirmed reuse.
-        Expectation: A repeated header records one event and subsequent identical headers reuse its tensor.
-        """
+    def test_header_cache_keeps_cross_stream_readiness(self) -> None:
+        """Each exact control header owns one event, reused by later consumer streams."""
         workspace = SimpleNamespace(route_header_cache=None)
-        producer, ready = Mock(), Mock()
-        with (patch.object(route_module, "_upload_route_tensor", side_effect=lambda value, _device: value) as upload,
-              patch.object(torch, "npu", create=True) as mock_npu,
-              patch.object(torch, "device", return_value=SimpleNamespace(type="npu", index=0))):
-            current, event = mock_npu.current_stream, mock_npu.Event
-            current.return_value, event.return_value = producer, ready
-            route_module._dynamic_header((0, 129, 31), torch.int32, "npu:0", workspace)
-            self.assertIsNone(workspace.route_header_cache.tensor)
-            route_module._dynamic_header((0, 257, 31), torch.int32, "npu:0", workspace)
-            self.assertIsNone(workspace.route_header_cache.tensor)
-            current.assert_not_called()
-            event.assert_not_called()
-            confirmed = route_module._dynamic_header((0, 257, 31), torch.int32, "npu:0", workspace)
-            again = route_module._dynamic_header((0, 257, 31), torch.int32, "npu:0", workspace)
-            self.assertIs(confirmed, again)
-            self.assertEqual(upload.call_count, 3)
-            self.assertEqual(current.call_count, 2)
-            event.assert_called_once()
-            ready.record.assert_called_once_with(producer)
+        producer, consumer, ready = Mock(), Mock(), Mock()
+        header = Mock(spec=torch.Tensor)
+        with (patch.object(route_module, "_upload_route_tensor", return_value=header) as upload,
+              patch.object(torch, "npu", create=True) as mock_npu):
+            mock_npu.current_stream.return_value = producer
+            mock_npu.Event.return_value = ready
+            first = route_module._dynamic_header((0, 129, 31), torch.int32, "npu:0", workspace)
+            repeated = route_module._dynamic_header((0, 129, 31), torch.int32, "npu:0", workspace)
+            self.assertIs(first, repeated)
+            mock_npu.current_stream.return_value = consumer
+            again = route_module._dynamic_header((0, 129, 31), torch.int32, "npu:0", workspace)
+            self.assertIs(first, again)
+            upload.assert_called_once()
+            mock_npu.Event.assert_called_once()
+            consumer.wait_event.assert_called_once_with(ready)
+            header.record_stream.assert_called_once_with(consumer)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -913,7 +993,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         for _ in range(2):
             metadata = route_module._dynamic_route_metadata(supplied, payload, raw, spec, summary[0])
             route_module._cache_host_route(workspace, spec, raw, summary, metadata, "cpu")
-        self.assertIsNotNone(workspace.route_cache.metadata)
+        self.assertIsNotNone(next(reversed(workspace.route_cache.values())).metadata)
         supplied.zero_()
         _, _, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
         self.assertIsNotNone(cached)
@@ -927,8 +1007,9 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         Description: Changing wide tables temporarily use device summaries without reading the full Host table.
         Expectation: Eight fallback calls preserve validation, then repeated counts recover immutable descriptors.
         """
-        spec = self._spec(384, rank=1)
-        payload = self._payload(384, torch.int32)
+        experts = 384
+        spec = self._spec(experts, rank=1)
+        payload = self._payload(experts, torch.int32)
         workspace = SimpleNamespace(route_cache=None, route_cache_probe_after=0)
         summary, raw, _ = route_module._read_cached_route(payload, spec, workspace, "cpu")
         metadata = route_module._dynamic_route_metadata(payload[1, 3:], payload, raw, spec, summary[0])
@@ -949,7 +1030,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                 self.assertEqual(workspace.route_cache_probe_after, remaining)
             self.assertEqual(device_summary.call_count, route_module._ROUTE_CACHE_REPROBE_STEPS)
         _, raw, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
-        self.assertIsNone(cached)
+        self.assertIs(cached, metadata)
         route_module._cache_host_route(workspace, spec, raw, changed, metadata, "cpu")
         _, _, cached = route_module._read_cached_route(payload, spec, workspace, "cpu")
         self.assertIs(cached, metadata)

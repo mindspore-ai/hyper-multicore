@@ -136,6 +136,7 @@ class AllToAllFillConfig(FillConfig):
             task.task_index           = i
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
+            task.extra_value_1 = 2 if hasattr(op, "compact_lanes") else 0
             task.tiling_data_position = 0xFFFFFFFF
 
             cfg.all_tasks[tsv.pre_task_num + i] = task

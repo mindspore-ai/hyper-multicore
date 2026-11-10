@@ -222,6 +222,7 @@ def new_layers(
     capacity_growth_factor: float | None = None,
     dispatch_mode: str | None = None,
     expert_weight_layout: str = "EIO",
+    enable_hot_replica: bool = False,
 ) -> tuple[MegaMoeExperts, torch.nn.Module]:
     """Construct parameter-aligned MegaMoe and common expert layers.
 
@@ -238,6 +239,7 @@ def new_layers(
     common_moe = new_common_moe(shape)
     mode = dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     mega = MegaMoeExperts(
+        enable_hot_replica=enable_hot_replica,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,

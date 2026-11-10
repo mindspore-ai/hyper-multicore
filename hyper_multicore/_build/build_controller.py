@@ -100,6 +100,18 @@ def cmake_pair(python, identity, common, sdk, args, run):
     env["LD_LIBRARY_PATH"] = os.pathsep.join(
         [str(common / "shmem/lib"), str(common / "shmem/lib/shmem"), env.get("LD_LIBRARY_PATH", "")])
     compile_pair(python, directory, payload, common, args, run, env, identifier)
+    with run.commands.scope("MoonEP"):
+        standard = (directory / "torch/torch_cxx_standard.txt").read_text().strip()
+        output = payload / "moonep"
+        run.commands(
+            [str(python), str(ROOT / "hyper_multicore/moonep/build.py"), "--shared",
+             "--sdk-root", str(sdk / "shmem"), "--cxx-standard", standard,
+             "--output-dir", str(output)],
+            label=f"compile-{identifier}-moonep", env=env,
+        )
+        link_env = {**env, "LD_LIBRARY_PATH": os.pathsep.join([str(output), env["LD_LIBRARY_PATH"]])}
+        for name in ("_a3_allocator.so", "_moonep_shared_bridge.so", "libhp_moonep_shared_kernels.so"):
+            validate_elf(output / name, identity["host_arch"], run.commands, link_env)
     with run.commands.scope("Load"):
         load_pair(python, payload, common, run, env, identifier)
     with run.commands.scope("ELF"):

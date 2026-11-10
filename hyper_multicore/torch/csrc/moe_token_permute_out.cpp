@@ -16,7 +16,7 @@
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 #include <tuple>
-#include "csrc/cached_op_api.h"
+#include "csrc/cached_moe_op_api.h"
 
 namespace {
 
@@ -54,7 +54,7 @@ PermuteOutputs permute_npu(const at::Tensor &tokens, const at::Tensor &indices, 
   if (indices.numel() != 0) {
     int64_t num_out_tokens = indices.numel();
     bool padded_mode = false;
-    HYPER_EXEC_NPU_CMD_EXT(aclnnMoeTokenPermute, tokens, indices, num_out_tokens, padded_mode, output, mapping);
+    HMC_EXEC_CACHED_MOE_OP(aclnnMoeTokenPermute, tokens, indices, num_out_tokens, padded_mode, output, mapping);
   }
   return {output, mapping};
 }

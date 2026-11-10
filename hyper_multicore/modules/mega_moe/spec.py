@@ -50,10 +50,14 @@ class MegaMoeSpec:
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
     swiglu_limit: float | None = None
+    clamp_after_activation: bool = False
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    batch_experts: bool = False
+    nominal_schedule: bool = False
+    apply_probs_before_fc2: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -212,6 +216,8 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
+        clamp_after_activation=specification.get("clamp_after_activation", False),
+        apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),

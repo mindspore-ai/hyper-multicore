@@ -40,7 +40,7 @@ class PutMemSignalKernel {
   __aicore__ inline PutMemSignalKernel() {}
   __aicore__ inline void Init(GM_ADDR target, int64_t target_offset, GM_ADDR src, int64_t src_offset, int64_t size,
                               GM_ADDR signal, int64_t signal_offset, int32_t signal_value, int64_t signal_op,
-                              int64_t target_pe, bool non_blocking, GM_ADDR workspace) {
+                              int64_t target_pe, bool /* non_blocking */, GM_ADDR /* workspace */) {
     // Initialize pointers and parameters
     target_ = reinterpret_cast<__gm__ T *>(target);
     src_ = reinterpret_cast<__gm__ T *>(src);
@@ -52,32 +52,25 @@ class PutMemSignalKernel {
     signal_value_ = signal_value;
     signal_op_ = signal_op;
     target_pe_ = target_pe;
-    non_blocking_ = non_blocking;
 
-    // UB tiling set
-    aiv_idx_ = 0;
-    aiv_num_ = 1;
-
-    syncGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(workspace), 256);
-    pipe.InitBuffer(localwork, 1, sizeof(int32_t) * aiv_num_);
+    // One scheduler worker owns this task; SHMEM supplies its copy UB.
   }
 
-  __aicore__ inline void Process() {
+  __aicore__ inline void Process(bool publish_signal = true) {
     // Empty tiles still satisfy remote dependencies without resolving data addresses.
     if (size_ == 0) {
-      shmem_data_plane::fence();
-      shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
-                               signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
-                               target_pe_);
+      if (publish_signal) {
+        shmem_data_plane::fence();
+        shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
+                                signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
+                                target_pe_);
+      }
       return;
     }
     // Perform data transfer
-    auto size_per_core = size_ / aiv_num_;
-    auto target_ptr = target_ + target_offset_ + aiv_idx_ * size_per_core;
-    auto src_ptr = src_ + src_offset_ + aiv_idx_ * size_per_core;
-    if (aiv_idx_ == aiv_num_ - 1) {
-      size_per_core = size_ - size_per_core * aiv_idx_;
-    }
+    auto size_per_core = size_;
+    auto target_ptr = target_ + target_offset_;
+    auto src_ptr = src_ + src_offset_;
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
     /* CopyUB Config Set */
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
@@ -116,21 +109,17 @@ class PutMemSignalKernel {
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
 
+    // The following activation transfer fences both copies before publishing
+    // the existing completion signal. The probability sidecar only waits MTE3.
+    if (!publish_signal) {
+      AscendC::PipeBarrier<PIPE_ALL>();
+      return;
+    }
     // Write signal after data transfer
     auto signal_ptr = signal_ + signal_offset_;
-    if (non_blocking_) {
-      shmem_data_plane::fence();
-    } else {
-      shmem_data_plane::fence();
-    }
-    // Sync ensure corresponding tasks are done
-    if (aiv_num_ > 1) {
-      AscendC::LocalTensor<int32_t> workLocal = localwork.AllocTensor<int32_t>();
-      AscendC::SyncAll(syncGlobal, workLocal, aiv_num_);
-      localwork.FreeTensor(workLocal);
-    }
+    shmem_data_plane::fence();
 
-    if (aiv_idx_ == 0) {
+    if (publish_signal) {
       shmem_data_plane::signal(signal_ptr, signal_value_,
                                signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
                                target_pe_);
@@ -141,7 +130,6 @@ class PutMemSignalKernel {
   __gm__ T *target_;
   __gm__ T *src_;
   __gm__ int32_t *signal_;
-  AscendC::TPipe pipe;
 
   int64_t target_offset_ = 0;
   int64_t src_offset_ = 0;
@@ -150,12 +138,6 @@ class PutMemSignalKernel {
   int32_t signal_value_ = 0;
   int64_t signal_op_ = 0;
   int64_t target_pe_ = 0;
-  bool non_blocking_ = true;
-  AscendC::GlobalTensor<int32_t> syncGlobal;
-  AscendC::TQue<AscendC::TPosition::VECIN, 1> localwork;
-  // ub
-  uint32_t aiv_idx_ = 0;
-  uint32_t aiv_num_ = 0;
 };
 
 }  // namespace hyper_multicore
