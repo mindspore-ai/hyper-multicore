@@ -83,10 +83,13 @@ def reset_workspace(directory, root):
 
 def environment_directory(native: Path) -> Path:
     """Locate reusable framework environments without following redirected roots."""
-    directory = native / "envs"
-    if directory.is_symlink():
+    configured = os.environ.get("HYPER_MULTICORE_VENV_PATH")
+    if configured and not Path(configured).is_absolute():
+        raise ValueError("HYPER_MULTICORE_VENV_PATH must be an absolute path")
+    directory = Path(configured) if configured else native / "envs"
+    if any(path.is_symlink() for path in (directory, *directory.parents)):
         raise ValueError(f"Refusing symlinked framework storage: {directory}")
-    return directory
+    return directory.resolve()
 
 
 RUN_DIRECTORY = re.compile(r"\d{8}-\d{6}-\d+\Z")

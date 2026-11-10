@@ -3,7 +3,10 @@
   "indexes": {
     "torch": "https://download.pytorch.org/whl/cpu",
     "pta": "https://pypi.org/simple",
-    "dependencies": "https://pypi.org/simple"
+    "dependencies": "https://pypi.org/simple",
+    "dependencies_extra": [
+      "https://mirrors.huaweicloud.com/repository/pypi/simple"
+    ]
   },
   "build_requirements": [
     "numpy>=1.26,<2",

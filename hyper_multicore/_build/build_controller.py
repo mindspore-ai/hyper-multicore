@@ -278,6 +278,7 @@ def report_local_framework(python: Path):
 
 def prepare_matrix_environments(targets, run, base, socs, source):
     """Prepare and verify each target once, including its actual installed package versions."""
+    message(f"Framework environment storage: {FRAMEWORK.environment_directory(NATIVE)}")
     pythons, identities = [], []
 
     def collect(python, expected):

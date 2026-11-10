@@ -47,6 +47,7 @@ def _local_preparation(monkeypatch, tmp_path):
 def test_current_framework_ignores_release_matrix(local_preparation, monkeypatch, capsys):
     """Local versions reach capability checks even when the release matrix is unavailable."""
     args, run, identity = local_preparation
+    monkeypatch.setenv("HYPER_MULTICORE_VENV_PATH", "invalid-relative-path")
     def _unavailable(_path):
         raise ValueError("missing or damaged release matrix")
     monkeypatch.setattr(ENV, "load_targets", _unavailable)
@@ -64,6 +65,9 @@ def test_environment_isolation_preserves_cann_but_removes_framework_paths():
                                         "/old/build/native/envs/other/lib"),
                     "PIP_EXTRA_INDEX_URL": "https://wrong.invalid", "PIP_FIND_LINKS": "/wrong",
                     "PIP_CACHE_DIR": "/user/cache", "PIP_NO_CACHE_DIR": "1",
+                    "HYPER_MULTICORE_VENV_PATH": "/custom/unused/../venvs",
+                    "CPATH": ("/custom/venvs:/custom/venvs/other/include:"
+                              "/custom/unused/../venvs/old/include:/custom/venvs-other:/cann/include"),
                     "ASCEND_HOME_PATH": "/cann", "CMAKE_PREFIX_PATH": "/cann/compiler:/old/site-packages/torch/share/cmake"}, clear=True):
         result = ENV.isolated_environment(Path("/owned/venv/bin/python"))
         pip = ENV.pip_environment(Path("/owned/venv/bin/python"))
@@ -71,6 +75,7 @@ def test_environment_isolation_preserves_cann_but_removes_framework_paths():
     assert result["LD_LIBRARY_PATH"] == "/cann/lib64"
     assert result["ASCEND_HOME_PATH"] == "/cann"
     assert result["CMAKE_PREFIX_PATH"] == "/cann/compiler"
+    assert result["CPATH"] == "/custom/venvs-other:/cann/include"
     assert result["PATH"].startswith("/owned/venv/bin")
     assert "PIP_EXTRA_INDEX_URL" not in pip and "PIP_FIND_LINKS" not in pip
     assert pip["PIP_CACHE_DIR"] == "/user/cache" and pip["PIP_NO_CACHE_DIR"] == "1"
@@ -208,10 +213,23 @@ def test_shell_entries_preserve_arguments_and_failure(tmp_path, entry, selection
     assert ("--all" in arguments) == bool(selection)
 
 
-def test_environment_key_separates_architecture_python_and_requirements(tmp_path):
+def test_environment_key_separates_architecture_python_and_requirements(tmp_path, monkeypatch):
     """Platform changes and requested build requirements cannot share a venv."""
     target = make_target(tmp_path)
     key = ENV.environment_key(target, Path(sys.executable))
+    legacy = ENV.digest_json({"schema": 2, "base_python": str(Path(sys.executable).resolve()),
+        "base_version": sys.version, "abi": sys.implementation.cache_tag,
+        "arch": ENV.platform.machine(), "request": target})
+    assert key == legacy
+    monkeypatch.setenv("HYPER_MULTICORE_VENV_PATH", str(tmp_path / "elsewhere"))
+    assert ENV.environment_key(target, Path(sys.executable)) == key
+    target["indexes"]["dependencies_extra"] = ["https://mirror.example/simple"]
+    assert ENV.environment_key(target, Path(sys.executable)) == key
+    target["indexes"].pop("dependencies_extra")
+    with patch.dict(target["indexes"], dependencies="https://other.example/simple"):
+        assert ENV.environment_key(target, Path(sys.executable)) != key
+    with patch.dict(target, pta_build_version="1.0.1"):
+        assert ENV.environment_key(target, Path(sys.executable)) != key
     with patch.object(ENV.platform, "machine", return_value="other-architecture"):
         assert ENV.environment_key(target, Path(sys.executable)) != key
     with patch.object(ENV.sys, "version", "another-python"):
@@ -228,11 +246,19 @@ def test_cann_reference_only_warns(reference, actual, warnings, capsys):
     assert actual in output and output.count("WARN") == warnings
 
 
-def test_environment_install_and_reuse_only_locks_framework_pair(tmp_path):
+@pytest.mark.parametrize("mirrors", [None, [], ["https://mirror.example/simple"],
+    ["https://mirror.example/simple", "https://second.example/simple"]],
+    ids=["missing", "empty", "single", "multiple"])
+def test_environment_install_and_reuse_only_locks_framework_pair(tmp_path, mirrors, monkeypatch):
     """The actual manager installs exact roots once, then accepts other package changes."""
     wheels = tmp_path / "downloads"
     wheels.mkdir()
     target = make_target(wheels)
+    storage = tmp_path / "external venvs"
+    monkeypatch.setenv("HYPER_MULTICORE_VENV_PATH", str(storage))
+    if mirrors is not None:
+        target["indexes"]["dependencies_extra"] = mirrors
+    original_request = json.loads(json.dumps(target))
     commands = []
     def runner(command, **_kwargs):
         commands.append(command)
@@ -243,25 +269,48 @@ def test_environment_install_and_reuse_only_locks_framework_pair(tmp_path):
             source = wheels / f"{name}-1.0.0-py3-none-any.whl"
             shutil.copyfile(source, destination / source.name)
         if "--report" in command:
-            Path(command[command.index("--report") + 1]).write_text(json.dumps({"install": []}))
+            report = {"install": [{"metadata": {"name": "numpy"},
+                                   "download_info": {"url": "https://installed.example/numpy.whl"}}]}
+            Path(command[command.index("--report") + 1]).write_text(json.dumps(report))
     actual = [{"name": "numpy", "version": "1.26.4"}]
     def probe(_python, expected):
         assert expected == {"torch": "1.0.0", "torch-npu": "1.0.0"}
         return actual
     python = ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable), identity_probe=probe)
-    assert python.parent.parent.parent == tmp_path / "envs"
+    assert python.parent.parent.parent == storage
+    assert not (tmp_path / "envs").exists()
     install = next(c for c in commands if "--report" in c)
     assert "--only-binary=:all:" in install and "--no-deps" not in install
+    assert install[install.index("--index-url") + 1] == target["indexes"]["dependencies"]
+    assert [install[i + 1] for i, arg in enumerate(install) if arg == "--extra-index-url"] == (mirrors or [])
+    assert all("--extra-index-url" not in c for c in commands if "--dest" in c)
     assert not list(python.parent.parent.glob("framework-install-*"))
+    ready = python.parent.parent / "ready.json"
+    installation = json.loads(ready.read_text())["installation"]
     actual[0]["version"] = "2.0.0"
     commands.clear()
-    ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable), identity_probe=probe)
+    target["indexes"]["dependencies_extra"] = ["https://replacement.example/simple"]
+    assert ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable), identity_probe=probe) == python
+    target["indexes"].pop("dependencies_extra")
+    assert ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable), identity_probe=probe) == python
     assert commands == []
-    record = json.loads((python.parent.parent / "ready.json").read_text())
+    record = json.loads(ready.read_text())
     assert record["installed_packages"] == actual
+    assert record["request"] == original_request and record["installation"] == installation
     with pytest.raises(RuntimeError, match="changed"):
         ENV.prepare_environment(target, tmp_path, runner, Path(sys.executable),
                                 identity_probe=lambda *_: (_ for _ in ()).throw(RuntimeError("framework changed")))
+
+
+@pytest.mark.parametrize("mirrors", ["https://mirror.example/simple", ["http://mirror.example/simple"]])
+def test_invalid_extra_indexes_fail_before_environment_creation(tmp_path, mirrors):
+    target = make_target(tmp_path)
+    target["indexes"]["dependencies_extra"] = mirrors
+    def unexpected_install(*_args, **_kwargs):
+        pytest.fail("invalid mirror configuration reached installation")
+    with pytest.raises(ValueError, match="dependencies_extra"):
+        ENV.prepare_environment(target, tmp_path, unexpected_install, Path(sys.executable))
+    assert not (tmp_path / "envs").exists()
 
 
 def test_failed_install_cleans_downloads_without_publishing_ready(tmp_path, monkeypatch):
