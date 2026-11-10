@@ -1,0 +1,22 @@
+ascend910b:
+  activation_checkpoint: 1200
+  shard: 2400
+  distributed_checkpoint: 960
+  accuracy: 960
+  pipeline_parallel: 4800
+  dtensor: 960
+  tensor_parallel: 2400
+  context_parallel: 960
+  clip_grad: 960
+  expert_parallel: 960
+  trainer: 960
+  fully_shard: 4800
+  init_weights: 950
+  llama3_examples: 960
+  process_group: 720
+  swap_optimizer: 960
+  optimizer: 2400
+  auto_models: 1200
+  multicore: 960
+  activation_memory: 960
+
