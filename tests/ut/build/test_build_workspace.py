@@ -146,9 +146,13 @@ def test_distribution_rotation_refuses_external_symlink(tmp_path):
     assert old.exists()
 
 
-def test_success_prunes_only_owned_old_environments(tmp_path):
+@pytest.mark.parametrize("custom", [False, True], ids=["default-root", "custom-root"])
+def test_success_prunes_only_owned_old_environments(tmp_path, monkeypatch, custom):
     """Retain current and latest successful rollback; never touch external symlinks."""
-    base = tmp_path / "envs"
+    base = tmp_path / ("custom venvs" if custom else "envs")
+    if custom:
+        monkeypatch.setenv("HYPER_MULTICORE_VENV_PATH", str(base))
+    protected = put(tmp_path / "other-storage/sentinel")
     base.mkdir(parents=True)
     current = base / ("current-" + "a" * 20)
     for name, timestamp in (("current", 3), ("rollback", 2), ("older", 1), ("removed-branch", 5)):
@@ -174,6 +178,32 @@ def test_success_prunes_only_owned_old_environments(tmp_path):
     assert {Path(p).name for p in removed} == {"older-" + "a" * 20, "removed-branch-" + "a" * 20, abandoned.name}
     assert current.exists() and (base / ("rollback-" + "a" * 20)).exists() and external.exists() and unknown.exists()
     assert sentinel.exists() and (redirected / "ready.json").is_symlink()
+    assert protected.exists()
+
+
+def test_environment_storage_selection_and_redirect_protection(tmp_path, monkeypatch):
+    """Only explicit absolute roots replace the default; redirected storage stays protected."""
+    assert WORKSPACE.environment_directory(tmp_path) == tmp_path / "envs"
+    monkeypatch.setenv("HYPER_MULTICORE_VENV_PATH", "")
+    assert WORKSPACE.environment_directory(tmp_path) == tmp_path / "envs"
+    storage = tmp_path / "external venvs"
+    monkeypatch.setenv("HYPER_MULTICORE_VENV_PATH", str(tmp_path / "unused/../external venvs"))
+    assert WORKSPACE.environment_directory(tmp_path) == storage
+    storage.mkdir()
+    redirected = tmp_path / "redirected"
+    redirected.symlink_to(storage, target_is_directory=True)
+    monkeypatch.setenv("HYPER_MULTICORE_VENV_PATH", str(redirected / "envs"))
+    with pytest.raises(ValueError, match="symlinked"):
+        WORKSPACE.environment_directory(tmp_path)
+
+
+@pytest.mark.parametrize("configured", ["relative/venvs", "~/venvs"])
+def test_relative_environment_storage_fails_before_install(tmp_path, monkeypatch, configured):
+    monkeypatch.setattr(BUILD, "NATIVE", tmp_path)
+    monkeypatch.setenv("HYPER_MULTICORE_VENV_PATH", configured)
+    with pytest.raises(ValueError, match="HYPER_MULTICORE_VENV_PATH must be an absolute path"):
+        BUILD.prepare_matrix_environments([], None, Path(sys.executable), "ascend910b", {})
+    assert not (tmp_path / "envs").exists()
 
 
 def test_interruption_kills_grandchild_before_controller_returns(tmp_path):

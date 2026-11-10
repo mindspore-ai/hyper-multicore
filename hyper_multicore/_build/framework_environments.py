@@ -84,15 +84,27 @@ def validate_target(target: dict) -> None:
     validate_sources_and_requirements(target)
 
 
+def validate_index_url(address: str, name: str) -> None:
+    """Apply the same HTTPS source rules to primary and additional indexes."""
+    if not isinstance(address, str):
+        raise ValueError(f"Framework index must be an HTTPS URL string: {name}")
+    url = urllib.parse.urlparse(address)
+    if url.scheme != "https" or not url.netloc or url.username or url.password or url.query or url.fragment:
+        raise ValueError(f"Framework indexes require credential-free HTTPS URLs: {name}")
+
+
 def validate_sources_and_requirements(target: dict):
     """Validate common resolver settings without prescribing a complete package list."""
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
 
     for name in ("torch", "pta", "dependencies"):
-        url = urllib.parse.urlparse(target["indexes"][name])
-        if url.scheme != "https" or not url.netloc or url.username or url.password or url.query or url.fragment:
-            raise ValueError(f"Framework indexes require credential-free HTTPS URLs: {name}")
+        validate_index_url(target["indexes"][name], name)
+    extra = target["indexes"].get("dependencies_extra", [])
+    if not isinstance(extra, list):
+        raise ValueError("indexes.dependencies_extra must be a list of HTTPS URLs")
+    for address in extra:
+        validate_index_url(address, "dependencies_extra")
     for text in target["build_requirements"]:
         requirement = Requirement(text)
         if (
@@ -110,6 +122,7 @@ def isolated_environment(python: Path) -> dict:
         env.pop(key, None)
     env.update(PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1", TORCH_DEVICE_BACKEND_AUTOLOAD="0")
     env["PATH"] = str(python.parent) + os.pathsep + env.get("PATH", "")
+    storage = environment_directory(Path(__file__).resolve().parents[2] / "build/native")
     # Framework-owned paths are chosen from the target interpreter, never inherited from another venv.
     for key in ("LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "CPLUS_INCLUDE_PATH", "CMAKE_PREFIX_PATH"):
         if key in env:
@@ -118,6 +131,7 @@ def isolated_environment(python: Path) -> dict:
                 for p in env[key].split(os.pathsep)
                 if "site-packages/torch" not in p
                 and "/build/native/envs/" not in p
+                and not Path(p).resolve().is_relative_to(storage)
                 and "site-packages/hyper_multicore" not in p
                 and "/build/native/payload/" not in p
             )
@@ -176,6 +190,15 @@ def file_digest(path: Path) -> str:
     return checksum.hexdigest()
 
 
+def environment_request(target: dict) -> dict:
+    """Keep install-only mirrors out of environment identity without modifying provenance."""
+    request = dict(target)
+    indexes = request.get("indexes")
+    if isinstance(indexes, dict):
+        request["indexes"] = {name: value for name, value in indexes.items() if name != "dependencies_extra"}
+    return request
+
+
 def environment_key(target: dict, base_python: Path) -> str:
     """Separate version requests, Python runtimes and architectures, not transitive versions."""
     return digest_json(
@@ -185,7 +208,7 @@ def environment_key(target: dict, base_python: Path) -> str:
             "base_version": sys.version,
             "abi": sys.implementation.cache_tag,
             "arch": platform.machine(),
-            "request": target,
+            "request": environment_request(target),
         }
     )
 
@@ -251,7 +274,9 @@ def prepare_environment(target: dict, native: Path, run, base_python: Path, *, i
     reused = ready.is_file()
     if reused:
         record = json.loads(ready.read_text())
-        if record.get("environment_key") != key or record.get("request") != target:
+        previous = record.get("request")
+        if (record.get("environment_key") != key or not isinstance(previous, dict)
+                or environment_request(previous) != environment_request(target)):
             raise ValueError(f"Corrupt environment completion marker: {directory}")
         message(f"PTA {target['pta_build_version']}: checking installed framework pair")
     else:
@@ -282,8 +307,10 @@ def install_framework(target, directory, python, run):
         temporary = Path(temporary)
         roots = download_roots(target, temporary, python, run)
         report = temporary / "pip-report.json"
+        extra = [argument for address in target["indexes"].get("dependencies_extra", [])
+                 for argument in ("--extra-index-url", address)]
         run([str(python), "-m", "pip", "install", "--only-binary=:all:", "--progress-bar", "off",
-             "--index-url", target["indexes"]["dependencies"], "--report", str(report),
+             "--index-url", target["indexes"]["dependencies"], *extra, "--report", str(report),
              *map(str, roots), *target["build_requirements"]],
             label=f"install-{target['id']}", env=pip_environment(python))
         installation = json.loads(report.read_text())

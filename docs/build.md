@@ -55,7 +55,7 @@ bash hyper_multicore/build.sh --soc-list ascend910b --jobs 24
 | --- | --- | --- |
 | 框架来源 | 当前解释器实际导入的 Torch/PTA | [框架矩阵](../hyper_multicore/_build/frameworks.lock.json)中的准确配对 |
 | 版本选择 | 接受正式版、开发版和自定义版本标识 | 使用配置指定的发行版本 |
-| 框架安装 | 使用本机环境 | 创建或复用 `build/native/envs/` 下的 venv |
+| 框架安装 | 使用本机环境 | 在指定目录创建或复用 venv，默认 `build/native/envs/` |
 | 公共资源 | 使用调用者 CANN 工具环境 | 使用调用者 CANN 工具环境 |
 | 适配对 | 编译一组 | 按预算并行编译全部配置目标 |
 | wheel | 包含当前 PTA 标签 | 不带单一 PTA 标签 |
@@ -190,11 +190,37 @@ python -m pip show -f hyper-multicore
 ```
 
 修改现有文件时保留 `schema_version`、`indexes` 和 `build_requirements`。
+可通过 `indexes.dependencies_extra` 配置依赖安装的额外索引，例如：
+
+```json
+"dependencies_extra": ["https://mirrors.huaweicloud.com/repository/pypi/simple"]
+```
+
+每个地址对应一组 `pip install --extra-index-url`；缺失或空列表时不追加索引。
+主源和额外索引共同参与选包，不按配置顺序作失败回退。该设置仅用于新建 venv 的依赖安装，
+Torch/PTA wheel 仍从各自指定的主源下载。增删额外索引不改变环境身份，已有成功 venv 继续复用；
+`ready.json` 保留创建时的请求和安装来源。默认开发构建不读取该配置。
+
 pip 按当前 Python 和平台从各自索引选择准确框架 wheel，再解析必要依赖；缺少兼容 wheel 时失败，
 不换版本或回退源码安装。构建不主动安装 pytest，也不需要独立的 pybind11 Python 包。
 下载复用由 pip 自身缓存负责，尊重 `PIP_CACHE_DIR` 和 `PIP_NO_CACHE_DIR`，不清理用户全局缓存。
 
-成功 venv 位于 `build/native/envs/`。请求、Python、架构或基础解释器变化会选择不同环境；
+`HYPER_MULTICORE_VENV_PATH` 可指定 `--all` 的 venv 根目录，每个框架目标使用独立子目录：
+
+```bash
+export HYPER_MULTICORE_VENV_PATH=/data/hyper-multicore/venvs
+bash build.sh --all --soc-list ascend910b --jobs 24
+```
+
+未设置或为空时使用 `build/native/envs/`。配置值必须是绝对路径，不接受相对路径或未展开的 `~/...`。
+默认开发构建忽略此变量。环境创建、复用及回收使用同一根目录，启动日志显示实际位置。
+更换根目录不会迁移已有环境，也不会回退查找旧目录。不同 checkout 不得并发使用同一 venv 根目录；
+构建锁仅保护当前 checkout，不提供跨 checkout 的目录互斥。
+
+`--clean` 不删除 venv。需要重建框架环境时，应停止相关构建后手动删除对应环境目录。
+删除项目 `build/` 不会清理存放在外部的 venv。
+
+存储位置不参与环境键。除额外索引外，请求、Python、架构或基础解释器变化会选择不同环境；
 复用只严格核对 Torch/PTA，其他包的变化记录到实际安装版本，不自动升级或重装。
 必要依赖缺失和接口问题由真实构建报告。`ready.json` 保存请求、安装来源和实际安装版本，作为追溯信息。
 传递依赖由 pip 解析，不同时间创建的环境可能不同，不提供完整依赖离线重装快照。
