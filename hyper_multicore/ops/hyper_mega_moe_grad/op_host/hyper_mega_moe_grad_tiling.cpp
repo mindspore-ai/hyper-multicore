@@ -86,8 +86,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   tiling.set_seqSize(seqSize);
   tiling.set_coreNum(static_cast<int64_t>(coreNum));
 
-  auto runtimeShape = context->GetInputShape(27);
-  auto eventShape = context->GetInputShape(28);
+  auto runtimeShape = context->GetInputShape(26);
+  auto eventShape = context->GetInputShape(27);
   OP_CHECK_NULL_WITH_CONTEXT(context, runtimeShape);
   OP_CHECK_NULL_WITH_CONTEXT(context, eventShape);
   int64_t runtimeBytes = runtimeShape->GetStorageShape().GetShapeSize();

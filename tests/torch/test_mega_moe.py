@@ -89,13 +89,13 @@ def test_mega_moe_level0_precision(monkeypatch) -> None:
 
 
 def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:
-    """Run common/MegaMoe A/B in one four-rank process group."""
+    """Run reference/MegaMoe A/B in one four-rank process group."""
     result_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(result_dir))) / "performance"
     result_path = result_dir / "routed_expert_ab.json"
     monkeypatch.delenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE", raising=False)
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PERFORMANCE_WORLD_SIZE))
-    monkeypatch.setenv("HP_MEGA_MOE_PERF_WARMUP", "3")
-    monkeypatch.setenv("HP_MEGA_MOE_PERF_MEASURED", "5")
+    monkeypatch.setenv("HP_MEGA_MOE_PERF_WARMUP", os.getenv("HP_MEGA_MOE_PERF_WARMUP", "3"))
+    monkeypatch.setenv("HP_MEGA_MOE_PERF_MEASURED", os.getenv("HP_MEGA_MOE_PERF_MEASURED", "5"))
     monkeypatch.setenv("HP_MEGA_MOE_PERF_RESULT", str(result_path))
     monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", "62000-62063")
     monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
@@ -113,11 +113,12 @@ def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:
     essential_mark="unessential",
 )
 def test_mega_moe_representative_performance(monkeypatch, tmp_path: Path) -> None:
-    """Enforce one steady-state common/MegaMoe routed-expert A/B threshold."""
+    """Collect a steady-state reference/MegaMoe A/B result without a speed gate."""
     _prepare_torch_multicore_test_environment()
     comparison = _run_performance_worker(monkeypatch, tmp_path)
     results = comparison["results"]
-    reference = results["common"]
+    reference_key = "common" if "common" in results else "mega_moe_external_shared"
+    reference = results[reference_key]
     for tag, backend_result in results.items():
         assert backend_result["shape"] == reference["shape"], (
             f"performance shape drifted for {tag}: "
@@ -134,8 +135,10 @@ def test_mega_moe_representative_performance(monkeypatch, tmp_path: Path) -> Non
             f"performance validation failed for {tag}: "
             f"validation={backend_result['validation']}"
         )
+        for schedule in backend_result.get("schedule", {}).values():
+            assert schedule["total_tasks"] == schedule["aic_tasks"] + schedule["aiv_tasks"], schedule
 
-    common_median = results["common"]["rank_max_fwd_bwd_ms"]["median"]
+    common_median = results[reference_key]["rank_max_fwd_bwd_ms"]["median"]
     mega_median = results["mega_moe"]["rank_max_fwd_bwd_ms"]["median"]
     assert common_median > 0.0, (
         f"common median latency must be positive, got {common_median}."
@@ -145,7 +148,7 @@ def test_mega_moe_representative_performance(monkeypatch, tmp_path: Path) -> Non
     assert comparison["performance_acceptance"] is False
     print(
         "MegaMoe representative A/B: "
-        f"common_ms={common_median}, mega_ms={mega_median}, ratio={ratio:.6f}"
+        f"reference={reference_key}, reference_ms={common_median}, mega_ms={mega_median}, ratio={ratio:.6f}"
     )
 
 

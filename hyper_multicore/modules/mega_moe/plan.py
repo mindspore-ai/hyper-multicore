@@ -28,7 +28,7 @@ from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
 )
 from hyper_multicore.modules.mega_moe.backward.graph import (
-    build_backward_graph,
+    build_backward_graph, build_route_backward_graph,
 )
 from hyper_multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
 from hyper_multicore.modules.mega_moe.backward.tiling_tables import (
@@ -42,19 +42,20 @@ from hyper_multicore.modules.mega_moe.forward.gen_runtime_data import (
     build_config_for_rank as build_forward_config,
 )
 from hyper_multicore.modules.mega_moe.forward.graph import (
-    build_forward_graph,
+    build_forward_graph, build_route_forward_graph,
 )
 from hyper_multicore.modules.mega_moe.forward.tiling_tables import (
     get_down_proj_tiling_bytes,
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
-from hyper_multicore.scheduler.config import TaskSplitValue
+from hyper_multicore.scheduler.config import TaskSplitValue, mega_moe_event_capacity
 from hyper_multicore.scheduler.graph import ComputeGraph
 
-from .diagnostics import _mega_moe_owner_options
+from .diagnostics import _mega_moe_owner_options, bind_shared_diagnostic_ports
 from .spec import MegaMoeSpec
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
+from .shared import shared_tiling_bytes
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,9 @@ class MegaMoePlan:
     w2_grad_tiling: Any
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
+    route_slots: Any | None = None
+    shared_forward_runtime: Any | None = None
+    shared_backward_runtime: Any | None = None
 
     @property
     def fwd_runtime_config(self) -> Any:
@@ -120,20 +124,27 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     Returns:
         Scheduler values whose single partition is the rank-local input.
     """
-    return TaskSplitValue(
+    values = TaskSplitValue(
         tp=1,
         ep=spec.ep_size,
         seq_size=spec.plan_tokens,
         all_expert_num=spec.num_experts,
         top_k=spec.top_k,
         dispatch_mode=spec.dispatch_mode,
+        event_capacity_floor=mega_moe_event_capacity(
+            spec.num_experts, spec.ep_size, shared_expert=bool(spec.shared_intermediate_size),
+            route_fusion=spec.forward_fusion_mode != "legacy" or spec.backward_fusion_mode != "legacy",
+        ),
     )
+    values.local_num_tokens = spec.local_num_tokens
+    return values
 
 
 def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     task_values = _build_task_values(spec)
-    forward_graph = build_forward_graph(
+    forward_builder = build_route_forward_graph if spec.forward_permute_fused else build_forward_graph
+    forward_graph = forward_builder(
         task_values,
         dispatch_sv=spec.dispatch_split,
         swiglu_sv=spec.swiglu_split,
@@ -143,6 +154,10 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
         expert_weight_layout=spec.expert_weight_layout,
+        integrated_unpermute=spec.forward_unpermute_fused,
+        shared_intermediate_size=spec.shared_intermediate_size,
+        fuse_shared_expert=spec.forward_shared_expert,
+        integrated_shared_output=spec.forward_shared_expert or spec.backward_shared_expert,
     )
     forward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(forward_graph)
@@ -152,7 +167,12 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         spec.rank_id,
         spec.num_cube_cores,
     )
-    backward_graph = build_backward_graph(
+    task_values = _build_task_values(spec)
+    route_backward = spec.backward_permute_fused or spec.backward_unpermute_fused
+    backward_options = ({"integrated_permute": spec.backward_permute_fused,
+                         "integrated_unpermute": spec.backward_unpermute_fused} if route_backward else {})
+    backward_builder = build_route_backward_graph if route_backward else build_backward_graph
+    backward_graph = backward_builder(
         task_values,
         dispatch_sv=spec.dispatch_split,
         swiglu_sv=spec.swiglu_split,
@@ -162,6 +182,9 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
         expert_weight_layout=spec.expert_weight_layout,
+        shared_intermediate_size=spec.shared_intermediate_size,
+        fuse_shared_expert=spec.backward_shared_expert,
+        **backward_options,
     )
     backward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(backward_graph)
@@ -185,20 +208,40 @@ def _prepare_diagnostics(
     """Bind forward/backward plans to the public diagnostics integration API."""
     topology = _build_task_values(spec)
     topology.rank_id = spec.rank_id
+    route_abi = (spec.forward_fusion_mode != "legacy" or spec.backward_fusion_mode != "legacy"
+                 or spec.forward_shared_expert or spec.backward_shared_expert)
     options = {
         "kernel_name": "mega_moe",
         "device": device,
         "rank": dist.get_rank() if dist.is_initialized() else spec.rank_id,
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
     }
+    forward_options = options.copy()
+    backward_options = options.copy()
+    if spec.forward_shared_expert or (spec.backward_shared_expert and spec.forward_unpermute_fused):
+        forward_options["graph_adapter"] = lambda graph, config: bind_shared_diagnostic_ports(
+            graph, config, forward=True,
+        )
+    if spec.backward_shared_expert:
+        backward_options["graph_adapter"] = lambda graph, config: bind_shared_diagnostic_ports(
+            graph, config, forward=False,
+        )
     return (
-        prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
-        prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, **options),
+        prepare_mega_kernel_diagnostics(
+            forward_graph, forward_config,
+            parameter_count=(35 if spec.forward_shared_expert or spec.backward_shared_expert
+                             else (27 if route_abi else 16)), **forward_options,
+        ),
+        prepare_mega_kernel_diagnostics(
+            backward_graph, backward_config,
+            parameter_count=((47 if spec.backward_unpermute_fused else 46) if spec.backward_shared_expert
+                             else (33 if route_abi else 20)), **backward_options,
+        ),
     )
 
 
 def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
-    """Build trimmed dense forward/backward runtime images without fusion slots.
+    """Build trimmed forward/backward runtime images for the selected fusion modes.
 
     Args:
         spec: Validated local-token and expert topology specification.
@@ -219,6 +262,17 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     }
     return MegaMoePlan(
         spec=spec,
+        route_slots=(torch.arange(spec.routed_slots, dtype=torch.float32, device=device).reshape(-1, 1)
+                     if (spec.backward_permute_fused
+                         or spec.forward_permute_fused and not spec.dynamic_tokens) else None),
+        shared_forward_runtime=(
+            _tensor_from_bytes(shared_tiling_bytes(spec, backward=False), device)
+            if spec.forward_shared_expert or spec.backward_shared_expert else None
+        ),
+        shared_backward_runtime=(
+            _tensor_from_bytes(shared_tiling_bytes(spec, backward=True), device)
+            if spec.backward_shared_expert else None
+        ),
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),

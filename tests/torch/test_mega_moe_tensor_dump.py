@@ -76,3 +76,10 @@ def test_mega_moe_forward_l1_tensor_dump(monkeypatch, tmp_path: Path) -> None:
     Expectation: Mega moe forward l1 tensor dump.
     """
     _run_dump_case(monkeypatch, tmp_path, "test_mega_moe_forward_l1_tensor_dump_worker")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_mega_moe_shared_l1_tails(monkeypatch, tmp_path: Path) -> None:
+    """Verify full-fusion shared F+B task snapshots at unequal 129/257 token tails."""
+    _run_dump_case(monkeypatch, tmp_path, "test_mega_moe_shared_l1_tail_worker")

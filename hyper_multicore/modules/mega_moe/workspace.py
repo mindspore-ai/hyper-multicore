@@ -44,6 +44,21 @@ _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
 
 
+def _pull_workspace_options(spec: MegaMoeSpec | Mapping[str, Any]) -> dict[str, Any]:
+    """Size original-row publication separately from the expert-major return."""
+    values = spec if isinstance(spec, Mapping) else vars(spec)
+    forward = values.get("forward_fusion_mode", "legacy") in {"permute", "both"}
+    backward = values.get("backward_fusion_mode", "legacy") in {"permute", "both"}
+    pull = values.get("dispatch_mode", "push") == "pull"
+    return {
+        "source_rows": values["local_num_tokens"] if pull and forward and backward else None,
+        "route_metadata": pull and (forward or backward),
+        "shared_expert": bool(values.get("shared_intermediate_size", 0)),
+        "route_fusion": (values.get("forward_fusion_mode", "legacy") != "legacy"
+                         or values.get("backward_fusion_mode", "legacy") != "legacy"),
+    }
+
+
 def _workspace_allocation_specs(
     *,
     dispatch_mode: str,
@@ -53,18 +68,29 @@ def _workspace_allocation_specs(
     ep_size: int,
     num_experts: int,
     dtype: torch.dtype,
+    source_rows: int | None = None,
+    route_metadata: bool = False,
+    shared_expert: bool = False,
+    route_fusion: bool = False,
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
-    event_bytes = event_workspace_bytes(ep_size, num_experts)
+    if dispatch_mode == "pull" and source_rows is not None:
+        data_rows = source_rows
+    event_bytes = event_workspace_bytes(
+        ep_size, num_experts, shared_expert=shared_expert, route_fusion=route_fusion,
+    )
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
-    return (
+    allocations = (
         (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
         ("routed_buffer", allocation_spec((routed_slots, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
         ("forward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
         ("backward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
     )
+    if route_metadata:
+        allocations += (("route_metadata", allocation_spec((routed_slots, 2), torch.int32, _WORKSPACE_ALIGNMENT)),)
+    return allocations
 
 
 def _spec_workspace_bytes(
@@ -90,6 +116,7 @@ def _spec_workspace_bytes(
         ep_size=specification["ep_size"],
         num_experts=specification["num_experts"],
         dtype=dtype,
+        **_pull_workspace_options(specification),
     )
     return sum(
         spec.dtype.itemsize * math.prod(spec.shape)
@@ -111,6 +138,7 @@ class MegaMoeWorkspace:
     source_buffer: Any | None = None
     expert_buffer: Any | None = None
     routed_buffer: Any | None = None
+    route_metadata: Any | None = None
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
     gmm_workspace: Any | None = None
@@ -147,6 +175,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            **_pull_workspace_options(spec),
         )
         replacement = _lifecycle._AllocationReplacement  # pylint: disable=protected-access
         return tuple(replacement(getattr(self, field_name), target) for field_name, target in targets)
@@ -176,6 +205,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            **_pull_workspace_options(spec),
         )
         if len(replacements) != len(expected):
             raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
@@ -204,9 +234,11 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            **_pull_workspace_options(spec),
         )
         self.source_buffer = None
         self.expert_buffer = None
+        self.route_metadata = None
         for tensor, (field_name, _) in zip(tensors, targets):
             setattr(self, field_name, tensor)
         self.dispatch_mode = spec.dispatch_mode
@@ -214,7 +246,11 @@ class MegaMoeWorkspace:
         self.device = device
         self.expert_capacity = receive_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        options = _pull_workspace_options(spec)
+        self.event_counter_bytes = mega_moe_event_capacity(
+            spec.num_experts, spec.ep_size, shared_expert=options["shared_expert"],
+            route_fusion=options["route_fusion"],
+        ) * 4
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
 
@@ -234,6 +270,7 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            **_pull_workspace_options(spec),
         )
         if len(tensors) != len(targets):
             raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
@@ -301,13 +338,18 @@ class MegaMoeWorkspace:
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
             dtype=dtype,
+            **_pull_workspace_options(spec),
         )
         self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        options = _pull_workspace_options(spec)
+        self.event_counter_bytes = mega_moe_event_capacity(
+            spec.num_experts, spec.ep_size, shared_expert=options["shared_expert"],
+            route_fusion=options["route_fusion"],
+        ) * 4
         try:
             for field_name, allocation in allocations:
                 setattr(self, field_name, shmem.empty(
@@ -386,7 +428,7 @@ class MegaMoeWorkspace:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
         if self.closing:
             remaining = tuple(tensor is not None for tensor in (
-                self.source_buffer, self.expert_buffer, self.routed_buffer,
+                self.source_buffer, self.expert_buffer, self.routed_buffer, self.route_metadata,
                 self.forward_event_counters, self.backward_event_counters))
             peers = _collective.exchange(
                 remaining,
@@ -401,6 +443,7 @@ class MegaMoeWorkspace:
             "routed_buffer",
             "forward_event_counters",
             "backward_event_counters",
+            "route_metadata",
         ):
             tensor = getattr(self, field_name)
             if tensor is None:
@@ -438,6 +481,7 @@ class MegaMoeWorkspace:
                 self.source_buffer,
                 self.expert_buffer,
                 self.routed_buffer,
+                self.route_metadata,
                 self.forward_event_counters,
                 self.backward_event_counters,
                 self.gmm_workspace,

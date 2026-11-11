@@ -103,6 +103,9 @@ enum class TaskType : uint32_t {
   TASK_GATE_GRAD_ADD_SELECTED = 139,
   TASK_GATE_GRAD_ZEROS = 140,
   TASK_SHMEM_GET_MEM = 141,
+  TASK_UNPERMUTE_REDUCE_GRAD = 142,
+  TASK_TOPK_WEIGHT_GRAD = 143,
+  TASK_WEIGHTED_UNPERMUTE = 144,
 };
 
 enum class EventType : uint32_t {
@@ -186,12 +189,18 @@ struct RuntimeHeader {
   uint32_t aiv_profile_record_capacity;
   uint32_t completion_event;
   uint32_t protocol_version;
-  uint32_t padding[6];
+  uint64_t shared_tensor_table;
+  uint64_t shared_tiling;
+  uint32_t padding[2];
 };
 
 static_assert(sizeof(RuntimeHeader) == 64);
 static_assert(sizeof(TensorDesc) == 64);
 static_assert(sizeof(TaskDesc) == 576);
+
+__aicore__ inline __gm__ uint8_t *getSharedResource(__gm__ uint8_t *runtime, uint32_t index) {
+  return reinterpret_cast<__gm__ uint8_t *>(reinterpret_cast<__gm__ uint64_t *>(runtime + 40)[index]);
+}
 
 __aicore__ inline uint32_t getTaskNum(__gm__ uint8_t *tiling) { return (*(__gm__ uint32_t *)(tiling)); }
 

@@ -37,10 +37,20 @@ import os
 from hyper_multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
+from hyper_multicore.scheduler.graph import ComputeGraph
+from hyper_multicore.scheduler.scheduler import revise_task_queue
+from hyper_multicore.tasks.utils import (
+    add_dynamic_data,
+    add_terminate,
+    add_terminate_on_event,
+)
 from hyper_multicore.modules.mega_moe.forward.tiling_tables import (
     get_down_proj_tiling_bytes,
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
+)
+from hyper_multicore.modules.mega_moe.shared_schedule import (
+    schedule_shared_forward_overlap,
 )
 from hyper_multicore.scheduler.builder import allocate_graph_config
 from hyper_multicore.scheduler.config import (
@@ -51,10 +61,7 @@ from hyper_multicore.scheduler.config import (
     init_task_split_value,
     validate_runtime_config,
 )
-from hyper_multicore.scheduler.graph import ComputeGraph
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
-from hyper_multicore.scheduler.scheduler import revise_task_queue
-from hyper_multicore.tasks.utils import add_dynamic_data, add_terminate
 
 
 @dataclass(frozen=True)
@@ -116,8 +123,37 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     dispatch_op = graph.get_op("dispatch")
     swiglu_op   = graph.get_op("swiglu")
     combine_op  = graph.get_op("combine")
-    add_terminate(cfg, tsv, combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_op.task_num, combine_op.task_num)
+    terminal_epilogue = next(
+        (
+            graph.get_op(name)
+            for name in ("weighted_unpermute", "external_output_acquire")
+            if graph.has_op(name)
+        ),
+        None,
+    )
+    if terminal_epilogue is None:
+        add_terminate(cfg, tsv, combine_op.task_num // tsv.ep * tsv.ep)
+    else:
+        add_terminate_on_event(
+            cfg,
+            tsv,
+            tsv.all_event_num,
+            terminal_epilogue.task_num,
+        )
+    if tsv.shared_expert and not tsv.shared_output_fused:
+        # Preserve the routed branch's fan-in threshold before replacing termination.
+        cfg.task_index_num[1] -= 1
+        add_terminate_on_event(
+            cfg, tsv, tsv.shared_completion_event, tsv.shared_completion_count,
+        )
+    revise_task_queue(
+        cfg,
+        tsv,
+        dispatch_op.task_num,
+        swiglu_op.task_num,
+        combine_op.task_num,
+    )
+    schedule_shared_forward_overlap(cfg, tsv, dispatch_op.task_num)
     add_dynamic_data(cfg, tsv, dynamic_input_position=6)
 
     cfg.task_num = task_num_all

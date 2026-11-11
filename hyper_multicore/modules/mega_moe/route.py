@@ -63,12 +63,13 @@ class RouteMetadata:
 class PreparedTopKRoute:
     """Permuted payload and exact metadata for one Router decision."""
 
-    routed_tokens: torch.Tensor
+    routed_tokens: torch.Tensor | None
     unpermute_mapping: torch.Tensor
     tokens_per_expert: torch.Tensor
     received_counts: torch.Tensor
     metadata: RouteMetadata
     maximum_received_slots: int = 0
+    permute_src_index: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -249,6 +250,23 @@ def _permute_topk_input_out(
     return output, mapping
 
 
+def _build_route_indices(
+    route_slots: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build expert-major route slots and the inverse token route map."""
+    if topk_ids.numel() == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=topk_ids.device)
+        return empty, empty.reshape_as(topk_ids)
+    permuted_slots, inverse_order = load_torch_npu().npu_moe_token_permute(
+        route_slots,
+        topk_ids.reshape(-1, 1),
+    )
+    permute_src_index = permuted_slots.reshape(-1).to(torch.int32).contiguous()
+    inverse_order = inverse_order.reshape(-1).to(torch.int32).contiguous()
+    return permute_src_index, inverse_order.reshape_as(topk_ids).contiguous()
+
+
 def _compute_route_metadata(
     counts: torch.Tensor,
     counts_by_source: torch.Tensor,
@@ -401,6 +419,7 @@ def prepare_topk_route(
     *,
     autograd_mask: int = 0,
     prepare_workspace: Callable[[int, int], None] | None = None,
+    route_slots: torch.Tensor | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -432,7 +451,13 @@ def prepare_topk_route(
         else:
             workspace.wait_for_reuse()
     counts_by_source, count_work = _start_count_gather(counts, spec)
-    if permutation_output is None:
+    permute_src_index = None
+    if spec.forward_permute_fused:
+        if route_slots is None:
+            raise RuntimeError("Fused route preparation requires the plan's scalar route slots")
+        permute_src_index, unpermute_mapping = _build_route_indices(route_slots, topk_ids)
+        routed_tokens = None
+    elif permutation_output is None:
         routed_tokens, unpermute_mapping = _permute_topk_input(hidden_states, topk_ids)
     else:
         routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
@@ -444,6 +469,7 @@ def prepare_topk_route(
         tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
+        permute_src_index=permute_src_index,
         metadata=_compute_route_metadata(
             counts,
             counts_by_source,
@@ -664,6 +690,8 @@ def _dynamic_route_payload(
     flexible = spec.auto_tokens
     invalid = (tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 if flexible
                else tokens > spec.max_local_num_tokens)
+    if spec.forward_fusion_mode != "legacy" or spec.backward_fusion_mode != "legacy":
+        invalid = invalid or tokens * spec.top_k > 1 << 24
     counts = (torch.zeros(spec.num_experts, dtype=torch.int32, device=hidden_states.device) if invalid
               else _resolve_counts(flat_ids, supplied_counts, spec))
     payload_dtype = torch.int32 if flexible else torch.int64
@@ -685,6 +713,20 @@ def _start_dynamic_gather(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[tor
     return gathered, work
 
 
+def _finish_dynamic_permutation(
+    hidden_states: torch.Tensor, topk_ids: torch.Tensor, spec: MegaMoeSpec,
+    workspace: MegaMoeWorkspace | None, permuted: tuple[torch.Tensor, torch.Tensor] | None, invalid: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Publish external route rows only after capacity agreement and lease acquisition."""
+    if invalid or spec.forward_permute_fused:
+        return None
+    if spec.dispatch_mode == "pull":
+        if permuted is None:
+            return _permute_dynamic_pull(hidden_states, topk_ids, spec, workspace)
+        return _publish_staged_pull(permuted, hidden_states, spec, workspace)
+    return _permute_topk_input(hidden_states, topk_ids) if permuted is None else permuted
+
+
 def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
@@ -698,7 +740,13 @@ def _prepare_dynamic_route(
         workspace.wait_for_reuse()
     gathered, work = _start_dynamic_gather(payload, spec)
     # Ordinary storage remains valid if count agreement triggers a SHMEM restart.
-    permuted = _stage_dynamic_permutation(hidden_states, topk_ids, spec, invalid, workspace)
+    permute_src_index = unpermute_mapping = None
+    permuted = None
+    if spec.forward_permute_fused and not invalid:
+        slots = torch.arange(topk_ids.numel(), dtype=torch.float32, device=hidden_states.device).reshape(-1, 1)
+        permute_src_index, unpermute_mapping = _build_route_indices(slots, topk_ids)
+    elif not spec.forward_permute_fused:
+        permuted = _stage_dynamic_permutation(hidden_states, topk_ids, spec, invalid, workspace)
     summary, host_rows, metadata = None, None, None
     if spec.auto_tokens:
         if work is not None:
@@ -708,13 +756,7 @@ def _prepare_dynamic_route(
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
         prepare_workspace(summary[1], summary[2])
-    if invalid:
-        permuted = None
-    elif spec.dispatch_mode == "pull":
-        permuted = (_permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if permuted is None else
-                    _publish_staged_pull(permuted, hidden_states, spec, workspace))
-    elif permuted is None:
-        permuted = _permute_topk_input(hidden_states, topk_ids)
+    permuted = _finish_dynamic_permutation(hidden_states, topk_ids, spec, workspace, permuted, invalid)
     if work is not None:
         work.wait()
     if summary is None:
@@ -726,7 +768,9 @@ def _prepare_dynamic_route(
             _cache_host_route(workspace, spec, host_rows, summary, metadata, hidden_states.device)
     received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
     return PreparedTopKRoute(
-        routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
+        routed_tokens=None if spec.forward_permute_fused else permuted[0],
+        unpermute_mapping=unpermute_mapping if spec.forward_permute_fused else permuted[1],
+        permute_src_index=permute_src_index, tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum,
         metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens),
@@ -753,6 +797,6 @@ def restore_topk_output(
         return expert_output[:0] + topk_weights.sum().to(expert_output.dtype)
     return load_torch_npu().npu_moe_token_unpermute(
         expert_output,
-        unpermute_mapping,
+        unpermute_mapping.reshape(-1),
         probs=topk_weights.float().contiguous(),
     )

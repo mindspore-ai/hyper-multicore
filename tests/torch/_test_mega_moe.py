@@ -29,9 +29,10 @@ from pathlib import Path
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
 import torch
 import torch.distributed as dist
-import torch_npu
+import torch_npu  # noqa: F401  # pylint: disable=unused-import
 
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, shmem
+from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from tests.common.multicore.moe_reference import TorchExperts
 
 _RTOL = 2e-2
@@ -564,10 +565,20 @@ def _new_performance_layer(
     """Construct one seeded backend without retaining its comparison peer."""
     if backend == "common":
         return new_common_moe(shape)
-    if backend != "mega_moe":
+    if backend not in {"mega_moe", "mega_moe_external_shared"}:
         raise ValueError(
-            f"HP_MEGA_MOE_PERF_BACKEND must be common or mega_moe, got {backend!r}."
+            f"unsupported performance backend {backend!r}."
         )
+    def env_flag(name: str) -> bool:
+        """Read the explicit benchmark switches independently of runtime defaults."""
+        return os.getenv(name, "0").lower() in {"1", "true", "yes", "on"}
+
+    forward_shared = env_flag("HP_MEGA_MOE_FORWARD_SHARED_EXPERT")
+    backward_shared = env_flag("HP_MEGA_MOE_BACKWARD_SHARED_EXPERT")
+    if backend == "mega_moe_external_shared":
+        forward_shared = backward_shared = False
+    shared_intermediate = int(os.getenv("HP_MEGA_MOE_SHARED_INTERMEDIATE_SIZE", "0"))
+    include_shared = shared_intermediate > 0
     return MegaMoeExperts(
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
@@ -577,6 +588,11 @@ def _new_performance_layer(
         dispatch_mode=os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
+        shared_intermediate_size=shared_intermediate if include_shared else 0,
+        forward_shared_expert=forward_shared,
+        backward_shared_expert=backward_shared,
+        **({"forward_fusion_mode": "legacy", "backward_fusion_mode": "legacy"}
+           if backend == "mega_moe_external_shared" else {}),
     ).to(
         device=DEVICE,
         dtype=torch.bfloat16,
@@ -599,14 +615,17 @@ def _timed_fwd_bwd(
     grad_output: torch.Tensor,
     *,
     validate_gradients: bool = False,
-) -> float:
+) -> tuple[float, float]:
     """Time one synchronized layer forward and backward operation."""
     layer.zero_grad(set_to_none=True)
     hidden = hidden_states.detach().requires_grad_(True)
     route_weights = topk_weights.detach().requires_grad_(True)
     dist.barrier()
     torch.npu.synchronize(DEVICE)
+    start_event = torch.npu.Event(enable_timing=True)
+    end_event = torch.npu.Event(enable_timing=True)
     start = time.perf_counter()
+    start_event.record()
     output = forward_layer(
         layer,
         hidden,
@@ -615,6 +634,7 @@ def _timed_fwd_bwd(
         tokens_per_expert=tokens_per_expert,
     )
     output.backward(grad_output)
+    end_event.record()
     torch.npu.synchronize(DEVICE)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     gate_up_weight_grad, down_weight_grad = expert_weight_gradients(layer)
@@ -624,6 +644,9 @@ def _timed_fwd_bwd(
         ("gate/up weight", gate_up_weight_grad),
         ("down weight", down_weight_grad),
     )
+    if isinstance(layer, MegaMoeExperts) and layer.shared_intermediate_size:
+        gradients += (("shared gate/up weight", layer.shared_gate_up_weight.grad),
+                      ("shared down weight", layer.shared_down_weight.grad))
     missing = [name for name, gradient in gradients if gradient is None]
     if missing:
         raise AssertionError(
@@ -641,7 +664,7 @@ def _timed_fwd_bwd(
             raise AssertionError(
                 f"rank={RANK}: performance F+B produced non-finite gradients."
             )
-    return rank_max_latency(elapsed_ms)
+    return rank_max_latency(elapsed_ms), rank_max_latency(start_event.elapsed_time(end_event))
 
 
 def _performance_result(
@@ -649,6 +672,7 @@ def _performance_result(
     shape: MoeShape,
     warmup_steps: int,
     latencies: list[float],
+    device_latencies: list[float],
 ) -> dict:
     """Build one routed-expert performance result."""
     return {
@@ -668,13 +692,84 @@ def _performance_result(
         "warmup_steps": warmup_steps,
         "measured_steps": len(latencies),
         "validation": {"gradients_present": True, "gradients_finite": True},
+        "shared_expert": {
+            "intermediate_size": int(os.getenv("HP_MEGA_MOE_SHARED_INTERMEDIATE_SIZE", "0")),
+            "forward": os.getenv("HP_MEGA_MOE_FORWARD_SHARED_EXPERT", "0"),
+            "backward": os.getenv("HP_MEGA_MOE_BACKWARD_SHARED_EXPERT", "0"),
+            "external_reference": backend == "mega_moe_external_shared",
+        },
+        "route_fusion": {
+            "forward": os.getenv("HYPER_MULTICORE_MEGA_MOE_FORWARD_FUSION_MODE", "default"),
+            "backward": os.getenv("HYPER_MULTICORE_MEGA_MOE_BACKWARD_FUSION_MODE", "default"),
+        },
         "rank_max_fwd_bwd_ms": {
+            "mean": statistics.mean(latencies),
             "median": statistics.median(latencies),
             "minimum": min(latencies),
             "maximum": max(latencies),
             "samples": latencies,
         },
+        "rank_max_npu_event_ms": {
+            "mean": statistics.mean(device_latencies),
+            "median": statistics.median(device_latencies),
+            "minimum": min(device_latencies),
+            "maximum": max(device_latencies),
+            "samples": device_latencies,
+        },
         "device_healthy": True,
+    }
+
+
+def _record_performance_schedule(result: dict, layer: MegaMoeExperts, backend: str, shape: MoeShape) -> None:
+    """Describe the exact graph selected by the measured public-layer invocation."""
+    resources = layer._resource_group.resources
+    plan = resources.plan_for_tokens(shape.local_num_tokens, DEVICE)
+    result["route_fusion"] = {
+        "forward": plan.spec.forward_fusion_mode,
+        "backward": plan.spec.backward_fusion_mode,
+    }
+    result["shared_expert"].update({
+        "forward": plan.spec.forward_shared_expert,
+        "backward": plan.spec.backward_shared_expert,
+        "external_reference": backend == "mega_moe_external_shared",
+    })
+    result["integration"] = {
+        "reuse_backward_dispatch": plan.reuse_backward_dispatch,
+        "forward_shared_sum_in_kernel": plan.spec.forward_unpermute_fused and (
+            plan.spec.forward_shared_expert or plan.spec.backward_shared_expert),
+        "backward_shared_sum_in_kernel": (
+            plan.spec.backward_unpermute_fused and plan.spec.backward_shared_expert),
+        "shared_weight_gradient_layout": "EOI" if plan.spec.backward_shared_expert else "autograd",
+    }
+    _, fwd_config, _, bwd_config = _build_runtime_artifacts(plan.spec)
+    result["schedule"] = {
+        direction: {
+            # Both worker queues include termination; forward task_num does not.
+            "total_tasks": sum(int(count) for count in config.task_index_num[:2]),
+            "aic_tasks": int(config.task_index_num[0]),
+            "aiv_tasks": int(config.task_index_num[1]),
+        }
+        for direction, config in (("forward", fwd_config), ("backward", bwd_config))
+    }
+
+
+def _record_performance_memory(result: dict, memory_values: list[int]) -> None:
+    """Aggregate captured memory metrics without counting reporting allocations."""
+    torch.npu.synchronize(DEVICE)
+    memory = torch.tensor(memory_values, dtype=torch.int64, device=DEVICE)
+    dist.all_reduce(memory, op=dist.ReduceOp.MAX)
+    names = ("peak_allocated", "peak_reserved", "peak_device_used_sampled", "shmem_heap",
+             "current_allocated", "current_reserved", "baseline_allocated", "baseline_reserved",
+             "peak_allocated_increment")
+    result["memory_bytes"] = dict(zip(names, (int(value) for value in memory.cpu().tolist())))
+    result["memory_measurement"] = {
+        "scope": "steady_state_fwd_bwd_after_gradient_validation_and_warmup",
+        "reset_after": "clear_parameter_gradients_collect_and_synchronize",
+        "validation_cache_released_before_warmup": True,
+        "aggregation": "maximum_across_ranks_for_each_metric",
+        "increment": "maximum_across_ranks_of_local_peak_minus_local_baseline",
+        "device_used_sampling": "before_measurement_and_after_each_synchronized_fwd_bwd",
+        "device_used_is_continuous_peak": False,
     }
 
 
@@ -690,8 +785,16 @@ def _benchmark_performance_backend(
     measured_steps: int,
 ) -> dict:
     """Warm up and measure one routed-expert backend."""
+    torch.manual_seed(99173 + RANK)
     layer = _new_performance_layer(shape, backend)
     try:
+        def sample_memory() -> tuple[int, int]:
+            """Sample synchronized device use and the current symmetric heap."""
+            torch.npu.synchronize(DEVICE)
+            free_bytes, total_bytes = torch.npu.mem_get_info(DEVICE)
+            heap_bytes = (shmem.debug_state().get("config") or {}).get("heap_size_bytes", 0)
+            return total_bytes - free_bytes, heap_bytes
+
         _timed_fwd_bwd(
             layer,
             hidden_states,
@@ -701,9 +804,27 @@ def _benchmark_performance_backend(
             grad_output,
             validate_gradients=True,
         )
+        # Finite checks allocate full-sized temporary masks. Release their cached
+        # blocks before warmup so they affect neither live nor reserved peaks.
+        layer.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.npu.synchronize(DEVICE)
+        torch.npu.empty_cache()
+        for _ in range(warmup_steps):
+            _timed_fwd_bwd(
+                layer, hidden_states, topk_ids, topk_weights, tokens_per_expert, grad_output,
+            )
+        layer.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.npu.synchronize(DEVICE)
+        baseline_allocated = torch.npu.memory_allocated(DEVICE)
+        baseline_reserved = torch.npu.memory_reserved(DEVICE)
+        peak_device_used, peak_shmem_heap = sample_memory()
+        torch.npu.reset_peak_memory_stats(DEVICE)
         latencies = []
-        for step in range(warmup_steps + measured_steps):
-            latency = _timed_fwd_bwd(
+        device_latencies = []
+        for _ in range(measured_steps):
+            latency, device_latency = _timed_fwd_bwd(
                 layer,
                 hidden_states,
                 topk_ids,
@@ -711,16 +832,32 @@ def _benchmark_performance_backend(
                 tokens_per_expert,
                 grad_output,
             )
-            if step >= warmup_steps:
-                latencies.append(latency)
-        return _performance_result(backend, shape, warmup_steps, latencies)
+            used_bytes, heap_bytes = sample_memory()
+            peak_device_used = max(peak_device_used, used_bytes)
+            peak_shmem_heap = max(peak_shmem_heap, heap_bytes)
+            latencies.append(latency)
+            device_latencies.append(device_latency)
+        # Capture allocator statistics before diagnostic graph construction and
+        # the reporting reduction allocate their own temporary tensors.
+        peak_allocated = torch.npu.max_memory_allocated(DEVICE)
+        memory_values = [
+            peak_allocated, torch.npu.max_memory_reserved(DEVICE),
+            peak_device_used, peak_shmem_heap, torch.npu.memory_allocated(DEVICE),
+            torch.npu.memory_reserved(DEVICE), baseline_allocated, baseline_reserved,
+            peak_allocated - baseline_allocated,
+        ]
+        result = _performance_result(backend, shape, warmup_steps, latencies, device_latencies)
+        if isinstance(layer, MegaMoeExperts):
+            _record_performance_schedule(result, layer, backend, shape)
+        _record_performance_memory(result, memory_values)
+        return result
     finally:
         if isinstance(layer, MegaMoeExperts):
             layer.close()
 
 
 def test_mega_moe_fwd_bwd_performance() -> None:
-    """Measure common then MegaMoe F+B in one distributed A/B launch."""
+    """Compare selected reference and MegaMoe F+B backends in one distributed launch."""
     warmup_steps = int(os.getenv("HP_MEGA_MOE_PERF_WARMUP", "3"))
     measured_steps = int(os.getenv("HP_MEGA_MOE_PERF_MEASURED", "5"))
     if warmup_steps < 0 or measured_steps <= 0:
@@ -732,7 +869,11 @@ def test_mega_moe_fwd_bwd_performance() -> None:
     topk_ids, topk_weights, tokens_per_expert = make_balanced_route(shape)
     hidden_states, grad_output = make_data(shape)
     results = {}
-    for backend in ("common", "mega_moe"):
+    shared_enabled = int(os.getenv("HP_MEGA_MOE_SHARED_INTERMEDIATE_SIZE", "0")) > 0
+    backends = ("mega_moe_external_shared", "mega_moe") if shared_enabled else ("common", "mega_moe")
+    if os.getenv("HP_MEGA_MOE_PERF_REVERSE") == "1":
+        backends = tuple(reversed(backends))
+    for backend in backends:
         results[backend] = _benchmark_performance_backend(
             backend,
             shape,
@@ -748,20 +889,26 @@ def test_mega_moe_fwd_bwd_performance() -> None:
         torch.npu.empty_cache()
         dist.barrier()
 
-    common_median = results["common"]["rank_max_fwd_bwd_ms"]["median"]
-    mega_median = results["mega_moe"]["rank_max_fwd_bwd_ms"]["median"]
-    ratio = mega_median / common_median
-    # This independent oracle is for correctness, not the former GroupedExperts speed gate.
+    ratio = None
+    if shared_enabled:
+        reference_median = results["mega_moe_external_shared"]["rank_max_fwd_bwd_ms"]["median"]
+        mega_median = results["mega_moe"]["rank_max_fwd_bwd_ms"]["median"]
+        ratio = mega_median / reference_median
+    else:
+        common_median = results["common"]["rank_max_fwd_bwd_ms"]["median"]
+        mega_median = results["mega_moe"]["rank_max_fwd_bwd_ms"]["median"]
+        ratio = mega_median / common_median
     if RANK == 0:
         result_path = os.getenv("HP_MEGA_MOE_PERF_RESULT")
         if not result_path:
             raise ValueError("HP_MEGA_MOE_PERF_RESULT must name the output JSON path.")
         result = {
-            "order": ["common", "mega_moe"],
+            "order": list(results),
             "results": results,
-            "mega_over_common": ratio,
+            "mega_over_reference": ratio,
             "performance_acceptance": False,
-            "reference_kind": "independent_torch_correctness_oracle",
+            "reference_kind": ("external_shared_legacy_megamoe" if shared_enabled
+                               else "independent_torch_correctness_oracle"),
         }
         path = Path(result_path)
         path.parent.mkdir(parents=True, exist_ok=True)

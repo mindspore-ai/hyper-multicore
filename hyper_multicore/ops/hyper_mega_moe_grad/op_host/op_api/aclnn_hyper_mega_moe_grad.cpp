@@ -100,19 +100,19 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   const aclTensor *combine_size, const aclTensor *permute_out, const aclTensor *gate_dw, const aclTensor *group_list,
   const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w1_grad_tiling,
   const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
-  const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
-  const aclTensor *diagnostic_buffer,
+  const aclTensor *runtime_config, const aclTensor *all_event_counters, const aclTensor *permute_src_index,
+  const aclTensor *route_weight, const aclTensor *reduce_route_index, const aclTensor *diagnostic_buffer,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
   aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
-  L2_DFX_PHASE_1(aclnnHyperMegaMoeGrad,
-                 DFX_IN(dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, hidden, hidden_dw,
-                        weight, y, gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off,
-                        combine_size, permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling,
-                        w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-                        runtime_config, all_event_counters, diagnostic_buffer, rankId, ep, expert_num, hidden_size,
-                        seq_size),
-                 DFX_OUT(dispatch_target, hidden_dw, y, grad_gate, gate_dx, grad_x, gate_dw));
+  L2_DFX_PHASE_1(
+    aclnnHyperMegaMoeGrad,
+    DFX_IN(dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, hidden, hidden_dw, weight, y,
+           gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size, permute_out,
+           gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling,
+           gmm_workspace, runtime_config, all_event_counters, permute_src_index, route_weight, reduce_route_index,
+           diagnostic_buffer, rankId, ep, expert_num, hidden_size, seq_size),
+    DFX_OUT(dispatch_target, hidden_dw, y, grad_gate, gate_dx, grad_x, permute_out, gate_dw));
 
   auto uniqueExecutor = CREATE_EXECUTOR();
   aclOpExecutor *executorPtr = uniqueExecutor.get();
@@ -148,31 +148,22 @@ ACLNN_API aclnnStatus aclnnHyperMegaMoeGradGetWorkspaceSize(
   MAKE_CONTIGUOUS_CHECK(w2_grad_tiling);
   MAKE_CONTIGUOUS_CHECK(swiglu_grad_tiling);
   MAKE_CONTIGUOUS_CHECK(gmm_workspace);
-  MAKE_CONTIGUOUS_CHECK(swiglu_grad_workspace);
   MAKE_CONTIGUOUS_CHECK(runtime_config);
   MAKE_CONTIGUOUS_CHECK(all_event_counters);
   MAKE_CONTIGUOUS_CHECK(diagnostic_buffer);
 
+  MAKE_CONTIGUOUS_CHECK(permute_src_index);
+  MAKE_CONTIGUOUS_CHECK(route_weight);
+  MAKE_CONTIGUOUS_CHECK(reduce_route_index);
 #undef MAKE_CONTIGUOUS_CHECK
-
-#define MAKE_CONTIGUOUS_WITH_NAME_CHECK(tensor, name)                         \
-  auto name##_cont = l0op::Contiguous(tensor, executorPtr); \
-  CHECK_RET(name##_cont != nullptr, ACLNN_ERR_INNER_NULLPTR)
-
-  MAKE_CONTIGUOUS_WITH_NAME_CHECK(params.hidden, hidden);
-  MAKE_CONTIGUOUS_WITH_NAME_CHECK(params.weight, weight);
-  MAKE_CONTIGUOUS_WITH_NAME_CHECK(params.w1, w1);
-  MAKE_CONTIGUOUS_WITH_NAME_CHECK(params.permute_out, permute_out);
-
-#undef MAKE_CONTIGUOUS_WITH_NAME_CHECK
 
   // Invoke the underlying operator.
   auto bwd_output = l0op::HyperMegaMoeGrad(
     dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, params.hidden, hidden_dw, params.weight,
     y, gate, grad_gate, params.w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size,
     params.permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
-    swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, diagnostic_buffer,
-    rankId, ep, expert_num, hidden_size, seq_size, executorPtr);
+    swiglu_grad_tiling, gmm_workspace, runtime_config, all_event_counters, permute_src_index, route_weight,
+    reduce_route_index, diagnostic_buffer, rankId, ep, expert_num, hidden_size, seq_size, executorPtr);
   bool bwd_output_success = std::all_of(bwd_output.begin(), bwd_output.end(), [](const aclTensor* ptr) {
     return ptr != nullptr;
   });

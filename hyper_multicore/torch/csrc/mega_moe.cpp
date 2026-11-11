@@ -18,7 +18,7 @@
 
 namespace {
 
-using FwdReturn = std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>;
+using FwdReturn = std::tuple<at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&>;
 
 // ---------------------------------------------------------------------------
 // NPU device implementation
@@ -46,7 +46,12 @@ FwdReturn mega_moe_npu(
     const at::Tensor& down_proj_tiling,    // pos 19
     const at::Tensor& runtime_config,      // pos 20
     const at::Tensor& all_event_counters,  // pos 21
-    const at::Tensor& diagnostic_buffer,   // pos 22
+    const at::Tensor& original_x,          // pos 22
+    const at::Tensor& permute_src_index,   // pos 23
+    const at::Tensor& reduce_route_index,  // pos 24
+    const at::Tensor& topk_weights,        // pos 25
+    at::Tensor& final_out,                // pos 26 — inplace write, declared return
+    const at::Tensor& diagnostic_buffer,   // pos 27
     int64_t rank_id,
     int64_t ep,
     int64_t expert_num,
@@ -60,9 +65,10 @@ FwdReturn mega_moe_npu(
         down_proj_weight, down_proj_glist, down_proj_y,
         combine_target, combine_target_off, combine_src_off, combine_size,
         gmm_workspace, up_proj_tiling, swiglu_tiling, down_proj_tiling,
-        runtime_config, all_event_counters, diagnostic_buffer,
+        runtime_config, all_event_counters, original_x, permute_src_index,
+        reduce_route_index, topk_weights, final_out, diagnostic_buffer,
         rank_id, ep, expert_num, hidden_size, seq_size);
-    return FwdReturn(dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target);
+    return FwdReturn(dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target, final_out);
 }
 
 // ---------------------------------------------------------------------------
@@ -92,13 +98,18 @@ FwdReturn mega_moe_meta(
     const at::Tensor& /* down_proj_tiling */,
     const at::Tensor& /* runtime_config */,
     const at::Tensor& /* all_event_counters */,
+    const at::Tensor& /* original_x */,
+    const at::Tensor& /* permute_src_index */,
+    const at::Tensor& /* reduce_route_index */,
+    const at::Tensor& /* topk_weights */,
+    at::Tensor& final_out,
     const at::Tensor& /* diagnostic_buffer */,
     int64_t /* rank_id */,
     int64_t /* ep */,
     int64_t /* expert_num */,
     int64_t /* hidden_size */,
     int64_t /* seq_size */) {
-    return FwdReturn(dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target);
+    return FwdReturn(dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target, final_out);
 }
 
 }  // namespace

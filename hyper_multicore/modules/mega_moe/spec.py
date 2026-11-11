@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +55,11 @@ class MegaMoeSpec:
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    forward_fusion_mode: str = "legacy"
+    backward_fusion_mode: str = "legacy"
+    shared_intermediate_size: int = 0
+    forward_shared_expert: bool = False
+    backward_shared_expert: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -74,6 +80,73 @@ class MegaMoeSpec:
     def routed_slots(self) -> int:
         """Return routed rows produced by local Top-K expansion."""
         return self.local_num_tokens * self.top_k
+
+
+    @property
+    def forward_permute_fused(self) -> bool:
+        """Return whether the forward permute endpoint runs in the MegaKernel."""
+        return self.forward_fusion_mode in {"permute", "both"}
+
+    @property
+    def forward_unpermute_fused(self) -> bool:
+        """Return whether the forward unpermute endpoint runs in the MegaKernel."""
+        return self.forward_fusion_mode in {"unpermute", "both"}
+
+    @property
+    def backward_permute_fused(self) -> bool:
+        """Return whether the backward permute endpoint runs in the MegaKernel."""
+        return self.backward_fusion_mode in {"permute", "both"}
+
+    @property
+    def backward_unpermute_fused(self) -> bool:
+        """Return whether the backward unpermute endpoint runs in the MegaKernel."""
+        return self.backward_fusion_mode in {"unpermute", "both"}
+
+
+def _resolve_fusion_modes(specification: Mapping[str, Any]) -> tuple[str, str]:
+    """Resolve route endpoints before resource agreement and symmetric allocation."""
+    supported = (specification["top_k"] <= 16
+                 and (specification.get("auto_tokens", False)
+                      or specification["local_num_tokens"] * specification["top_k"] <= 1 << 24))
+    shared = os.getenv("HYPER_MULTICORE_MEGA_MOE_FUSION_MODE")
+    defaults = ("legacy", "legacy")
+    modes = []
+    for direction, default in zip(("forward", "backward"), defaults):
+        name = f"{direction}_fusion_mode"
+        value = specification.get(name)
+        if value is None:
+            value = os.getenv(f"HYPER_MULTICORE_MEGA_MOE_{direction.upper()}_FUSION_MODE", shared or default)
+        if value not in {"legacy", "permute", "unpermute", "both"}:
+            raise ValueError(f"{name} must be legacy, permute, unpermute or both, got {value!r}")
+        if value != "legacy" and not supported:
+            raise ValueError("Route fusion requires top_k <= 16 and actual T * K <= 2**24")
+        modes.append(value)
+    return modes[0], modes[1]
+
+
+def _resolve_shared_fusion_modes(specification: Mapping[str, Any]) -> tuple[bool, bool]:
+    """Resolve independent shared-expert forward and backward switches."""
+    shared_default = False
+    shared = os.getenv("HYPER_MULTICORE_MEGA_MOE_SHARED_EXPERT")
+    result = []
+    for direction in ("forward", "backward"):
+        value = specification.get(f"{direction}_shared_expert")
+        if value is None:
+            value = os.getenv(
+                f"HYPER_MULTICORE_MEGA_MOE_{direction.upper()}_SHARED_EXPERT",
+                shared if shared is not None else str(shared_default),
+            )
+        if isinstance(value, str):
+            normalized = value.lower()
+            if normalized not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+                raise ValueError(f"{direction}_shared_expert must be a boolean")
+            value = normalized in {"1", "true", "yes", "on"}
+        if not isinstance(value, bool):
+            raise ValueError(f"{direction}_shared_expert must be a boolean")
+        result.append(value)
+    if not specification.get("shared_intermediate_size", 0) and any(result):
+        raise ValueError("shared expert fusion requires shared_intermediate_size")
+    return result[0], result[1]
 
 
 def _align_capacity(capacity: int) -> int:
@@ -199,6 +272,8 @@ def bind_mega_moe_spec(
         local_num_tokens * top_k,
         ep_size,
     )
+    forward_fusion_mode, backward_fusion_mode = _resolve_fusion_modes(specification)
+    forward_shared_expert, backward_shared_expert = _resolve_shared_fusion_modes(specification)
     return MegaMoeSpec(
         local_num_tokens=local_num_tokens,
         hidden_size=specification["hidden_size"],
@@ -219,4 +294,8 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        forward_fusion_mode=forward_fusion_mode, backward_fusion_mode=backward_fusion_mode,
+        shared_intermediate_size=specification.get("shared_intermediate_size", 0),
+        forward_shared_expert=forward_shared_expert,
+        backward_shared_expert=backward_shared_expert,
     )

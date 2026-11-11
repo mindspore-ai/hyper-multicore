@@ -49,6 +49,12 @@
             "purpose": "add task-configured DeepSeek clipped SwiGLU forward and backward semantics"
           },
           {
+            "path": "hyper_multicore/ops/patches/swi_glu_shared_rounding.patch",
+            "sha256": "72b45e01d1bbf847e06924ef313cc0bf0dc55a986ad024102f215a5ef87b50d8",
+            "allow_zero_context": true,
+            "purpose": "preserve separate PyTorch activation rounding in shared-expert forward and backward"
+          },
+          {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
             "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
             "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior"

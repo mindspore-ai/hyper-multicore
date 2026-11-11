@@ -35,13 +35,60 @@ from hyper_multicore.modules.mega_moe.backward.tiling_tables import (
 )
 from hyper_multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
-from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec, _resolve_fusion_modes
 from hyper_multicore.scheduler.config import TaskSplitValue
 from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fusion_defaults_preserve_legacy(self) -> None:
+        """Unselected route endpoints preserve the legacy path."""
+        specification = {
+            "max_local_num_tokens": None,
+            "auto_tokens": True,
+            "top_k": 8,
+            "local_num_tokens": 4096,
+            "dispatch_mode": "push",
+        }
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(_resolve_fusion_modes(specification), ("legacy", "legacy"))
+
+    def test_fusion_modes_accept_automatic_tokens(self) -> None:
+        """Resolve every endpoint mode without requiring a removed static-token API."""
+        specification = {
+            "auto_tokens": True, "local_num_tokens": 128, "top_k": 2, "dispatch_mode": "push",
+        }
+        modes = ("legacy", "permute", "unpermute", "both")
+        with patch.dict("os.environ", {}, clear=True):
+            for forward, backward in product(modes, repeat=2):
+                with self.subTest(forward=forward, backward=backward):
+                    selected = {**specification, "forward_fusion_mode": forward,
+                                "backward_fusion_mode": backward}
+                    self.assertEqual(_resolve_fusion_modes(selected), (forward, backward))
+
+    def test_fused_dynamic_plans_keep_exact_local_shapes(self) -> None:
+        """Shared and route endpoints retain immutable local rows inside one group bucket."""
+        resources = self._cache_resources(512, automatic=True)
+        resources.spec = replace(resources.spec, forward_fusion_mode="both", backward_fusion_mode="both",
+                                 shared_intermediate_size=4, forward_shared_expert=True,
+                                 backward_shared_expert=True)
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
+            plans = []
+            for rows in (0, 1, 127, 128, 129, 257):
+                plan = resources.plan_for_tokens(512, "cpu", local_num_tokens=rows)
+                self.assertEqual((plan.spec.local_num_tokens, plan.spec.plan_tokens), (rows, 512))
+                self.assertIs(resources.plan_for_tokens(512, "cpu", local_num_tokens=rows), plan)
+                plans.append(plan)
+            for rows in range(40):
+                resources.plan_for_tokens(512, "cpu", local_num_tokens=rows)
+            self.assertLessEqual(len(resources._plans), 32)
+            self.assertEqual([plan.spec.local_num_tokens for plan in plans], [0, 1, 127, 128, 129, 257])
+        self.assertEqual(resources.spec.local_num_tokens, 512)
 
     # pylint: disable=protected-access
 
@@ -241,8 +288,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
                 if kind == "layout":
                     peer_specification = list(value[2][0])
-                    self.assertEqual(peer_specification[-3], "EOI")
-                    peer_specification[-3] = "EIO"
+                    layout_index = peer_specification.index("EOI")
+                    peer_specification[layout_index] = "EIO"
                     peer = (value[0], value[1], (tuple(peer_specification),))
                 else:
                     peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)
@@ -469,6 +516,68 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_shared_expert_parameters_and_autograd(self) -> None:
+        """Feature: token-local shared SwiGLU parameters.
+
+        Description: Construct an owned shared branch and evaluate it with dense CPU tensors.
+        Expectation: The packed weights use the public shapes and receive gradients independently.
+        """
+        experts = MegaMoeExperts(
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            shared_intermediate_size=4,
+            ep_size=1,
+        ).to(dtype=torch.bfloat16)
+        self.addCleanup(experts.close)
+        self.assertEqual(experts.shared_intermediate_size, 4)
+        self.assertEqual(tuple(experts.shared_gate_up_weight.shape), (8, 16))
+        self.assertEqual(tuple(experts.shared_down_weight.shape), (16, 4))
+        self.assertEqual(experts._resource_group.specification["shared_intermediate_size"], 4)
+
+        hidden = torch.randn(6, 16, dtype=torch.bfloat16, requires_grad=True)
+        output = experts._execute_shared_expert(
+            hidden, experts.shared_gate_up_weight, experts.shared_down_weight,
+        )
+        output.float().square().mean().backward()
+        self.assertIsNotNone(hidden.grad)
+        self.assertIsNotNone(experts.shared_gate_up_weight.grad)
+        self.assertIsNotNone(experts.shared_down_weight.grad)
+
+        for invalid in (-1, True, 1.5):
+            with self.subTest(shared_intermediate_size=invalid), self.assertRaisesRegex(
+                ValueError, "shared_intermediate_size"
+            ):
+                MegaMoeExperts(
+                    hidden_size=16,
+                    intermediate_size=8,
+                    num_experts=4,
+                    top_k=2,
+                    shared_intermediate_size=invalid,
+                    ep_size=1,
+                )
+
+    def test_full_fusion_interface(self) -> None:
+        """Normalize the automatic-token full preset and reject conflicting settings."""
+        arguments = {"hidden_size": 5120, "intermediate_size": 128, "num_experts": 4,
+                     "top_k": 2, "shared_intermediate_size": 256, "ep_size": 1,
+                     "create_parameters": False, "fusion_mode": "full"}
+        experts = MegaMoeExperts(**arguments)
+        self.addCleanup(experts.close)
+        spec = experts._resource_group.specification
+        self.assertTrue(spec["auto_tokens"])
+        self.assertEqual(spec["forward_fusion_mode"], "both")
+        self.assertEqual(spec["backward_fusion_mode"], "both")
+        self.assertTrue(spec["forward_shared_expert"])
+        self.assertTrue(spec["backward_shared_expert"])
+        for overrides in ({"forward_fusion_mode": "legacy"}, {"backward_shared_expert": False},
+                          {"shared_intermediate_size": 0}, {"fusion_mode": "unknown"}):
+            with self.subTest(**overrides), self.assertRaises(ValueError):
+                MegaMoeExperts(**{**arguments, **overrides})
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_forward_passes_router_inputs_and_restores_shape(self) -> None:
         """Feature: forward passes router inputs and restores shape.
         Description: Execute forward with router metadata and caller-shaped inputs.
@@ -487,9 +596,12 @@ class TestMegaMoeExperts(unittest.TestCase):
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False),
-                                    plan=object(), workspace=object(), ensure_capacity=Mock(),
-                                    plan_for_tokens=Mock())
+        spec = SimpleNamespace(auto_tokens=False, dynamic_tokens=False, local_num_tokens=128,
+                               forward_permute_fused=False,
+                               forward_shared_expert=False, backward_shared_expert=False,
+                               forward_fusion_mode="legacy", backward_fusion_mode="legacy")
+        resources = SimpleNamespace(spec=spec, plan=SimpleNamespace(spec=spec), workspace=object(),
+                                    ensure_capacity=Mock(), plan_for_tokens=Mock())
         route = SimpleNamespace(
             routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
             unpermute_mapping=object(), maximum_received_slots=512

@@ -416,7 +416,7 @@ def _operator_ports(operator: Any, task: Any) -> tuple[Any, ...]:
                 specs: Native-bound graph operands requiring Host descriptors.
             """
             return [TensorDescC(input_position=spec.param_position, data_type=spec.dtype_size,
-                                dynamic_shape=1) for spec in specs]
+                                dynamic_shape=int(spec.is_dynamic)) for spec in specs]
 
         return (("input", descriptors(operator.inputs), operator.inputs, len(operator.inputs)),
                 ("output", descriptors(operator.outputs), operator.outputs, len(operator.outputs)))

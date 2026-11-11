@@ -139,6 +139,9 @@ launcher 已经负责启动分布式 worker，以下 pytest 命令不要再套�
 | [test_mega_gate.py](torch/test_mega_gate.py) | 1 | text/vision 路由、正反向、数学顺序、动态形状、训练图和符号解析并发 |
 | [test_mega_mhc.py](torch/test_mega_mhc.py) | 1 | 同形状前向/反向在多 stream 下与串行 native 执行结果一致 |
 | [test_mega_moe.py](torch/test_mega_moe.py) | 按用例为 2、4 或 8 | 输出及完整梯度、SGD、push/pull、Router、容量、生命周期、subgroup 和动态 token |
+| [test_mega_moe_route_fusion.py](torch/test_mega_moe_route_fusion.py) | 2 | 16 种路由前后向开关组合、尾块、零接收 rank 和重复反向 |
+| [test_mega_moe_shared.py](torch/test_mega_moe_shared.py) | 按用例为 2 或 4 | 64 种路由/shared 开关组合、完整梯度、动态 token、容量增长、空 rank 和保留图 |
+| [test_mega_moe_backward_memory.py](torch/test_mega_moe_backward_memory.py) | 2 | push/pull 普通反向复用、保留图与 saved-tensor hooks 回退、完整梯度 exact |
 | [test_swiglu_clamp_st.py](torch/test_swiglu_clamp_st.py) | 1 | clipped SwiGLU 数值 |
 | [test_mega_moe_profiling.py](torch/test_mega_moe_profiling.py)、[test_mega_moe_tensor_dump.py](torch/test_mega_moe_tensor_dump.py) | 2 | kernel trace 和 tensor dump |
 | [shmem/test_binding.py](torch/shmem/test_binding.py) | 按用例为 1 或 2 | 分配、释放、通信、stream 顺序、错误及原生日志 |
@@ -184,6 +187,30 @@ python -m pytest tests/torch -v --junitxml=logs/npu.xml
 
 也可以用 `-m level0` 选择基础检查，或 `-k` 按名称过滤。当前 MHC 多 stream 用例标记为 level1，
 不会包含在 level0 选择中。默认 pytest 串行执行各 launcher；不要用 pytest-xdist 并行扩展整套测试。
+
+### 路由与 shared expert 开关评测
+
+使用 4 张空闲 NPU 运行完整 64 配置矩阵，结果写入指定目录。每个配置使用独立进程，
+比较 legacy MegaMoe 加外部 shared 分支与所选融合配置；固定形状为每 rank `T=4096`、
+`H=5120`、路由和 shared 中间维度 `1792`、32 个专家、Top-K=8、EP=4、BF16。
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+bash tests/torch/run_mega_moe_switch_matrix.sh /path/to/new-results
+```
+
+每次运行先检查梯度存在且有限，再释放检查过程的缓存、预热 8 次、清空参数梯度并重置
+allocator 峰值，随后采集 30 次 F+B。JSON 分别记录同步 wall time 与 NPU Event 时间、
+各指标的 rank-max、allocator 基线/峰值/增量，以及 SHMEM heap；算子图任务数包含终止任务。`peak_device_used_sampled`
+只在同步后的采样点统计，不能当作设备连续峰值；该脚本不设性能通过阈值。
+输出目录应为新的实验目录，已有结果会跳过；更换代码、设备、环境或测量口径时不要复用旧目录。
+
+动态融合回归包含 push/pull 的变长、rank 不等长、空输入/零接收、保留图跨容量增长和重复反向：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+python -m pytest tests/torch/test_mega_moe_shared.py -k dynamic_shared_fusion -v -s
+```
 
 ## 添加或扩展用例
 
