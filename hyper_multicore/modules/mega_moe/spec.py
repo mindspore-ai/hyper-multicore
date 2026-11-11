@@ -60,6 +60,8 @@ class MegaMoeSpec:
     mx_swiglu_row_only: bool = False
     mx_poll_policy: str = '0'
     route_count_policy: str = "baseline"
+    bf16_schedule: str = "legacy_odd"
+    ready_depth: int = 0
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -219,6 +221,8 @@ def bind_mega_moe_spec(
         num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit,
         mx_vector_policy=specification.get("mx_vector_policy", "legacy_odd"),
+        bf16_schedule=specification.get("bf16_schedule", "legacy_odd"),
+        ready_depth=specification.get("ready_depth", 0),
         mx_schedule_dir=specification.get("mx_schedule_dir", ""),
         mx_swiglu_row_only=specification.get("mx_swiglu_row_only", False),
         dispatch_mode=specification.get("dispatch_mode", "push"),

@@ -56,7 +56,7 @@ def _resolve_expert_owner(
     rank_owner_base = topology.rank_id * topology.single_rank_expert_num
 
     if operator.op_type == OpType.GMM:
-        return rank_owner_base + task_desc.task_index // context.num_cube_cores
+        return rank_owner_base + task_desc.task_index // (task_desc.extra_value_0 or context.num_cube_cores)
 
     if operator.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD):
         if task_desc.task_split_value == 0:

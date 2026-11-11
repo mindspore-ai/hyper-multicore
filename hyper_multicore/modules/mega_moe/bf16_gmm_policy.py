@@ -21,6 +21,9 @@ def configure_gmm_tasks(graph: ComputeGraph, config: RuntimeConfigC) -> None:
         return
     for index in range(config.task_num):
         task = config.all_tasks[index]
+        if task.task_type == TaskType.TASK_SWI_GLU_GRAD:
+            if os.environ.get('HYPER_MULTICORE_BF16_ACTIVATION_POLICY', 'legacy') == 'a5':
+                task.extra_value_1 = 1
         if task.task_type == TaskType.TASK_GROUPED_MATMUL:
             task.extra_value_1 = 2
     offset = 0
@@ -28,6 +31,9 @@ def configure_gmm_tasks(graph: ComputeGraph, config: RuntimeConfigC) -> None:
         if op.name in ("act_grad", "gate_grad", "w1_grad", "w2_grad"):
             for index in range(offset, offset + op.task_num):
                 task = config.all_tasks[index]
+        if task.task_type == TaskType.TASK_SWI_GLU_GRAD:
+            if os.environ.get('HYPER_MULTICORE_BF16_ACTIVATION_POLICY', 'legacy') == 'a5':
+                task.extra_value_1 = 1
                 if task.task_type != TaskType.TASK_GROUPED_MATMUL:
                     raise RuntimeError(f"Backward GMM descriptor type differs for {op.name} at {index}")
                 task.extra_value_1 = 3

@@ -363,6 +363,10 @@ __aicore__ inline uint32_t getTaskIndexNumOffset(__gm__ uint8_t *tiling) {
   return getAllEventsOffset(tiling) + getRuntimeEventCapacity(tiling) * 4 * UINT32_T_SIZE;
 }
 
+__aicore__ inline int32_t getTaskQueueLayoutTag(__gm__ uint8_t *tiling) {
+  return reinterpret_cast<__gm__ int32_t *>(tiling + getTaskIndexNumOffset(tiling))[3];
+}
+
 __aicore__ inline int32_t getTaskIndexNumByTaskType(__gm__ uint8_t *tiling, TaskAiCoreType task_aicore_type) {
   uint32_t size = getAllEventsOffset(tiling) + getRuntimeEventCapacity(tiling) * 4 * UINT32_T_SIZE;
   if (task_aicore_type == TaskAiCoreType::TASK_AICORE_VECTOR) {

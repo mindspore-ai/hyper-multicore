@@ -43,7 +43,7 @@ The deployed MX policy is configured before constructing the executor:
 
 ```bash
 export HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_udma
-export HYPER_MULTICORE_SHMEM_UDMA_QP_NUM=16
+export HYPER_MULTICORE_SHMEM_UDMA_QP_NUM=1
 export HYPER_MULTICORE_SHMEM_HEAP_SIZE=1073741824
 export HYPER_MULTICORE_MX_AIV_POLICY=window2
 export HYPER_MULTICORE_MX_GMM_TILE=t6
@@ -56,13 +56,28 @@ export HYPER_MULTICORE_MOE_SHARE_EXECUTION_RESOURCES=1
 export SHMEM_LOG_LEVEL=ERROR
 ```
 
-BF16 UDMA currently uses QP32. Set `HYPER_MULTICORE_SHMEM_UDMA_QP_NUM=32` for it,
-then select `HYPER_MULTICORE_BF16_GMM_POLICY=blaze_bwd_lanes_a5` and
-`HYPER_MULTICORE_BF16_NOGRAD_NO_COPY=1` for the adopted BF16 policy. The package default
-BF16 math remains generic. QP1/QP16 are qualified MX bank configurations, not counts
-of communication AIVs. Actual `(peer, QP)` ownership and completion order must remain valid.
-EP64/TSV4096 QP1 is host-builder qualified; a smaller EP task geometry can have
-multiple owners of one peer and correctly reject QP1 before launch.
+BF16 A5 scheduled execution shares QP1 transport planning with MX. Select before constructing it:
+
+```bash
+export HYPER_MULTICORE_BF16_GMM_POLICY=blaze_bwd_lanes_a5
+export HYPER_MULTICORE_BF16_ACTIVATION_POLICY=a5
+export HYPER_MULTICORE_BF16_NOGRAD_NO_COPY=1
+export HYPER_MULTICORE_BF16_SCHEDULE=window2
+```
+
+The standalone BF16 default remains `legacy_odd`/generic, including automatic tokens
+and EIO/EOI layouts. MX policy alone does not change BF16 scheduling. Legacy BF16
+retains its existing QP32 requirement. The explicit A5 window2/half16 paths require
+32 physical AIC and QP1; no arbitrary A2/A3 scheduling change is implied.
+At small EP each remote peer has one owner; spare odd AIV perform independent
+self copies. At EP64 all odd owner lanes are occupied and the established mapping
+is retained. Do not infer32 simultaneous remote payload movers from32 configured
+communication lanes, and do not remove the shared-producer safety check.
+
+BF16 and MX reuse the same transport planner/owner validator, common split control,
+Put/Get completion and source-lifetime protocol. Their mathematical DAGs and joins
+remain precision-specific. QP1 does not imply a slower dtype or packed FP8 token
+communication; routed payloads in both paths are BF16.
 
 Set `HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE=pull` for Pull; combine remains Push.
 Push accepts receive-capacity factors. Pull uses source/routed symmetric buffers,
@@ -120,3 +135,30 @@ forward, recompute and backward with zero dropped records and continued training
 The final installed wheel also completed a replay after its source build directory
 was moved away. These are functional migration gates, not steady-state speedup claims.
 No new multi-node or A3 device run is implied.
+
+
+## Optional BF16 half-Cube scheduling
+
+`HYPER_MULTICORE_BF16_SCHEDULE=half16` is an explicit, default-disabled alternative
+to window2. Physical AIC0–15 handle zero-based local experts0/2/4, while AIC16–31
+handle1/3/5, each in Up -> activation-ready -> Down order before its next expert.
+Each expert has16 logical lanes with complete tile coverage; no output is dropped.
+Forward and recomputation change; backward remains32-lane. AIV transport/activation
+ownership and completion stay unchanged. Cube ready lookahead is disabled inside
+each half group to preserve its strict sequence; vector lookahead keeps its setting.
+
+Prior local module data did not show a half16 gain; it is retained for explicit
+workload comparisons rather than promoted as a default. Profile task counts/owners
+per expert, not only the metadata reporting32 active physical Cube workers.
+A shorter Combine WAIT is not proof of faster complete MoE or step time.
+
+The shared communication split control now applies to BF16 as well. Environment
+Pull ignores downstream Push-reservation factors, while an explicit independent
+BF16 `dispatch_mode='pull'` call without that environment selection keeps the
+original capacity-argument validation. Preserve source/ctx/stream lifetime gates.
+
+After applying these source changes, rebuild with the documented native build
+command. Old build products do not acquire the new16-lane/CSR/device VF code by
+copying only Python files. No former workspace or binary archive is required;
+no system CANN file is changed. Source-only commits intentionally contain no
+compiled objects or temporary fault diagnostics.

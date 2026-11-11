@@ -2,7 +2,7 @@
   "source": "${ASCEND_HOME_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/common",
   "version": "installed CANN9.2 20261015",
   "license": "CANN Open Software License Agreement Version 2.0, retained in each file",
-  "adaptation": "Only quoted same-component include paths made relative, no math changes",
+  "adaptation": "Quoted same-component include paths made relative; optional logical core count override for task-local tail scheduling; math unchanged",
   "files": [
     {
       "path": "blaze/gemm/block/block_mmad.h",
@@ -57,7 +57,7 @@
     {
       "path": "blaze/gemm/block/block_scheduler_grouped_matmul.h",
       "source_sha256": "89462de8c91c8e45c5dd47b85d59716456c2ea43b15324ff8b4dcb4d16de4965",
-      "adapted_sha256": "59793d4e883df3be3fbd88dce004cbfc76f68e826d16707c347a8fa699bfcd35"
+      "adapted_sha256": "1190ed734e79b5a8eed2d45b4de0b0fa14014d6396be9d5c5c127e0ac5c47d63"
     },
     {
       "path": "blaze/gemm/policy/dispatch_policy.h",

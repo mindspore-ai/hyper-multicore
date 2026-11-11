@@ -4,26 +4,8 @@ from typing import Any
 
 from hyper_multicore.shmem._runtime import _udma_qps_per_peer
 
-from .config import TaskType
 from .planned_queue import install_worker_queues
-
-
-def _validate_qp_owners(cfg: Any, spec: Any, vectors: list[list[int]], qps: int) -> None:
-    """Reject concurrent producers of one peer/QP without changing task order."""
-    owners = {}
-    for worker in range(1, 64, 2):
-        qp = worker // (64 // qps)
-        for tid in vectors[worker]:
-            task = cfg.all_tasks[tid]
-            if task.task_type not in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
-                continue
-            peer = task.task_index // (task.task_split_num // spec.ep_size)
-            if peer == spec.rank_id:
-                continue
-            key = peer, qp
-            owner = owners.setdefault(key, worker)
-            if owner != worker:
-                raise ValueError(f'QP owner collision: peer={peer}, qp={qp}, workers={owner}/{worker}')
+from .transport_queue import build_transport_queues, validate_qp_owners as _validate_qp_owners
 
 
 def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) -> None:
@@ -47,6 +29,7 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
     vectors = [[] for _ in range(64)]
     cubes = [[] for _ in range(32)]
     communication = list(cfg.vector_task_indices[:cfg.task_index_num[3]])
+    transport = build_transport_queues(cfg, spec, communication, _udma_qps_per_peer())
     for lane in range(32):
         for stage in cube_stages[:front]:
             cubes[lane].extend(tasks(stage, 0, lane))
@@ -57,13 +40,10 @@ def configure_window_queue(cfg: Any, graph: Any, spec: Any, *, forward: bool) ->
                 cubes[lane].extend(tasks(stage, expert - 1, lane))
         for stage in cube_stages[front:]:
             cubes[lane].extend(tasks(stage, spec.local_experts - 1, lane))
-        vectors[2 * lane + 1] = communication[lane::32]
+        vectors[2 * lane + 1] = transport[2 * lane + 1]
         vectors[2 * lane].extend(tasks(inputs[0], 0, lane))
         for expert in range(spec.local_experts):
             if expert + 1 < spec.local_experts:
                 vectors[2 * lane].extend(tasks(inputs[0], expert + 1, lane))
             vectors[2 * lane].extend(tasks(inputs[1], expert, lane))
-    qps = _udma_qps_per_peer()
-    if qps < 32:
-        _validate_qp_owners(cfg, spec, vectors, qps)
-    install_worker_queues(cfg, cubes, vectors)
+    install_worker_queues(cfg, cubes, vectors, transport_queues=transport)

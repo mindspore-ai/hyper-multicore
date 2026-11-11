@@ -67,6 +67,9 @@ public:
         blockNum_ = static_cast<int64_t>(AscendC::GetBlockNum());
     }
 
+    // A worker owns a logical subpartition of the physical mixed launch.
+    __aicore__ inline void SetLogicalCoreCount(int64_t cores) { blockNum_ = cores; }
+
     // Keep the block scheduling interface aligned with BlockSchedulerMatmulBasic.
     __aicore__ inline int64_t GetBlockNums()
     {

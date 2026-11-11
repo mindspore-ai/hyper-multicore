@@ -124,5 +124,11 @@ def can_reuse_backward_dispatch(cfg: RuntimeConfigC, num_experts: int, num_cores
         if reads_dispatch and (task.task_type != TaskType.TASK_GROUPED_MATMUL
                                or task.outputs[0].input_position not in (_WEIGHT2_GRAD, _ACTIVATION_GRAD)):
             return False
+    if cfg.task_index_num[3] == -2:
+        offsets = cfg.mix_task_indices
+        queues = [cube_tasks[offsets[65 + w]:offsets[66 + w]] for w in range(num_cores)]
+        if len({len(queue) for queue in queues}) != 1:
+            return False
+        cube_tasks = [queue[pos] for pos in range(len(queues[0])) for queue in queues]
     return (_worker_read_order(cube_tasks, num_experts, num_cores)
             and _expert_events_join_readers(cfg, cube_tasks, vector_tasks, num_experts, num_cores))

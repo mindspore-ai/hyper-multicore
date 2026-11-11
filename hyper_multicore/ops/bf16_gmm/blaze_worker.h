@@ -26,6 +26,7 @@ __aicore__ inline void RunBlaze(const Problem& problem, GM_ADDR a, GM_ADDR b, GM
       tiling.baseM, tiling.baseN, tail.m, tail.n, 1, 1, -1, 1, static_cast<int64_t>(problem.m),
       true, true, true, Mmad::TRANS_B, false, sizeof(bfloat16_t)};
   Block::BlockSchedulerGmmNoQuant schedule(schedule_params);
+  schedule.SetLogicalCoreCount(cubes);
   typename Mmad::TupleShape shape{static_cast<int64_t>(problem.m), static_cast<int64_t>(problem.n),
                                  static_cast<int64_t>(problem.k), 1};
   schedule.UpdateNextGroup(shape);
@@ -66,7 +67,8 @@ __aicore__ inline void RunBlaze(const Problem& problem, GM_ADDR a, GM_ADDR b, GM
 template <bool RotateLanes = false, class Task>
 __aicore__ inline void ExecuteBlazeTask(const Task& task, GM_ADDR* inputs, uint32_t cubes) {
   if ASCEND_IS_AIV { return; }
-  const uint32_t expert = task.task_index / cubes;
+  const uint32_t lanes = task.extra_value_0 == 16 ? 16 : cubes;
+  const uint32_t expert = task.task_index / lanes;
   AscendC::GlobalTensor<int64_t> groups;
   groups.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(inputs[task.inputs[2].input_position]));
   const uint64_t start = expert == 0 ? 0 : groups.GetValue(expert - 1);
@@ -82,13 +84,13 @@ __aicore__ inline void ExecuteBlazeTask(const Task& task, GM_ADDR* inputs, uint3
   GM_ADDR c = inputs[task.outputs[0].input_position] + problem.c * sizeof(bfloat16_t);
   if (trans_a) {
     RunBlaze<asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn, RotateLanes>(
-        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert);
+        problem, a, b, c, tiling, task.task_index % lanes, lanes, expert);
   } else if (trans_b) {
     RunBlaze<asc::te::nd_ext_layout_ptn, asc::te::dn_ext_layout_ptn, RotateLanes>(
-        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert);
+        problem, a, b, c, tiling, task.task_index % lanes, lanes, expert);
   } else {
     RunBlaze<asc::te::nd_ext_layout_ptn, asc::te::nd_ext_layout_ptn, RotateLanes>(
-        problem, a, b, c, tiling, task.task_index % cubes, cubes, expert);
+        problem, a, b, c, tiling, task.task_index % lanes, lanes, expert);
   }
 }
 }  // namespace MulticoreBf16

@@ -22,6 +22,7 @@
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
 #include "bf16_gmm/cgmct_worker.h"
 #include "bf16_gmm/blaze_worker.h"
+#include "bf16_swiglu_grad/worker.h"
 #endif
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
@@ -65,11 +66,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       case TaskType::TASK_GROUPED_MATMUL:
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
         if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
-          if (task_desc.extra_value_1 == 1) {
+          if ((task_desc.extra_value_1 & 31) == 1) {
             MulticoreBf16::ExecuteCgmctTask(task_desc, input_list, this->core_num);
-          } else if (task_desc.extra_value_1 == 2) {
+          } else if ((task_desc.extra_value_1 & 31) == 2) {
             MulticoreBf16::ExecuteBlazeTask(task_desc, input_list, this->core_num);
-          } else if (task_desc.extra_value_1 == 3) {
+          } else if ((task_desc.extra_value_1 & 31) == 3) {
             MulticoreBf16::ExecuteBlazeTask<true>(task_desc, input_list, this->core_num);
           } else {
             ExecuteGroupedMatmul(task_desc);
@@ -85,7 +86,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteShmemPutMem(task_desc);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
-        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET, true>(task_desc);
         break;
       case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);
@@ -164,6 +165,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
                                     ? base_ptr_offset * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+          const int64_t columns = task_desc.inputs[0].dim[1];
+          if ((task_desc.extra_value_1 & 31) == 1 && GetSwiGluClampLimit(task_desc) <= 0.0f && columns % 16 == 0) {
+            const int64_t rows = end - base_ptr_offset < task_desc.task_split_value
+                                     ? end - base_ptr_offset : task_desc.task_split_value;
+            MulticoreBf16::ExecuteSwiGluGradVf(
+                input_list[task_desc.inputs[0].input_position] + input_0_offset,
+                input_list[task_desc.inputs[1].input_position] + input_1_offset,
+                input_list[task_desc.outputs[0].input_position] + output_0_offset, rows, columns);
+            return;
+          }
+        }
+#endif
         if (start + current_seq_end <= end) {
           swi_glu_grad(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
@@ -317,8 +332,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
 
 }  // namespace MulticoreRuntime
 
+#include "runtime/bf16_planned_worker.h"
+
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
+  if (MulticoreRuntime::getTaskQueueLayoutTag(runtimeConfigPtr) == -2) {
+    MulticoreRuntime::Bf16PlannedWorker worker;
+    worker.Init(worker_id, runtimeConfigPtr, input_list);
+    worker.ProcessPlanned();
+    return;
+  }
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();

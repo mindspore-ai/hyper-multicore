@@ -101,6 +101,7 @@ class GmmFillConfig(FillConfig):
             data_index = i // self.num_cube_cores
             task = TaskDescC()
             task.task_type        = TaskType.TASK_GROUPED_MATMUL
+            task.extra_value_0    = self.num_cube_cores
             task.task_aicore_type = TaskAiCoreType.TASK_AICORE_CUBE
             task.num_inputs       = len(op.inputs)
             task.num_outputs      = len(op.outputs)

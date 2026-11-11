@@ -271,6 +271,8 @@ def _compose_hyper_multicore_ops(
             continue
         shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
         shutil.copytree(_MULTICORE_OPS / "bf16_gmm", operator_root / "op_kernel/bf16_gmm")
+        if operator_name == "hyper_mega_moe_grad":
+            shutil.copytree(_MULTICORE_OPS / "bf16_swiglu_grad", operator_root / "op_kernel/bf16_swiglu_grad")
         shutil.copytree(transformer_copy / "gmm/common/cgmct", operator_root / "op_kernel/cgmct")
         shutil.copytree(
             ops_nn_copy / "activation" / "swi_glu" / "op_kernel",

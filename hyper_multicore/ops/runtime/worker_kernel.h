@@ -120,7 +120,8 @@ class KernelWorkerBase {
     // for operators whose sixth field is not the AIC count (for example mHC).
     this->vector_num = getNumWorkers(this->runtimeConfigPtr);
     this->core_num = this->vector_num / 2;
-    this->active_vector_num = WorkerPolicy == VectorWorkerPolicy::ALL ? this->vector_num : this->vector_num / 2;
+    this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL ||
+        getTaskQueueLayoutTag(this->runtimeConfigPtr) == -2) ? this->vector_num : this->vector_num / 2;
   }
 
   __aicore__ inline void Process() {
@@ -348,7 +349,8 @@ class KernelWorkerBase {
     if constexpr (WorkerPolicy != VectorWorkerPolicy::LEGACY_ODD) {
       return this->worker_id_ < this->active_vector_num;
     }
-    return this->worker_id_ % VECTOR_WORKER_STRIDE != 0;
+    return getTaskQueueLayoutTag(this->runtimeConfigPtr) == -2 ||
+        this->worker_id_ % VECTOR_WORKER_STRIDE != 0;
   }
 
   __aicore__ inline void AtomicAddForAllEventCounters(uint32_t event_index) {

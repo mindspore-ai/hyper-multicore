@@ -120,7 +120,7 @@ def _resolve_ep_size(ep_size: int | None, ep_group: Any | None) -> int:
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
-    _extra_manifest_fields: tuple[str, ...] = ()
+    _extra_manifest_fields: tuple[str, ...] = ("bf16_schedule", "ready_depth")
 
     def __init__(
         self,
@@ -131,9 +131,10 @@ class _MegaMoeExecutionResources:
         active_specifications: tuple[Mapping[str, Any], ...],
     ) -> None:
         """Bind resources once to the first NPU tensor."""
-        if _udma_qps_per_peer() != 32:
-            raise ValueError('The 16-QP experiment supports MXFP8 window2, not the BF16 execution plan')
         self.spec = bind_mega_moe_spec(specification, tensor)
+        expected_qps = 32 if self.spec.bf16_schedule == 'legacy_odd' else 1
+        if _udma_qps_per_peer() != expected_qps:
+            raise ValueError(f'BF16 {self.spec.bf16_schedule} requires{expected_qps} QP per peer')
         self._token_capacity = self.spec.local_num_tokens
         self._plans = {}
         if dist.is_initialized():
@@ -182,7 +183,7 @@ class _MegaMoeExecutionResources:
 
     def lifecycle_signature(self) -> tuple[Any, ...]:
         """Identify allocations independently of process-local group addresses."""
-        return (
+        signature = (
             "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
@@ -191,6 +192,9 @@ class _MegaMoeExecutionResources:
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
             _udma_qps_per_peer(),
         )
+        if self.spec.bf16_schedule != 'legacy_odd':
+            return (*signature, self.spec.bf16_schedule, self.spec.ready_depth)
+        return signature
 
     def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
         """Commit physical capacity before taking a pull lease and publishing source rows.
@@ -345,7 +349,7 @@ class MegaMoeExperts(MulticoreModule):
         ep_group: Any | None = None,
         create_parameters: bool = True,
         expert_weight_layout: ExpertWeightLayout = "EIO",
-        dispatch_mode: str = "push",
+        dispatch_mode: str | None = None,
         initial_capacity_factor: float | None = None,
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
@@ -384,6 +388,21 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
+        if type(self) is MegaMoeExperts:
+            selected = os.environ.get('HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE')
+            if selected not in (None, 'push', 'pull') or dispatch_mode not in (None, 'push', 'pull'):
+                raise ValueError('dispatch_mode must be push or pull')
+            if selected is not None and dispatch_mode is not None and selected != dispatch_mode:
+                raise ValueError('Explicit BF16 dispatch mode conflicts with HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE')
+            dispatch_mode = selected or dispatch_mode or 'push'
+            if selected == 'pull':
+                initial_capacity_factor = capacity_growth_factor = None
+            split = os.environ.get('HYPER_MULTICORE_MX_COMM_SPLIT')
+            if split is not None:
+                if split not in ('128', '256', '512', '4096'):
+                    raise ValueError('HYPER_MULTICORE_MX_COMM_SPLIT must be128,256,512 or4096')
+                dispatch_split = combine_split = int(split)
+        dispatch_mode = dispatch_mode or 'push'
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT if local_num_tokens is None else local_num_tokens,
             "hidden_size": hidden_size,
@@ -459,6 +478,14 @@ class MegaMoeExperts(MulticoreModule):
                 "or 'EOI' ([experts, out_features, in_features]), "
                 f"got {expert_weight_layout!r}."
             )
+        if cls is MegaMoeExperts:
+            policy = os.environ.get('HYPER_MULTICORE_BF16_SCHEDULE', 'legacy_odd')
+            depth = os.environ.get('HYPER_MULTICORE_MX_READY_DEPTH', '0')
+            if policy not in ('legacy_odd', 'window2', 'half16') or depth not in ('0', '1', '8'):
+                raise ValueError('BF16 requires window2/half16 and ready depth0/1/8')
+            if policy != 'legacy_odd' and os.environ.get('HYPER_MULTICORE_BF16_GMM_POLICY', 'generic') != 'blaze_bwd_lanes_a5':
+                raise ValueError('BF16 scheduled execution requires the qualified A5 Blaze math policy')
+            specification = dict(specification, bf16_schedule=policy, ready_depth=int(depth))
         count_policy = resolve_count_policy(os.environ, bf16=cls is MegaMoeExperts)
         validate_count_policy(count_policy, specification["num_experts"], specification.get("max_local_num_tokens"))
         if count_policy == "histc" and specification["local_num_tokens"] * specification["top_k"] > 2**24:

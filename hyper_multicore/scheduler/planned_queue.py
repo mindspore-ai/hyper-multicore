@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .runtime import serialize_runtime_config
+from .transport_queue import COMMUNICATION_TYPES
 
 PLANNED_QUEUE_TAG = -1
 
@@ -20,7 +21,8 @@ def configure_planned_queue(cfg: Any, spec: Any, *, forward: bool) -> None:
 
 
 def install_worker_queues(cfg: Any, cubes: list[list[int]], vectors: list[list[int]],
-                          *, communication_lanes: int = 32) -> None:
+                          *, communication_lanes: int = 32,
+                          transport_queues: list[list[int]] | None = None) -> None:
     """Install CSR queues while preserving complete work and communication ownership."""
     if len(cubes) != 32 or len(vectors) != 64 or len({len(q) for q in cubes}) != 1:
         raise ValueError('Planned queue requires32 AIC and64 AIV streams')
@@ -29,8 +31,6 @@ def install_worker_queues(cfg: Any, cubes: list[list[int]], vectors: list[list[i
     old_cube = list(cfg.cube_task_indices[:cfg.task_index_num[0]])
     old_vector = list(cfg.vector_task_indices[:cfg.task_index_num[1]])
     split = cfg.task_index_num[3]
-    owners = {tid: 2 * (pos % communication_lanes) + 1 for pos, tid in enumerate(old_vector[:split])
-              if cfg.all_tasks[tid].task_type in (0, 105, 141)}
     flat_cube = [q[index] for index in range(len(cubes[0])) for q in cubes]
     flat_vector = [tid for q in vectors for tid in q]
     if sorted(flat_cube) != sorted(old_cube) or sorted(flat_vector) != sorted(old_vector):
@@ -39,13 +39,13 @@ def install_worker_queues(cfg: Any, cubes: list[list[int]], vectors: list[list[i
         if any(old_cube.index(tid) % 32 != worker for tid in queue):
             raise ValueError('Planned queue cannot move AIC math workers')
     for worker, queue in enumerate(vectors):
-        original = (
+        original = transport_queues[worker] if transport_queues is not None else (
             [tid for tid in old_vector[:split][worker // 2::communication_lanes]
-             if cfg.all_tasks[tid].task_type in (0, 105, 141)]
+             if cfg.all_tasks[tid].task_type in COMMUNICATION_TYPES]
             if worker % 2 and worker // 2 < communication_lanes else []
         )
-        actual = [tid for tid in queue if cfg.all_tasks[tid].task_type in (0, 105, 141)]
-        if actual != original or any(owners[tid] != worker for tid in actual):
+        actual = [tid for tid in queue if cfg.all_tasks[tid].task_type in COMMUNICATION_TYPES]
+        if actual != original:
             raise ValueError('Communication/termination QP owner or order changed')
     for i, tid in enumerate(flat_cube): cfg.cube_task_indices[i] = tid
     for i, tid in enumerate(flat_vector): cfg.vector_task_indices[i] = tid

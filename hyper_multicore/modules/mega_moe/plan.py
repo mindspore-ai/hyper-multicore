@@ -142,6 +142,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
+        gmm_cube_cores=16 if spec.bf16_schedule == "half16" else spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
         expert_weight_layout=spec.expert_weight_layout,
     )
@@ -174,6 +175,10 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
     )
     configure_gmm_tasks(forward_graph, forward_data)
     configure_gmm_tasks(backward_graph, backward_data)
+    if spec.bf16_schedule != "legacy_odd":
+        from hyper_multicore.scheduler.bf16_queue import configure_bf16_queue
+        configure_bf16_queue(forward_data, forward_graph, spec, forward=True)
+        configure_bf16_queue(backward_data, backward_graph, spec, forward=False)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -194,6 +199,8 @@ def _prepare_diagnostics(
         "rank": dist.get_rank() if dist.is_initialized() else spec.rank_id,
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
     }
+    if spec.bf16_schedule != 'legacy_odd':
+        options.update(vector_worker_stride=1, active_vector_workers=2 * spec.num_cube_cores)
     return (
         prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
         prepare_mega_kernel_diagnostics(backward_graph, backward_config, parameter_count=20, **options),

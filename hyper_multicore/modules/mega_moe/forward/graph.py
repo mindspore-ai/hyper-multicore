@@ -178,6 +178,7 @@ def build_forward_graph(tsv, *,
                         intermediate_size: int = 2048,
                         dtype_size:        int = 2,
                         num_cube_cores:    int = 24,
+                        gmm_cube_cores: int | None = None,
                         swiglu_limit:      float | None = None,
                         expert_weight_layout: str = "EIO") -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
@@ -215,7 +216,7 @@ def build_forward_graph(tsv, *,
     dispatch, up_proj, swiglu, down_proj, combine = _build_fwd_ops(
         tsv, specs,
         dispatch_sv=dispatch_sv, up_proj_sv=up_proj_sv, swiglu_sv=swiglu_sv,
-        down_proj_sv=down_proj_sv, combine_sv=combine_sv, num_cube_cores=num_cube_cores,
+        down_proj_sv=down_proj_sv, combine_sv=combine_sv, num_cube_cores=gmm_cube_cores or num_cube_cores,
         swiglu_limit=swiglu_limit,
     )
     graph = ComputeGraph()

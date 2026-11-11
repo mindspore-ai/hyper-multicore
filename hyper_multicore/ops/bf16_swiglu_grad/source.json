@@ -1,0 +1,37 @@
+{
+  "source": "${ASCEND_HOME_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ops_nn/ascendc",
+  "version": "CANN9.2 20261015",
+  "adaptation": "Logical vector index and local include only; original numerical implementation retained",
+  "files": [
+    {
+      "path": "swi_glu_grad_base.h",
+      "source": "swi_glu_grad/arch35/swi_glu_grad_base.h",
+      "source_sha256": "7d9fbadb7d67721cfe15f764c162e16f1834a081aad1fd084586bc6ab4371579",
+      "adapted_sha256": "227807faa3ab6a332aa6d8b0611a60fad0afef3c88bb0cce82070092915038b2"
+    },
+    {
+      "path": "swi_glu_grad_move_align.h",
+      "source": "swi_glu_grad/arch35/swi_glu_grad_move_align.h",
+      "source_sha256": "01c73da6df52f2fb00dda81dd1dee196eea7ab7fb5d015d0aa8f1daf8de04aaa",
+      "adapted_sha256": "745cac16b0c571d79d03d4ecdbf58dc5a395a6de18dcbe8f48da9e751bee0a8e"
+    },
+    {
+      "path": "swi_glu_grad_regbase_tiling.h",
+      "source": "swi_glu_grad/arch35/swi_glu_grad_regbase_tiling.h",
+      "source_sha256": "0c1928860c74af33d0cfdb06247b054df6f9845c9cf52d3fe9bce40a2cf75c85",
+      "adapted_sha256": "0c1928860c74af33d0cfdb06247b054df6f9845c9cf52d3fe9bce40a2cf75c85"
+    },
+    {
+      "path": "platform.h",
+      "source": "inc/platform.h",
+      "source_sha256": "a4504d153d37203d52e69df34167fc374d94ce3a0353b3d153cc33397803cb2c",
+      "adapted_sha256": "a71bf640e3bdffc28d59fd253ed39d498fd710aed0b479b7ecb04e9a6feca64f"
+    },
+    {
+      "path": "bf16_kernel_utils.h",
+      "source": "inc/kernel_utils.h",
+      "source_sha256": "eca01c57432e9a5e4c7b5245a249a1acef82a8aad4b8e37e4bb45c62635de99d",
+      "adapted_sha256": "eca01c57432e9a5e4c7b5245a249a1acef82a8aad4b8e37e4bb45c62635de99d"
+    }
+  ]
+}

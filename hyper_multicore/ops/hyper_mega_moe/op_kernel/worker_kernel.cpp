@@ -58,9 +58,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       case TaskType::TASK_GROUPED_MATMUL:
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
         if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
-          if (task_desc.extra_value_1 == 1) {
+          if ((task_desc.extra_value_1 & 31) == 1) {
             MulticoreBf16::ExecuteCgmctTask(task_desc, input_list, this->core_num);
-          } else if (task_desc.extra_value_1 == 2) {
+          } else if ((task_desc.extra_value_1 & 31) == 2) {
             MulticoreBf16::ExecuteBlazeTask(task_desc, input_list, this->core_num);
           } else {
             ExecuteGroupedMatmul(task_desc);
@@ -79,7 +79,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteShmemPutMem(task_desc);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
-        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET, true>(task_desc);
         break;
       default:
         break;
@@ -288,8 +288,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
 
 }  // namespace MulticoreRuntime
 
+#include "runtime/bf16_planned_worker.h"
+
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
+  if (MulticoreRuntime::getTaskQueueLayoutTag(runtimeConfigPtr) == -2) {
+    MulticoreRuntime::Bf16PlannedWorker worker;
+    worker.Init(worker_id, runtimeConfigPtr, input_list);
+    worker.ProcessPlanned();
+    return;
+  }
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();

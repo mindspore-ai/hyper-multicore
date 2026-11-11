@@ -307,11 +307,16 @@ def _calculate_event_driven_profile_layout(
         active_worker_count if role_boundary else (
             num_workers // vector_worker_stride if active_vector_workers is None else active_vector_workers),
     )
-    if role_boundary == -1:
+    if role_boundary in (-1, -2):
         offsets = runtime_config.mix_task_indices
         aiv_required_records = max(sum(_records_for_task(runtime_config.all_tasks[
             runtime_config.vector_task_indices[pos]]) for pos in range(offsets[worker], offsets[worker + 1]))
             for worker in range(64))
+    if role_boundary == -2:
+        offsets = runtime_config.mix_task_indices
+        aic_required_records = max(sum(_records_for_task(runtime_config.all_tasks[
+            runtime_config.cube_task_indices[pos]]) for pos in range(offsets[65 + worker], offsets[66 + worker]))
+            for worker in range(32))
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,

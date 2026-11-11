@@ -663,7 +663,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False)
+                                     dynamic_tokens=False, auto_tokens=False, bf16_schedule="legacy_odd", ready_depth=0)
         workspace = Mock()
         manager = Mock(root_group=root_group, heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
         manager.reserve.return_value = ({},)
@@ -715,7 +715,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False)
+                                     dynamic_tokens=False, auto_tokens=False, bf16_schedule="legacy_odd", ready_depth=0)
 
         manager = Mock(heap_bytes=1024, epoch=0, workspaces=[])
         manager.reserve.return_value = ({},)
@@ -756,7 +756,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         specification = {"name": "new resource"}
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False)
+                                     dynamic_tokens=False, auto_tokens=False, bf16_schedule="legacy_odd", ready_depth=0)
         growth_record = {"epoch": 1, "heap_bytes": 4096}
         manager = Mock(heap_bytes=2048, epoch=0, workspaces=[object()], growth_records=[])
         manager.attach_runtime.return_value = False
