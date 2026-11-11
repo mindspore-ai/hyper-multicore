@@ -202,7 +202,7 @@ def _build_runtime_artifacts(
     from .schedule_policy import (
         collapse_batched_tasks, compact_graph, pipeline_cube_queue, pipeline_vector_queue,
     )
-    compact = spec.dispatch_mode == "push" and compact_graph(forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
+    compact = spec.dispatch_mode == "push" and spec.intermediate_size < 2048 and compact_graph(forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
     forward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(forward_graph)
     forward_data = build_forward_config(
