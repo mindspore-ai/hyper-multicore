@@ -25,7 +25,7 @@ from tests.common.multicore._test_env import (
 )
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
 def test_mega_mhc_same_shape_multistream() -> None:
     """Run same-shape forward/backward calls on two independent NPU streams."""

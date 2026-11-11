@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 import hashlib
+from importlib import import_module
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,7 @@ def digest_json(value) -> str:
 
 def load_targets(path: Path) -> list[dict]:
     """Read version pairs independently of the current interpreter's wheel tags."""
-    from packaging.version import Version
+    version_type = import_module("packaging.version").Version
 
     config = json.loads(path.read_text())
     if config.get("schema_version") != 2:
@@ -54,8 +55,8 @@ def load_targets(path: Path) -> list[dict]:
             **target,
             "indexes": config["indexes"],
             "build_requirements": config["build_requirements"],
-            "torch_release": Version(target["torch_version"]).base_version,
-            "pta_release": Version(target["pta_build_version"]).base_version,
+            "torch_release": version_type(target["torch_version"]).base_version,
+            "pta_release": version_type(target["pta_build_version"]).base_version,
         }
         for target in config["targets"]
     ]
@@ -72,13 +73,13 @@ def load_targets(path: Path) -> list[dict]:
 
 def validate_target(target: dict) -> None:
     """Require exact framework versions and named indexes, without per-platform artifacts."""
-    from packaging.version import Version
+    version_type = import_module("packaging.version").Version
 
     for field in ("id", "torch_release", "pta_release", "torch_version", "pta_build_version"):
         if not isinstance(target.get(field), str) or not re.fullmatch(r"[a-zA-Z0-9.+_-]+", target[field]):
             raise ValueError(f"Unsafe framework target field: {field}")
     for distribution, field in (("torch", "torch_version"), ("pta", "pta_build_version")):
-        version = Version(target[field])
+        version = version_type(target[field])
         if version.base_version != target[f"{distribution}_release"]:
             raise ValueError(f"Framework branch differs from build version: {field}")
     validate_sources_and_requirements(target)
@@ -95,8 +96,8 @@ def validate_index_url(address: str, name: str) -> None:
 
 def validate_sources_and_requirements(target: dict):
     """Validate common resolver settings without prescribing a complete package list."""
-    from packaging.requirements import Requirement
-    from packaging.utils import canonicalize_name
+    requirement_type = import_module("packaging.requirements").Requirement
+    canonicalize_name = import_module("packaging.utils").canonicalize_name
 
     for name in ("torch", "pta", "dependencies"):
         validate_index_url(target["indexes"][name], name)
@@ -106,7 +107,7 @@ def validate_sources_and_requirements(target: dict):
     for address in extra:
         validate_index_url(address, "dependencies_extra")
     for text in target["build_requirements"]:
-        requirement = Requirement(text)
+        requirement = requirement_type(text)
         if (
             requirement.url
             or requirement.extras
@@ -158,10 +159,10 @@ def cann_tool_environment(python: Path, *, isolated=False) -> dict:
 
 def wheel_record(path: Path, source: str) -> dict:
     """Inspect a selected wheel using current interpreter tags and primary metadata."""
-    from packaging.tags import sys_tags
-    from packaging.utils import parse_wheel_filename, canonicalize_name
+    sys_tags = import_module("packaging.tags").sys_tags
+    utilities = import_module("packaging.utils")
 
-    filename_name, filename_version, _, tags = parse_wheel_filename(path.name)
+    filename_name, filename_version, _, tags = utilities.parse_wheel_filename(path.name)
     if not tags.intersection(sys_tags()):
         raise ValueError(f"Wheel tags do not match build platform: {path.name}")
     with zipfile.ZipFile(path) as archive:
@@ -169,11 +170,11 @@ def wheel_record(path: Path, source: str) -> dict:
         if len(entries) != 1:
             raise ValueError(f"Ambiguous wheel metadata: {path}")
         meta = BytesParser().parsebytes(archive.read(entries[0]))
-    if canonicalize_name(meta["Name"]) != filename_name or str(filename_version) != meta["Version"]:
+    if utilities.canonicalize_name(meta["Name"]) != filename_name or str(filename_version) != meta["Version"]:
         raise ValueError(f"Wheel distribution identity mismatch: {path}")
     checksum = file_digest(path)
     return {
-        "name": canonicalize_name(meta["Name"]),
+        "name": utilities.canonicalize_name(meta["Name"]),
         "version": meta["Version"],
         "filename": path.name,
         "sha256": checksum,
@@ -191,7 +192,7 @@ def file_digest(path: Path) -> str:
 
 
 def environment_request(target: dict) -> dict:
-    """Keep install-only mirrors out of environment identity without modifying provenance."""
+    """Keep extra mirrors out of environment identity without modifying provenance."""
     request = dict(target)
     indexes = request.get("indexes")
     if isinstance(indexes, dict):
@@ -223,8 +224,14 @@ def pip_environment(python: Path) -> dict:
     return env
 
 
+def extra_index_arguments(target: dict) -> list[str]:
+    """Use the configured extra indexes for framework downloads and dependency installs."""
+    return [argument for address in target["indexes"].get("dependencies_extra", [])
+            for argument in ("--extra-index-url", address)]
+
+
 def download_roots(target: dict, directory: Path, python: Path, run) -> list[Path]:
-    """Let pip select each exact framework wheel from its own official source."""
+    """Let pip select exact framework wheels from configured primary and extra indexes."""
     roots = directory / "roots"
     roots.mkdir()
     result = []
@@ -242,6 +249,7 @@ def download_roots(target: dict, directory: Path, python: Path, run) -> list[Pat
             "off",
             "--index-url",
             target["indexes"][index],
+            *extra_index_arguments(target),
             "--dest",
             str(destination),
         ]
@@ -301,16 +309,15 @@ def prepare_environment(target: dict, native: Path, run, base_python: Path, *, i
 
 def install_framework(target, directory, python, run):
     """Use pip's download cache and resolver; retain provenance, not a private wheelhouse."""
-    from packaging.utils import canonicalize_name
+    canonicalize_name = import_module("packaging.utils").canonicalize_name
 
     with tempfile.TemporaryDirectory(prefix="framework-install-", dir=directory) as temporary:
         temporary = Path(temporary)
         roots = download_roots(target, temporary, python, run)
         report = temporary / "pip-report.json"
-        extra = [argument for address in target["indexes"].get("dependencies_extra", [])
-                 for argument in ("--extra-index-url", address)]
         run([str(python), "-m", "pip", "install", "--only-binary=:all:", "--progress-bar", "off",
-             "--index-url", target["indexes"]["dependencies"], *extra, "--report", str(report),
+             "--index-url", target["indexes"]["dependencies"], *extra_index_arguments(target),
+             "--report", str(report),
              *map(str, roots), *target["build_requirements"]],
             label=f"install-{target['id']}", env=pip_environment(python))
         installation = json.loads(report.read_text())
@@ -326,7 +333,8 @@ def environment_summary(target: dict, record: dict, action: str):
     """Print actual installed versions for both newly created and reused environments."""
     detail = "Torch/PTA pair verified; no download or reinstallation" if action == "REUSE" else "installed and verified"
     message(
-        f"PTA {target['pta_build_version']}: environment {'reused' if action == 'REUSE' else 'ready'}; {len(record['installed_packages'])} installed packages; {detail}"
+        f"PTA {target['pta_build_version']}: environment {'reused' if action == 'REUSE' else 'ready'}; "
+        f"{len(record['installed_packages'])} installed packages; {detail}"
     )
     packages = " ".join(f"{p['name']}=={p['version']}" for p in sorted(record["installed_packages"], key=lambda p: p["name"]))
     print(
@@ -351,12 +359,14 @@ def verify_environment(python: Path, target: dict, run, *, identity_probe=None) 
     code = (
         "import json,sys; from importlib import metadata; "
         "expected=json.loads(sys.argv[1]); actual={n:metadata.version(n) for n in expected}\n"
-        "if actual != expected: raise RuntimeError(f'Framework environment changed: {actual!r} != {expected!r}')\n"
+        "if actual != expected: "
+        "raise RuntimeError(f'Framework environment changed: {actual!r} != {expected!r}')\n"
         "print(json.dumps(sorted([{'name':d.metadata['Name'],'version':d.version} "
         "for d in metadata.distributions()],key=lambda p:p['name'].lower())))"
     )
     return json.loads(run([str(python), "-c", code, json.dumps(expected)],
-                          label=f"identity-{python.parent.parent.name}", env=isolated_environment(python), capture=True))
+                          label=f"identity-{python.parent.parent.name}",
+                          env=isolated_environment(python), capture=True))
 
 
 def environment_record(directory: Path):

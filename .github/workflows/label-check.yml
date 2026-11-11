@@ -18,22 +18,15 @@ jobs:
     timeout-minutes: 2
 
     steps:
-      # Leave ENABLE_LABEL_CHECK unset until the CI label integration is configured.
-      # Set it to true in repository Actions variables to enable the upstream gate.
-      - name: Pass while label enforcement is disabled
-        if: vars.ENABLE_LABEL_CHECK != 'true'
-        run: echo "Label enforcement is disabled; label-check passes."
-
       # Label cleanup uses GITHUB_TOKEN, so it does not trigger an unlabeled run.
       # The synchronize run must block without accepting the previous CI labels.
       - name: Require a fresh CI result after a push
-        if: vars.ENABLE_LABEL_CHECK == 'true' && github.event.action == 'synchronize'
+        if: github.event.action == 'synchronize'
         run: |
           echo "::error::New commits were pushed. Waiting for CI to add a fresh pipeline-passed label."
           exit 1
 
       - name: Check for required label
-        if: vars.ENABLE_LABEL_CHECK == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

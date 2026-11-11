@@ -37,6 +37,7 @@ from ._bootstrap import load_module
 from .command_runner import message
 from .build_utils import atomic_json as write_json, measured, version_label
 from .build_state import BuildContext, BuildResult, PreparedFramework
+from .artifacts import _payload_hashes, _source_identity
 from .build_publication import SourceGuard, publish_wheel, publish_payload, validate_elf, validate_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -153,7 +154,8 @@ def validate_toolchain() -> None:
     """Reject unavailable common build inputs before preparing any framework environment."""
     cann = os.environ.get("ASCEND_HOME_PATH", "")
     if not cann or not Path(cann).is_dir():
-        raise ValueError("ASCEND_HOME_PATH must identify a toolkit directory; source the CANN set_env.sh before building")
+        raise ValueError("ASCEND_HOME_PATH must identify a toolkit directory; "
+                         "source the CANN set_env.sh before building")
     identity = HELPERS.cann_identity(Path(cann))
     message(f"CANN: {identity['cann_version']}; toolkit {identity['cann_root']}")
     required = ("cmake", "ctest", "gcc", "g++", "make", "git", "bisheng", "asc_opc", "readelf", "ldd", "ld")
@@ -176,6 +178,12 @@ def build(args, publication) -> Path:
 def _build(args, run: BuildContext, transaction: SourceGuard) -> BuildResult:
     """Compile common resources once and each requested pair from fresh workspaces."""
     started = time.monotonic()
+    if args.tests:
+        checks = ROOT / "tests/ut/build/check_build.py"
+        if not checks.is_file():
+            raise FileNotFoundError(f"Build source checks are missing: {checks}; use a complete source checkout")
+        with measured(run.events, "build-source-checks"):
+            run.commands([sys.executable, str(checks)], label="build-source-checks")
     validate_toolchain()
     run_id = run.run_id
     with measured(run.events, "framework-preparation"):
@@ -209,20 +217,21 @@ def finish_maintenance(args, run: BuildContext, result: BuildResult):
     maintenance_started = time.monotonic()
     try:
         VENDOR.publish(ROOT, run.vendor_requests)
-        run.events.extend({"stage": "vendor-cache-publication", "soc": r["soc"], "elapsed_seconds": r["publish_seconds"]}
+        run.events.extend({"stage": "vendor-cache-publication", "soc": r["soc"],
+                           "elapsed_seconds": r["publish_seconds"]}
                           for r in run.vendor_requests if "publish_seconds" in r)
         if args.all:
             removed = FRAMEWORK.prune_environments(NATIVE, pythons, branches)
             run.events.append({"stage": "prune-framework-environments", "removed": removed})
         WORKSPACE.clear_temporary_outputs(NATIVE)
-    except (Exception, KeyboardInterrupt) as error:
+    except (OSError, ValueError, RuntimeError, KeyboardInterrupt) as error:
         detail = str(error) or type(error).__name__
         run.events.append({"stage": "build-maintenance", "status": "warning", "error": detail})
         message(f"Build committed; maintenance stopped: {detail}. The new artifact is valid and retained.", "WARN")
     run.events.append({"stage": "maintenance", "elapsed_seconds": time.monotonic() - maintenance_started})
     try:
         write_json(run.directory / "stages.json", run.events)
-    except (Exception, KeyboardInterrupt) as error:
+    except (OSError, ValueError, RuntimeError, KeyboardInterrupt) as error:
         message(f"Build committed; unable to finish maintenance records: {error}", "WARN")
     build_progress_summary(args, run, pairs, time.monotonic() - started)
 
@@ -236,7 +245,7 @@ def prepare_frameworks(args, run: BuildContext):
     mode = f"full framework matrix: {len(targets)} targets" if args.all else "locally installed framework"
     message(f"Building {mode}; Python cp{sys.version_info.major}{sys.version_info.minor}, "
             f"{platform.machine()}, SoC {args.soc_list}, jobs {args.jobs}")
-    source = HELPERS._source_identity(ROOT)
+    source = _source_identity(ROOT)
     if args.all:
         reference = json.loads(config.read_text()).get("reference_cann")
         report_cann_reference(reference, HELPERS.cann_identity(Path(os.environ["ASCEND_HOME_PATH"]))["cann_version"])
@@ -261,7 +270,8 @@ def report_cann_reference(reference, actual):
     if reference:
         message(f"CANN reference: {reference}; actual: {actual}")
         if actual != reference:
-            message("CANN differs from the matrix reference or is unknown; continuing with the installed toolkit", "WARN")
+            message("CANN differs from the matrix reference or is unknown; "
+                    "continuing with the installed toolkit", "WARN")
     else:
         message(f"CANN actual: {actual}")
 
@@ -315,7 +325,7 @@ def build_common(args, run: BuildContext, python: Path):
     env.update(PYTHON_BIN=str(python), HP_NATIVE_STAGE="common", HP_COMPONENT_ROOT=str(common),
                HP_NATIVE_WORK_ROOT=str(directory / "work"), HP_SHMEM_WORK_ROOT=str(directory / "shmem-work"),
                HP_SHMEM_HANDOFF=str(directory / "sdk.json"))
-    origin = HELPERS._source_identity(ROOT)
+    origin = _source_identity(ROOT)
     env.update(HP_VENDOR_CACHE_ROOT=str(NATIVE), HP_VENDOR_ORIGIN=json.dumps(origin))
     if getattr(args, "clean", False):
         env["HP_VENDOR_CACHE_CLEAN"] = "1"
@@ -324,7 +334,8 @@ def build_common(args, run: BuildContext, python: Path):
     run.commands(["bash", str(ROOT / "hyper_multicore/build.sh"), "--stage-only",
                   "--soc-list", args.soc_list, "--jobs", str(args.jobs)], label="common-resources", env=env)
     sdk = Path(json.loads((directory / "sdk.json").read_text())["install_root"])
-    run.vendor_requests = [json.loads(p.read_text()) for p in sorted((directory / "work").glob("vendor-request-*.json"))]
+    run.vendor_requests = [json.loads(p.read_text())
+                           for p in sorted((directory / "work").glob("vendor-request-*.json"))]
     for request in run.vendor_requests:
         run.events.append({"stage": "vendor", **{k: request[k] for k in
                           ("soc", "reused", "lookup_seconds", "compile_seconds") if k in request}})
@@ -397,18 +408,15 @@ def parallel_adapters(args, run, pythons, identities, common, sdk, transaction, 
                 targets.task_done()
 
     pool = ThreadPoolExecutor(max_workers=len(budgets), thread_name_prefix="native-adapter")
-    error = None
     try:
         futures = [pool.submit(slot, jobs) for jobs in budgets]
         for future in as_completed(futures):
             future.result()
     except BaseException as caught:
         run.commands.cancel(caught)
-        error = run.commands.failure or caught
+        raise run.commands.failure or caught
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
-    if error is not None:
-        raise error
     return results
 
 
@@ -463,7 +471,7 @@ def assemble_payload(args, run_id, identities, outputs, records, common):
         ),
     }
     info["native_sha256"] = {p.relative_to(payload).as_posix(): MANIFEST.file_sha256(p) for p in payload.rglob("*.so")}
-    info["payload_sha256"] = HELPERS._payload_hashes(payload)
+    info["payload_sha256"] = _payload_hashes(payload)
     HELPERS.validate_payload(payload, info)
     write_json(payload / "build_info.json", info)
     return payload, info
@@ -511,8 +519,8 @@ def publish_build_payload(payload: Path, run_id: str, transaction: SourceGuard) 
     return selected
 
 
-def main() -> None:
-    """Expose default local-framework builds and the explicit complete release matrix."""
+def parse_arguments(argv=None):
+    """Resolve source-check defaults without importing frameworks or reading the matrix."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--all", action="store_true",
                         help="Build every configured framework target; adapter concurrency follows --jobs")
@@ -520,8 +528,11 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=os.cpu_count(),
                         help="Compiler job budget, shared by concurrent adapters")
     parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--tests", choices=("on", "off"),
+                        help="Run lightweight build source checks (default: on with --all, otherwise off)")
     parser.add_argument("--native-only", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    args.tests = args.all if args.tests is None else args.tests == "on"
     socs = args.soc_list.split(",")
     if (
         args.jobs < 1
@@ -532,6 +543,12 @@ def main() -> None:
         parser.error("--jobs must be positive and --soc-list must contain unique supported CANN SoCs")
     if platform.system() != "Linux":
         parser.error("Native builds require Linux/CANN/PTA")
+    return args
+
+
+def main() -> None:
+    """Expose default local-framework builds and the explicit complete release matrix."""
+    args = parse_arguments()
     NATIVE.mkdir(parents=True, exist_ok=True)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     acquired = False
@@ -591,7 +608,8 @@ def framework_failure(identity: dict, args, python: Path, error: RuntimeError) -
     if re.search(r"C\+\+20.*(?:required|support)|cxx_std_20|(?:gnu|c)\+\+20.*(?:invalid|unrecognized)",
                  str(error), re.IGNORECASE):
         command = ["bash", "build.sh", *(["--all"] if args.all else []),
-                   "--soc-list", args.soc_list, "--jobs", str(args.jobs)]
+                   "--soc-list", args.soc_list, "--jobs", str(args.jobs),
+                   "--tests", "on" if args.tests else "off"]
         detail += (
             "\nThis Torch requires final C++20 (__cplusplus >= 202002L). Select a compiler compatible with its headers."
             "\nRetry from the source root, replacing the compiler path:"

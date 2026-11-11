@@ -23,6 +23,7 @@ can inflate ST wall time.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import subprocess
 import sys
 from typing import Optional
@@ -43,6 +44,8 @@ def torchrun_case(
     """
     env = os.environ.copy()
     abs_file = os.path.abspath(file_name)
+    root = Path(__file__).resolve().parents[2]
+    log_directory = os.path.abspath(f"./logs/{file_name}/{case_name}")
     max_attempts = 3
     for attempt in range(max_attempts):
         if master_port is None or attempt > 0:
@@ -52,7 +55,7 @@ def torchrun_case(
             "-m",
             "torch.distributed.run",
             f"--nproc-per-node={num_proc}",
-            f"--log-dir=./logs/{file_name}/{case_name}",
+            f"--log-dir={log_directory}",
             "-r",
             "3",
             "--master_addr=127.0.0.1",
@@ -62,7 +65,7 @@ def torchrun_case(
             "-s",
             f"{abs_file}::{case_name}",
         ]
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+        result = subprocess.run(cmd, cwd=root, env=env, capture_output=True, text=True, check=False)
         if result.returncode == 0:
             return
         combined = result.stdout + result.stderr

@@ -33,16 +33,16 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from examples._optimizer import Float16OptimizerWithFloat16Params
-from hyper_multicore import MegaMhc, MegaMoeExperts
 from examples import _training as training
+from examples._optimizer import AdamW, Float16OptimizerWithFloat16Params
 from examples.moe import benchmark
 from examples.moe import experts as moe_module
+from examples.moe.benchmark import _synchronize_gradients
 from examples.moe.model import (
     MoeTransformerConfig,
     MoeTransformerModel,
 )
-from examples._optimizer import AdamW
+from hyper_multicore import MegaMhc, MegaMoeExperts
 from tests.common.mark_utils import arg_mark
 
 rms_norm_module = importlib.import_module("examples._layers")
@@ -227,7 +227,7 @@ class TestMoeTransformerExample(unittest.TestCase):
             patch.object(benchmark, "_dense_gradients", return_value=gradients),
             patch.object(benchmark.dist, "all_reduce_coalesced", side_effect=sum_gradients) as all_reduce,
         ):
-            benchmark._synchronize_gradients(model, 8)  # pylint: disable=protected-access
+            _synchronize_gradients(model, 8)
         self.assertEqual(all_reduce.call_count, 2)
         torch.testing.assert_close(expert.grad, expected_expert, rtol=0, atol=0)
         self.assertIsNone(unused.grad)
@@ -250,7 +250,7 @@ class TestMoeTransformerExample(unittest.TestCase):
         parameter.sum().backward()
         with (patch.object(model, "expert_parameters", return_value=(parameter,), create=True),
               patch.object(benchmark, "_dense_gradients", return_value=[])):
-            benchmark._synchronize_gradients(model, 2)
+            _synchronize_gradients(model, 2)
         torch.testing.assert_close(
             parameter.grad, torch.full((2,), 0.5, dtype=parameter.dtype), rtol=0, atol=0)
         self.assertEqual(parameter.main_param.dtype, torch.float32)
@@ -370,7 +370,8 @@ from examples.moe import benchmark, model
 assert not any(name.startswith('examples.mhc') for name in sys.modules)
 assert 'hyper_multicore.modules.mega_mhc.module' not in sys.modules
 """
-        subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+        subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[4],
+                       check=True, capture_output=True, text=True)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

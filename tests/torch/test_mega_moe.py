@@ -309,7 +309,7 @@ def test_mega_moe_heap_growth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, v
     _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_heap_growth", 2, "_test_mega_moe_memory.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
           essential_mark="unessential")
 def test_mega_moe_model_replacement_and_layouts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Feature: Model replacement and tensor layout contracts.

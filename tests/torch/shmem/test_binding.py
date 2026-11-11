@@ -218,7 +218,7 @@ def test_binding_final_release_with_active_allocation_is_retryable(monkeypatch) 
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level1",
+    level_mark="level0",
     card_mark="allcards",
     essential_mark="unessential",
 )
@@ -292,7 +292,9 @@ def test_binding_native_log_path_and_levels(monkeypatch, tmp_path: Path) -> None
     debug_lines = "\n".join(debug_contents).splitlines()
     assert any(" debug " in line and "[HYPER_MULTICORE_SHMEM " in line for line in debug_lines), debug_contents
     assert any(" info " in line and "[HYPER_MULTICORE_SHMEM " in line for line in debug_lines), debug_contents
-    assert any("[SHM_SHMEM " in content and "[HYPER_MULTICORE_SHMEM " in content for content in debug_contents), debug_contents
+    assert any(
+        "[SHM_SHMEM " in content and "[HYPER_MULTICORE_SHMEM " in content for content in debug_contents
+    ), debug_contents
 
     default_path = tmp_path / "default"
     default_path.mkdir()
