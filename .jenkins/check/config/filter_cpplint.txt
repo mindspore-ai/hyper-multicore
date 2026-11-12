@@ -1,0 +1,3 @@
+# CANN SDK and assembled operator headers use flat or adjacent include paths.
+"hyper-multicore/hyper_multicore/ops"                      "build/include_subdir"
+"hyper-multicore/hyper_multicore/shmem/ccsrc/cann"         "build/include_subdir"

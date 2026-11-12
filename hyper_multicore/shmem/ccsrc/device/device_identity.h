@@ -15,18 +15,27 @@
 
 namespace hyper_multicore::shmem {
 
-/** @brief Framework-independent NPU models recognized by the symmetric-memory component. */
-enum class DeviceModel : uint8_t {
-  kAscend910B,
-  kAscend910C,
-  kAscend950,
-};
+inline constexpr int64_t kAscend910NpuArch = 2201;
+inline constexpr int64_t kAscend950NpuArch = 3510;
+
+#ifdef HP_SHMEM_ASCEND950
+inline constexpr int64_t kBackendNpuArch = kAscend950NpuArch;
+inline constexpr char kBackendSocType[] = "Ascend950";
+#else
+inline constexpr int64_t kBackendNpuArch = kAscend910NpuArch;
+inline constexpr char kBackendSocType[] = "Ascend910B";
+#endif
+
+/** @brief Reject a device generation that cannot use the linked private SHMEM backend. */
+inline constexpr bool BackendSupportsDevice(int64_t npu_arch) {
+  return npu_arch == kBackendNpuArch;
+}
 
 /** @brief Current ACL device and its owned SoC identity observed during Runtime initialization. */
 struct DeviceIdentity {
   int32_t device_index;
-  DeviceModel model;
-  std::string soc_name;
+  int64_t npu_arch;
+  std::string device_soc_name;
 };
 
 }  // namespace hyper_multicore::shmem

@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
-#include <iterator>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -21,6 +20,8 @@
 
 #include "cann/log.h"
 #include "shmem.h"
+
+#define HP_SHMEM_UDMA_QP_NUM 1U
 
 namespace hyper_multicore::shmem::cann::host {
 namespace {
@@ -161,39 +162,13 @@ runtime::Status CannFailureWithoutCode(std::string_view operation, std::string_v
   return runtime::Status{runtime::ErrorCode::CannError, std::nullopt, std::move(message), summary};
 }
 
-bool StartsWith(std::string_view value, std::string_view prefix) {
-  return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
-}
-
-runtime::Result<DeviceModel> NormalizeDeviceModel(const char *soc_name) {
-  if (soc_name == nullptr || soc_name[0] == '\0') {
-    return runtime::Result<DeviceModel>::Failure(runtime::Status{
-      runtime::ErrorCode::UnsupportedCapability, std::nullopt, "aclrtGetSocName returned an empty SoC name"});
-  }
-
-  constexpr std::string_view kAscend910BNames[]{"Ascend910B1", "Ascend910B2", "Ascend910B2C",
-                                                "Ascend910B3", "Ascend910B4", "Ascend910B4-1"};
-  constexpr std::string_view kAscend910CNames[]{"Ascend910_9362", "Ascend910_9363", "Ascend910_9372", "Ascend910_9381",
-                                                "Ascend910_9382", "Ascend910_9391", "Ascend910_9392"};
-
-  const std::string_view name(soc_name);
-  if (std::find(std::cbegin(kAscend910BNames), std::cend(kAscend910BNames), name) != std::cend(kAscend910BNames)) {
-    return runtime::Result<DeviceModel>::Success(DeviceModel::kAscend910B);
-  }
-  if (std::find(std::cbegin(kAscend910CNames), std::cend(kAscend910CNames), name) != std::cend(kAscend910CNames)) {
-    return runtime::Result<DeviceModel>::Success(DeviceModel::kAscend910C);
-  }
-  if (StartsWith(name, "Ascend950")) {
-    return runtime::Result<DeviceModel>::Success(DeviceModel::kAscend950);
-  }
-  return runtime::Result<DeviceModel>::Failure(
-    runtime::Status{runtime::ErrorCode::UnsupportedCapability, std::nullopt,
-                    "unsupported SoC name returned by aclrtGetSocName: " + std::string(name)});
-}
-
 runtime::Result<data_op_engine_type_t> DataEngineMask(runtime::DataEngine data_engine) {
   if (data_engine == runtime::DataEngine::Mte) {
     return runtime::Result<data_op_engine_type_t>::Success(ACLSHMEM_DATA_OP_MTE);
+  }
+  if (data_engine == runtime::DataEngine::MteUdma) {
+    return runtime::Result<data_op_engine_type_t>::Success(
+        static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA));
   }
   return runtime::Result<data_op_engine_type_t>::Failure(
     InvalidArgument("data_engine must be a supported Runtime DataEngine value"));
@@ -268,6 +243,21 @@ runtime::Status initialize(const InitOptions &options) {
   const std::string_view tls_detail = config_store_tls_capture.finish();
   if (tls_status != ACLSHMEM_SUCCESS) {
     return CannFailure("aclshmemx_set_conf_store_tls", tls_status, tls_detail);
+  }
+
+  if (options.data_engine == runtime::DataEngine::MteUdma) {
+    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, HP_SHMEM_UDMA_QP_NUM);
+    if (qp_status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_set_qp_num", qp_status);
+    }
+    uint32_t actual_qps = 0;
+    const int32_t get_status = aclshmemx_get_qp_num(ACLSHMEM_DATA_OP_UDMA, &actual_qps);
+    if (get_status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_get_qp_num", get_status);
+    }
+    if (actual_qps != HP_SHMEM_UDMA_QP_NUM) {
+      return InvalidArgument("UDMA QP count does not match the requested configuration");
+    }
   }
 
   aclshmemx_init_attr_t attributes{};
@@ -390,12 +380,17 @@ runtime::Result<DeviceIdentity> query_device_identity() {
     return runtime::Result<DeviceIdentity>::Failure(current_device.error());
   }
 
-  const char *soc_name = aclrtGetSocName();
-  const auto model = NormalizeDeviceModel(soc_name);
-  if (!model.ok()) {
-    return runtime::Result<DeviceIdentity>::Failure(model.error());
+  int64_t npu_arch = 0;
+  const aclError arch_status = aclrtGetDeviceInfo(current_device.value(), ACL_DEV_ATTR_NPU_ARCH, &npu_arch);
+  if (arch_status != ACL_SUCCESS) {
+    return runtime::Result<DeviceIdentity>::Failure(AclFailure("aclrtGetDeviceInfo(NPU_ARCH)", arch_status));
   }
-  return runtime::Result<DeviceIdentity>::Success(DeviceIdentity{current_device.value(), model.value(), soc_name});
+  const char *device_soc_name = aclrtGetSocName();
+  if (device_soc_name == nullptr || device_soc_name[0] == '\0') {
+    return runtime::Result<DeviceIdentity>::Failure(runtime::Status{
+      runtime::ErrorCode::UnsupportedCapability, std::nullopt, "aclrtGetSocName returned an empty SoC name"});
+  }
+  return runtime::Result<DeviceIdentity>::Success(DeviceIdentity{current_device.value(), npu_arch, device_soc_name});
 }
 
 }  // namespace hyper_multicore::shmem::cann::host

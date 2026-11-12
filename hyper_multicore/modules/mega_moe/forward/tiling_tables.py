@@ -20,94 +20,21 @@ struct-based SwiGLU tiling is expanded 49 times (= 2 * 24 + 1 for Ascend 910B).
 """
 # pylint: disable=line-too-long
 import copy
-import ctypes
 
+from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.scheduler.config import (
     SwiGluTilingDataC,
 )
 
+from .._gmm_tiling import _expand_gmm_string, _patch_gmm_dims
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-def _expand_gmm_string(csv: str, repeat: int = 24) -> bytes:
-    """Parse comma-separated uint32 string and tile it `repeat` times."""
-    vals = [int(x) for x in csv.split(',')]
-    arr = (ctypes.c_uint32 * (len(vals) * repeat))()
-    for i in range(len(vals) * repeat):
-        arr[i] = vals[i % len(vals)]
-    return bytes(arr)
-
 
 def _expand_swiglu_struct(td: SwiGluTilingDataC) -> bytes:
     """Tile SwiGluTilingDataC 49 times (= 2 * 24 AI Cube cores + 1)."""
     one = bytes(td)
     return one * 49
-
-
-def _find_protected_positions(vals, active_map, split_value, is_weight_grad):
-    """Return index positions that must not be replaced by dim_map substitution.
-
-    When split_value collides with a K/N dim in active_map, the M-tile or
-    K-tile positions (depending on GMM type) must be shielded.
-    T is located via the 393216 anchor which sits at T+19.
-    """
-    if split_value is None or split_value not in active_map:
-        return set()
-    for i in range(350, len(vals)):
-        if vals[i] == 393216:          # anchor always at t_base+19
-            t_base = i - 19
-            if is_weight_grad:
-                return {t_base + 3, t_base + 4, t_base + 7}
-            return {14, t_base + 1, t_base + 5}
-    return set()
-
-
-def _patch_gmm_dims(csv: str, dim_map: dict, num_groups: int,
-                    default_groups: int = 8,
-                    split_value: int = None,
-                    num_cube_cores: int = 24,
-                    default_num_cores: int = 24) -> str:
-    """Replace matrix dimension values in a GMM tiling CSV string.
-
-    dim_map:         {old_int_value: new_int_value} for K/N dimension replacements.
-                     Entries where old == new are no-ops and can be omitted.
-    num_groups:      replacement for default_groups; only applied at index > 350.
-    split_value:     M tile size (table key). When it equals a K/N value in dim_map,
-                     we must protect M-tile positions from accidental replacement.
-                     Two GMM types detected via vals[10]:
-                       0 → activation GMM: M tile at {14, T+1, T+5}
-                       2 → weight-grad GMM: split (K-tile) at {T+3, T+4, T+7}
-                     T is found via the 393216 anchor fixed at T+19.
-    num_cube_cores:  number of AI Cube cores on the target hardware (default 24 = 910B).
-                     Replaces the hardcoded usedCoreNum/blockDim fields in the CSV:
-                       vals[1]    — header blockDim field
-                       i > 350    — tail usedCoreNum and any derived parallelism fields
-    """
-    active_map = {k: v for k, v in dim_map.items() if k != v}
-    groups_changed = num_groups != default_groups
-    cores_changed  = num_cube_cores != default_num_cores
-    if not active_map and not groups_changed and not cores_changed:
-        return csv  # fast path: nothing to do
-
-    vals = list(map(int, csv.split(',')))
-    is_weight_grad = vals[10] == 2
-
-    # Header fields (set before main loop, not touched in loop)
-    if groups_changed and vals[0] == default_groups:
-        vals[0] = num_groups          # vals[0] = groupNum
-    if cores_changed and vals[1] == default_num_cores:
-        vals[1] = num_cube_cores      # vals[1] = blockDim
-
-    protected = _find_protected_positions(vals, active_map, split_value, is_weight_grad)
-
-    for i, v in enumerate(vals):
-        if i in protected:
-            continue
-        if v in active_map:
-            vals[i] = active_map[v]
-        elif cores_changed and i > 350 and v == default_num_cores:
-            vals[i] = num_cube_cores   # covers T+0 (usedCoreNum) and derived fields
-    return ','.join(map(str, vals))
 
 
 # ── Forward GMM1: x=[per_rank_seq,7168], weight=[E,7168,4096] ─────────────────
@@ -168,7 +95,7 @@ def get_up_proj_tiling_bytes(split_value: int, *,
                            hidden_size: int = 7168,
                            intermediate_size: int = 2048,
                            num_groups: int = 8,
-                           num_cube_cores: int = 24) -> bytes:
+                           num_cube_cores: int = DEFAULT_CORE_SPEC.num_cube_cores) -> bytes:
     """Forward GMM1 tiling [x,hidden]×[E,hidden,intermediate*2], expanded num_cube_cores times."""
     if split_value not in GMM1_TABLE:
         raise KeyError(f"GMM1 tiling: split_value={split_value} not found")
@@ -183,7 +110,7 @@ def get_down_proj_tiling_bytes(split_value: int, *,
                            hidden_size: int = 7168,
                            intermediate_size: int = 2048,
                            num_groups: int = 8,
-                           num_cube_cores: int = 24) -> bytes:
+                           num_cube_cores: int = DEFAULT_CORE_SPEC.num_cube_cores) -> bytes:
     """Forward GMM2 tiling [x,intermediate]×[E,intermediate,hidden], expanded num_cube_cores times."""
     if split_value not in GMM2_TABLE:
         raise KeyError(f"GMM2 tiling: split_value={split_value} not found")

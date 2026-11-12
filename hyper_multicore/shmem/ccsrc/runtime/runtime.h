@@ -15,7 +15,7 @@
 #include <optional>
 #include <string_view>
 
-#include "device/device_model.h"
+#include "device/device_identity.h"
 #include "runtime/allocation.h"
 #include "runtime/config.h"
 #include "runtime/dfx.h"
@@ -52,9 +52,6 @@ class Runtime final {
 
   /** @brief Locally return the CANN Root WORLD size while Ready, without CANN access or DFX updates. */
   Result<int32_t> RootSize() const;
-
-  /** @brief Locally return the frozen device model while Ready, without CANN access or DFX updates. */
-  Result<DeviceModel> QueryDeviceModel() const;
 
   /**
    * @brief Validate local preconditions for closing the active Runtime lifecycle.

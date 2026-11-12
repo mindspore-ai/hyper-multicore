@@ -60,7 +60,7 @@ def build_mega_mhc_plan(
         token_count: Total flattened token count.
         hidden_size: Hidden dimension.
         device: Target NPU device.
-        num_cube_cores: Physical AIC core count.
+        num_cube_cores: Number of Cube cores.
         token_tile: Preferred token count per task.
     """
     token_tile = resolve_token_tile(token_count, token_tile, num_cube_cores)

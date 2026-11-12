@@ -21,13 +21,15 @@ from typing import Any
 
 import torch
 
+from hyper_multicore._core_spec import get_device_core_spec
 from hyper_multicore.modules.mega_mhc_grad.common import MegaMhcGradCache
-from hyper_multicore.modules.mega_mhc_grad.function import _resolve_core_counts, hyper_mega_mhc_grad
+from hyper_multicore.modules.mega_mhc_grad.function import hyper_mega_mhc_grad
 from hyper_multicore.torch import ops as multicore_ops
 
 from ..mega_mhc_common import (
     MHC_SINKHORN_ITERS,
     MegaMhcOutputs,
+    validate_mega_mhc_core_spec,
     validate_mega_mhc_native_inputs,
     validate_mega_mhc_token_count,
 )
@@ -146,7 +148,9 @@ def _hyper_mega_mhc_forward(
     device_index = residual.device.index
     if device_index is None:
         device_index = torch.npu.current_device()
-    num_cube_cores, num_vector_cores = _resolve_core_counts(device_index)
+    core_spec = get_device_core_spec(device_index)
+    validate_mega_mhc_core_spec(core_spec)
+    num_cube_cores, num_vector_cores = core_spec.num_cube_cores, core_spec.num_vector_cores
     if need_backward:
         validate_mega_mhc_token_count(token_count, num_vector_cores)
     plan = _get_cached_plan(

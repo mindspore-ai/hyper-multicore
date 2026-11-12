@@ -16,8 +16,8 @@
 
 import unittest
 
+from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.scheduler.config import (
-    NUM_WORKERS_CUBE,
     TaskSplitValue,
     TaskType,
     configure_ready_handshake,
@@ -90,7 +90,7 @@ class TestValidateRuntimeConfig(unittest.TestCase):
             top_k=2,
         )
         self.config = allocate_runtime_config(1)
-        self.config.num_workers = 2 * NUM_WORKERS_CUBE
+        self.config.num_workers = 2 * DEFAULT_CORE_SPEC.num_cube_cores
         self.config.dynamic_data.dynamic_group_size = self.values.single_rank_expert_num
         self.config.task_num = 1
 
@@ -101,7 +101,7 @@ class TestValidateRuntimeConfig(unittest.TestCase):
         task.task_index = 3
         task.task_split_num = 4
 
-        validate_runtime_config(self.config, self.values, NUM_WORKERS_CUBE)
+        validate_runtime_config(self.config, self.values, DEFAULT_CORE_SPEC.num_cube_cores)
 
     def test_rejects_unsafe_task_arithmetic(self) -> None:
         """Reject zero divisors and task indices that can exceed device buffers."""
@@ -120,7 +120,7 @@ class TestValidateRuntimeConfig(unittest.TestCase):
                 task.task_type = task_type
                 task.task_index = task_index
                 task.task_split_num = task_split_num
-                validate_runtime_config(self.config, self.values, NUM_WORKERS_CUBE)
+                validate_runtime_config(self.config, self.values, DEFAULT_CORE_SPEC.num_cube_cores)
 
 
 class TestReadyHandshakeConfig(unittest.TestCase):

@@ -13,6 +13,10 @@
 # -----------------------------------------------------------------------------
 cmake_minimum_required(VERSION 3.18)
 project(hyper_multicore_shmem_torch LANGUAGES CXX)
+set(HP_SHMEM_SOC_TYPE "Ascend910B" CACHE STRING "SHMEM backend device generation")
+if(NOT HP_SHMEM_SOC_TYPE MATCHES "^(Ascend910B|Ascend950)$")
+    message(FATAL_ERROR "Unsupported SHMEM device generation: ${HP_SHMEM_SOC_TYPE}")
+endif()
 
 # Build the new SHMEM stack host side: the runtime static library
 # (runtime + CANN host adapter) and the pybind11 Torch binding module
@@ -95,6 +99,9 @@ add_library(hyper_multicore_shmem_runtime STATIC
     cann/host.cpp
     cann/log.cpp
 )
+if(HP_SHMEM_SOC_TYPE STREQUAL "Ascend950")
+    target_compile_definitions(hyper_multicore_shmem_runtime PUBLIC HP_SHMEM_ASCEND950)
+endif()
 target_include_directories(hyper_multicore_shmem_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${ASCEND_HOME_PATH}/include
@@ -106,8 +113,17 @@ if(BUILD_TESTING)
     find_package(Threads REQUIRED)
     set(multicore_test_root
         "${CMAKE_CURRENT_LIST_DIR}/../../../tests/ut")
+    add_executable(hyper_multicore_shmem_native_config_test
+        ${multicore_test_root}/shmem/cpp/native_config_test.cpp
+        runtime/config.cpp)
+    target_include_directories(hyper_multicore_shmem_native_config_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    hp_enable_compile_hardening(hyper_multicore_shmem_native_config_test)
+    add_test(NAME shmem_config
+        COMMAND hyper_multicore_shmem_native_config_test)
+
     add_executable(hyper_multicore_shmem_native_log_test
-        ${multicore_test_root}/shmem/native_log_test.cpp
+        ${multicore_test_root}/shmem/cpp/native_log_test.cpp
         runtime/log.cpp
         cann/log.cpp
     )
@@ -129,6 +145,20 @@ if(BUILD_TESTING)
         set_tests_properties(shmem_log_level_${log_level_name} PROPERTIES
             ENVIRONMENT "SHMEM_LOG_LEVEL=${log_level}")
     endforeach()
+
+    add_executable(hyper_multicore_shmem_native_device_identity_test
+        ${multicore_test_root}/shmem/cpp/native_device_identity_test.cpp)
+    target_include_directories(hyper_multicore_shmem_native_device_identity_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${ASCEND_HOME_PATH}/include)
+    target_link_libraries(hyper_multicore_shmem_native_device_identity_test PRIVATE
+        hyper_multicore_shmem_runtime
+        "${SHMEM_HOME_PATH}/shmem/lib/libhyper_multicore_shmem_utils.so"
+        "${SHMEM_HOME_PATH}/shmem/lib/libhyper_multicore_shmem.so"
+        "${ASCEND_HOME_PATH}/lib64/libascendcl.so")
+    hp_enable_compile_hardening(hyper_multicore_shmem_native_device_identity_test)
+    add_test(NAME shmem_device_identity
+        COMMAND hyper_multicore_shmem_native_device_identity_test)
 endif()
 
 # pybind11 Torch binding module, imported by name from Python.

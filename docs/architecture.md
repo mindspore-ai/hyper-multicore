@@ -74,12 +74,26 @@ GMM1 与 GMM4 并行，AllToAll-Combine 与 GMM3 并行，进一步减少空闲�
 | **算子层** | — | `ops/<op_name>/` | 算子特有计算核 + KernelWorker 调度循环 | 跨算子共享逻辑 |
 | **Torch binding** | `torch/` | `torch/csrc/` | Torch 算子注册 | 图与调度逻辑 |
 
+### 核数规格来源
+
+`_core_spec.py` 定义不可变的 `CoreSpec(num_cube_cores, num_vector_cores)`。
+`DEFAULT_CORE_SPEC` 的默认值为 24 个 Cube 核、48 个 Vector 核，供离线 CLI、图、builder、
+任务填充及 GMM tiling 使用；调用方可以显式指定核数。
+
+`get_device_core_spec(device_index)` 每次调用 `torch.npu.get_device_limit()` 查询 Device 核数限制。
+`CoreSpec` 校验核数为正整数，算子的 1:2 混合执行约束由算子层校验。
+MoE 在资源绑定时查询核数；MHC 在每次计划选择前查询，并将核数纳入计划缓存 key。
+
+RuntimeConfig 的最小 Cube scratch 槽位、profile 槽位和 Gate 的 AIV 槽位上限各自定义容量；
+GMM/SwiGLU 模板中的 24/49 表示模板格式。
+
 ### 2.2 核心运行时目录
 
 ```text
 multicore/
 ├── __init__.py
 ├── _loader.py                      # 首次调用时定位 payload、校验 OPP 并加载框架 adapter
+├── _core_spec.py                   # 核数规格、默认值及 Device 查询
 │
 ├── scheduler/                       # Python 编译器核心（无算子特化）
 │   ├── __init__.py
@@ -448,10 +462,12 @@ event capacity 至少为 1024，并覆盖无融合图、ready/completion 事件�
 普通事件区占 `event_capacity × 4` 字节；EP 大于 1 时，其后预留 `2 × (EP + 1) × 64` 字节持久 ready/completion 状态。
 每次调用只清零普通事件区，首次使用才初始化持久区并执行 Host barrier。
 
-grouped-matmul 的各 AIC scratch 按 128 字节对齐，每核步长为 `ceil(local_experts × 8 / 128) × 128` 字节。
-`group_list_bytes = max(4096, 24 × 每核步长 + 128)`，包含首地址对齐余量，完整 cache line 写回不会覆盖相邻核。
-每 rank 的专家数决定 Host 分配、序列化与 Device 偏移。
-16 个以内使用固定 scratch 大小，更多专家按需扩大 scratch，受 uint32 偏移与实际内存限制。
+grouped-matmul 的各 AIC scratch 按 128 字节对齐，每核步长为
+`max(128, ceil(local_experts × 8 / 128) × 128)` 字节。
+Cube 槽位容量为 `max(24, ceil(num_workers / 2))`，其中 `num_workers` 表示 Runtime AIV 容量。
+`group_list_bytes = max(4096, Cube槽位容量 × 每核步长 + 128)`，包含首地址对齐余量，
+完整 cache line 写回不会覆盖相邻核。Host 分配、序列化与 Device 偏移共同使用核数和每 rank 的专家数，
+scratch 大小受 uint32 偏移与实际内存限制。
 
 ### 6.1 正向
 
@@ -540,13 +556,18 @@ Multicore 组件入口负责依赖准备、私有 SHMEM、分 SoC vendor、vendo
 每个 SoC 的 CANN 构建同时生成 `HyperMegaMoe` 和 `HyperMegaMoeGrad`。组件会校验新构建的 vendor，
 并在合并后再次校验四个 `aclnnHyperMegaMoe*` API、kernel object/metadata、SONAME 和运行时依赖。
 私有 SHMEM 库会校验专属 SONAME；所有随包 host 共享库均校验 ELF 架构、安全链接属性、无
-RPATH/RUNPATH 和依赖边界。动态库搜索路径由 `set_env.bash` 在启动 Python 前统一配置。
+RPATH/RUNPATH 和依赖边界。`set_env.bash` 在启动 Python 前配置 vendor 搜索路径；SHMEM 私有库按后端绝对加载。
 
 MegaMoE、MegaGate 和 MegaMHC 通过 `torch/ops.py` 共用一个延迟加载入口，
-首次调用时按框架分支及 ABI 选择适配对，加载 `adapters/<variant-id>/libhyper_multicore_torch.so`。
+首次调用时按框架分支及 ABI 选择框架适配库，加载 `adapters/<variant-id>/libhyper_multicore_torch.so`。
 Torch adapter 是由 CMake 构建、通过 `torch.ops.load_library()` 加载的 dispatcher 共享库，不生成
 `PyInit_*` 入口，也不链接 `libpython` 或 `libtorch_python`。adapter 运行时按组件相对路径定位并绝对加载
 自带 vendor；`set_env.bash` 按 CANN custom OPP 契约设置 vendor 的 OPP 与动态库搜索路径。
+
+910B/910C 共用 `Ascend910B` SHMEM 后端，950 使用 `Ascend950` 后端，私有资源分别按 `arch22/arch35` 保存于
+`shmem/lib/<arch>/`。每个框架变体包含一份 Torch adapter，以及 `shmem/<arch>/` 中的各后端 binding。
+首次使用 SHMEM 时查询可见逻辑设备 0 的架构，仅加载匹配的一套 SDK、ops 和 binding；查询不创建 NPU 上下文。
+同一进程可见设备须属于同一架构，实际 Runtime 初始化仍校验调用方当前设备。
 
 ---
 

@@ -22,6 +22,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/../hardening.cmake)
 
 set(HP_MULTICORE_SOURCE_ROOT "" CACHE PATH "Assembled HyperMegaMoe source root")
 set(HP_SHMEM_SDK_ROOT "" CACHE PATH "Installed SHMEM SDK root")
+set(HP_MULTICORE_REGISTERED_SOCS "" CACHE STRING "Series registered for this architecture")
 set(HP_VENDOR_STAGE_ROOT "${CMAKE_BINARY_DIR}/stage" CACHE PATH "CANN vendor stage root")
 
 if(NOT HP_MULTICORE_SOURCE_ROOT

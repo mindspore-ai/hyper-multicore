@@ -13,9 +13,38 @@
 #include <cstdint>
 
 #include "cann/signal.h"
+#include "kernel_operator.h"
 #include "shmem.h"
 
 namespace hyper_multicore::shmem::cann::device {
+
+/** @brief Return the calling PE's Root rank. */
+ACLSHMEM_DEVICE int32_t my_pe() { return aclshmem_my_pe(); }
+
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+/** @brief Return the initialized number of UDMA QPs per peer. */
+ACLSHMEM_DEVICE uint32_t udma_qp_count() { return aclshmemi_udma_qp_info_fetch()->qp_num; }
+
+/** @brief Complete a GET on a caller-owned QP, waiting after each SDK-sized chunk. */
+template <typename T>
+ACLSHMEM_DEVICE void get_udma(GM_ADDR destination, GM_ADDR source, int64_t elements, int32_t source_pe, uint32_t qp) {
+  AscendC::TPipe pipe;
+  AscendC::TBuf<AscendC::TPosition::VECOUT> staging;
+  pipe.InitBuffer(staging, ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE);
+  auto scratch = reinterpret_cast<__ubuf__ uint8_t *>(staging.Get<uint8_t>().GetPhyAddr());
+  auto local = reinterpret_cast<__gm__ uint8_t *>(destination);
+  auto remote = reinterpret_cast<__gm__ uint8_t *>(source);
+  uint64_t remaining = elements * sizeof(T);
+  while (remaining > 0) {
+    const uint32_t bytes = remaining < (1ULL << 28) ? remaining : (1ULL << 28);
+    aclshmemx_udma_qp_get_nbi<uint8_t>(local, remote, scratch, bytes, source_pe, qp, 0);
+    aclshmemx_udma_qp_quiet(source_pe, qp);
+    local += bytes;
+    remote += bytes;
+    remaining -= bytes;
+  }
+}
+#endif
 
 /**
  * @brief Translate one local symmetric GM address to the corresponding address on a target Root PE.

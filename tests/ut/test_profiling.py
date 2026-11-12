@@ -171,7 +171,7 @@ class TestDiagnosticMetadata(unittest.TestCase):
         runtime = PreparedDiagnosticRuntime(ComputeGraph(), config, DiagnosticSpec("Custom"),
                                             parameter_count=0, tensor_factory=tensor_factory, rank=3, device_id=7)
         self.assertEqual(len(created), 1)
-        self.assertIsNone(runtime._metadata)
+        self.assertIsNone(runtime._metadata)  # pylint: disable=protected-access
         original = bytes(config)
         profile = _PreparedProfileRuntime(runtime)
         self.assertEqual(len(created), 2)
@@ -187,20 +187,24 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
 
     def test_layout_rounds_busiest_workers_to_sixteen_records(self):
         """Mirror Device round-robin assignment for AIC and AIV independently."""
-        runtime_config = _runtime_config(128)
-        runtime_config.num_workers = 48
-        runtime_config.all_tasks[0] = _three_record_task()
-        runtime_config.task_index_num[0] = 121
-        runtime_config.task_index_num[1] = 24
+        for workers, aic_records, aic_capacity, buffer_size in (
+            (48, 18, 32, 53760), (64, 12, 16, 55296),
+        ):
+            with self.subTest(workers=workers):
+                runtime_config = allocate_runtime_config(128, num_workers=workers)
+                runtime_config.all_tasks[0] = _three_record_task()
+                runtime_config.task_index_num[0] = 121
+                runtime_config.task_index_num[1] = 24
 
-        layout = _calculate_profile_layout(runtime_config)
+                layout = _calculate_profile_layout(runtime_config)
 
-        self.assertEqual(layout.aic_required_records, 18)
-        self.assertEqual(layout.aiv_required_records, 3)
-        self.assertEqual(layout.aic_record_capacity, 32)
-        self.assertEqual(layout.aiv_record_capacity, 16)
-        self.assertEqual(layout.buffer_size, 53760)
-        self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
+                self.assertEqual(layout.aic_required_records, aic_records)
+                self.assertEqual(layout.aiv_required_records, 3)
+                self.assertEqual(layout.aic_record_capacity, aic_capacity)
+                self.assertEqual(layout.aiv_record_capacity, 16)
+                self.assertEqual(layout.cube_slot_count, workers // 2)
+                self.assertEqual(layout.buffer_size, buffer_size)
+                self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
 
     def test_layout_preserves_records_beyond_legacy_capacity(self):
         """Allocate the complete trace when a long schedule exceeds 256 records."""
@@ -243,8 +247,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
                     graph_adapter=lambda graph, cfg, kernel_name=kernel_name: bind_pipeline_graph(
                         graph, cfg, backward=kernel_name.endswith("Grad")),
                 )
-                profile = _PreparedProfileRuntime(adapter._runtime)
-                layout = profile._layout
+                profile = _PreparedProfileRuntime(adapter._runtime)  # pylint: disable=protected-access
+                layout = profile._layout  # pylint: disable=protected-access
                 tasks = [runtime_config.all_tasks[task_id] for task_id in range(expected_count)]
                 metadata = adapter.metadata
 
@@ -309,10 +313,13 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
                     get_rank.assert_not_called()
 
     def test_soc_aliases_use_the_documented_counter_frequency(self):
-        """Recognize current 910B and 910C/A3 Torch NPU names."""
-        for soc_name in ("Ascend910B4", "Ascend910C1", "Ascend910_9372"):
+        """Recognize 910 and 950 PR/DT Torch NPU names."""
+        for soc_name, frequency_mhz in (
+            ("Ascend910B4", 50.0), ("Ascend910C1", 50.0), ("Ascend910_9372", 50.0),
+            ("Ascend950PR_9599", 1000.0), ("Ascend950DT_9591", 1000.0),
+        ):
             with self.subTest(soc_name=soc_name):
-                self.assertEqual(_resolve_cycle_frequency_mhz(soc_name), 50.0)
+                self.assertEqual(_resolve_cycle_frequency_mhz(soc_name), frequency_mhz)
 
 
 if __name__ == "__main__":

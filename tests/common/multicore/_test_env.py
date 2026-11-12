@@ -45,8 +45,6 @@ def _active_multicore_vendor_roots() -> list[Path]:
         for vendor_root in vendor_roots
         if (vendor_root / "op_api" / "lib" / "libcust_opapi.so").is_file()
         and (vendor_root / "op_api" / "lib").resolve() in library_roots
-        and (vendor_root.parents[1].parent / "shmem" / "lib").resolve() in library_roots
-        and (vendor_root.parents[1].parent / "shmem" / "lib" / "shmem").resolve() in library_roots
     ]
 
 
@@ -104,6 +102,13 @@ def _activation_vendor_root(activation_script: Path) -> Path | None:
     return vendor_root.resolve() if vendor_root.is_dir() else None
 
 
+def _update_activation_variables(output: bytes) -> None:
+    """Apply only the packaged OPP variables from a successful activation shell."""
+    activated = dict(entry.split("=", 1) for entry in output.decode("utf-8").split("\0") if entry)
+    os.environ.update({variable: activated[variable] for variable in HP_ACTIVATION_VARIABLES
+                       if variable in activated})
+
+
 def prepare_multicore_test_environment() -> None:
     """Validate CANN and activate the wheel or PYTHONPATH multicore environment."""
     required_cann_variables = ("ASCEND_HOME_PATH", "ASCEND_OPP_PATH", "ASCEND_AICPU_PATH")
@@ -141,14 +146,7 @@ def prepare_multicore_test_environment() -> None:
             error = result.stderr.decode("utf-8", errors="replace").strip()
             activation_errors.append(f"command={activation_command} error={error}")
             continue
-        activated_environment = {}
-        for entry in result.stdout.split(b"\0"):
-            name, separator, value = entry.partition(b"=")
-            if separator:
-                activated_environment[name.decode("utf-8")] = value.decode("utf-8")
-        for variable in HP_ACTIVATION_VARIABLES:
-            if variable in activated_environment:
-                os.environ[variable] = activated_environment[variable]
+        _update_activation_variables(result.stdout)
         if multicore_test_environment_is_active():
             return
         activation_errors.append(f"command={activation_command} error=vendor paths were not activated")

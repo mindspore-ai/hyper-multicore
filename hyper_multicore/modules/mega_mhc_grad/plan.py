@@ -61,8 +61,8 @@ def build_mega_mhc_grad_plan(
         token_count: Total number of flattened tokens.
         hidden_size: Hidden dimension of every token.
         device: NPU device used to materialize runtime tensors.
-        num_cube_cores: Number of physical AIC cores.
-        num_vector_cores: Number of physical AIV cores.
+        num_cube_cores: Number of Cube cores.
+        num_vector_cores: Number of Vector cores.
         token_tile: Requested AIV token tile.
 
     Returns:

@@ -15,10 +15,11 @@ PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 source "${PROJECT_ROOT}/scripts/native/cann_version.sh"
 BUILD_DIR="${PROJECT_ROOT}/build"
 NATIVE_ROOT="${BUILD_DIR}/native"
-WORK_ROOT="${HP_NATIVE_WORK_ROOT:-${NATIVE_ROOT}/work/multicore}"
-COMPONENT_ROOT="${HP_COMPONENT_ROOT:-${NATIVE_ROOT}/components/multicore/hyper_multicore}"
+COMMON_ROOT="${NATIVE_ROOT}/common/$(uname -m)"
+WORK_ROOT="${HP_NATIVE_WORK_ROOT:-${COMMON_ROOT}/work}"
+COMPONENT_ROOT="${HP_COMPONENT_ROOT:-${COMMON_ROOT}/payload}"
 OUTPUT_ROOT="${COMPONENT_ROOT}/lib"
-SOC_LIST="ascend910b,ascend910_93"
+SOC_LIST=""
 NATIVE_JOBS="$(nproc)"
 CLEAN="off"
 CURRENT_REASON_CODE="MULTICORE_BUILD_FAILED"
@@ -30,7 +31,7 @@ Usage:
   bash hyper_multicore/build.sh [OPTIONS]
 
 Options:
-  --soc-list VALUE    Comma-separated CANN SoC IDs. Default: ascend910b,ascend910_93.
+  --soc-list VALUE    Comma-separated CANN SoC IDs. Default: ascend910b,ascend910_93,ascend950.
   --jobs VALUE        Parallel build jobs. Default: nproc.
   --clean             Remove multicore work and install outputs before building.
   -h, --help          Show this help message.
@@ -108,37 +109,6 @@ if ! [[ "${NATIVE_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
     fail "INVALID_SELECTION" "--jobs must be a positive integer, got '${NATIVE_JOBS}'." 2
 fi
 
-RAW_SOC_LIST="${SOC_LIST}"
-IFS=',' read -r -a requested_socs <<< "${RAW_SOC_LIST}"
-declare -a CANN_SOCS=()
-declare -A seen_cann_socs=()
-for requested_soc in "${requested_socs[@]}"; do
-    requested_soc="${requested_soc//[[:space:]]/}"
-    case "${requested_soc}" in
-        ascend910b)
-            cann_soc="ascend910b"
-            ;;
-        ascend910_93)
-            cann_soc="ascend910_93"
-            ;;
-        ascend950)
-            cann_soc="ascend950"
-            ;;
-        *)
-            soc_error="Unsupported SoC '${requested_soc}' in --soc-list=${RAW_SOC_LIST}; "
-            soc_error+="use ascend910b, ascend910_93, or ascend950."
-            fail "UNSUPPORTED_SOC_SELECTION" "${soc_error}" 10
-            ;;
-    esac
-    if [[ -z "${seen_cann_socs[${cann_soc}]:-}" ]]; then
-        CANN_SOCS+=("${cann_soc}")
-        seen_cann_socs["${cann_soc}"]=1
-    fi
-done
-if [[ ${#CANN_SOCS[@]} -eq 0 ]]; then
-    fail "UNSUPPORTED_SOC_SELECTION" "--soc-list must select at least one SoC." 10
-fi
-CANN_SOC_LIST=$(IFS=,; echo "${CANN_SOCS[*]}")
 [[ "$(uname -s)" == Linux ]] || fail "UNSUPPORTED_HOST" "Native builds require Linux/CANN/PTA." 3
 
 function validate_multicore_build_log() {
@@ -190,6 +160,8 @@ function validate_multicore_vendor() {
     local vendor_root=$1
     local soc_list=$2
     local build_log=${3:-}
+    local kernel_layout=${4:-series}
+    local kernel_id
     local library
     local dynamic_section
     local ldd_output
@@ -246,10 +218,14 @@ function validate_multicore_vendor() {
 
     IFS=',' read -r -a validation_socs <<< "${soc_list}"
     for soc in "${validation_socs[@]}"; do
+        kernel_id=${soc}
+        if [[ "${kernel_layout}" == "architecture" ]]; then
+            read -r kernel_id _ <<< "$("${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/soc_selection.py" --groups "${soc}")"
+        fi
         for op_name in hyper_mega_moe hyper_mega_moe_grad hyper_mega_mhc hyper_mega_mhc_grad \
                 hyper_mega_gate_route hyper_mega_gate_route_grad; do
             mapfile -t artifacts < <(
-                find "${vendor_root}/op_impl/ai_core/tbe/kernel/${soc}/${op_name}" \
+                find "${vendor_root}/op_impl/ai_core/tbe/kernel/${kernel_id}/${op_name}" \
                     -maxdepth 1 -type f -name '*.o' -print 2>/dev/null
             )
             if [[ ${#artifacts[@]} -eq 0 ]]; then
@@ -260,7 +236,7 @@ function validate_multicore_vendor() {
                 require_nonempty_artifact "${artifact}" "${soc} ${op_name} kernel object"
             done
             mapfile -t artifacts < <(
-                find "${vendor_root}/op_impl/ai_core/tbe/kernel/${soc}/${op_name}" \
+                find "${vendor_root}/op_impl/ai_core/tbe/kernel/${kernel_id}/${op_name}" \
                     -maxdepth 1 -type f -name '*.json' -print 2>/dev/null
             )
             if [[ ${#artifacts[@]} -eq 0 ]]; then
@@ -302,10 +278,19 @@ function validate_multicore_vendor() {
     echo "INFO: validated multicore vendor ${vendor_root} for ${soc_list}"
 }
 
+SOC_ARGS=()
+if [[ -n "${SOC_LIST}" ]]; then SOC_ARGS+=("${SOC_LIST}"); fi
+SOC_SELECTION=$("${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/soc_selection.py" "${SOC_ARGS[@]}") ||
+    fail "UNSUPPORTED_SOC_SELECTION" "Invalid --soc-list=${SOC_LIST}." 10
+read -r SOC_LIST _ <<< "${SOC_SELECTION}"
+
 if [[ "${HP_NATIVE_STAGE:-}" != "common" ]]; then
-    exec "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/build_native.py" --native-only "$@" \
-        --soc-list "${SOC_LIST}" --jobs "${NATIVE_JOBS}" $(if [[ "${CLEAN}" == "on" ]]; then echo --clean; fi)
+    BUILD_ARGS=(--native-only --soc-list "${SOC_LIST}" --jobs "${NATIVE_JOBS}")
+    if [[ "${CLEAN}" == "on" ]]; then BUILD_ARGS+=(--clean); fi
+    exec "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/build_native.py" "${BUILD_ARGS[@]}"
 fi
+
+CANN_SOC_LIST="${SOC_LIST}"
 
 cd "${PROJECT_ROOT}"
 if [[ "${CLEAN}" == "on" ]]; then
@@ -352,20 +337,31 @@ OPS_TRANSFORMER_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loa
 
 CURRENT_REASON_CODE="SHMEM_SDK_HANDOFF_FAILED"
 # SHMEM publishes this before the vendor work root is fingerprinted.
-SHMEM_SDK_MANIFEST="${HP_SHMEM_HANDOFF:-${NATIVE_ROOT}/work/multicore/shmem/sdk.json}"
-SHMEM_INSTALL_ROOT=$("${PYTHON_BIN}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["install_root"])' \
-    "${SHMEM_SDK_MANIFEST}")
-HP_SHMEM_TOOLCHAIN_KEY=$("${PYTHON_BIN}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["toolchain_key"])' \
-    "${SHMEM_SDK_MANIFEST}")
-if [[ ! -f "${SHMEM_INSTALL_ROOT}/shmem/include/shmem.h" \
-      || ! -d "${SHMEM_INSTALL_ROOT}/shmem/src" \
-      || ! -f "${SHMEM_INSTALL_ROOT}/shmem/lib/libhyper_multicore_shmem.so" \
-      || ! -f "${SHMEM_INSTALL_ROOT}/shmem/lib/libhyper_multicore_shmem_utils.so" \
-      || ! -f "${SHMEM_INSTALL_ROOT}/shmem/lib/aclshmem_bootstrap_uid.so" \
-      || ! -f "${SHMEM_INSTALL_ROOT}/shmem/lib/aclshmem_bootstrap_config_store.so" ]]; then
-    fail "SHMEM_SDK_NOT_PREPARED" \
-        "Full SHMEM SDK is missing at ${SHMEM_INSTALL_ROOT}." 9
-fi
+SHMEM_SDK_MANIFEST="${HP_SHMEM_HANDOFF:-${COMMON_ROOT}/sdk.json}"
+SHMEM_HEADERS_IDENTITY=$("${PYTHON_BIN}" - "${SHMEM_SDK_MANIFEST}" <<'PYHEADERS'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+backends = json.loads(Path(sys.argv[1]).read_text())["architectures"]
+identities = set()
+for backend in backends.values():
+    sdk = Path(backend["install_root"]) / "shmem"
+    required = ["include/shmem.h", "lib/libhyper_multicore_shmem.so", "lib/libhyper_multicore_shmem_utils.so",
+                "lib/aclshmem_bootstrap_uid.so", "lib/aclshmem_bootstrap_config_store.so"]
+    if any(not (sdk / name).is_file() for name in required):
+        raise ValueError(f"Full SHMEM SDK is missing at {sdk}")
+    headers = {str(path.relative_to(sdk)): hashlib.sha256(path.read_bytes()).hexdigest()
+               for folder in ("include", "src/device") for path in sorted((sdk / folder).rglob("*")) if path.is_file()}
+    if not headers:
+        raise ValueError(f"SHMEM SDK headers are missing at {sdk}")
+    identities.add(hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest())
+if len(identities) != 1:
+    raise ValueError("SHMEM SDK headers differ across backends")
+print(identities.pop())
+PYHEADERS
+)
 
 if ! MULTICORE_LOCK_DIGEST=$("${PYTHON_BIN}" -c '
 import hashlib
@@ -385,15 +381,13 @@ fi
 
 mkdir -p "${WORK_ROOT}/logs"
 
-export ASCEND_SHMEM_HOME_PATH="${SHMEM_INSTALL_ROOT}"
-export SHMEM_HOME_PATH="${SHMEM_INSTALL_ROOT}"
 export PIP_NO_BUILD_ISOLATION=false
 export PIP_NO_INDEX=1
 
 echo "INFO: building unified multicore CANN vendor"
 echo "  CANN: ${ASCEND_HOME_PATH}"
 echo "  SOCs: ${CANN_SOC_LIST}"
-echo "  SHMEM SDK: ${SHMEM_INSTALL_ROOT}"
+echo "  SHMEM SDKs: ${SHMEM_SDK_MANIFEST}"
 
 function calculate_vendor_fingerprint() {
     local cann_soc=$1
@@ -438,7 +432,7 @@ function calculate_vendor_fingerprint() {
                 "env_LDFLAGS=${LDFLAGS-}" \
                 "env_CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE-}" \
                 "multicore_lock=${MULTICORE_LOCK_DIGEST}" \
-                "shmem_toolchain=${HP_SHMEM_TOOLCHAIN_KEY}" \
+                "shmem_headers=${SHMEM_HEADERS_IDENTITY}" \
                 "arch=$(uname -m)"
             if [[ -f "${CANN_VERSION_FILE}" ]]; then
                 sha256sum "${CANN_VERSION_FILE}"
@@ -471,18 +465,23 @@ function vendor_cache() {
 
 declare -a PER_SOC_VENDOR_INPUTS=()
 declare -a PER_SOC_HOST_INPUT_IDENTITIES=()
-for cann_soc in "${CANN_SOCS[@]}"; do
-    ASSEMBLY_ROOT="${WORK_ROOT}/source-assembly/${cann_soc}"
+ARCH_GROUPS=$("${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/soc_selection.py" --groups "${CANN_SOC_LIST}")
+while read -r device_arch _sdk_soc_type cann_soc registered_socs _selected_socs; do
+    SHMEM_INSTALL_ROOT=$("${PYTHON_BIN}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["architectures"][sys.argv[2]]["install_root"])' \
+        "${SHMEM_SDK_MANIFEST}" "${device_arch}")
+    export ASCEND_SHMEM_HOME_PATH="${SHMEM_INSTALL_ROOT}"
+    export SHMEM_HOME_PATH="${SHMEM_INSTALL_ROOT}"
+    ASSEMBLY_ROOT="${WORK_ROOT}/source-assembly/${device_arch}"
     SOURCE_ROOT="${ASSEMBLY_ROOT}/source"
-    VENDOR_BUILD_ROOT="${WORK_ROOT}/vendor-build/${cann_soc}"
+    VENDOR_BUILD_ROOT="${WORK_ROOT}/vendor-build/${device_arch}"
     VENDOR_STAGE_ROOT="${VENDOR_BUILD_ROOT}/stage"
     VENDOR_CANDIDATE="${VENDOR_STAGE_ROOT}/packages/vendors/hyper_multicore_nn"
-    KERNEL_LOG="${WORK_ROOT}/logs/cann-vendor-build-${cann_soc}.log"
-    VENDOR_REQUEST="${WORK_ROOT}/vendor-request-${cann_soc}.json"
-    REUSED_VENDOR="${WORK_ROOT}/vendor-reuse-${cann_soc}/hyper_multicore_nn"
+    KERNEL_LOG="${WORK_ROOT}/logs/cann-vendor-build-${device_arch}.log"
+    VENDOR_REQUEST="${WORK_ROOT}/vendor-request-${device_arch}.json"
+    REUSED_VENDOR="${WORK_ROOT}/vendor-reuse-${device_arch}/hyper_multicore_nn"
     if [[ -n "${HP_VENDOR_CACHE_ROOT:-}" ]]; then
         CACHE_ARGS=(prepare --root "${PROJECT_ROOT}" --native "${HP_VENDOR_CACHE_ROOT}"
-                    --soc "${cann_soc}" --sdk "${SHMEM_INSTALL_ROOT}/shmem" --request "${VENDOR_REQUEST}")
+                    --arch "${device_arch}" --sdk "${SHMEM_INSTALL_ROOT}/shmem" --request "${VENDOR_REQUEST}")
         if [[ "${HP_VENDOR_CACHE_CLEAN:-}" == "1" ]]; then
             CACHE_ARGS+=(--clean)
         fi
@@ -514,6 +513,7 @@ for cann_soc in "${CANN_SOCS[@]}"; do
             -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
             -DASCEND_CANN_PACKAGE_PATH="${ASCEND_HOME_PATH}" \
             -DASCEND_COMPUTE_UNIT="${cann_soc}" \
+            -DHP_MULTICORE_REGISTERED_SOCS="${registered_socs//,/;}" \
             -DASCEND_PYTHON_EXECUTABLE="${PYTHON_BIN}" \
             -DHP_MULTICORE_SOURCE_ROOT="${SOURCE_ROOT}" \
             -DHP_SHMEM_SDK_ROOT="${SHMEM_INSTALL_ROOT}/shmem" \
@@ -542,7 +542,7 @@ for cann_soc in "${CANN_SOCS[@]}"; do
     fi
     PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${VENDOR_CANDIDATE}")
     PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${COMMON_HOST_INPUT_IDENTITY}")
-done
+done <<< "${ARCH_GROUPS}"
 
 VENDOR_ROOT="${OUTPUT_ROOT}/vendors/hyper_multicore_nn"
 mkdir -p "$(dirname "${VENDOR_ROOT}")"
@@ -550,10 +550,11 @@ CURRENT_REASON_CODE="CANN_VENDOR_MERGE_FAILED"
 "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/merge_multicore_vendors.py" \
     "${PER_SOC_VENDOR_INPUTS[@]}" \
     "${PER_SOC_HOST_INPUT_IDENTITIES[@]}" \
+    --soc-list "${CANN_SOC_LIST}" \
     --output "${VENDOR_ROOT}"
 
 CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
-validate_multicore_vendor "${VENDOR_ROOT}" "${CANN_SOC_LIST}"
+validate_multicore_vendor "${VENDOR_ROOT}" "${CANN_SOC_LIST}" "" architecture
 cp "${PROJECT_ROOT}/hyper_multicore/set_env.bash" "${OUTPUT_ROOT}/set_env.bash"
 
 while IFS= read -r packaged_library; do

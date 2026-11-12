@@ -1,3 +1,3 @@
 ascend910b:
-  torch: 1500
+  torch: 3000
   shmem: 600

@@ -37,7 +37,7 @@ from hyper_multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
 from hyper_multicore.scheduler.config import (
-    NUM_WORKERS_CUBE,
+    MIN_CUBE_WORKER_CAPACITY,
     RuntimeConfigC,
     TaskDescC,
     TaskSplitValue,
@@ -51,6 +51,7 @@ from hyper_multicore.scheduler.runtime import (
     allocate_runtime_config,
     runtime_config_serialized_size,
     runtime_config_task_capacity,
+    runtime_cube_worker_capacity,
     serialize_runtime_config,
 )
 from tests.common.mark_utils import arg_mark
@@ -338,6 +339,23 @@ class TestRuntimeCppReader(unittest.TestCase):
         for experts in (1, 16, 17, 31, 32, 33, 64, 128, 257):
             self._check_group_list_isolation(experts)
 
+    def test_last_cube_scratch_fits_48_and_64_worker_layouts(self) -> None:
+        """The final Cube list must fit before atomics in both supported worker capacities."""
+        for workers in (48, 64):
+            with self.subTest(workers=workers):
+                cfg = allocate_runtime_config(16, local_experts=17, num_workers=workers)
+                cfg.task_num = 1
+                cfg.atomic_add_values[0] = 1
+                image = serialize_runtime_config(cfg)
+                buffer = ctypes.create_string_buffer(image)
+                offsets = (ctypes.c_uint32 * 12)()
+                self.reader.read_layout(buffer, offsets)
+                self.assertTrue(self.reader.valid_runtime(buffer, len(image), cfg.event_capacity * 4))
+                self.assertEqual(offsets[9], type(cfg).atomic_add_values.offset)
+                last = self.reader.group_list_offset(buffer, runtime_cube_worker_capacity(workers) - 1)
+                self.assertEqual(last % 64, 0)
+                self.assertLessEqual(last + 17 * 8, offsets[9])
+
     def _check_group_list_isolation(self, experts: int) -> None:
         """Bound every worker's list at both cache-line widths and offset residues."""
         for tasks, events in ((1, 1024), (17, 1024), (25601, 1024), (17, 1040), (17, 2048)):
@@ -352,7 +370,7 @@ class TestRuntimeCppReader(unittest.TestCase):
             for line_bytes in (64, 128):
                 with self.subTest(experts=experts, tasks=tasks, events=events, line_bytes=line_bytes):
                     owned_lines = set()
-                    for worker in range(NUM_WORKERS_CUBE):
+                    for worker in range(MIN_CUBE_WORKER_CAPACITY):
                         begin = self.reader.group_list_offset(buffer, worker)
                         end = begin + experts * 8
                         self.assertEqual(begin % line_bytes, 0)

@@ -39,7 +39,8 @@ def format_text(result: dict) -> str:
     widths = [max(len(row[i]) for row in table) for i in range(3)]
     lines = [
         f"HyperMulticore {result['package_version']}",
-        *fields([("Mode", f"{info['build_mode']} ({len(rows)} adapter pairs)"), ("Location", result["package_root"])]),
+        *fields([("Mode", f"{info['build_mode']} ({len(rows)} framework variants)"),
+                 ("Location", result["package_root"])]),
         "",
         "Build",
         *fields(
@@ -49,10 +50,11 @@ def format_text(result: dict) -> str:
                 ("CANN actual", info.get("cann_version", "unknown")),
                 ("CANN reference", info.get("reference_cann") or "not specified"),
                 ("SoC", ", ".join(info["soc_list"])),
+                ("Device architectures", ", ".join(info["architectures"])),
             ]
         ),
         "",
-        "Adapters",
+        "Framework variants",
     ]
     for index, row in enumerate(table):
         lines.append("  | " + " | ".join(f"{value:<{width}}" for value, width in zip(row, widths)) + " |")
@@ -90,7 +92,7 @@ def main() -> None:
         root = Path(distribution.locate_file("hyper_multicore")).resolve()
         info = json.loads((root / "build_info.json").read_text())
         manifest = json.loads((root / "adapters/manifest.json").read_text())
-        if info.get("schema_version") != 2 or manifest.get("schema_version") != 1:
+        if info.get("schema_version") != 3 or manifest.get("schema_version") != 2:
             raise ValueError("Unsupported build identity or adapter schema")
         helpers = runpy.run_path(str(root / "_native_manifest.py"))
         manifest = helpers["read_manifest"](root)
