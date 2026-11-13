@@ -22,6 +22,8 @@ OUTPUT_ROOT="${COMPONENT_ROOT}/lib"
 SOC_LIST=""
 NATIVE_JOBS="$(nproc)"
 CLEAN="off"
+PHASE=""
+DEVICE_ARCH=""
 CURRENT_REASON_CODE="MULTICORE_BUILD_FAILED"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
@@ -86,6 +88,11 @@ while [[ $# -gt 0 ]]; do
         --jobs)
             require_value "$1" "${2:-}"
             NATIVE_JOBS="$2"
+            shift 2
+            ;;
+        --phase|--arch)
+            require_value "$1" "${2:-}"
+            if [[ "$1" == --phase ]]; then PHASE=$2; else DEVICE_ARCH=$2; fi
             shift 2
             ;;
         --stage-only)
@@ -293,17 +300,6 @@ fi
 CANN_SOC_LIST="${SOC_LIST}"
 
 cd "${PROJECT_ROOT}"
-if [[ "${CLEAN}" == "on" ]]; then
-    rm -rf "${WORK_ROOT}" "${COMPONENT_ROOT}"
-fi
-rm -rf "${COMPONENT_ROOT}"
-mkdir -p "${OUTPUT_ROOT}"
-SHMEM_ARGS=(--soc-list "${SOC_LIST}" --jobs "${NATIVE_JOBS}")
-if [[ "${CLEAN}" == "on" ]]; then
-    SHMEM_ARGS+=(--clean)
-fi
-bash "${SCRIPT_DIR}/shmem/build.sh" "${SHMEM_ARGS[@]}"
-
 if [[ -z "${ASCEND_HOME_PATH:-}" || ! -d "${ASCEND_HOME_PATH}" ]]; then
     fail "CANN_ENV_NOT_CONFIGURED" \
         "ASCEND_HOME_PATH must identify the selected CANN installation; source its set_env.sh first." 3
@@ -325,69 +321,6 @@ for required_tool in "${required_tools[@]}"; do
     fi
 done
 MULTICORE_VENDOR_CMAKE="${PROJECT_ROOT}/hyper_multicore/cmake/vendor"
-
-CURRENT_REASON_CODE="MULTICORE_DEPENDENCY_PREPARATION_FAILED"
-PREPARED_DEPENDENCIES=$("${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/prepare_dependencies.py" \
-    --dependency ops_nn \
-    --dependency ops_transformer)
-OPS_NN_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["ops_nn"]["source_dir"])' \
-    "${PREPARED_DEPENDENCIES}")
-OPS_TRANSFORMER_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["ops_transformer"]["source_dir"])' \
-    "${PREPARED_DEPENDENCIES}")
-
-CURRENT_REASON_CODE="SHMEM_SDK_HANDOFF_FAILED"
-# SHMEM publishes this before the vendor work root is fingerprinted.
-SHMEM_SDK_MANIFEST="${HP_SHMEM_HANDOFF:-${COMMON_ROOT}/sdk.json}"
-SHMEM_HEADERS_IDENTITY=$("${PYTHON_BIN}" - "${SHMEM_SDK_MANIFEST}" <<'PYHEADERS'
-import hashlib
-import json
-from pathlib import Path
-import sys
-
-backends = json.loads(Path(sys.argv[1]).read_text())["architectures"]
-identities = set()
-for backend in backends.values():
-    sdk = Path(backend["install_root"]) / "shmem"
-    required = ["include/shmem.h", "lib/libhyper_multicore_shmem.so", "lib/libhyper_multicore_shmem_utils.so",
-                "lib/aclshmem_bootstrap_uid.so", "lib/aclshmem_bootstrap_config_store.so"]
-    if any(not (sdk / name).is_file() for name in required):
-        raise ValueError(f"Full SHMEM SDK is missing at {sdk}")
-    headers = {str(path.relative_to(sdk)): hashlib.sha256(path.read_bytes()).hexdigest()
-               for folder in ("include", "src/device") for path in sorted((sdk / folder).rglob("*")) if path.is_file()}
-    if not headers:
-        raise ValueError(f"SHMEM SDK headers are missing at {sdk}")
-    identities.add(hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest())
-if len(identities) != 1:
-    raise ValueError("SHMEM SDK headers differ across backends")
-print(identities.pop())
-PYHEADERS
-)
-
-if ! MULTICORE_LOCK_DIGEST=$("${PYTHON_BIN}" -c '
-import hashlib
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as source:
-    lock = json.load(source)["components"]["multicore"]
-encoded = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()
-print(hashlib.sha256(encoded).hexdigest())
-' "${PROJECT_ROOT}/hyper_multicore/_build/dependencies.lock.json"); then
-    fail "MULTICORE_LOCK_INVALID" "Cannot read the locked multicore dependency contract." 9
-fi
-if [[ ! "${MULTICORE_LOCK_DIGEST}" =~ ^[0-9a-f]{64}$ ]]; then
-    fail "MULTICORE_LOCK_INVALID" "Cannot read the locked multicore dependency contract." 9
-fi
-
-mkdir -p "${WORK_ROOT}/logs"
-
-export PIP_NO_BUILD_ISOLATION=false
-export PIP_NO_INDEX=1
-
-echo "INFO: building unified multicore CANN vendor"
-echo "  CANN: ${ASCEND_HOME_PATH}"
-echo "  SOCs: ${CANN_SOC_LIST}"
-echo "  SHMEM SDKs: ${SHMEM_SDK_MANIFEST}"
 
 function calculate_vendor_fingerprint() {
     local cann_soc=$1
@@ -457,16 +390,15 @@ function calculate_vendor_fingerprint() {
     )
 }
 
-COMMON_HOST_INPUT_IDENTITY=$(calculate_vendor_fingerprint "common-host-input")
 function vendor_cache() {
     "${PYTHON_BIN}" -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from _hyper_multicore_bootstrap import load_module; load_module("vendor_cache").main()' \
         "${PROJECT_ROOT}/hyper_multicore/_build" "$@"
 }
 
-declare -a PER_SOC_VENDOR_INPUTS=()
-declare -a PER_SOC_HOST_INPUT_IDENTITIES=()
+SHMEM_SDK_MANIFEST="${HP_SHMEM_HANDOFF:-${COMMON_ROOT}/sdk.json}"
 ARCH_GROUPS=$("${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/soc_selection.py" --groups "${CANN_SOC_LIST}")
-while read -r device_arch _sdk_soc_type cann_soc registered_socs _selected_socs; do
+
+function vendor_paths() {
     SHMEM_INSTALL_ROOT=$("${PYTHON_BIN}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["architectures"][sys.argv[2]]["install_root"])' \
         "${SHMEM_SDK_MANIFEST}" "${device_arch}")
     export ASCEND_SHMEM_HOME_PATH="${SHMEM_INSTALL_ROOT}"
@@ -479,86 +411,188 @@ while read -r device_arch _sdk_soc_type cann_soc registered_socs _selected_socs;
     KERNEL_LOG="${WORK_ROOT}/logs/cann-vendor-build-${device_arch}.log"
     VENDOR_REQUEST="${WORK_ROOT}/vendor-request-${device_arch}.json"
     REUSED_VENDOR="${WORK_ROOT}/vendor-reuse-${device_arch}/hyper_multicore_nn"
-    if [[ -n "${HP_VENDOR_CACHE_ROOT:-}" ]]; then
+}
+
+function prepare_common() {
+    cd "${PROJECT_ROOT}"
+    if [[ "${CLEAN}" == "on" ]]; then
+        rm -rf "${WORK_ROOT}" "${COMPONENT_ROOT}"
+    fi
+    rm -rf "${COMPONENT_ROOT}"
+    mkdir -p "${OUTPUT_ROOT}"
+    SHMEM_ARGS=(--soc-list "${SOC_LIST}" --jobs "${NATIVE_JOBS}")
+    if [[ "${CLEAN}" == "on" ]]; then
+        SHMEM_ARGS+=(--clean)
+    fi
+    bash "${SCRIPT_DIR}/shmem/build.sh" "${SHMEM_ARGS[@]}"
+
+    CURRENT_REASON_CODE="MULTICORE_DEPENDENCY_PREPARATION_FAILED"
+    PREPARED_DEPENDENCIES=$("${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/prepare_dependencies.py" \
+        --dependency ops_nn \
+        --dependency ops_transformer)
+    OPS_NN_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["ops_nn"]["source_dir"])' \
+        "${PREPARED_DEPENDENCIES}")
+    OPS_TRANSFORMER_SOURCE_DIR=$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["ops_transformer"]["source_dir"])' \
+        "${PREPARED_DEPENDENCIES}")
+
+    CURRENT_REASON_CODE="SHMEM_SDK_HANDOFF_FAILED"
+    # SHMEM publishes this before the vendor work root is fingerprinted.
+    SHMEM_HEADERS_IDENTITY=$("${PYTHON_BIN}" - "${SHMEM_SDK_MANIFEST}" <<'PYHEADERS'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+backends = json.loads(Path(sys.argv[1]).read_text())["architectures"]
+identities = set()
+for backend in backends.values():
+    sdk = Path(backend["install_root"]) / "shmem"
+    required = ["include/shmem.h", "lib/libhyper_multicore_shmem.so", "lib/libhyper_multicore_shmem_utils.so",
+                "lib/aclshmem_bootstrap_uid.so", "lib/aclshmem_bootstrap_config_store.so"]
+    if any(not (sdk / name).is_file() for name in required):
+        raise ValueError(f"Full SHMEM SDK is missing at {sdk}")
+    headers = {str(path.relative_to(sdk)): hashlib.sha256(path.read_bytes()).hexdigest()
+               for folder in ("include", "src/device") for path in sorted((sdk / folder).rglob("*")) if path.is_file()}
+    if not headers:
+        raise ValueError(f"SHMEM SDK headers are missing at {sdk}")
+    identities.add(hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest())
+if len(identities) != 1:
+    raise ValueError("SHMEM SDK headers differ across backends")
+print(identities.pop())
+PYHEADERS
+    )
+
+    if ! MULTICORE_LOCK_DIGEST=$("${PYTHON_BIN}" -c '
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    lock = json.load(source)["components"]["multicore"]
+encoded = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(encoded).hexdigest())
+    ' "${PROJECT_ROOT}/hyper_multicore/_build/dependencies.lock.json"); then
+        fail "MULTICORE_LOCK_INVALID" "Cannot read the locked multicore dependency contract." 9
+    fi
+    if [[ ! "${MULTICORE_LOCK_DIGEST}" =~ ^[0-9a-f]{64}$ ]]; then
+        fail "MULTICORE_LOCK_INVALID" "Cannot read the locked multicore dependency contract." 9
+    fi
+
+    mkdir -p "${WORK_ROOT}/logs"
+
+    echo "INFO: building unified multicore CANN vendor"
+    echo "  CANN: ${ASCEND_HOME_PATH}"
+    echo "  SOCs: ${CANN_SOC_LIST}"
+    echo "  SHMEM SDKs: ${SHMEM_SDK_MANIFEST}"
+
+    COMMON_HOST_INPUT_IDENTITY=$(calculate_vendor_fingerprint "common-host-input")
+    PENDING_ARCHES=()
+    while read -r device_arch _sdk_soc_type cann_soc registered_socs _selected_socs; do
+        vendor_paths
         CACHE_ARGS=(prepare --root "${PROJECT_ROOT}" --native "${HP_VENDOR_CACHE_ROOT}"
                     --arch "${device_arch}" --sdk "${SHMEM_INSTALL_ROOT}/shmem" --request "${VENDOR_REQUEST}")
-        if [[ "${HP_VENDOR_CACHE_CLEAN:-}" == "1" ]]; then
-            CACHE_ARGS+=(--clean)
-        fi
+        if [[ "${HP_VENDOR_CACHE_CLEAN:-}" == "1" ]]; then CACHE_ARGS+=(--clean); fi
         vendor_cache "${CACHE_ARGS[@]}"
-        if [[ -d "${REUSED_VENDOR}" ]]; then
-            if (validate_multicore_vendor "${REUSED_VENDOR}" "${cann_soc}"); then
-                PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${REUSED_VENDOR}")
-                PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${COMMON_HOST_INPUT_IDENTITY}")
-                continue
-            fi
-            echo "WARN: cached ${cann_soc} vendor failed validation; rebuilding"
+        if [[ -d "${REUSED_VENDOR}" ]] && (validate_multicore_vendor "${REUSED_VENDOR}" "${cann_soc}"); then
+            continue
         fi
-    fi
-    VENDOR_STARTED=${EPOCHREALTIME}
-    rm -rf "${ASSEMBLY_ROOT}" "${VENDOR_BUILD_ROOT}"
-    CURRENT_REASON_CODE="MULTICORE_SOURCE_ASSEMBLY_FAILED"
-    "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/assemble_multicore_source.py" \
-        --ops-nn-source "${OPS_NN_SOURCE_DIR}" \
-        --ops-transformer-source "${OPS_TRANSFORMER_SOURCE_DIR}" \
-        --work-dir "${ASSEMBLY_ROOT}"
+        PENDING_ARCHES+=("${device_arch}")
+    done <<< "${ARCH_GROUPS}"
+}
 
-    echo "INFO: building isolated ${cann_soc} vendor input from ${SOURCE_ROOT}"
-    CURRENT_REASON_CODE="CANN_VENDOR_BUILD_FAILED"
-    set +e
-    (
-        set -e
-        cmake -S "${MULTICORE_VENDOR_CMAKE}" \
-            -B "${VENDOR_BUILD_ROOT}" \
-            -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
-            -DASCEND_CANN_PACKAGE_PATH="${ASCEND_HOME_PATH}" \
-            -DASCEND_COMPUTE_UNIT="${cann_soc}" \
-            -DHP_MULTICORE_REGISTERED_SOCS="${registered_socs//,/;}" \
-            -DASCEND_PYTHON_EXECUTABLE="${PYTHON_BIN}" \
-            -DHP_MULTICORE_SOURCE_ROOT="${SOURCE_ROOT}" \
-            -DHP_SHMEM_SDK_ROOT="${SHMEM_INSTALL_ROOT}/shmem" \
-            -DHP_VENDOR_STAGE_ROOT="${VENDOR_STAGE_ROOT}"
-        cmake --build "${VENDOR_BUILD_ROOT}" --parallel "${NATIVE_JOBS}"
-        cmake --build "${VENDOR_BUILD_ROOT}" --parallel "${NATIVE_JOBS}" \
-            --target binary
-        cmake --install "${VENDOR_BUILD_ROOT}"
-    ) 2>&1 | tee "${KERNEL_LOG}"
-    cann_build_status=${PIPESTATUS[0]}
-    set -e
-    if [[ ${cann_build_status} -ne 0 ]]; then
-        fail "CANN_VENDOR_BUILD_FAILED" \
-            "${cann_soc} CANN vendor build exited ${cann_build_status}; inspect ${KERNEL_LOG}." \
-            "${cann_build_status}"
-    fi
+case "${PHASE}" in
+    prepare)
+        prepare_common >&2
+        "${PYTHON_BIN}" - "${OPS_NN_SOURCE_DIR}" "${OPS_TRANSFORMER_SOURCE_DIR}" \
+            "${COMMON_HOST_INPUT_IDENTITY}" "${PENDING_ARCHES[@]}" <<'PYCONTEXT'
+import json
+import sys
+print(json.dumps({"ops_nn_source": sys.argv[1], "ops_transformer_source": sys.argv[2],
+                  "host_input_identity": sys.argv[3], "pending": sys.argv[4:]}))
+PYCONTEXT
+        exit 0
+        ;;
+    vendor)
+        export PIP_NO_BUILD_ISOLATION=false
+        export PIP_NO_INDEX=1
+        while read -r device_arch _sdk_soc_type cann_soc registered_socs _selected_socs; do
+            if [[ "${device_arch}" != "${DEVICE_ARCH}" ]]; then continue; fi
+            vendor_paths
+            VENDOR_STARTED=${EPOCHREALTIME}
+            rm -rf "${ASSEMBLY_ROOT}" "${VENDOR_BUILD_ROOT}"
+            CURRENT_REASON_CODE="MULTICORE_SOURCE_ASSEMBLY_FAILED"
+            "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/assemble_multicore_source.py" \
+                --ops-nn-source "${HP_OPS_NN_SOURCE}" \
+                --ops-transformer-source "${HP_OPS_TRANSFORMER_SOURCE}" \
+                --work-dir "${ASSEMBLY_ROOT}"
 
-    if [[ ! -d "${VENDOR_CANDIDATE}" ]]; then
-        fail "UNIFIED_VENDOR_NOT_FOUND" \
-            "Expected ${cann_soc} hyper_multicore_nn package at ${VENDOR_CANDIDATE}." 12
-    fi
-    CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
-    validate_multicore_vendor "${VENDOR_CANDIDATE}" "${cann_soc}" "${KERNEL_LOG}"
-    if [[ -n "${HP_VENDOR_CACHE_ROOT:-}" ]]; then
-        vendor_cache built --request "${VENDOR_REQUEST}" --candidate "${VENDOR_CANDIDATE}" --started "${VENDOR_STARTED}"
-    fi
-    PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${VENDOR_CANDIDATE}")
-    PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${COMMON_HOST_INPUT_IDENTITY}")
-done <<< "${ARCH_GROUPS}"
+            echo "INFO: building isolated ${cann_soc} vendor input from ${SOURCE_ROOT}"
+            CURRENT_REASON_CODE="CANN_VENDOR_BUILD_FAILED"
+            set +e
+            (
+                set -e
+                cmake -S "${MULTICORE_VENDOR_CMAKE}" \
+                    -B "${VENDOR_BUILD_ROOT}" \
+                    -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
+                    -DASCEND_CANN_PACKAGE_PATH="${ASCEND_HOME_PATH}" \
+                    -DASCEND_COMPUTE_UNIT="${cann_soc}" \
+                    -DHP_MULTICORE_REGISTERED_SOCS="${registered_socs//,/;}" \
+                    -DASCEND_PYTHON_EXECUTABLE="${PYTHON_BIN}" \
+                    -DHP_MULTICORE_SOURCE_ROOT="${SOURCE_ROOT}" \
+                    -DHP_SHMEM_SDK_ROOT="${SHMEM_INSTALL_ROOT}/shmem" \
+                    -DHP_VENDOR_STAGE_ROOT="${VENDOR_STAGE_ROOT}"
+                cmake --build "${VENDOR_BUILD_ROOT}" --parallel "${NATIVE_JOBS}"
+                cmake --build "${VENDOR_BUILD_ROOT}" --parallel "${NATIVE_JOBS}" \
+                    --target binary
+                cmake --install "${VENDOR_BUILD_ROOT}"
+            ) 2>&1 | tee "${KERNEL_LOG}"
+            cann_build_status=${PIPESTATUS[0]}
+            set -e
+            if [[ ${cann_build_status} -ne 0 ]]; then
+                fail "CANN_VENDOR_BUILD_FAILED" \
+                    "${cann_soc} CANN vendor build exited ${cann_build_status}; inspect ${KERNEL_LOG}." \
+                    "${cann_build_status}"
+            fi
 
-VENDOR_ROOT="${OUTPUT_ROOT}/vendors/hyper_multicore_nn"
-mkdir -p "$(dirname "${VENDOR_ROOT}")"
-CURRENT_REASON_CODE="CANN_VENDOR_MERGE_FAILED"
-"${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/merge_multicore_vendors.py" \
-    "${PER_SOC_VENDOR_INPUTS[@]}" \
-    "${PER_SOC_HOST_INPUT_IDENTITIES[@]}" \
-    --soc-list "${CANN_SOC_LIST}" \
-    --output "${VENDOR_ROOT}"
+            if [[ ! -d "${VENDOR_CANDIDATE}" ]]; then
+                fail "UNIFIED_VENDOR_NOT_FOUND" \
+                    "Expected ${cann_soc} hyper_multicore_nn package at ${VENDOR_CANDIDATE}." 12
+            fi
+            CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
+            validate_multicore_vendor "${VENDOR_CANDIDATE}" "${cann_soc}" "${KERNEL_LOG}"
+            if [[ -n "${HP_VENDOR_CACHE_ROOT:-}" ]]; then
+                vendor_cache built --request "${VENDOR_REQUEST}" --candidate "${VENDOR_CANDIDATE}" --started "${VENDOR_STARTED}"
+            fi
+            exit 0
+        done <<< "${ARCH_GROUPS}"
+        fail "UNSUPPORTED_SOC_SELECTION" "Architecture ${DEVICE_ARCH} is not selected." 10
+        ;;
+    merge)
+        PER_SOC_VENDOR_INPUTS=()
+        PER_SOC_HOST_INPUT_IDENTITIES=()
+        while read -r device_arch _sdk_soc_type cann_soc registered_socs _selected_socs; do
+            vendor_paths
+            candidate=$("${PYTHON_BIN}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate"])' "${VENDOR_REQUEST}")
+            PER_SOC_VENDOR_INPUTS+=("--input" "${cann_soc}=${candidate}")
+            PER_SOC_HOST_INPUT_IDENTITIES+=("--host-input-identity" "${cann_soc}=${HP_VENDOR_HOST_IDENTITY}")
+        done <<< "${ARCH_GROUPS}"
+        VENDOR_ROOT="${OUTPUT_ROOT}/vendors/hyper_multicore_nn"
+        mkdir -p "$(dirname "${VENDOR_ROOT}")"
+        CURRENT_REASON_CODE="CANN_VENDOR_MERGE_FAILED"
+        "${PYTHON_BIN}" "${PROJECT_ROOT}/hyper_multicore/_build/merge_multicore_vendors.py" \
+            "${PER_SOC_VENDOR_INPUTS[@]}" \
+            "${PER_SOC_HOST_INPUT_IDENTITIES[@]}" \
+            --soc-list "${CANN_SOC_LIST}" \
+            --output "${VENDOR_ROOT}"
 
-CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
-validate_multicore_vendor "${VENDOR_ROOT}" "${CANN_SOC_LIST}" "" architecture
-cp "${PROJECT_ROOT}/hyper_multicore/set_env.bash" "${OUTPUT_ROOT}/set_env.bash"
+        CURRENT_REASON_CODE="CANN_VENDOR_VALIDATION_FAILED"
+        validate_multicore_vendor "${VENDOR_ROOT}" "${CANN_SOC_LIST}" "" architecture
+        cp "${PROJECT_ROOT}/hyper_multicore/set_env.bash" "${OUTPUT_ROOT}/set_env.bash"
 
-while IFS= read -r packaged_library; do
-    validate_shared_library_security "${packaged_library}"
-done < <(find "${COMPONENT_ROOT}" -type f -name '*.so' -print)
-echo "INFO: common multicore resources completed: ${COMPONENT_ROOT}"
-exit 0
+        while IFS= read -r packaged_library; do
+            validate_shared_library_security "${packaged_library}"
+        done < <(find "${COMPONENT_ROOT}" -type f -name '*.so' -print)
+        echo "INFO: common multicore resources completed: ${COMPONENT_ROOT}"
+        ;;
+    *) fail "INVALID_SELECTION" "Unknown internal build phase: ${PHASE}." 2 ;;
+esac

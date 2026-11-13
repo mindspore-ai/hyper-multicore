@@ -349,8 +349,10 @@ def build_common(args, run: BuildContext, python: Path):
         env["HP_VENDOR_CACHE_CLEAN"] = "1"
     else:
         env.pop("HP_VENDOR_CACHE_CLEAN", None)
-    run.commands(["bash", str(ROOT / "hyper_multicore/build.sh"), "--stage-only",
-                  "--soc-list", args.soc_list, "--jobs", str(args.jobs)], label="common-resources", env=env)
+    command = ["bash", str(ROOT / "hyper_multicore/build.sh"), "--stage-only",
+               "--soc-list", args.soc_list]
+    prepared = json.loads(run.commands(command + ["--phase", "prepare", "--jobs", str(args.jobs)],
+                                       label="common-prepare", env=env, capture=True))
     handoff = json.loads((directory / "sdk.json").read_text())
     sdks = handoff["architectures"]
     if set(sdks) != set(args.architectures):
@@ -361,6 +363,11 @@ def build_common(args, run: BuildContext, python: Path):
             raise ValueError(f"SHMEM SDK backend {name} does not match {socs}")
         sdk.update(**ARCHITECTURES[name], shmem_root=f"shmem/lib/{name}",
                    kernel_root=f"lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/{name}")
+    env.update(HP_OPS_NN_SOURCE=prepared["ops_nn_source"],
+               HP_OPS_TRANSFORMER_SOURCE=prepared["ops_transformer_source"],
+               HP_VENDOR_HOST_IDENTITY=prepared["host_input_identity"])
+    build_vendors(command, prepared["pending"], args.jobs, run, env)
+    run.commands(command + ["--phase", "merge"], label="common-merge", env=env)
     run.vendor_requests = [json.loads(p.read_text())
                            for p in sorted((directory / "work").glob("vendor-request-*.json"))]
     for request in run.vendor_requests:
@@ -370,12 +377,44 @@ def build_common(args, run: BuildContext, python: Path):
     return common, sdks
 
 
-def adapter_budgets(count, jobs):
+def compiler_budgets(count: int, jobs: int) -> list[int]:
     """Use serial, two-slot or all-target scheduling without exceeding the compile budget."""
     workers = count if jobs >= 2 * count else (2 if jobs >= 4 else 1)
     workers = min(workers, count)
     quotient, remainder = divmod(jobs, workers)
     return [quotient + (slot < remainder) for slot in range(workers)]
+
+
+def build_vendors(command: list[str], pending: list[str], jobs: int,
+                  run: BuildContext, env: dict[str, str]) -> None:
+    """Compile cache misses within one job budget; merge only after every task succeeds."""
+    if not pending:
+        return
+    budgets = compiler_budgets(len(pending), jobs)
+    run.commands.add_event({"stage": "vendor-schedule", "architectures": pending,
+                            "worker_jobs": budgets, "total_jobs": jobs})
+
+    def compile_slot(architectures: list[str], budget: int) -> None:
+        """Execute assigned architectures with an independent environment and fixed quota."""
+        for arch in architectures:
+            with run.commands.scope(f"{arch} / Vendor"):
+                run.commands(command + ["--phase", "vendor", "--arch", arch, "--jobs", str(budget)],
+                             label=f"vendor-{arch}", env=env.copy())
+
+    if len(budgets) == 1:
+        compile_slot(pending, budgets[0])
+        return
+    pool = ThreadPoolExecutor(max_workers=len(budgets), thread_name_prefix="native-vendor")
+    try:
+        futures = [pool.submit(compile_slot, pending[slot::len(budgets)], budget)
+                   for slot, budget in enumerate(budgets)]
+        for future in as_completed(futures):
+            future.result()
+    except BaseException as error:
+        run.commands.cancel(error)
+        raise run.commands.failure or error
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def build_adapter(index, count, python, identity, jobs, args, run, common, sdk, transaction):
@@ -450,7 +489,7 @@ def parallel_adapters(args, run, pythons, identities, common, sdk, transaction, 
 def build_adapters(args, run: BuildContext, pythons, identities, common, sdk, transaction: SourceGuard):
     """Compile framework variants within the shared job budget and preserve matrix order."""
     count = len(identities)
-    budgets = adapter_budgets(count, args.jobs) if args.all else [args.jobs]
+    budgets = compiler_budgets(count, args.jobs) if args.all else [args.jobs]
     message(f"Adapter schedule: {len(budgets)} concurrent framework variants; "
             f"compiler jobs per slot {', '.join(map(str, budgets))}; total budget {args.jobs}")
     run.commands.add_event({"stage": "adapter-schedule", "workers": len(budgets),

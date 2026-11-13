@@ -25,7 +25,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from .build_utils import atomic_json as write_json
@@ -142,9 +142,9 @@ def stage_failure(label: str, status: int, log: Path, start=0, end=None) -> str:
 class StageOutput:
     """Mirror tool logs live and report quiet stages without piping or blocking the child."""
 
-    def __init__(self, log: Path, label: str, started: float, *, capture=False, heartbeat=10.0, context=""):
+    def __init__(self, log: Path, label: str, started: float, *, heartbeat=10.0, context=""):
         self.log, self.label, self.started = log, label, started
-        self.capture, self.heartbeat, self.context = capture, heartbeat, context
+        self.heartbeat, self.context = heartbeat, context
         self.pending = ""
         self.stopped = threading.Event()
         self.worker = threading.Thread(target=self.follow, name="native-build-output", daemon=True)
@@ -174,7 +174,7 @@ class StageOutput:
         last_output = time.monotonic()
         with self.log.open("rb") as source:
             while True:
-                data = b"" if self.capture else source.read(8192)
+                data = source.read(8192)
                 if data:
                     if not self.emit_lines(decoder.decode(data)):
                         return
@@ -304,17 +304,19 @@ class Commands:
             message(f"Stopping {len(processes)} active tool process groups", "WARN")
             stop_stages(processes)
 
+    @contextmanager
     def start(self, command, output, env, capture):
-        """Make cancellation and process registration atomic with respect to worker starts."""
-        with self._process_lock:
-            if self.cancelled.is_set():
-                raise CommandCancelled("Build cancelled; no further commands will start")
-            process = subprocess.Popen(
-                command, cwd=self.root, env=env, stdout=subprocess.PIPE if capture else output,
-                stderr=output, text=True, start_new_session=True,
-            )
-            self._processes[process.pid] = process
-            return process
+        """Register starts atomically and scope process resources to execution."""
+        with ExitStack() as resources:
+            with self._process_lock:
+                if self.cancelled.is_set():
+                    raise CommandCancelled("Build cancelled; no further commands will start")
+                process = resources.enter_context(subprocess.Popen(
+                    command, cwd=self.root, env=env, stdout=subprocess.PIPE if capture else output,
+                    stderr=output, text=True, start_new_session=True,
+                ))
+                self._processes[process.pid] = process
+            yield process
 
     def record(self, command, label, started, wall_started, spool, status, error=None):
         """Merge one complete raw block and give it an exclusive byte interval."""
@@ -340,10 +342,9 @@ class Commands:
     def execute(self, command, label, spool, started, env, capture):
         """Each child owns its output file; only terminal rendering is shared while running."""
         stdout = None
-        with spool.open("wb", buffering=0) as output:
-            process = self.start(command, output, env, capture)
+        with spool.open("wb", buffering=0) as output, self.start(command, output, env, capture) as process:
             try:
-                with StageOutput(spool, label, started, capture=capture,
+                with StageOutput(spool, label, started,
                                  context=getattr(self._local, "context", "")):
                     stdout, _ = process.communicate()
             except BaseException as error:
@@ -382,7 +383,9 @@ class Commands:
                     error = CommandCancelled("Stage cancelled after another failure or interruption")
             except BaseException as caught:
                 error = caught
-            record = self.record(command, label, started, wall_started, spool, status, error)
+                raise
+            finally:
+                record = self.record(command, label, started, wall_started, spool, status, error)
         finally:
             spool.unlink(missing_ok=True)
         if error is not None:
