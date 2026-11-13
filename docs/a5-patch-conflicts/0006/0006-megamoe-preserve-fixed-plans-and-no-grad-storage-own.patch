@@ -1,0 +1,183 @@
+From 47b928f96da766d7358df381d1f7197f96eb46f8 Mon Sep 17 00:00:00 2001
+From: hedongdong <hdd475375904@126.com>
+Date: Fri, 13 Nov 2026 18:25:23 +0800
+Subject: [PATCH 06/27] megamoe: preserve fixed plans and no-grad storage
+ ownership
+
+---
+ hyper_multicore/modules/mega_moe/function.py | 41 +++++++++++---------
+ hyper_multicore/modules/mega_moe/module.py   | 13 +++++--
+ tests/ut/modules/mega_moe/test_function.py   |  1 +
+ 3 files changed, 34 insertions(+), 21 deletions(-)
+
+diff --git a/hyper_multicore/modules/mega_moe/function.py b/hyper_multicore/modules/mega_moe/function.py
+index 27f4b8e..b48a975 100644
+--- a/hyper_multicore/modules/mega_moe/function.py
++++ b/hyper_multicore/modules/mega_moe/function.py
+@@ -476,6 +476,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
+         permutation: tuple[Any, Any, Any] | None,
+         topk_weights: torch.Tensor | None,
+         workspace_claimed: bool,
++        grad_enabled: bool = True,
+     ) -> Any:
+         """Launch the legacy forward op and save owned backward inputs.
+ 
+@@ -496,8 +497,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
+             Owned expert-major output rows.
+         """
+         spec = plan.spec
+-        if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
+-            raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
++        retain_backward = grad_enabled and any(ctx.needs_input_grad)
++        if topk_weights is not None and (permutation is None or (spec.dispatch_mode != "pull" and retain_backward)):
++            raise ValueError("Integrated output unpermutation requires pull or no-grad execution and an input permutation.")
+         metadata = route
+         permutation_inputs = ()
+         if permutation is not None:
+@@ -533,8 +535,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
+                 weight2,
+                 execution,
+             )
+-            output = execution.combine[:ctx.source_rows].clone()
+-            if spec.dispatch_mode == "pull":
++            output = execution.combine[:ctx.source_rows]
++            if retain_backward or not ctx.has_unpermute:
++                output = output.clone()
++            if not retain_backward:
++                saved_dispatch = None
++            elif spec.dispatch_mode == "pull":
+                 saved_dispatch = execution.dispatch
+             else:
+                 # Combine has consumed down_proj before SHMEM dispatch is reused.
+@@ -545,19 +551,15 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
+                 ctx.topk_dtype = topk_weights.dtype
+                 permutation_inputs += (output, probs)
+                 output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
+-                          if ctx.source_rows else output[:0])
+-            _save_forward_state(
+-                ctx,
+-                plan,
+-                workspace,
+-                saved_dispatch,
+-                execution.intermediates.up_proj,
+-                execution.intermediates.activation,
+-                weight1,
+-                weight2,
+-                metadata,
+-                permutation_inputs,
+-            )
++                          if ctx.source_rows else output.new_empty((0, spec.hidden_size)))
++                if not retain_backward and output.untyped_storage().data_ptr() == execution.combine.untyped_storage().data_ptr():
++                    output = output.clone()
++            if retain_backward:
++                _save_forward_state(
++                    ctx, plan, workspace, saved_dispatch,
++                    execution.intermediates.up_proj, execution.intermediates.activation,
++                    weight1, weight2, metadata, permutation_inputs,
++                )
+             return output
+         finally:
+             if not workspace_claimed:
+@@ -608,7 +610,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
+             ))
+             grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+             _release_completed_graph(ctx, workspace)
+-            return (
++            gradients = (
+                 grad_input,
+                 execution.intermediates.grad_weight1,
+                 execution.intermediates.grad_weight2,
+@@ -619,6 +621,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
+                 grad_topk_weights,
+                 None,
+             )
++            return gradients + (None,) if len(ctx.needs_input_grad) == 10 else gradients
+         finally:
+             workspace.release()
+ 
+@@ -656,6 +659,7 @@ def execute_mega_moe(
+         None,
+         None,
+         False,
++        torch.is_grad_enabled(),
+     )
+ 
+ 
+@@ -699,4 +703,5 @@ def execute_mega_moe_with_permutation(
+         (route.routed_tokens, topk_ids, route.unpermute_mapping),
+         topk_weights,
+         workspace_claimed,
++        torch.is_grad_enabled(),
+     )
+diff --git a/hyper_multicore/modules/mega_moe/module.py b/hyper_multicore/modules/mega_moe/module.py
+index aca0a76..0e591bf 100644
+--- a/hyper_multicore/modules/mega_moe/module.py
++++ b/hyper_multicore/modules/mega_moe/module.py
+@@ -19,6 +19,7 @@ from __future__ import annotations
+ __all__ = ["MegaMoeExperts"]
+ 
+ import math
++import os
+ import struct
+ from collections.abc import Mapping
+ from dataclasses import replace
+@@ -435,6 +436,10 @@ class MegaMoeExperts(MulticoreModule):
+         self.ep_size = specification["ep_size"]
+         self.local_experts = self.num_experts // self.ep_size
+         self._ep_group = specification["ep_group"]
++        no_copy = os.environ.get("HYPER_MULTICORE_BF16_NOGRAD_NO_COPY", "1")
++        if no_copy not in ("0", "1"):
++            raise ValueError("BF16 no-grad no-copy must be 0 or 1")
++        self.nograd_no_copy = no_copy == "1"
+         if create_parameters:
+             self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
+                 self.local_experts, self.hidden_size, self.intermediate_size, self.expert_weight_layout,
+@@ -653,6 +658,7 @@ class MegaMoeExperts(MulticoreModule):
+         )}
+         pull = self.dispatch_mode == "pull"
+         automatic = resources.spec.auto_tokens
++        fast_no_grad = self.nograd_no_copy and not torch.is_grad_enabled() and resources.spec.transport_engine == "udma"
+         claimed = False
+         def prepare_workspace(tokens: int, received: int) -> None:
+             """Grow before publishing pull source rows into symmetric memory.
+@@ -685,7 +691,8 @@ class MegaMoeExperts(MulticoreModule):
+                 )
+             if not pull and not automatic:
+                 resources.ensure_capacity(route.maximum_received_slots)
+-            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
++            plan = (resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
++                    if automatic else resources.plan)
+             expert_output = execute_mega_moe_with_permutation(
+                 hidden_flat,
+                 topk_ids,
+@@ -694,13 +701,13 @@ class MegaMoeExperts(MulticoreModule):
+                 route,
+                 plan,
+                 resources.workspace,
+-                topk_weights=topk_weights if pull else None,
++                topk_weights=topk_weights if pull or fast_no_grad else None,
+                 workspace_claimed=pull,
+             )
+         finally:
+             if claimed:
+                 resources.workspace.release()
+-        if pull:
++        if pull or fast_no_grad:
+             return expert_output.reshape_as(hidden_states)
+         output = restore_topk_output(
+             expert_output,
+diff --git a/tests/ut/modules/mega_moe/test_function.py b/tests/ut/modules/mega_moe/test_function.py
+index a969de6..8c21808 100644
+--- a/tests/ut/modules/mega_moe/test_function.py
++++ b/tests/ut/modules/mega_moe/test_function.py
+@@ -114,6 +114,7 @@ class TestMegaMoeFunction(unittest.TestCase):
+         """
+         tensors = tuple(torch.ones(1) for _ in range(13))
+         context = Mock()
++        context.needs_input_grad = (False,) * 9
+         gradient = torch.ones(1)
+         context.plan.spec.dispatch_mode = "push"
+         execution = function_module._BackwardExecution(
+-- 
+2.54.0
+

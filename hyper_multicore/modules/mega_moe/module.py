@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = ["MegaMoeExperts"]
 
 import math
+import os
 import struct
 from collections.abc import Mapping
 from dataclasses import replace
@@ -435,6 +436,10 @@ class MegaMoeExperts(MulticoreModule):
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
         self._ep_group = specification["ep_group"]
+        no_copy = os.environ.get("HYPER_MULTICORE_BF16_NOGRAD_NO_COPY", "1")
+        if no_copy not in ("0", "1"):
+            raise ValueError("BF16 no-grad no-copy must be 0 or 1")
+        self.nograd_no_copy = no_copy == "1"
         if create_parameters:
             self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
                 self.local_experts, self.hidden_size, self.intermediate_size, self.expert_weight_layout,
@@ -653,6 +658,7 @@ class MegaMoeExperts(MulticoreModule):
         )}
         pull = self.dispatch_mode == "pull"
         automatic = resources.spec.auto_tokens
+        fast_no_grad = self.nograd_no_copy and not torch.is_grad_enabled() and resources.spec.transport_engine == "udma"
         claimed = False
         def prepare_workspace(tokens: int, received: int) -> None:
             """Grow before publishing pull source rows into symmetric memory.
@@ -685,7 +691,8 @@ class MegaMoeExperts(MulticoreModule):
                 )
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            plan = (resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+                    if automatic else resources.plan)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
@@ -694,13 +701,13 @@ class MegaMoeExperts(MulticoreModule):
                 route,
                 plan,
                 resources.workspace,
-                topk_weights=topk_weights if pull else None,
+                topk_weights=topk_weights if pull or fast_no_grad else None,
                 workspace_claimed=pull,
             )
         finally:
             if claimed:
                 resources.workspace.release()
-        if pull:
+        if pull or fast_no_grad:
             return expert_output.reshape_as(hidden_states)
         output = restore_topk_output(
             expert_output,

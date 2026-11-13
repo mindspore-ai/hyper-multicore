@@ -25,5 +25,13 @@
     ],
     "rejected_hunks": [],
     "action": "incoming conflict versions retained; all stages archived for review"
+  },
+  {
+    "patch": 6,
+    "unmerged_paths": [
+      "hyper_multicore/modules/mega_moe/function.py"
+    ],
+    "rejected_hunks": [],
+    "action": "incoming conflict versions retained; all stages archived for review"
   }
 ]

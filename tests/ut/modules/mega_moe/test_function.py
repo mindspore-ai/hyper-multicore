@@ -134,6 +134,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         """
         tensors = tuple(torch.ones(1) for _ in range(13))
         context = Mock()
+        context.needs_input_grad = (False,) * 9
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
         context.plan.spec.apply_probs_before_fc2 = False
