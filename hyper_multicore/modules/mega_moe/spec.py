@@ -33,7 +33,7 @@ _DEFAULT_CAPACITY_FACTOR = 1.25
 
 @dataclass(frozen=True)
 class MegaMoeSpec:
-    """Shape, capacity, topology, and hardware values bound on first use."""
+    """Shape, capacity, topology, and Device core limits bound on first use."""
 
     local_num_tokens: int
     hidden_size: int
@@ -211,7 +211,7 @@ def bind_mega_moe_spec(
         ep_size=ep_size,
         ep_group=ep_group,
         rank_id=rank_id,
-        num_cube_cores=num_cube_cores,
+        num_cube_cores=core_spec.num_cube_cores,
         swiglu_limit=swiglu_limit,
         clamp_after_activation=specification.get("clamp_after_activation", False),
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),

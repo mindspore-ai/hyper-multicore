@@ -21,8 +21,8 @@ constexpr uint32_t MAX_INPUTS_PER_TASK = 4;
 constexpr uint32_t MAX_OUTPUTS_PER_TASK = 4;
 
 constexpr uint32_t MIN_EVENT_CAPACITY = 1024;
-constexpr uint32_t NUM_WORKERS_VECTOR = 48;
-constexpr uint32_t NUM_WORKERS_CUBE = 24;
+// Minimum Cube worker slots in the serialized runtime.
+constexpr uint32_t MIN_CUBE_WORKER_CAPACITY = 24;
 constexpr uint32_t MIN_GROUP_LIST_CAPACITY = 512;
 constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
 constexpr uint32_t RUNTIME_PROTOCOL_VERSION = 1;
@@ -214,6 +214,11 @@ __aicore__ inline uint32_t getTaskNum(__gm__ uint8_t *tiling) { return (*(__gm__
 
 __aicore__ inline uint32_t getNumWorkers(__gm__ uint8_t *tiling) {
   return (*(__gm__ uint32_t *)(tiling + UINT32_T_SIZE));
+}
+
+__aicore__ inline uint32_t getCubeWorkerCapacity(__gm__ uint8_t *tiling) {
+  const uint32_t workers = (static_cast<uint64_t>(getNumWorkers(tiling)) + 1) / 2;
+  return workers > MIN_CUBE_WORKER_CAPACITY ? workers : MIN_CUBE_WORKER_CAPACITY;
 }
 
 __aicore__ inline uint32_t getRuntimeTaskCapacity(__gm__ uint8_t *tiling) {
@@ -420,7 +425,8 @@ __aicore__ inline uint64_t getGroupedMatmulGroupListStride(__gm__ uint8_t *tilin
 }
 
 __aicore__ inline uint64_t getGroupedMatmulGroupListBytes(__gm__ uint8_t *tiling) {
-  const uint64_t bytes = NUM_WORKERS_CUBE * getGroupedMatmulGroupListStride(tiling) + GROUP_LIST_CACHE_LINE_BYTES;
+  const uint64_t bytes = getCubeWorkerCapacity(tiling) * getGroupedMatmulGroupListStride(tiling) +
+                         GROUP_LIST_CACHE_LINE_BYTES;
   const uint64_t minimum = MIN_GROUP_LIST_CAPACITY * INT64_T_SIZE;
   return bytes > minimum ? bytes : minimum;
 }

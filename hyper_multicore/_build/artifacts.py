@@ -17,7 +17,7 @@
 from __future__ import annotations
 import argparse
 import hashlib
-from importlib import metadata
+from importlib import import_module, metadata
 import json
 import os
 from pathlib import Path
@@ -28,18 +28,15 @@ import sys
 import time
 from contextlib import contextmanager
 from packaging.version import Version
+from packaging.utils import canonicalize_name
 from ._bootstrap import load_module
 from .build_utils import version_label
+from .soc_selection import DEFAULT_SOC_LIST, SOC_ARCHITECTURES, SUPPORTED_SOCS
 
 COMPONENT_VERSION = "0.1.0.dev0"
 _MANIFEST = load_module("native_manifest")
 REQUIRED_LIBRARIES = (
     "lib/vendors/hyper_multicore_nn/op_api/lib/libcust_opapi.so",
-    "shmem/lib/libhyper_multicore_shmem_ops.so",
-    "shmem/lib/shmem/libhyper_multicore_shmem.so",
-    "shmem/lib/shmem/libhyper_multicore_shmem_utils.so",
-    "shmem/lib/shmem/aclshmem_bootstrap_uid.so",
-    "shmem/lib/shmem/aclshmem_bootstrap_config_store.so",
 )
 _VENDOR_OPERATORS = (
     "hyper_mega_moe",
@@ -87,7 +84,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _shmem_cpp_test_sources(root: Path) -> list[Path]:
+    """Return SHMEM C++ test sources in a stable order."""
+    return sorted(path for path in (root / "tests/ut/shmem/cpp").glob("*.cpp") if path.is_file())
+
+
 def _source_identity(root: Path) -> dict:
+    """Hash build inputs and record the checkout commit."""
     inputs = {}
     for directory in ("hyper_multicore", "scripts"):
         for path in sorted((root / directory).rglob("*")):
@@ -101,8 +104,8 @@ def _source_identity(root: Path) -> dict:
                 inputs[path.relative_to(root).as_posix()] = _sha256(path)
     for name in ("setup.py", "MANIFEST.in", "build.sh", "requirements.txt"):
         inputs[name] = _sha256(root / name)
-    native_test = root / "tests/ut/shmem/native_log_test.cpp"
-    inputs["tests/ut/shmem/native_log_test.cpp"] = _sha256(native_test) if native_test.is_file() else None
+    for path in _shmem_cpp_test_sources(root):
+        inputs[path.relative_to(root).as_posix()] = _sha256(path)
     build_commit = None
     if (root / ".git").exists():
         result = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=False, capture_output=True)
@@ -140,10 +143,11 @@ def build_identity(root: Path, soc_list: str, *, source=None, timings=None, expe
     verify_package_versions(expected_versions or {}, timings)
     pta = _MANIFEST.framework_package("torch_npu")
     with identity_phase(timings, "framework_import"):
-        import torch
+        torch = import_module("torch")
     with identity_phase(timings, "source_identity"):
         source = _source_identity(root) if source is None else source
-    info = identity_metadata(root, soc_list, torch, str(getattr(torch, "__version__", "unknown")), pta["version"], source)
+    info = identity_metadata(root, soc_list, torch, str(getattr(torch, "__version__", "unknown")),
+                             pta["version"], source)
     info["framework_locations"] = {"torch": str(Path(torch.__file__).resolve().parent), "torch_npu": pta["root"]}
     info["build_fingerprint"] = hashlib.sha256(json.dumps(info, sort_keys=True).encode()).hexdigest()
     return info
@@ -172,7 +176,7 @@ def identity_metadata(root, soc_list, torch, torch_version, pta_version, source)
         "torch_version": torch_version,
         "op_plugin_version": torch_op_plugin_version(Path(torch.__file__).resolve().parent),
         "torch_commit": getattr(torch.version, "git_version", None),
-        "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+        "torch_cxx11_abi": torch.compiled_with_cxx11_abi(),
         "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
         "host_arch": platform.machine(),
         "soc_list": soc_list.split(","),
@@ -206,7 +210,7 @@ def _kernel_references(value):
             yield from _kernel_references(item)
 
 
-def _kernel_index_resources(kernel_root: Path, index: Path) -> list[Path]:
+def _kernel_index_resources(kernel_root: Path, index: Path, device_arch: str) -> list[Path]:
     """Require every indexed kernel variant and its metadata/object pair."""
     if not index.is_file():
         raise RuntimeError(f"Missing native payload resource: {index}")
@@ -220,7 +224,7 @@ def _kernel_index_resources(kernel_root: Path, index: Path) -> list[Path]:
     required = []
     for relative in references:
         path = kernel_root / relative
-        if not path.resolve().is_relative_to(kernel_root.resolve()):
+        if Path(relative).parts[0] != device_arch or not path.resolve().is_relative_to(kernel_root.resolve()):
             raise RuntimeError(f"Kernel index reference outside payload: {relative}")
         required.append(path)
         if path.suffix == ".json":
@@ -233,7 +237,7 @@ def _validate_vendor_resources(root: Path, soc_list: list[str], host_arch: str) 
     if (
         not isinstance(soc_list, list)
         or not soc_list
-        or any(soc not in {"ascend910b", "ascend910_93"} for soc in soc_list)
+        or any(soc not in SUPPORTED_SOCS for soc in soc_list)
     ):
         raise RuntimeError(f"Missing or unsupported payload SoC list: {soc_list}")
     if host_arch not in {"aarch64", "x86_64"}:
@@ -252,12 +256,12 @@ def _validate_vendor_resources(root: Path, soc_list: list[str], host_arch: str) 
             required.append(index)
             indexes.append(index)
             for suffix in (".o", ".json"):
-                matches = sorted((vendor / f"kernel/{soc}/{operator}").glob(f"*{suffix}"))
+                matches = sorted((vendor / f"kernel/{SOC_ARCHITECTURES[soc]}/{operator}").glob(f"*{suffix}"))
                 if not matches:
                     raise RuntimeError(f"Missing native payload resource: {soc}/{operator}/*{suffix}")
                 required.extend(matches)
         for index in indexes:
-            required.extend(_kernel_index_resources(vendor / "kernel", index))
+            required.extend(_kernel_index_resources(vendor / "kernel", index, SOC_ARCHITECTURES[soc]))
         for path in required:
             if not path.is_file() or path.stat().st_size == 0:
                 raise RuntimeError(f"Missing or empty native payload resource: {path.relative_to(root)}")
@@ -293,7 +297,7 @@ def validate_payload(root: Path, info: dict) -> None:
     if info.get("build_mode") not in ("current", "all"):
         raise RuntimeError("Unknown payload build mode")
     if info["build_mode"] == "current" and len(manifest["variants"]) != 1:
-        raise RuntimeError("Current-environment payload must contain one adapter pair")
+        raise RuntimeError("Current-environment payload must contain one framework variant")
     _validate_payload_hashes(root, info)
 
 
@@ -316,7 +320,7 @@ def main() -> None:
     """Prepare identity before compilation, finalize its resources, or validate a payload."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--soc-list", default="ascend910b,ascend910_93")
+    parser.add_argument("--soc-list", default=DEFAULT_SOC_LIST)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--prepare", action="store_true")
     action.add_argument("--finalize", type=Path, metavar="IDENTITY_JSON")
@@ -339,8 +343,6 @@ def main() -> None:
 
 def installed_packages():
     """Observe actual distributions for provenance, without enforcing a dependency lock."""
-    from packaging.utils import canonicalize_name
-
     return sorted([{"name": canonicalize_name(d.metadata["Name"]), "version": d.version}
                    for d in metadata.distributions() if d.metadata["Name"]], key=lambda p: (p["name"], p["version"]))
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""One local developer vendor snapshot per architecture/SoC; never cache framework adapters."""
+"""One local developer vendor snapshot per device architecture; never cache framework adapters."""
 
 import argparse
 import hashlib
@@ -29,11 +29,13 @@ from .build_utils import atomic_json
 from .build_workspace import check_workspace, claim_workspace, safe_component
 from .build_publication import publish_payload
 from .command_runner import message
+from .soc_selection import ARCHITECTURES
 
 
 SCRIPTS = (
     "build.sh", "_build/assemble_multicore_source.py", "_build/merge_multicore_vendors.py",
-    "_build/vendor_cache.py", "_build/prepare_dependencies.py", "_build/dependencies.lock.json",
+    "_build/vendor_cache.py", "_build/soc_selection.py", "_build/prepare_dependencies.py",
+    "_build/dependencies.lock.json",
     "cmake/hardening.cmake",
     "shmem/_build/shmem_sdk.sh",
 )
@@ -92,7 +94,7 @@ def tool_inputs(environment: dict) -> dict:
     return result
 
 
-def vendor_inputs(root: Path, sdk: Path, soc: str, environment: dict) -> dict:
+def vendor_inputs(root: Path, sdk: Path, device_arch: str, environment: dict) -> dict:
     """A bounded local fingerprint, not certification of an arbitrary CANN installation."""
     component = root / "hyper_multicore"
     cann = Path(environment["ASCEND_HOME_PATH"]).resolve()
@@ -105,7 +107,8 @@ def vendor_inputs(root: Path, sdk: Path, soc: str, environment: dict) -> dict:
     sdk_files = {name: development_files(sdk / name) for name in ("include", "src/device", "lib")}
     if any(not files for files in sdk_files.values()):
         raise ValueError("SDK vendor inputs unavailable")
-    return {"schema": 1, "arch": platform.machine(), "soc": soc, "sources": sources,
+    return {"schema": 2, "host_arch": platform.machine(), "device_arch": device_arch,
+            **ARCHITECTURES[device_arch], "sources": sources,
             "sdk": sdk_files, "cann_root": str(cann), "cann_version_info": version.read_text(),
             "tools": tool_inputs(environment), "environment": environment,
             "python": {"path": str(Path(sys.executable).resolve()), "version": sys.version}}
@@ -128,25 +131,26 @@ def read_snapshot(directory: Path, inputs: dict) -> dict | None:
     return None
 
 
-def prepare(root: Path, native: Path, soc: str, sdk: Path, request_path: Path, clean: bool = False) -> None:
+def prepare(root: Path, native: Path, device_arch: str, sdk: Path, request_path: Path, clean: bool = False) -> None:
     """Stage a verified hit or a request to publish a freshly built vendor after commit."""
     started = time.monotonic()
-    directory = native / "vendor-cache" / safe_component(platform.machine() + "-" + soc)
+    directory = native / "vendor-cache" / safe_component(platform.machine() + "-" + device_arch)
     check_workspace(directory, root)
     if clean and directory.exists():
         shutil.rmtree(directory)
     environment = {name: os.environ.get(name, "") for name in ENVIRONMENT}
-    request = {"soc": soc, "directory": str(directory), "sdk": str(sdk), "environment": environment,
+    request = {"device_arch": device_arch, "soc": ARCHITECTURES[device_arch]["compile_soc"],
+               "directory": str(directory), "sdk": str(sdk), "environment": environment,
                "reused": False, "origin": json.loads(os.environ.get("HP_VENDOR_ORIGIN", "{}"))}
     reason = "--clean requested" if clean else "no matching complete snapshot"
     try:
-        inputs = vendor_inputs(root, sdk, soc, environment)
+        inputs = vendor_inputs(root, sdk, device_arch, environment)
         request["fingerprint"] = fingerprint(inputs)
         request["origin"]["environment"] = {k: inputs[k] for k in
                                             ("cann_root", "cann_version_info", "tools", "environment", "python")}
         record = None if clean else read_snapshot(directory, inputs)
         if record is not None:
-            reused = request_path.parent / ("vendor-reuse-" + soc) / "hyper_multicore_nn"
+            reused = request_path.parent / ("vendor-reuse-" + device_arch) / "hyper_multicore_nn"
             shutil.copytree(directory / "vendor", reused)
             request.update(reused=True, candidate=str(reused), origin=record["origin"])
             reason = "cache hit"
@@ -155,7 +159,7 @@ def prepare(root: Path, native: Path, soc: str, sdk: Path, request_path: Path, c
         reason = f"cache unavailable; rebuilding ({error})"
     request["lookup_seconds"] = time.monotonic() - started
     atomic_json(request_path, request)
-    message(f"Vendor {soc}: {reason}; checked in {request['lookup_seconds']:.2f}s")
+    message(f"Vendor {device_arch}: {reason}; checked in {request['lookup_seconds']:.2f}s")
 
 
 def built(request_path: Path, candidate: Path, started: float) -> None:
@@ -172,7 +176,7 @@ def publish(root: Path, requests: list[dict]) -> None:
         if request["reused"] or "fingerprint" not in request:
             continue
         started = time.monotonic()
-        inputs = vendor_inputs(root, Path(request["sdk"]), request["soc"], request["environment"])
+        inputs = vendor_inputs(root, Path(request["sdk"]), request["device_arch"], request["environment"])
         if fingerprint(inputs) != request["fingerprint"]:
             message(f"Vendor {request['soc']}: inputs changed; snapshot not saved", "WARN")
             continue
@@ -201,7 +205,7 @@ def main() -> None:
     prepare_args = sub.add_parser("prepare")
     for name in ("root", "native", "sdk", "request"):
         prepare_args.add_argument("--" + name, type=Path, required=True)
-    prepare_args.add_argument("--soc", required=True)
+    prepare_args.add_argument("--arch", required=True)
     prepare_args.add_argument("--clean", action="store_true")
     built_args = sub.add_parser("built")
     built_args.add_argument("--request", type=Path, required=True)
@@ -209,7 +213,7 @@ def main() -> None:
     built_args.add_argument("--started", type=float, required=True)
     args = parser.parse_args()
     if args.operation == "prepare":
-        prepare(args.root, args.native, args.soc, args.sdk, args.request, args.clean)
+        prepare(args.root, args.native, args.arch, args.sdk, args.request, args.clean)
     else:
         built(args.request, args.candidate, args.started)
 

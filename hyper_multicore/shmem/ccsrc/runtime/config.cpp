@@ -109,12 +109,12 @@ Result<Config> ParseConfig(const ConfigInput &input) {
 
   const std::string_view data_engine =
     input.data_engine.has_value() ? std::string_view(*input.data_engine) : kDefaultDataEngine;
-  if (data_engine != kDefaultDataEngine) {
+  if (data_engine != kDefaultDataEngine && data_engine != "mte_udma") {
     return Result<Config>::Failure(InvalidConfig(std::string(kDataEngineEnv) +
-                                                 " only accepts the case-sensitive value 'mte', but got '" +
+                                                 " only accepts 'mte' or 'mte_udma', but got '" +
                                                  std::string(data_engine) + "'"));
   }
-  config.data_engine = DataEngine::Mte;
+  config.data_engine = data_engine == "mte_udma" ? DataEngine::MteUdma : DataEngine::Mte;
 
   const std::string_view endpoint = input.bootstrap_endpoint_base.has_value()
                                       ? std::string_view(*input.bootstrap_endpoint_base)

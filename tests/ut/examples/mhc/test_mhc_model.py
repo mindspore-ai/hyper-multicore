@@ -202,7 +202,8 @@ class TestDenseMhcModel(unittest.TestCase):
         for cores, tokens, minimum in (((20, 40), 39, 40), ((24, 48), 40, 48)):
             with (self.subTest(cores=cores), patch.dict(os.environ, {"WORLD_SIZE": "1"}),
                   patch.object(torch.npu, "set_device"),
-                  patch.object(benchmark, "_resolve_core_counts", return_value=cores),
+                  patch.object(benchmark, "get_device_core_spec",
+                               return_value=SimpleNamespace(num_cube_cores=cores[0], num_vector_cores=cores[1])),
                   patch.object(benchmark, "MhcTransformerModel") as build,
                   self.assertRaisesRegex(ValueError, f"at least {minimum} tokens")):
                 _build_workloads(benchmark.parse_args(["--tokens", str(tokens)]))

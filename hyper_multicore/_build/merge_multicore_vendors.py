@@ -26,6 +26,10 @@ import shutil
 import subprocess
 from typing import Any
 
+from _hyper_multicore_bootstrap import load_module
+
+SOC_SELECTION = load_module("soc_selection")
+
 
 _VENDOR_NAME = "hyper_multicore_nn"
 _KERNEL_ROOT = Path("op_impl/ai_core/tbe/kernel")
@@ -45,6 +49,7 @@ _HOST_IDENTITY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _HOST_SOC_PRIORITY = {
     "ascend910_93": 0,
     "ascend910b": 1,
+    "ascend950": 2,
 }
 
 
@@ -78,6 +83,7 @@ def _parse_args() -> argparse.Namespace:
         help="Repeat once per input to prove an identical common host build input.",
     )
     parser.add_argument("--output", required=True)
+    parser.add_argument("--soc-list", required=True)
     return parser.parse_args()
 
 
@@ -90,33 +96,19 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _is_soc_payload(relative_path: Path, soc: str) -> bool:
-    """Return whether a file belongs to the selected compiled-kernel subtree."""
-    try:
-        kernel_relative = relative_path.relative_to(_KERNEL_ROOT)
-    except ValueError:
-        kernel_relative = None
-    if kernel_relative is not None and kernel_relative.parts:
-        return kernel_relative.parts[0] == soc or (
-            len(kernel_relative.parts) > 1
-            and kernel_relative.parts[0] == "config"
-            and kernel_relative.parts[1] == soc
-        )
-    try:
-        config_relative = relative_path.relative_to(_CONFIG_ROOT)
-    except ValueError:
-        return False
-    return bool(config_relative.parts) and config_relative.parts[0] == soc
+def _is_soc_payload(relative_path: Path) -> bool:
+    """Keep every architecture's generated registration separate from common host files."""
+    return relative_path.is_relative_to(_KERNEL_ROOT) or relative_path.is_relative_to(_CONFIG_ROOT)
 
 
-def _common_files(vendor_root: Path, soc: str) -> dict[str, str]:
+def _common_files(vendor_root: Path) -> dict[str, str]:
     """Hash all host/source payload that must be byte-identical across SoC builds."""
     common_files = {}
     for path in sorted(vendor_root.rglob("*")):
         if not path.is_file():
             continue
         relative_path = path.relative_to(vendor_root)
-        if _is_soc_payload(relative_path, soc) or relative_path == _SUPPORTED_OPS_PATH:
+        if _is_soc_payload(relative_path) or relative_path == _SUPPORTED_OPS_PATH:
             continue
         common_files[str(relative_path)] = _sha256(path)
     return common_files
@@ -212,7 +204,7 @@ def _compare_host_payload(
     vendor_root: Path,
 ) -> list[str]:
     """Validate one discarded host variant and return its ABI-compatible ELF paths."""
-    common_files = _common_files(vendor_root, soc)
+    common_files = _common_files(vendor_root)
     if common_files == base_common_files:
         return []
 
@@ -344,7 +336,7 @@ def _prepare_merge(
         output=validated_output,
         base_soc=base_soc,
         base_vendor=base_vendor,
-        base_common_files=_common_files(base_vendor, base_soc),
+        base_common_files=_common_files(base_vendor),
         host_input_identity=host_input_identity,
     )
 
@@ -372,15 +364,57 @@ def _validate_common_host_payload(context: _MergeContext) -> list[str]:
     return discarded_host_variants
 
 
-def _copy_vendor_payloads(context: _MergeContext) -> int:
-    """Copy the selected host vendor and each additional SoC payload."""
+def _relocate_index(value: Any, source_soc: str, device_arch: str) -> Any:
+    """Change only CANN resource references, leaving compiler metadata untouched."""
+    if isinstance(value, list):
+        return [_relocate_index(item, source_soc, device_arch) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in {"binPath", "jsonPath", "jsonFilePath"}:
+            path = Path(item)
+            if path.is_absolute() or path.parts[0] != source_soc or ".." in path.parts:
+                raise ValueError(f"Unexpected {source_soc} kernel reference: {item}")
+            result[key] = str(Path(device_arch, *path.parts[1:]))
+        else:
+            result[key] = _relocate_index(item, source_soc, device_arch)
+    return result
+
+
+def _copy_soc_registration(vendor: Path, output: Path, source_soc: str, soc: str, device_arch: str) -> None:
+    """Retain real per-series op definitions and reference the one architecture binary set."""
+    info = vendor / _CONFIG_ROOT / soc / f"aic-{soc}-ops-info.json"
+    canonical = vendor / _CONFIG_ROOT / source_soc / f"aic-{source_soc}-ops-info.json"
+    if json.loads(info.read_text()) != json.loads(canonical.read_text()):
+        raise ValueError(f"Cannot share {device_arch} kernels: {soc} op definitions differ from {source_soc}")
+    destination = output / _CONFIG_ROOT / soc
+    destination.mkdir(parents=True)
+    shutil.copy2(info, destination / info.name)
+    index_root = output / _KERNEL_CONFIG_ROOT / soc
+    index_root.mkdir(parents=True)
+    for index in sorted((vendor / _KERNEL_CONFIG_ROOT / source_soc).glob("*.json")):
+        data = _relocate_index(json.loads(index.read_text()), source_soc, device_arch)
+        (index_root / index.name).write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _copy_vendor_payloads(context: _MergeContext, selected_socs: list[str]) -> int:
+    """Retain one host set, one kernel set per architecture and selected SoC indexes."""
+    _, groups = SOC_SELECTION.resolve_soc_selection(",".join(selected_socs))
+    vendors = dict(context.inputs)
+    expected = {SOC_SELECTION.ARCHITECTURES[name]["compile_soc"] for name in groups}
+    if set(vendors) != expected:
+        raise ValueError("Compiled vendor architectures do not match the selected SoCs")
     shutil.rmtree(context.output, ignore_errors=True)
     shutil.copytree(context.base_vendor, context.output)
-    for soc, vendor_root in context.inputs[1:]:
-        kernel_path, kernel_config_path, config_path = _require_soc_payload(vendor_root, soc)
-        shutil.copytree(kernel_path, context.output / _KERNEL_ROOT / soc)
-        shutil.copytree(kernel_config_path, context.output / _KERNEL_CONFIG_ROOT / soc)
-        shutil.copytree(config_path, context.output / _CONFIG_ROOT / soc)
+    shutil.rmtree(context.output / _KERNEL_ROOT)
+    shutil.rmtree(context.output / _CONFIG_ROOT)
+    for device_arch, socs in groups.items():
+        source_soc = SOC_SELECTION.ARCHITECTURES[device_arch]["compile_soc"]
+        vendor = vendors[source_soc]
+        shutil.copytree(vendor / _KERNEL_ROOT / source_soc, context.output / _KERNEL_ROOT / device_arch)
+        for soc in socs:
+            _copy_soc_registration(vendor, context.output, source_soc, soc, device_arch)
     return _merge_supported_ops(context.inputs, context.output)
 
 
@@ -397,13 +431,15 @@ def _build_merge_report(
     discarded_host_variants: list[str],
     supported_ops_entries: int,
     opapi_library: Path,
+    selected_socs: list[str],
 ) -> dict[str, Any]:
     """Build the stable machine-readable merge report."""
     return {
         "schema_version": 1,
         "status": "PASSED",
         "vendor_root": str(context.output),
-        "supported_socs": [soc for soc, _ in context.inputs],
+        "supported_socs": selected_socs,
+        "compiled_socs": [soc for soc, _ in context.inputs],
         "host_vendor_soc": context.base_soc,
         "host_payload_files": len(context.base_common_files),
         "host_input_identity": context.host_input_identity,
@@ -417,6 +453,7 @@ def merge_vendors(
     inputs: list[tuple[str, Path]],
     output: Path,
     host_input_identities: dict[str, str],
+    selected_socs: list[str],
 ) -> dict[str, Any]:
     """Retain one provenanced host vendor and merge verified per-SoC kernels.
 
@@ -424,16 +461,18 @@ def merge_vendors(
         inputs: Ordered SoC and vendor-root pairs.
         output: Destination directory for the merged vendor payload.
         host_input_identities: Build identities keyed by SoC name.
+        selected_socs: Requested SoC registrations sharing the compiled architecture kernels.
     """
     context = _prepare_merge(inputs, output, host_input_identities)
     discarded_host_variants = _validate_common_host_payload(context)
-    supported_ops_entries = _copy_vendor_payloads(context)
+    supported_ops_entries = _copy_vendor_payloads(context, selected_socs)
     opapi_library = _require_merged_opapi(context)
     return _build_merge_report(
         context,
         discarded_host_variants,
         supported_ops_entries,
         opapi_library,
+        selected_socs,
     )
 
 
@@ -454,7 +493,8 @@ def main() -> int:
         if soc in host_input_identities:
             raise ValueError(f"Duplicate host input identity: {soc}")
         host_input_identities[soc] = identity
-    report = merge_vendors(inputs, Path(args.output), host_input_identities)
+    socs, _ = SOC_SELECTION.resolve_soc_selection(args.soc_list)
+    report = merge_vendors(inputs, Path(args.output), host_input_identities, socs)
     report_text = json.dumps(report, indent=2, sort_keys=True) + "\n"
     print(report_text, end="")
     return 0

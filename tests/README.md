@@ -125,6 +125,14 @@ python -m pytest tests/ut/test_native_loading.py tests/ut/test_loader.py -q
 ```
 
 构建检查不由 pytest 自动收集，执行普通 UT 不能替代上面的独立命令。
+
+SHMEM Runtime 配置解析和设备身份检查由 native 构建中的 CTest 执行，不需要运行设备通信。
+可在已配置并编译测试目标的 SHMEM 构建目录中定向执行：
+
+```bash
+ctest --test-dir /path/to/shmem-build -R '^shmem_(config|device_identity)$' --output-on-failure
+```
+
 安装态加载用例使用自包含的 payload 夹具，不要求具备 C++ 源码、CMake 文件或仓库检查脚本。
 实际 native 编译、框架兼容性和设备数值使用对应的构建或设备验收验证。
 

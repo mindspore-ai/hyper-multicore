@@ -44,13 +44,13 @@
           },
           {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
-            "sha256": "e8e278434a4dc475477f1ee55d339c307f409e504cbf7dad6e29186d1121200f",
-            "purpose": "add a logical token-block entry point while preserving the native RMSNorm entry behavior"
+            "sha256": "d1751299e120709f3a625af9b6d606c1696059fbb55c99ed01788765f1840004",
+            "purpose": "add a logical token-block RMSNorm entry point and non-atomic Ascend950 backward-cache writes"
           },
           {
             "path": "hyper_multicore/ops/patches/rms_norm_grad_worker_fusion.patch",
-            "sha256": "b55856bdaa183684576febdcbf2df01cace97932f00d2a336e54cb7d59ee8964",
-            "purpose": "add a task-local RMSNormGrad entry point and explicit fused-task pipe cleanup"
+            "sha256": "0d6eacd29418c897cd3ac42bd4b62eb331912a62a36fa506a4df80f6fffd1ce2",
+            "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -68,7 +68,7 @@
             "patches": [
               {
                 "path": "hyper_multicore/ops/patches/grouped_matmul_fusion.patch",
-                "sha256": "1251b1a66dc1164c5c42285cf8beb16f0a01298d4750ac31508d12e594d7df60",
+                "sha256": "61506f77d380a36617c6e5e7ffbca689d18030c13c3f205a53113b2f07d7884c",
                 "purpose": "expose the selected grouped-matmul path as an inline building block"
               }
             ],
@@ -108,14 +108,13 @@
         }
       },
       "shmem": {
-        "version": "d30702bb55d0",
+        "version": "v1.8.0",
         "repository": "https://gitcode.com/cann/shmem.git",
-        "fetch_ref": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
-        "tag_object": null,
-        "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
-        "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
-        "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
-        "resolution": "exact upstream commit with a locked Runtime symbol-loading adapter applied only to an isolated source copy",
+        "tag_object": "ed07fa687d1ca30e636b5a86e1e6ceba82d88535",
+        "commit": "ed07fa687d1ca30e636b5a86e1e6ceba82d88535",
+        "tree": "4de052f7d50cecf19da4dbbc89102879aba69b05",
+        "git_archive_tar_sha256": "6216bf7f2281627d5e792d9b329d033883f528d2a524155b89ea2aa0c151da96",
+        "resolution": "Exact v1.8.0 plus runtime symbol resolution and private logging adapters",
         "patches": [
           {
             "path": "hyper_multicore/shmem/_build/patches/cann_runtime_symbols.patch",
@@ -138,11 +137,20 @@
           "reason": "avoid collision with framework-provided libshmem.so in one process",
           "isolated_source_adapted": true
         }
+      },
+      "nlohmann_json": {
+        "version": "v3.11.3",
+        "repository": "https://gitcode.com/GitHub_Trending/js/json.git",
+        "commit": "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+        "tree": "5af76d5aa32f4b473b5dd7f82fb9f2a4257322c6",
+        "git_archive_tar_sha256": "0a59c5f4e31190d4ab72e4adaac69a978199c2da1989bfc6273de21f4dc016e4",
+        "resolution": "SHMEM Ascend950 topology-reader header dependency; copied only to the isolated SDK source",
+        "packaging_policy": "build-only header dependency; not a Python runtime requirement"
       }
     }
   },
   "current_repository_baseline": {
-    "shmem": "d30702bb55d0",
+    "shmem": "v1.8.0",
     "ops_nn": "v9.1.0.pre",
     "ops_transformer": {
       "gmm": "v9.1.0.pre",

@@ -15,7 +15,7 @@
 #include <string_view>
 
 #include "cann/signal.h"
-#include "device/device_model.h"
+#include "device/device_identity.h"
 #include "runtime/config.h"
 #include "runtime/types.h"
 
@@ -100,9 +100,9 @@ void wait_signal_on_stream(uintptr_t local_signal, CompareOp comparison, int32_t
 runtime::Result<int32_t> query_current_device_index();
 
 /**
- * @brief Query the current ACL device and its raw SoC name once.
+ * @brief Query the current ACL device, its architecture, and its raw SoC name.
  *
- * @return Current device index, owned SoC name, and normalized model; or an error if either query fails.
+ * @return Current device index, NPU architecture, and owned SoC name; or an error if a query fails.
  */
 runtime::Result<DeviceIdentity> query_device_identity();
 

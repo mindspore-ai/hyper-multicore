@@ -74,7 +74,8 @@ class TestMulticoreNative(unittest.TestCase):
     def test_backend_import_failure_keeps_cause_and_metadata_context(self):
         """Broken PTA imports still expose the runtime and packaged matrix without another framework import."""
         (self.native_root.parent / "build_info.json").write_text(json.dumps({"variants": [
-            {"id": "built-fixture", "torch_version": "2.7.1+cpu", "pta_version": "2.7.1.post11", "torch_cxx11_abi": True}]}))
+            {"id": "built-fixture", "torch_version": "2.7.1+cpu", "pta_version": "2.7.1.post11",
+             "torch_cxx11_abi": True}]}))
         cann = self.root / "cann/opp"
         cann.mkdir(parents=True)
         (cann / "version.info").write_text("Version=9.2.0\n")
@@ -100,8 +101,6 @@ class TestMulticoreNative(unittest.TestCase):
             "LD_LIBRARY_PATH": os.pathsep.join([
                 "existing-lib",
                 str(op_api_root),
-                str(self.shmem_root),
-                str(self.shmem_root / "shmem"),
             ]),
         }
         with patch.dict(os.environ, environment, clear=True), patch.object(

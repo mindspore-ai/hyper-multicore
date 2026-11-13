@@ -31,9 +31,10 @@ from hyper_multicore.modules.mega_moe.backward.graph import build_backward_graph
 from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank
 from hyper_multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
 from hyper_multicore.modules.mega_moe.backward.tiling_tables import (
-    get_w1_grad_tiling_bytes, get_w2_grad_tiling_bytes,
+    get_act_grad_tiling_bytes, get_gate_grad_tiling_bytes, get_w1_grad_tiling_bytes, get_w2_grad_tiling_bytes,
 )
 from hyper_multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_multicore.modules.mega_moe.forward.tiling_tables import get_down_proj_tiling_bytes, get_up_proj_tiling_bytes
 from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.scheduler.config import TaskSplitValue
@@ -286,6 +287,32 @@ class TestMegaMoeExperts(unittest.TestCase):
                          ("push", 1.25, 1.25))
         mock_create_parameters.assert_called_once_with(2, 16, 8, "EIO")
         self.assertIsNone(experts.swiglu_limit)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_gmm_tiling_preserves_split_when_dimensions_collide(self) -> None:
+        """Keep native M/N/K fields and complete per-core rows when replacing dimensions."""
+        row_bytes = struct.calcsize("<504I")
+        for builder, dimensions in (
+            (get_up_proj_tiling_bytes, (4096, 8192, 4096)),
+            (get_down_proj_tiling_bytes, (4096, 4096, 4096)),
+            (get_act_grad_tiling_bytes, (4096, 4096, 4096)),
+            (get_gate_grad_tiling_bytes, (4096, 4096, 8192)),
+            (get_w1_grad_tiling_bytes, (4096, 8192, 4096)),
+            (get_w2_grad_tiling_bytes, (4096, 4096, 4096)),
+        ):
+            for cores in (20, 24, 32):
+                with self.subTest(builder=builder.__name__, cores=cores):
+                    data = builder(4096, hidden_size=4096, intermediate_size=4096,
+                                   num_groups=4, num_cube_cores=cores)
+                    self.assertEqual(len(data), cores * row_bytes)
+                    self.assertEqual(data, data[:row_bytes] * cores)
+                    words = struct.unpack("<504I", data[:row_bytes])
+                    self.assertEqual(words[:2], (4, cores))
+                    self.assertEqual(words[14], 4096)
+                    matmul_start = words.index(393216) - 19
+                    self.assertEqual(words[matmul_start], cores)
+                    self.assertEqual(words[matmul_start + 1:matmul_start + 4], dimensions)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

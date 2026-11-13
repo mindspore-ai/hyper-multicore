@@ -20,36 +20,15 @@ from functools import lru_cache
 
 import torch
 
+from hyper_multicore._core_spec import get_device_core_spec
 from hyper_multicore.torch import ops as multicore_ops
 
-from ..mega_mhc_common import validate_mega_mhc_native_inputs, validate_mega_mhc_token_count
+from ..mega_mhc_common import (
+    validate_mega_mhc_core_spec, validate_mega_mhc_native_inputs, validate_mega_mhc_token_count,
+)
 from .common import MegaMhcGradCache, MegaMhcGradOutputs, validate_mega_mhc_grad_tensors
 from .graph import DEFAULT_GRAD_TOKEN_TILE
 from .plan import MegaMhcGradPlan, build_mega_mhc_grad_plan
-
-
-def _resolve_core_counts(device_index: int) -> tuple[int, int]:
-    """Read and validate the physical core counts used by the 1:2 mixed launch."""
-    limits = torch.npu.get_device_limit(device_index)
-    num_cube_cores = limits.get("cube_core_num")
-    num_vector_cores = limits.get("vector_core_num")
-    if not isinstance(num_cube_cores, int) or num_cube_cores <= 0:
-        raise RuntimeError(
-            "torch.npu.get_device_limit() returned an invalid cube_core_num "
-            f"for NPU {device_index}: {num_cube_cores!r}."
-        )
-    if not isinstance(num_vector_cores, int) or num_vector_cores <= 0:
-        raise RuntimeError(
-            "torch.npu.get_device_limit() returned an invalid vector_core_num "
-            f"for NPU {device_index}: {num_vector_cores!r}."
-        )
-    if num_vector_cores != 2 * num_cube_cores:
-        raise RuntimeError(
-            "HyperMegaMhcGrad requires the KERNEL_TYPE_MIX_AIC_1_2 core ratio, "
-            f"but NPU {device_index} reports cube_core_num={num_cube_cores} and "
-            f"vector_core_num={num_vector_cores}."
-        )
-    return num_cube_cores, num_vector_cores
 
 
 @lru_cache(maxsize=16)
@@ -78,11 +57,13 @@ def _get_plan_for_shape(
     device: torch.device,
     token_tile: int,
 ) -> MegaMhcGradPlan:
-    """Resolve physical cores and retrieve the immutable plan for this shape."""
+    """Read current Device core limits and retrieve the immutable plan for this shape."""
     device_index = device.index
     if device_index is None:
         device_index = torch.npu.current_device()
-    num_cube_cores, num_vector_cores = _resolve_core_counts(device_index)
+    core_spec = get_device_core_spec(device_index)
+    validate_mega_mhc_core_spec(core_spec)
+    num_cube_cores, num_vector_cores = core_spec.num_cube_cores, core_spec.num_vector_cores
     validate_mega_mhc_token_count(token_count, num_vector_cores)
     return _get_cached_plan(
         token_count,

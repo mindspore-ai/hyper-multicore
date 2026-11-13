@@ -192,8 +192,9 @@ def file_digest(path: Path) -> str:
 
 
 def environment_request(target: dict) -> dict:
-    """Keep extra mirrors out of environment identity without modifying provenance."""
+    """Exclude display labels and extra mirrors from the installation identity."""
     request = dict(target)
+    request.pop("id", None)
     indexes = request.get("indexes")
     if isinstance(indexes, dict):
         request["indexes"] = {name: value for name, value in indexes.items() if name != "dependencies_extra"}
@@ -204,7 +205,7 @@ def environment_key(target: dict, base_python: Path) -> str:
     """Separate version requests, Python runtimes and architectures, not transitive versions."""
     return digest_json(
         {
-            "schema": 2,
+            "schema": 3,
             "base_python": str(base_python.resolve()),
             "base_version": sys.version,
             "abi": sys.implementation.cache_tag,
@@ -294,13 +295,14 @@ def prepare_environment(target: dict, native: Path, run, base_python: Path, *, i
             shutil.rmtree(directory)
         directory.mkdir(parents=True)
         record = {"owner": "hyper-multicore-framework-env", "environment_key": key,
-                  "request": target, "target": target["id"], "pta_release": target["pta_release"],
+                  "request": target, "target": target["id"],
                   "created_at": time.time()}
         atomic_json(directory / "pending.json", record)
         message(f"PTA {target['pta_build_version']}: creating isolated environment")
         run([str(base_python), "-m", "venv", str(directory)], label=f"venv-{target['id']}")
         record["installation"] = install_framework(target, directory, python, run)
     record["installed_packages"] = verify_environment(python, target, run, identity_probe=identity_probe)
+    record.update(request=target, target=target["id"])
     atomic_json(ready, record)
     (directory / "pending.json").unlink(missing_ok=True)
     environment_summary(target, record, "REUSE" if reused else "READY")
@@ -398,37 +400,15 @@ def environment_record(directory: Path):
     return None
 
 
-def rollback_environments(candidates, branches):
-    """Retain exactly the newest previously successful rollback for each active branch."""
-    keep = set()
-    for branch in branches:
-        successful = [
-            (d, m) for d, m in candidates if m.get("pta_release") == branch and m.get("last_successful_build")
-        ]
-        if successful:
-            keep.add(max(successful, key=lambda item: item[1]["last_successful_build"])[0])
-    return keep
-
-
-def prune_environments(native: Path, selected: list[Path], branches: set[str]) -> list[str]:
-    """After full success retain selected environments and one successful rollback per branch."""
+def prune_environments(native: Path, selected: list[Path]) -> list[str]:
+    """After full success retain only the selected managed environments."""
     current = {p.parent.parent.resolve() for p in selected}
-    candidates = []
-    for directory in environment_directory(native).iterdir():
-        if directory.is_symlink() or not directory.is_dir():
-            continue
-        record = environment_record(directory)
-        if record is None:
-            continue
-        if directory.resolve() in current:
-            record["last_successful_build"] = time.time()
-            atomic_json(directory / "ready.json", record)
-        else:
-            candidates.append((directory, record))
-    keep = rollback_environments(candidates, branches)
     removed = []
-    for directory, _ in candidates:
-        if directory not in keep:
-            shutil.rmtree(directory)
-            removed.append(str(directory))
+    for directory in environment_directory(native).iterdir():
+        if directory.is_symlink() or not directory.is_dir() or directory.resolve() in current:
+            continue
+        if environment_record(directory) is None:
+            continue
+        shutil.rmtree(directory)
+        removed.append(str(directory))
     return removed

@@ -33,12 +33,12 @@ _AIC_CAPACITY = 16
 _AIV_CAPACITY = 16
 
 
-def _slot_offset(core_type: int, block_id: int) -> int:
+def _slot_offset(core_type: int, block_id: int, cube_slot_count: int = CUBE_SLOT_COUNT) -> int:
     aic_stride = CORE_HEADER.size + _AIC_CAPACITY * PROFILE_RECORD.size
     if core_type == 1:
         return block_id * aic_stride
     aiv_stride = CORE_HEADER.size + _AIV_CAPACITY * PROFILE_RECORD.size
-    return CUBE_SLOT_COUNT * aic_stride + block_id * aiv_stride
+    return cube_slot_count * aic_stride + block_id * aiv_stride
 
 
 def _profile_buffer(
@@ -49,12 +49,13 @@ def _profile_buffer(
     dropped_count: int = 0,
     desc_id: int = 0x10002,
     owner_id: int = INVALID_OWNER_ID,
+    cube_slot_count: int = CUBE_SLOT_COUNT,
 ) -> bytearray:
     """Build a synthetic profile buffer with one initialized core slot."""
     buffer = bytearray(
-        _profile_buffer_bytes_for_capacities(_AIC_CAPACITY, _AIV_CAPACITY)
+        _profile_buffer_bytes_for_capacities(_AIC_CAPACITY, _AIV_CAPACITY, cube_slot_count)
     )
-    offset = _slot_offset(core_type, block_id)
+    offset = _slot_offset(core_type, block_id, cube_slot_count)
     capacity = _AIC_CAPACITY if core_type == 1 else _AIV_CAPACITY
     CORE_HEADER.pack_into(
         buffer,
@@ -80,7 +81,10 @@ def _profile_buffer(
     return buffer
 
 
-def _parse(buffer: bytes, *, detailed_task_names: bool = False, aiv_capacity: int = _AIV_CAPACITY) -> dict:
+def _parse(
+    buffer: bytes, *, detailed_task_names: bool = False, aiv_capacity: int = _AIV_CAPACITY,
+    cube_slot_count: int = CUBE_SLOT_COUNT,
+) -> dict:
     return _parse_cycle_buffer(
         buffer,
         _CycleTraceConfig(
@@ -93,6 +97,7 @@ def _parse(buffer: bytes, *, detailed_task_names: bool = False, aiv_capacity: in
             stage_names={0x10002: "GMM1"},
             soc_name="Ascend910B3",
             task_stage_names={9: "GMM1"},
+            cube_slot_count=cube_slot_count,
         ),
         aic_record_capacity=_AIC_CAPACITY,
         aiv_record_capacity=aiv_capacity,
@@ -193,6 +198,16 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
         self.assertEqual(event["tid"], 2003)
         self.assertEqual(event["args"]["core_type"], "AIV")
         self.assertEqual(event["args"]["block_id"], 3)
+
+    def test_parser_decodes_last_slot_with_64_vector_workers(self):
+        """Decode the final AIV slot after a 32-Cube region."""
+        buffer = _profile_buffer(core_type=2, block_id=63, cube_slot_count=32)
+        trace = _parse(buffer, cube_slot_count=32)
+        event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
+
+        self.assertEqual(event["tid"], 2063)
+        self.assertEqual(event["args"]["block_id"], 63)
+        self.assertEqual(trace["megaKernelCycleTrace"]["recordCount"], 1)
 
     def test_parser_rejects_header_identity_mismatch(self):
         """Reject a slot whose header does not match its physical region."""
