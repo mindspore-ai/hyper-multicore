@@ -717,16 +717,17 @@ py::object OptionalValue(const std::optional<T> &value) {
   return value.has_value() ? py::cast(*value) : py::none();
 }
 
-py::object ConfigObject(const std::optional<Config> &config) {
-  if (!config.has_value()) {
-    return py::none();
-  }
+py::dict ConfigObject(const Config &config) {
   py::dict result;
-  result["heap_size_bytes"] = config->heap_size_bytes;
-  result["timeout_seconds"] = config->timeout_seconds;
-  result["data_engine"] = ToString(config->data_engine);
-  result["bootstrap_endpoint_base"] = config->bootstrap_endpoint_base;
-  return std::move(result);
+  result["heap_size_bytes"] = config.heap_size_bytes;
+  result["timeout_seconds"] = config.timeout_seconds;
+  result["data_engine"] = ToString(config.data_engine);
+  result["bootstrap_endpoint_base"] = config.bootstrap_endpoint_base;
+  return result;
+}
+
+py::dict GetConfig() {
+  return ConfigObject(UnwrapRuntime(Runtime::Instance().QueryConfig(), "GetConfig"));
 }
 
 py::object AllocationRecordsObject(const std::optional<std::vector<AllocationRecord>> &records) {
@@ -755,7 +756,7 @@ py::dict DebugState() {
     snapshot.device_identity.has_value() ? py::cast(snapshot.device_identity->device_index) : py::none();
   result["device_soc_name"] =
     snapshot.device_identity.has_value() ? py::cast(snapshot.device_identity->device_soc_name) : py::none();
-  result["config"] = ConfigObject(snapshot.config);
+  result["config"] = snapshot.config.has_value() ? py::object(ConfigObject(*snapshot.config)) : py::none();
   result["allocated_count"] = OptionalValue(snapshot.allocated_count);
   result["allocated_bytes"] = OptionalValue(snapshot.allocated_bytes);
   result["remaining_bytes"] = snapshot.config.has_value() && snapshot.allocated_bytes.has_value()
@@ -796,6 +797,7 @@ PYBIND11_MODULE(hyper_multicore_shmem_torch, module) {
              py::arg("comparison") = "eq");
   module.def("_all_gather", &bindings::AllGather, py::arg("output"), py::arg("input"));
   module.def("_log_debug", &bindings::log_debug, py::arg("message"));
+  module.def("_get_config", &bindings::GetConfig);
   module.def("_debug_state", &bindings::DebugState);
   module.def("_validate_shutdown", &bindings::ValidateShutdown);
   module.def("_shutdown",

@@ -53,6 +53,9 @@ class Runtime final {
   /** @brief Locally return the CANN Root WORLD size while Ready, without CANN access or DFX updates. */
   Result<int32_t> RootSize() const;
 
+  // Return a copy of the effective configuration while the Runtime is Ready.
+  Result<Config> QueryConfig() const;
+
   /**
    * @brief Validate local preconditions for closing the active Runtime lifecycle.
    *

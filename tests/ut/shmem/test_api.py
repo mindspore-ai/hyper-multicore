@@ -18,6 +18,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from hyper_multicore import shmem
 from hyper_multicore.shmem import _api, _debug
 
 
@@ -45,6 +46,15 @@ class _Tensor:
 
 class TestShmemApiDiagnostics(unittest.TestCase):
     """Validate that opt-in diagnostics remain useful and best-effort."""
+
+    def test_get_config_uses_native_query(self) -> None:
+        """Query effective configuration through the public capability boundary."""
+        config = {"data_engine": "mte"}
+        native = SimpleNamespace(_get_config=Mock(return_value=config), _debug_state=Mock())
+        with patch.object(_api, "_load_native", return_value=native):
+            self.assertIs(shmem.get_config(), config)
+        native._get_config.assert_called_once_with()
+        native._debug_state.assert_not_called()
 
     def test_debug_state_reports_reference_count_after_runtime_state(self) -> None:
         """Expose the local lifecycle count next to the Native Runtime state."""

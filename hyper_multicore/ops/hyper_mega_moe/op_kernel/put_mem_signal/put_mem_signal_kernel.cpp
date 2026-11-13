@@ -14,25 +14,15 @@
  * limitations under the License.
  */
 
-#include "data_plane/rma.h"
+#include "data_plane/mte_rma.h"
 #include "data_plane/sync.h"
 #include "kernel_operator.h"
-#include "shmem.h"
 
 using namespace AscendC;
 
 namespace shmem_data_plane = hyper_multicore::shmem::data_plane;
 
 namespace hyper_multicore {
-
-template <typename T>
-__aicore__ inline void CopyGmSingleValueToUb(GM_ADDR gm_addr, T *result) {
-  __ubuf__ T *ubAddr = (__ubuf__ T *)(32);
-  smem_shm_copy_gm2ub(ubAddr, (__gm__ T *)gm_addr, sizeof(T));
-  AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-  AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-  *result = *ubAddr;
-}
 
 template <typename T>
 class PutMemSignalKernel {
@@ -52,7 +42,7 @@ class PutMemSignalKernel {
     signal_value_ = signal_value;
     signal_op_ = signal_op;
     target_pe_ = target_pe;
-    non_blocking_ = non_blocking;
+    (void)non_blocking;
 
     // UB tiling set
     aiv_idx_ = 0;
@@ -65,7 +55,7 @@ class PutMemSignalKernel {
   __aicore__ inline void Process() {
     // Empty tiles still satisfy remote dependencies without resolving data addresses.
     if (size_ == 0) {
-      shmem_data_plane::fence();
+      shmem_data_plane::mte_rma::quiet();
       shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
                                signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
                                target_pe_);
@@ -78,51 +68,12 @@ class PutMemSignalKernel {
     if (aiv_idx_ == aiv_num_ - 1) {
       size_per_core = size_ - size_per_core * aiv_idx_;
     }
-    __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
-    /* CopyUB Config Set */
-    uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
-    uint64_t copy_ub_size = device_state->mte_config.ub_size;
-    __ubuf__ T *ping_buff = reinterpret_cast<__ubuf__ T *>(copy_ub);
-    __ubuf__ T *pong_buff = reinterpret_cast<__ubuf__ T *>(copy_ub + copy_ub_size / 2);
-    auto ptr = shmem_data_plane::remote_ptr(target_ptr, target_pe_);
-    __gm__ T *remote_ptr = reinterpret_cast<__gm__ T *>(ptr);
-    uint64_t block_size = copy_ub_size / 2 / sizeof(T) * sizeof(T);
-    uint64_t remain = (size_per_core * sizeof(T)) % block_size;
-
-    uint64_t repeat_times = (size_per_core * sizeof(T)) / block_size;
-    uint64_t repeat_elem = block_size / sizeof(T);
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-    for (uint64_t i = 0; i < repeat_times; i++) {
-      AscendC::TEventID EVENT_ID = (i & 1) ? EVENT_ID0 : EVENT_ID1;
-      __ubuf__ T *buf = (i & 1) ? ping_buff : pong_buff;
-      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
-      aclshmemi_copy_gm2ub(buf, src_ptr + i * repeat_elem, block_size);
-      AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID);
-      AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID);
-      aclshmemi_copy_ub2gm(remote_ptr + i * repeat_elem, buf, block_size);
-      AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
-    }
-    if (remain > 0) {
-      AscendC::TEventID EVENT_ID = (repeat_times & 1) ? EVENT_ID0 : EVENT_ID1;
-      __ubuf__ T *buf = (repeat_times & 1) ? ping_buff : pong_buff;
-      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
-      aclshmemi_copy_gm2ub(buf, src_ptr + repeat_times * repeat_elem, remain);
-      AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID);
-      AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID);
-      aclshmemi_copy_ub2gm(remote_ptr + repeat_times * repeat_elem, buf, remain);
-      AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
-    }
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+    shmem_data_plane::mte_rma::put_pipelined<T>(reinterpret_cast<GM_ADDR>(target_ptr),
+                                               reinterpret_cast<GM_ADDR>(src_ptr), size_per_core, target_pe_);
 
     // Write signal after data transfer
     auto signal_ptr = signal_ + signal_offset_;
-    if (non_blocking_) {
-      shmem_data_plane::fence();
-    } else {
-      shmem_data_plane::fence();
-    }
+    shmem_data_plane::mte_rma::quiet();
     // Sync ensure corresponding tasks are done
     if (aiv_num_ > 1) {
       AscendC::LocalTensor<int32_t> workLocal = localwork.AllocTensor<int32_t>();
@@ -150,7 +101,6 @@ class PutMemSignalKernel {
   int32_t signal_value_ = 0;
   int64_t signal_op_ = 0;
   int64_t target_pe_ = 0;
-  bool non_blocking_ = true;
   AscendC::GlobalTensor<int32_t> syncGlobal;
   AscendC::TQue<AscendC::TPosition::VECIN, 1> localwork;
   // ub
