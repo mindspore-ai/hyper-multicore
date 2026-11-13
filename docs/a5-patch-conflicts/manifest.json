@@ -33,5 +33,14 @@
     ],
     "rejected_hunks": [],
     "action": "incoming conflict versions retained; all stages archived for review"
+  },
+  {
+    "patch": 8,
+    "unmerged_paths": [
+      "docs/architecture.md",
+      "tests/torch/_test_mega_moe_dynamic_tokens.py"
+    ],
+    "rejected_hunks": [],
+    "action": "incoming conflict versions retained; all stages archived for review"
   }
 ]

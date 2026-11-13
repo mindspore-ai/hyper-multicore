@@ -1,0 +1,864 @@
+From 8ad299fd99a7356a8a7f728a5ff584cc68e8660e Mon Sep 17 00:00:00 2001
+From: hedongdong <hdd475375904@126.com>
+Date: Fri, 13 Nov 2026 18:32:17 +0800
+Subject: [PATCH 08/27] docs: record A5 migration qualification and
+ reproducible replay
+
+---
+ docs/a5-migration.json                       | 501 ++++++++++++++++++-
+ docs/architecture.md                         |  40 ++
+ docs/build.md                                |  60 +++
+ tests/torch/_a5_megamoe_replay.py            | 142 ++++++
+ tests/torch/_test_mega_moe_dynamic_tokens.py |  22 +
+ 5 files changed, 755 insertions(+), 10 deletions(-)
+ create mode 100644 tests/torch/_a5_megamoe_replay.py
+
+diff --git a/docs/a5-migration.json b/docs/a5-migration.json
+index 30876de..76f24c5 100644
+--- a/docs/a5-migration.json
++++ b/docs/a5-migration.json
+@@ -36,32 +36,32 @@
+     {
+       "id": 0,
+       "name": "source identity and isolated A5 assembly",
+-      "state": "implemented; device qualification pending"
++      "state": "qualified on local A5"
+     },
+     {
+       "id": 1,
+       "name": "minimal math task adapters",
+-      "state": "implemented; device qualification pending"
++      "state": "qualified on local A5"
+     },
+     {
+       "id": 2,
+       "name": "shared QP1 transport",
+-      "state": "implemented; device qualification pending"
++      "state": "qualified on local A5"
+     },
+     {
+       "id": 3,
+       "name": "DAG and queue integration",
+-      "state": "implemented; device qualification pending"
++      "state": "qualified on local A5"
+     },
+     {
+       "id": 4,
+       "name": "correctness lifecycle performance and deployment",
+-      "state": "in_progress"
++      "state": "local A5 qualified; cluster and A3 device regression pending"
+     }
+   ],
+   "validation": {
+-    "build": "pending",
+-    "device": "pending",
++    "build": "passed: Python3.11.10 / torch2.12.0+cpu / torch_npu2.12.0.post3 / CANN9.2.0, ascend950",
++    "device": "passed: two/four-card component gates",
+     "native_binary_branch_identity": "unknown",
+     "source_assembly": {
+       "state": "passed",
+@@ -90,14 +90,486 @@
+     "host_integration": {
+       "tests_passed": 113,
+       "subtests_passed": 769,
+-      "log": "build/migration-all-host-v3.log"
++      "log": "build/migration-final-host.log"
+     },
+     "math_template_compile": {
+       "bf16_gmm_NN_NT_TN": "passed",
+       "mx_gmm": "passed",
+       "bf16_swiglu_grad_and_mx_vector_worker": "passed (device-only compiler pass)",
+       "device_execution": "pending"
+-    }
++    },
++    "profiler": {
++      "tests_passed": 38,
++      "subtests_passed": 20,
++      "normal_instrumentation": false,
++      "dropped_records": 0,
++      "scoped_phases": [
++        "forward",
++        "recompute",
++        "backward"
++      ],
++      "path": "build/migration-downstream-profile"
++    },
++    "device_cases": [
++      "BF16 EIO/EOI: independent output/dX/dProbs/dW/SGD oracle, balanced/empty/skew/single destination, Push/Pull",
++      "MX no-grad/recompute/full gradients/empty experts/current roots/old contexts/two streams",
++      "H5120 I1792 six experts per rank TSV512 ready-depth8: BF16 two cards and MX Pull four cards",
++      "automatic BF16 tokens: [0,0], [17,0], [127,257], [512,129], Push/Pull",
++      "actual downstream quantized root type and FSDP root refresh via external imports"
++    ],
++    "bitwise_comparison": {
++      "reference_commit": "1e8d0a498b89e59a855070c7a6c7a1b5aad88d81",
++      "result": "all recorded outputs, dX, dProbs, dW1, dW2 SHA identical",
++      "two_card_samples": 4,
++      "four_card_samples": 8,
++      "four_card_shape": {
++        "tokens": 512,
++        "hidden": 5120,
++        "intermediate": 1792,
++        "experts_per_rank": 6,
++        "top_k": 8
++      },
++      "normal_comparison": "migration-mx-new-final-normal4 vs migration-mx-old-normal4-retry"
++    },
++    "performance": {
++      "previous": {
++        "rank_max_event_samples_ms": [
++          8.778407096862793,
++          10.598976135253906,
++          10.16065788269043,
++          10.68963623046875,
++          10.559674263000488,
++          11.20959186553955,
++          9.887129783630371
++        ],
++        "event_median_ms": 10.559674263000488,
++        "wall_median_ms": 10.787679813802242
++      },
++      "current": {
++        "rank_max_event_samples_ms": [
++          10.823664665222168,
++          10.06666374206543,
++          9.80793571472168,
++          10.882139205932617,
++          9.822155952453613,
++          9.933552742004395,
++          10.487435340881348
++        ],
++        "event_median_ms": 10.06666374206543,
++        "wall_median_ms": 10.416069999337196
++      },
++      "interpretation": "No evident regression in this shallow replay; overlapping control spread, no performance gain asserted. F+B envelope includes orchestration, not pure math or training step."
++    },
++    "failures": [
++      {
++        "case": "fixed BF16 token plan",
++        "cause": "new optional fixed-token API selected an automatic-only plan_tokens field",
++        "resolution": "use the initial fixed plan; full shape replay/profile passed after fix"
++      },
++      {
++        "case": "first four-card previous-version control",
++        "cause": "HCCL AICPU RunAicpuIndOpThreadInit failed before Mega launch; root cause not established",
++        "resolution": "one retry passed; failed launch excluded from timing"
++      }
++    ],
++    "production_preprocess": {
++      "sha256": "23d8eb57fc7173d9811c28e9d1e20f3f75625223f4196c113523b376a160c6ea",
++      "contains_queue_state_publish_fix": true,
++      "path": "build/migration-production-mx-aiv.ii"
++    },
++    "remaining": [
++      "A3 device execution unavailable: source assembly and architecture guards checked, no A3 performance claim",
++      "large cluster regression not run",
++      "installed native binary tiler/template identity remains unknown",
++      "BF16 host legacy tiling tables remain inherited; no new raw-offset table patch added"
++    ],
++    "automatic_token_details": [
++      [
++        {
++          "mode": "push",
++          "result": {
++            "lengths": [
++              0,
++              0
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 768,
++              "receive_rows": 1024,
++              "heap_bytes": 134217728,
++              "epoch": 0
++            }
++          }
++        },
++        {
++          "mode": "push",
++          "result": {
++            "lengths": [
++              17,
++              0
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 768,
++              "receive_rows": 1024,
++              "heap_bytes": 134217728,
++              "epoch": 0
++            }
++          }
++        },
++        {
++          "mode": "push",
++          "result": {
++            "lengths": [
++              127,
++              257
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 2304,
++              "receive_rows": 1280,
++              "heap_bytes": 134217728,
++              "epoch": 1
++            }
++          }
++        },
++        {
++          "mode": "push",
++          "result": {
++            "lengths": [
++              512,
++              129
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 3072,
++              "receive_rows": 2048,
++              "heap_bytes": 134217728,
++              "epoch": 2
++            }
++          }
++        },
++        {
++          "mode": "pull",
++          "result": {
++            "lengths": [
++              0,
++              0
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 768,
++              "receive_rows": 768,
++              "heap_bytes": 134217728,
++              "epoch": 0
++            }
++          }
++        },
++        {
++          "mode": "pull",
++          "result": {
++            "lengths": [
++              17,
++              0
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 768,
++              "receive_rows": 768,
++              "heap_bytes": 134217728,
++              "epoch": 0
++            }
++          }
++        },
++        {
++          "mode": "pull",
++          "result": {
++            "lengths": [
++              127,
++              257
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 2304,
++              "receive_rows": 768,
++              "heap_bytes": 134217728,
++              "epoch": 1
++            }
++          }
++        },
++        {
++          "mode": "pull",
++          "result": {
++            "lengths": [
++              512,
++              129
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 3072,
++              "receive_rows": 768,
++              "heap_bytes": 134217728,
++              "epoch": 2
++            }
++          }
++        }
++      ],
++      [
++        {
++          "mode": "push",
++          "result": {
++            "lengths": [
++              0,
++              0
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 768,
++              "receive_rows": 1024,
++              "heap_bytes": 134217728,
++              "epoch": 0
++            }
++          }
++        },
++        {
++          "mode": "push",
++          "result": {
++            "lengths": [
++              17,
++              0
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 768,
++              "receive_rows": 1024,
++              "heap_bytes": 134217728,
++              "epoch": 0
++            }
++          }
++        },
++        {
++          "mode": "push",
++          "result": {
++            "lengths": [
++              127,
++              257
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 2304,
++              "receive_rows": 1280,
++              "heap_bytes": 134217728,
++              "epoch": 1
++            }
++          }
++        },
++        {
++          "mode": "push",
++          "result": {
++            "lengths": [
++              512,
++              129
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 3072,
++              "receive_rows": 2048,
++              "heap_bytes": 134217728,
++              "epoch": 2
++            }
++          }
++        },
++        {
++          "mode": "pull",
++          "result": {
++            "lengths": [
++              0,
++              0
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 768,
++              "receive_rows": 768,
++              "heap_bytes": 134217728,
++              "epoch": 0
++            }
++          }
++        },
++        {
++          "mode": "pull",
++          "result": {
++            "lengths": [
++              17,
++              0
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 768,
++              "receive_rows": 768,
++              "heap_bytes": 134217728,
++              "epoch": 0
++            }
++          }
++        },
++        {
++          "mode": "pull",
++          "result": {
++            "lengths": [
++              127,
++              257
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 2304,
++              "receive_rows": 768,
++              "heap_bytes": 134217728,
++              "epoch": 1
++            }
++          }
++        },
++        {
++          "mode": "pull",
++          "result": {
++            "lengths": [
++              512,
++              129
++            ],
++            "hot": false,
++            "max_abs_error": {
++              "output": 0.0,
++              "input_grad": 0.0,
++              "route_grad": 0.0,
++              "w1_grad": 0.0,
++              "w2_grad": 0.0
++            },
++            "capacity": {
++              "routed_rows": 3072,
++              "receive_rows": 768,
++              "heap_bytes": 134217728,
++              "epoch": 2
++            }
++          }
++        }
++      ]
++    ],
++    "kernel_sha256": {
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_gate_route/HyperMegaGateRoute_51b3ed5fb437e5de2c66aff4a6043505.o": "42e0c888321f436a4d2452c4ed8cdb4bfb5607f053d5ec398688dbc7d53e6f75",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_gate_route_grad/HyperMegaGateRouteGrad_303d12d6648a9fd322199a0a8d3ab5c0.o": "2ec42a6c006926f686c8bcc46192d8199aa097a79eb7080e3ec69885bc2cdcde",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_mhc/HyperMegaMhc_433fc592441f7ac1b484cebbff756b75.o": "6570e5431622c362ea1ead50b37e104ccef9bbf4d5c735e06c286cfce5c59b22",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_mhc_grad/HyperMegaMhcGrad_bf9c317a8a7bc83c9f4bed060af1a9cc.o": "afd68c8bf8cfef644b7d143b85f034bcba45ca3d66b226bce8e44b5257d376c6",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe/HyperMegaMoe_8fa11c3f49d35b114d045c751d29ca02.o": "64229405eb370f15ef5cd8d0513af347044d0d0337853e7df56b42b747d4a1ae",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe/HyperMegaMoe_e6c0ec2992b0e7c6cc20aea213fa5428.o": "118eae3948fbae7cd67cc06688b0847ff8fdec5e2bce04b5fb64d222c56d0d63",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_grad/HyperMegaMoeGrad_4a749b390f901cd7613a0b8a93a36252.o": "3b43a38a10421aa7febbdb04200d8d9a3dbf9fe80f6b90bd6f4f7c25b74c9f90",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_grad/HyperMegaMoeGrad_a3e209fcfebb8705529dbb31c9eba29b.o": "50f5429f8c9ca23deafb1074c881261bff54a44d91633b0438f7ce5505bbc21a",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_mxfp8/HyperMegaMoeMxfp8_69cf6e3b38a9f15d44136991671bf972.o": "ec7df9318def780b586e6fd77ff26c7efb7dadee3c31b206032e7b3a32c162a5",
++      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_mxfp8_grad/HyperMegaMoeMxfp8Grad_1f84f8722544bfdaf6b14787e3877291.o": "05baff62407251a2ea259438e033ee53dd28950051dacf6dc7fbb6a3281a1f21"
++    },
++    "source_manifest_sha256": "44b0f3e20012d347e1d56e4561caaf9265e24c1944521dc7f6cfe108f9a8b7f1"
+   },
+   "excluded": [
+     "QP8/16/32 controls",
+@@ -118,5 +590,14 @@
+     "legacy_wire_prefix": "unchanged when queue_layout=0",
+     "ready_depth": "per worker 0/1/8; no communication reorder by the executor",
+     "profile": "normal has no added records; profile reports ReadyQueueWait and sizes by actual queues"
+-  }
++  },
++  "migration_commits": [
++    "9731358 profiling: preserve caller tags without device instrumentation",
++    "47b928f megamoe: preserve fixed plans and no-grad storage ownership",
++    "64b1f69 megamoe: compose A5 BF16 and MX tasks over shared QP1 queues",
++    "9b15545 runtime: add explicit per-worker queues and bounded ready selection",
++    "dd422f3 shmem: share completed QP1 UDMA transfers across consumers",
++    "85c6964 build: expose task-local entries in upstream A5 primitives",
++    "09dae93 build: assemble A5 math from pinned upstream sources"
++  ]
+ }
+diff --git a/docs/architecture.md b/docs/architecture.md
+index bc83a5d..c7416fd 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -849,3 +849,43 @@ _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
+ | GMM workspace 越界 | TILE_M/N 设置过大 | 检查 `tiling_tables.py` 中 workspace 预算 |
+ | `runtime/worker_kernel.h` 找不到 | 新算子未纳入隔离源码组装 | 检查 `assemble_multicore_source.py` 的算子列表和 `MULTICORE_SOURCE_ASSEMBLY_FAILED` 日志 |
+ | Python `ImportError: scheduler` | 从非包根目录运行 | 从 `hyper-multicore/` 根目录用 `python -m` 方式运行 |
++
++## A5 MegaMoE 迁移边界
++
++BF16 和 MXFP8 共用 `modules/mega_moe/transport.py` 的 QP0 owner 规划和
++`ops/mega_moe_common/transport_task.h` 的完整传输/信用协议。SHMEM 只提供 MTE、UDMA
++及其完成语义，不解释专家、路由或模型层。A3 使用 MTE；A5 可显式选择 MTE 或 UDMA。
++UDMA 每个远端 peer 固定一个 QP，不读取历史的多 QP 配置变量。不同 peer 的 QP0 彼此独立。
++
++通信 AIV 按 peer 固定 owner，包含 post 和 quiet；本地自拷贝分散到可用 AIV，使用 MTE
++双缓冲，不占 QP。完成之前不发布消费者信用。Pull 的源 ready、读完成和源存储复用握手
++仍由公共运行时执行。跨 workspace/stream 的 QP0 使用由现有完成事件排序，不额外添加设备打点。
++
++业务 DAG 和双专家窗口在 `modules/mega_moe/schedule.py`，通用运行时只执行显式的每核队列。
++通信保持 FIFO，数学队列可配置 ready-depth 0/1/8；这不是跨核偷取，也不是固定 solver 表。
++每核队列是可选 ABI 扩展，旧队列的二进制前缀保持不变。核数由设备查询，业务层不固定写死为 32。
++当前数学队列采用偶数 AIV、通信采用奇数 AIV 的分工；通用运行时不包含这种分工假设。
++
++A5 数学实现从锁定的 CANN Git 源码装配，不在仓库内保存第二套 Blaze 或 SwiGLUGrad 源码树：
++
++| 内容 | 来源 | 本仓适配边界 |
++|---|---|---|
++| BF16 GMM NN/NT/TN | ops-tensor `c350b98e15` | 已解析的单专家、逻辑核编号、原标准 tile 循环 |
++| MX GMM | 同一 ops-tensor revision | 单专家入口、逻辑核轮转、资源/scale 配置 |
++| BF16 SwiGLUGrad | 原锁定 ops-nn `39e54ece7e` arch35 | 逻辑 AIV 编号；clamp/不适用形状保留原路径 |
++| MX 量化/SwiGLU 正反向 | 同一 ops-nn revision 的 arch35 | task 内 tiling、逻辑编号和物理 scale 布局 |
++| SHMEM | 原 master 锁定 v1.8.0 | 保留 master 的运行时符号和日志适配 |
++
++适配补丁不会重写 FMA、激活或量化数学函数。必要的代码包括指针/布局解释、单专家尾块、
++空专家零梯度、task 完成前排空和 tiling 配置。它们仍须通过数值/生命周期门禁；
++“来自标准源码”不等于已证明与当前系统 native 二进制选中了相同分支。
++构建输入的实际文件 SHA 在装配目录 `source/a5/sources.json`。
++
++MX 权重由调用方持有原始 Tensor/Parameter，提供当前 `col_data/col_scale`，反向还需
++`row_data/row_scale`。数据为 E4M3FN，scale 为 uint8 物理 E8M0 布局，逻辑权重为 EIO。
++反向重新从原始 root 解析物理存储，禁止缓存 FSDP gather 后的临时 view。
++正向 no-grad 的 SwiGLU 可只计算 rowwise；需要反向的首轮/重算仍生成完整 columnwise。
++Pull 的图计划按静态上界复用，真实负载只改变运行时 metadata，不生成逐路由队列表。
++
++未迁入未采纳的固定 solver 表、半核候选、老 SHMEM SDK、额外故障观察器和多 QP 开关。
++历史阴性实验不能作为否定新架构组合的依据；后续候选应单独提交并与迁移基线比较。
+diff --git a/docs/build.md b/docs/build.md
+index 82990a7..815a754 100644
+--- a/docs/build.md
++++ b/docs/build.md
+@@ -323,3 +323,63 @@ python -m pytest tests/ut -q
+ 
+ CPU 单测包含 C++17 runtime ABI reader，需要 G++。无 native 的 editable 安装用于 Host 开发；
+ NPU 用例需先构建并激活 native payload。
++
++## 从源码构建并使用 A5 BF16/MXFP8 MegaMoE
++
++A5 构建会额外解析锁文件中的 `ops_tensor`，其余 ops-nn、ops-transformer、SHMEM revision
++保持原 master 的锁定值。Blaze 的传递来源是 ops-tensor，单独拉 ops-transformer 不等于已具备
++完整头文件闭包。构建入口会下载/校验并在隔离目录装配全部依赖，既不修改系统 CANN，也不修改
++下载仓库的工作区。无需另带历史 SDK、数学源码副本或本机实验目录。
++
++```bash
++# 使用需要交付的同一 Python/Torch/torch_npu/CANN 环境。
++bash build.sh --soc-list ascend950 --jobs 16
++export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
++source build/native/payload/hyper_multicore/lib/set_env.bash
++export HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_udma
++export HYPER_MULTICORE_MEGAMOE_COMM_SPLIT=512
++export HYPER_MULTICORE_MEGAMOE_READY_DEPTH=8
++export HYPER_MULTICORE_SHMEM_LOG_LEVEL=2
++export SHMEM_LOG_LEVEL=ERROR
++```
++
++然后导入 `from hyper_multicore import MegaMoeExperts, MXFP8MegaMoeExperts`。
++BF16 原有自动 token API 保留，可选 `local_num_tokens` 建立固定计划；MX 当前要求显式传入
++`local_num_tokens`，并且 H/I 均为 64 的倍数。两者都可传 `dispatch_mode="push"` 或 `"pull"`；
++Pull 不传容量因子。外部权重每次用 `expert_weights=(root1, root2)` 传入。
++MX 的物理权重合同见 [architecture.md](architecture.md)。
++
++| 配置 | 作用 |
++|---|---|
++| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（原默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
++| `HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE` | 可选 `push/pull`；若同时传构造参数必须一致 |
++| `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，原 API 默认仍为 128 |
++| `HYPER_MULTICORE_MEGAMOE_READY_DEPTH` | 0 为 FIFO；1/8 为有限 ready 扫描；通信 FIFO 不变，默认 0 |
++| `HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY` | 默认 1，仅 no-grad 正向免算 SwiGLU columnwise |
++| `HYPER_MULTICORE_MX_NOGRAD_NO_CLONE` | 默认 1，在 lease 内完成 unpermute 后返回独立输出 |
++| `HYPER_MULTICORE_BF16_NOGRAD_NO_COPY` | 默认 1，A5 UDMA no-grad 免保存 dispatch，并在 lease 内 unpermute |
++| `HYPER_MULTICORE_SHMEM_HEAP_SIZE` | 显式字节预算；按实际模型/路由容量评估，不能用扩大预算代替正确性 |
++
++兼容旧精度别名 `HYPER_MULTICORE_MX_COMM_SPLIT`、`HYPER_MULTICORE_MX_READY_DEPTH` 和
++`HYPER_MULTICORE_BF16_READY_DEPTH`，共用变量优先。QP 固定 1，不需要配置 QP 数量。
++内部 profiling 复用本仓公共 profiler API，normal 不创建 profiling buffer、不记录任务打点。
++下游按层、step、micro 的采样过滤应放在适配层；本组件不导入或识别训练框架。
++
++可运行独立组件回放，覆盖 no-grad/重算/反向、空专家、物理 root 刷新和双 stream：
++
++```bash
++# 仅使用已确认空闲的卡；LOCAL_RANK 对应可见列表的索引。
++ASCEND_RT_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc-per-node=2 \
++  tests/torch/_a5_megamoe_replay.py --precision mxfp8 --tokens 512 \
++  --hidden 5120 --intermediate 1792 --mode pull --output ./replay-results
++```
++
++将 `--precision` 改为 `bf16` 可测 BF16；`--empty` 制造空专家；`--profile` 单独保存内部 trace；
++`--benchmark` 另起 normal 作业，预热 3 次并保存 7 次 F+B 包络，不能与 profiling 同时用。
++这只是组件回放，不代表训练整网或集群性能。
++
++集群免编译部署时，复制完整源码仓及其 `build/native/payload/hyper_multicore`，保持相对目录。
++在集群重新设置仓库根目录的 PYTHONPATH，再 source 同一 payload 的 set_env.bash。
++调用方可把这两步写入自己的 activate.bash。目标须满足构建制品记录的 CPU 架构、Python ABI、
++Torch/torch_npu 和 CANN 兼容性；不复制构建机器的 Conda 路径或个人环境脚本。
++切换源码或 native 制品后启动新 Python 进程，不在已加载旧库的进程里热替换。
+diff --git a/tests/torch/_a5_megamoe_replay.py b/tests/torch/_a5_megamoe_replay.py
+new file mode 100644
+index 0000000..c84200e
+--- /dev/null
++++ b/tests/torch/_a5_megamoe_replay.py
+@@ -0,0 +1,142 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
++"""Component replay: F/R/B, empty experts, fresh roots, streams and optional trace.
++
++Run under torchrun after activating the source-built payload. Normal correctness
++replay is separate from performance measurement. No downstream framework needed.
++"""
++import argparse, json, hashlib, os
++import time
++from pathlib import Path
++from datetime import timedelta
++import torch, torch.distributed as dist, torch_npu
++from hyper_multicore import MegaMoeExperts, MXFP8MegaMoeExperts
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument('--precision', choices=['bf16', 'mxfp8'], default='mxfp8')
++    p.add_argument('--hidden', type=int, default=512)
++    p.add_argument('--intermediate', type=int, default=128)
++    p.add_argument('--output', type=Path, required=True)
++    p.add_argument('--mode', choices=['push', 'pull'], default='push')
++    p.add_argument('--tokens', type=int, default=128)
++    p.add_argument('--empty', action='store_true')
++    p.add_argument('--profile', action='store_true')
++    p.add_argument('--save-tensors', action='store_true')
++    p.add_argument('--benchmark', action='store_true')
++    a = p.parse_args()
++    rank = int(os.environ['RANK'])
++    local = int(os.environ['LOCAL_RANK'])
++    torch.npu.set_device(local)
++    dist.init_process_group('hccl', timeout=timedelta(seconds=120))
++    world = dist.get_world_size()
++    dev = torch.device('npu', local)
++    torch.manual_seed(1729 + rank)
++    torch.npu.manual_seed(1729 + rank)
++    h, i, e, k = (a.hidden, a.intermediate, 6, 8)
++    shapes = ((e, h, 2 * i), (e, i, h))
++    physical = []
++    roots = []
++    for shape in shapes:
++        w = torch.randn(shape, dtype=torch.bfloat16, device=dev) * 0.02
++        quant = torch_npu.npu_dynamic_mx_quant_with_dual_axis(w, dst_type=torch.float8_e4m3fn, scale_alg=1) if a.precision == 'mxfp8' else None
++        root = torch.nn.Parameter(w)
++        roots.append(root)
++        physical.append(quant)
++    module = (MXFP8MegaMoeExperts if a.precision == 'mxfp8' else MegaMoeExperts)(local_num_tokens=a.tokens, hidden_size=h, intermediate_size=i, num_experts=e * world, top_k=k, ep_size=world, ep_group=dist.group.WORLD, create_parameters=False, dispatch_mode=a.mode, initial_capacity_factor=2 if a.mode == 'push' else None)
++
++    def axes(backward=False, fresh=False):
++        if a.precision == 'bf16':
++            return
++        for root, data in zip(roots, physical):
++            data = tuple((t.clone() for t in data)) if fresh else data
++            root.row_data, root.row_scale = (data[0], data[1]) if backward else (None, None)
++            root.col_data, root.col_scale = data[2:]
++
++    def inputs(index):
++        x = (torch.randn(a.tokens, h, dtype=torch.bfloat16, device=dev) * 0.1).requires_grad_()
++        probs = torch.softmax(torch.randn(a.tokens, k, device=dev), -1).requires_grad_()
++        ids = (torch.arange(a.tokens * k, device=dev).reshape(-1, k) + index) % (k if a.empty else e * world)
++        return (x, probs, ids, torch.randn_like(x) * 0.1)
++    records = []
++
++    def sig(t):
++        data = t.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
++        return dict(shape=list(t.shape), sha256=hashlib.sha256(data).hexdigest())
++    prof = None
++    if a.profile:
++        from hyper_multicore.diagnostics.profiler.api import TorchMegaKernelProfiler
++        from hyper_multicore.diagnostics.common.schedule import DiagnosticAction
++        prof = TorchMegaKernelProfiler(schedule=lambda _: DiagnosticAction.RECORD_AND_SAVE, on_trace_ready=lambda _: None, detailed_task_names=True, max_pending_calls=3)
++        prof.__enter__()
++    for micro in range(1 if a.profile else 2):
++        x, probs, ids, dy = inputs(micro)
++        axes()
++        with torch.no_grad():
++            first = module(x, ids, probs, expert_weights=tuple(roots))
++        axes()
++        out = module(x, ids, probs, expert_weights=tuple(roots))
++        torch.testing.assert_close(first, out, rtol=0, atol=0)
++        axes(True, True)
++        grads = torch.autograd.grad(out, (x, probs, *roots), grad_outputs=dy)
++        torch.npu.synchronize()
++        if not all((bool(t.float().isfinite().all().item()) for t in (out, *grads))):
++            raise RuntimeError('nonfinite output/gradient')
++        if a.empty:
++            inactive = torch.arange(e, device=dev) + rank * e >= k
++            for grad in grads[2:]:
++                if torch.count_nonzero(grad.reshape(e, -1)[inactive]).item():
++                    raise RuntimeError('empty expert gradient')
++        records.append(dict(micro=micro, input=sig(x), results=[sig(t) for t in (out, *grads)]))
++        a.output.mkdir(parents=True, exist_ok=True)
++        if a.save_tensors:
++            torch.save([t.detach().cpu() for t in (out, *grads)], a.output / f'rank{rank:05d}-micro{micro}.pt')
++    if prof:
++        prof.__exit__(None, None, None)
++        prof.export_chrome_trace(a.output / f'rank{rank:05d}-trace.json')
++    else:
++        streams = [torch.npu.Stream(), torch.npu.Stream()]
++        contexts = []
++        for index in range(2):
++            x, probs, ids, dy = inputs(index + 2)
++            axes()
++            streams[index].wait_stream(torch.npu.current_stream())
++            with torch.npu.stream(streams[index]):
++                out = module(x, ids, probs, expert_weights=tuple(roots))
++            contexts.append((x, probs, out, dy))
++        for index in (1, 0):
++            x, probs, out, dy = contexts[index]
++            axes(True, True)
++            streams[1 - index].wait_stream(torch.npu.current_stream())
++            with torch.npu.stream(streams[1 - index]):
++                grads = torch.autograd.grad(out, (x, probs, *roots), grad_outputs=dy)
++            torch.npu.synchronize()
++            if not all((bool(t.float().isfinite().all().item()) for t in grads)):
++                raise RuntimeError('old-context stream gradient')
++    timings = []
++    if a.benchmark:
++        if a.profile:
++            raise ValueError('Benchmark and profiling must be separate launches')
++        axes(True)
++        x, probs, ids, dy = inputs(0)
++        torch.npu.synchronize()
++        for iteration in range(10):
++            start, end = (torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True))
++            wall = time.perf_counter()
++            start.record()
++            out = module(x, ids, probs, expert_weights=tuple(roots))
++            grads = torch.autograd.grad(out, (x, probs, *roots), grad_outputs=dy)
++            end.record()
++            end.synchronize()
++            if iteration >= 3:
++                timings.append(dict(event_ms=start.elapsed_time(end), wall_ms=(time.perf_counter() - wall) * 1000))
++    module.close()
++    dist.barrier()
++    a.output.mkdir(parents=True, exist_ok=True)
++    (a.output / f'rank{rank:05d}.json').write_text(json.dumps(dict(
++        passed=True, rank=rank, world=world, precision=a.precision, mode=a.mode, empty=a.empty,
++        shape=dict(tokens=a.tokens, hidden=h, intermediate=i, experts_per_rank=e, top_k=k),
++        records=records, timings=timings), indent=2))
++    print(json.dumps(dict(rank=rank, passed=True)), flush=True)
++    dist.destroy_process_group()
++if __name__ == '__main__':
++    main()
+diff --git a/tests/torch/_test_mega_moe_dynamic_tokens.py b/tests/torch/_test_mega_moe_dynamic_tokens.py
+index 42b4261..324411b 100644
+--- a/tests/torch/_test_mega_moe_dynamic_tokens.py
++++ b/tests/torch/_test_mega_moe_dynamic_tokens.py
+@@ -608,6 +608,28 @@ def _supplied_count_cache_ownership(mega: MegaMoeExperts, weights: tuple, rank:
+     _check_gradients(mega, invocation, _rounded_oracle(weights, current), lengths, rank)
+ 
+ 
++def test_dynamic_token_transport_smoke() -> None:
++    """Two-rank bounded gate for empty/ragged growth with both transports."""
++    local = int(os.environ.get("LOCAL_RANK", "0"))
++    torch.npu.set_device(local)
++    dist.init_process_group("hccl")
++    rank, world = dist.get_rank(), dist.get_world_size()
++    if world != 2:
++        raise ValueError("The bounded token transport gate requires two ranks")
++    device = torch.device("npu", local)
++    weights = _weights(world * 6)
++    try:
++        for mode in ("push", "pull"):
++            layer = _layer(mode, weights, rank, world, device)
++            try:
++                for lengths in ([0, 0], [17, 0], [127, 257], [512, 129]):
++                    _verify(layer, lengths, weights, rank, device)
++            finally:
++                layer.close()
++    finally:
++        dist.destroy_process_group()
++
++
+ def test_dynamic_tokens() -> None:
+     """Validate automatic lengths, growth, numerical oracles and retained graphs in one EP worker."""
+     torch.set_num_threads(2)
+-- 
+2.54.0
+

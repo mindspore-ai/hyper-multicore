@@ -36,32 +36,32 @@
     {
       "id": 0,
       "name": "source identity and isolated A5 assembly",
-      "state": "implemented; device qualification pending"
+      "state": "qualified on local A5"
     },
     {
       "id": 1,
       "name": "minimal math task adapters",
-      "state": "implemented; device qualification pending"
+      "state": "qualified on local A5"
     },
     {
       "id": 2,
       "name": "shared QP1 transport",
-      "state": "implemented; device qualification pending"
+      "state": "qualified on local A5"
     },
     {
       "id": 3,
       "name": "DAG and queue integration",
-      "state": "implemented; device qualification pending"
+      "state": "qualified on local A5"
     },
     {
       "id": 4,
       "name": "correctness lifecycle performance and deployment",
-      "state": "in_progress"
+      "state": "local A5 qualified; cluster and A3 device regression pending"
     }
   ],
   "validation": {
-    "build": "pending",
-    "device": "pending",
+    "build": "passed: Python3.11.10 / torch2.12.0+cpu / torch_npu2.12.0.post3 / CANN9.2.0, ascend950",
+    "device": "passed: two/four-card component gates",
     "native_binary_branch_identity": "unknown",
     "source_assembly": {
       "state": "passed",
@@ -90,14 +90,486 @@
     "host_integration": {
       "tests_passed": 113,
       "subtests_passed": 769,
-      "log": "build/migration-all-host-v3.log"
+      "log": "build/migration-final-host.log"
     },
     "math_template_compile": {
       "bf16_gmm_NN_NT_TN": "passed",
       "mx_gmm": "passed",
       "bf16_swiglu_grad_and_mx_vector_worker": "passed (device-only compiler pass)",
       "device_execution": "pending"
-    }
+    },
+    "profiler": {
+      "tests_passed": 38,
+      "subtests_passed": 20,
+      "normal_instrumentation": false,
+      "dropped_records": 0,
+      "scoped_phases": [
+        "forward",
+        "recompute",
+        "backward"
+      ],
+      "path": "build/migration-downstream-profile"
+    },
+    "device_cases": [
+      "BF16 EIO/EOI: independent output/dX/dProbs/dW/SGD oracle, balanced/empty/skew/single destination, Push/Pull",
+      "MX no-grad/recompute/full gradients/empty experts/current roots/old contexts/two streams",
+      "H5120 I1792 six experts per rank TSV512 ready-depth8: BF16 two cards and MX Pull four cards",
+      "automatic BF16 tokens: [0,0], [17,0], [127,257], [512,129], Push/Pull",
+      "actual downstream quantized root type and FSDP root refresh via external imports"
+    ],
+    "bitwise_comparison": {
+      "reference_commit": "1e8d0a498b89e59a855070c7a6c7a1b5aad88d81",
+      "result": "all recorded outputs, dX, dProbs, dW1, dW2 SHA identical",
+      "two_card_samples": 4,
+      "four_card_samples": 8,
+      "four_card_shape": {
+        "tokens": 512,
+        "hidden": 5120,
+        "intermediate": 1792,
+        "experts_per_rank": 6,
+        "top_k": 8
+      },
+      "normal_comparison": "migration-mx-new-final-normal4 vs migration-mx-old-normal4-retry"
+    },
+    "performance": {
+      "previous": {
+        "rank_max_event_samples_ms": [
+          8.778407096862793,
+          10.598976135253906,
+          10.16065788269043,
+          10.68963623046875,
+          10.559674263000488,
+          11.20959186553955,
+          9.887129783630371
+        ],
+        "event_median_ms": 10.559674263000488,
+        "wall_median_ms": 10.787679813802242
+      },
+      "current": {
+        "rank_max_event_samples_ms": [
+          10.823664665222168,
+          10.06666374206543,
+          9.80793571472168,
+          10.882139205932617,
+          9.822155952453613,
+          9.933552742004395,
+          10.487435340881348
+        ],
+        "event_median_ms": 10.06666374206543,
+        "wall_median_ms": 10.416069999337196
+      },
+      "interpretation": "No evident regression in this shallow replay; overlapping control spread, no performance gain asserted. F+B envelope includes orchestration, not pure math or training step."
+    },
+    "failures": [
+      {
+        "case": "fixed BF16 token plan",
+        "cause": "new optional fixed-token API selected an automatic-only plan_tokens field",
+        "resolution": "use the initial fixed plan; full shape replay/profile passed after fix"
+      },
+      {
+        "case": "first four-card previous-version control",
+        "cause": "HCCL AICPU RunAicpuIndOpThreadInit failed before Mega launch; root cause not established",
+        "resolution": "one retry passed; failed launch excluded from timing"
+      }
+    ],
+    "production_preprocess": {
+      "sha256": "23d8eb57fc7173d9811c28e9d1e20f3f75625223f4196c113523b376a160c6ea",
+      "contains_queue_state_publish_fix": true,
+      "path": "build/migration-production-mx-aiv.ii"
+    },
+    "remaining": [
+      "A3 device execution unavailable: source assembly and architecture guards checked, no A3 performance claim",
+      "large cluster regression not run",
+      "installed native binary tiler/template identity remains unknown",
+      "BF16 host legacy tiling tables remain inherited; no new raw-offset table patch added"
+    ],
+    "automatic_token_details": [
+      [
+        {
+          "mode": "push",
+          "result": {
+            "lengths": [
+              0,
+              0
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 768,
+              "receive_rows": 1024,
+              "heap_bytes": 134217728,
+              "epoch": 0
+            }
+          }
+        },
+        {
+          "mode": "push",
+          "result": {
+            "lengths": [
+              17,
+              0
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 768,
+              "receive_rows": 1024,
+              "heap_bytes": 134217728,
+              "epoch": 0
+            }
+          }
+        },
+        {
+          "mode": "push",
+          "result": {
+            "lengths": [
+              127,
+              257
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 2304,
+              "receive_rows": 1280,
+              "heap_bytes": 134217728,
+              "epoch": 1
+            }
+          }
+        },
+        {
+          "mode": "push",
+          "result": {
+            "lengths": [
+              512,
+              129
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 3072,
+              "receive_rows": 2048,
+              "heap_bytes": 134217728,
+              "epoch": 2
+            }
+          }
+        },
+        {
+          "mode": "pull",
+          "result": {
+            "lengths": [
+              0,
+              0
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 768,
+              "receive_rows": 768,
+              "heap_bytes": 134217728,
+              "epoch": 0
+            }
+          }
+        },
+        {
+          "mode": "pull",
+          "result": {
+            "lengths": [
+              17,
+              0
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 768,
+              "receive_rows": 768,
+              "heap_bytes": 134217728,
+              "epoch": 0
+            }
+          }
+        },
+        {
+          "mode": "pull",
+          "result": {
+            "lengths": [
+              127,
+              257
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 2304,
+              "receive_rows": 768,
+              "heap_bytes": 134217728,
+              "epoch": 1
+            }
+          }
+        },
+        {
+          "mode": "pull",
+          "result": {
+            "lengths": [
+              512,
+              129
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 3072,
+              "receive_rows": 768,
+              "heap_bytes": 134217728,
+              "epoch": 2
+            }
+          }
+        }
+      ],
+      [
+        {
+          "mode": "push",
+          "result": {
+            "lengths": [
+              0,
+              0
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 768,
+              "receive_rows": 1024,
+              "heap_bytes": 134217728,
+              "epoch": 0
+            }
+          }
+        },
+        {
+          "mode": "push",
+          "result": {
+            "lengths": [
+              17,
+              0
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 768,
+              "receive_rows": 1024,
+              "heap_bytes": 134217728,
+              "epoch": 0
+            }
+          }
+        },
+        {
+          "mode": "push",
+          "result": {
+            "lengths": [
+              127,
+              257
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 2304,
+              "receive_rows": 1280,
+              "heap_bytes": 134217728,
+              "epoch": 1
+            }
+          }
+        },
+        {
+          "mode": "push",
+          "result": {
+            "lengths": [
+              512,
+              129
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 3072,
+              "receive_rows": 2048,
+              "heap_bytes": 134217728,
+              "epoch": 2
+            }
+          }
+        },
+        {
+          "mode": "pull",
+          "result": {
+            "lengths": [
+              0,
+              0
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 768,
+              "receive_rows": 768,
+              "heap_bytes": 134217728,
+              "epoch": 0
+            }
+          }
+        },
+        {
+          "mode": "pull",
+          "result": {
+            "lengths": [
+              17,
+              0
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 768,
+              "receive_rows": 768,
+              "heap_bytes": 134217728,
+              "epoch": 0
+            }
+          }
+        },
+        {
+          "mode": "pull",
+          "result": {
+            "lengths": [
+              127,
+              257
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 2304,
+              "receive_rows": 768,
+              "heap_bytes": 134217728,
+              "epoch": 1
+            }
+          }
+        },
+        {
+          "mode": "pull",
+          "result": {
+            "lengths": [
+              512,
+              129
+            ],
+            "hot": false,
+            "max_abs_error": {
+              "output": 0.0,
+              "input_grad": 0.0,
+              "route_grad": 0.0,
+              "w1_grad": 0.0,
+              "w2_grad": 0.0
+            },
+            "capacity": {
+              "routed_rows": 3072,
+              "receive_rows": 768,
+              "heap_bytes": 134217728,
+              "epoch": 2
+            }
+          }
+        }
+      ]
+    ],
+    "kernel_sha256": {
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_gate_route/HyperMegaGateRoute_51b3ed5fb437e5de2c66aff4a6043505.o": "42e0c888321f436a4d2452c4ed8cdb4bfb5607f053d5ec398688dbc7d53e6f75",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_gate_route_grad/HyperMegaGateRouteGrad_303d12d6648a9fd322199a0a8d3ab5c0.o": "2ec42a6c006926f686c8bcc46192d8199aa097a79eb7080e3ec69885bc2cdcde",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_mhc/HyperMegaMhc_433fc592441f7ac1b484cebbff756b75.o": "6570e5431622c362ea1ead50b37e104ccef9bbf4d5c735e06c286cfce5c59b22",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_mhc_grad/HyperMegaMhcGrad_bf9c317a8a7bc83c9f4bed060af1a9cc.o": "afd68c8bf8cfef644b7d143b85f034bcba45ca3d66b226bce8e44b5257d376c6",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe/HyperMegaMoe_8fa11c3f49d35b114d045c751d29ca02.o": "64229405eb370f15ef5cd8d0513af347044d0d0337853e7df56b42b747d4a1ae",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe/HyperMegaMoe_e6c0ec2992b0e7c6cc20aea213fa5428.o": "118eae3948fbae7cd67cc06688b0847ff8fdec5e2bce04b5fb64d222c56d0d63",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_grad/HyperMegaMoeGrad_4a749b390f901cd7613a0b8a93a36252.o": "3b43a38a10421aa7febbdb04200d8d9a3dbf9fe80f6b90bd6f4f7c25b74c9f90",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_grad/HyperMegaMoeGrad_a3e209fcfebb8705529dbb31c9eba29b.o": "50f5429f8c9ca23deafb1074c881261bff54a44d91633b0438f7ce5505bbc21a",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_mxfp8/HyperMegaMoeMxfp8_69cf6e3b38a9f15d44136991671bf972.o": "ec7df9318def780b586e6fd77ff26c7efb7dadee3c31b206032e7b3a32c162a5",
+      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_mxfp8_grad/HyperMegaMoeMxfp8Grad_1f84f8722544bfdaf6b14787e3877291.o": "05baff62407251a2ea259438e033ee53dd28950051dacf6dc7fbb6a3281a1f21"
+    },
+    "source_manifest_sha256": "44b0f3e20012d347e1d56e4561caaf9265e24c1944521dc7f6cfe108f9a8b7f1"
   },
   "excluded": [
     "QP8/16/32 controls",
@@ -118,5 +590,14 @@
     "legacy_wire_prefix": "unchanged when queue_layout=0",
     "ready_depth": "per worker 0/1/8; no communication reorder by the executor",
     "profile": "normal has no added records; profile reports ReadyQueueWait and sizes by actual queues"
-  }
+  },
+  "migration_commits": [
+    "9731358 profiling: preserve caller tags without device instrumentation",
+    "47b928f megamoe: preserve fixed plans and no-grad storage ownership",
+    "64b1f69 megamoe: compose A5 BF16 and MX tasks over shared QP1 queues",
+    "9b15545 runtime: add explicit per-worker queues and bounded ready selection",
+    "dd422f3 shmem: share completed QP1 UDMA transfers across consumers",
+    "85c6964 build: expose task-local entries in upstream A5 primitives",
+    "09dae93 build: assemble A5 math from pinned upstream sources"
+  ]
 }

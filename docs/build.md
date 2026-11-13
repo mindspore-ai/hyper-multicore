@@ -323,3 +323,63 @@ python -m pytest tests/ut -q
 
 CPU 单测包含 C++17 runtime ABI reader，需要 G++。无 native 的 editable 安装用于 Host 开发；
 NPU 用例需先构建并激活 native payload。
+
+## 从源码构建并使用 A5 BF16/MXFP8 MegaMoE
+
+A5 构建会额外解析锁文件中的 `ops_tensor`，其余 ops-nn、ops-transformer、SHMEM revision
+保持原 master 的锁定值。Blaze 的传递来源是 ops-tensor，单独拉 ops-transformer 不等于已具备
+完整头文件闭包。构建入口会下载/校验并在隔离目录装配全部依赖，既不修改系统 CANN，也不修改
+下载仓库的工作区。无需另带历史 SDK、数学源码副本或本机实验目录。
+
+```bash
+# 使用需要交付的同一 Python/Torch/torch_npu/CANN 环境。
+bash build.sh --soc-list ascend950 --jobs 16
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+source build/native/payload/hyper_multicore/lib/set_env.bash
+export HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_udma
+export HYPER_MULTICORE_MEGAMOE_COMM_SPLIT=512
+export HYPER_MULTICORE_MEGAMOE_READY_DEPTH=8
+export HYPER_MULTICORE_SHMEM_LOG_LEVEL=2
+export SHMEM_LOG_LEVEL=ERROR
+```
+
+然后导入 `from hyper_multicore import MegaMoeExperts, MXFP8MegaMoeExperts`。
+BF16 原有自动 token API 保留，可选 `local_num_tokens` 建立固定计划；MX 当前要求显式传入
+`local_num_tokens`，并且 H/I 均为 64 的倍数。两者都可传 `dispatch_mode="push"` 或 `"pull"`；
+Pull 不传容量因子。外部权重每次用 `expert_weights=(root1, root2)` 传入。
+MX 的物理权重合同见 [architecture.md](architecture.md)。
+
+| 配置 | 作用 |
+|---|---|
+| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（原默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
+| `HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE` | 可选 `push/pull`；若同时传构造参数必须一致 |
+| `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，原 API 默认仍为 128 |
+| `HYPER_MULTICORE_MEGAMOE_READY_DEPTH` | 0 为 FIFO；1/8 为有限 ready 扫描；通信 FIFO 不变，默认 0 |
+| `HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY` | 默认 1，仅 no-grad 正向免算 SwiGLU columnwise |
+| `HYPER_MULTICORE_MX_NOGRAD_NO_CLONE` | 默认 1，在 lease 内完成 unpermute 后返回独立输出 |
+| `HYPER_MULTICORE_BF16_NOGRAD_NO_COPY` | 默认 1，A5 UDMA no-grad 免保存 dispatch，并在 lease 内 unpermute |
+| `HYPER_MULTICORE_SHMEM_HEAP_SIZE` | 显式字节预算；按实际模型/路由容量评估，不能用扩大预算代替正确性 |
+
+兼容旧精度别名 `HYPER_MULTICORE_MX_COMM_SPLIT`、`HYPER_MULTICORE_MX_READY_DEPTH` 和
+`HYPER_MULTICORE_BF16_READY_DEPTH`，共用变量优先。QP 固定 1，不需要配置 QP 数量。
+内部 profiling 复用本仓公共 profiler API，normal 不创建 profiling buffer、不记录任务打点。
+下游按层、step、micro 的采样过滤应放在适配层；本组件不导入或识别训练框架。
+
+可运行独立组件回放，覆盖 no-grad/重算/反向、空专家、物理 root 刷新和双 stream：
+
+```bash
+# 仅使用已确认空闲的卡；LOCAL_RANK 对应可见列表的索引。
+ASCEND_RT_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tests/torch/_a5_megamoe_replay.py --precision mxfp8 --tokens 512 \
+  --hidden 5120 --intermediate 1792 --mode pull --output ./replay-results
+```
+
+将 `--precision` 改为 `bf16` 可测 BF16；`--empty` 制造空专家；`--profile` 单独保存内部 trace；
+`--benchmark` 另起 normal 作业，预热 3 次并保存 7 次 F+B 包络，不能与 profiling 同时用。
+这只是组件回放，不代表训练整网或集群性能。
+
+集群免编译部署时，复制完整源码仓及其 `build/native/payload/hyper_multicore`，保持相对目录。
+在集群重新设置仓库根目录的 PYTHONPATH，再 source 同一 payload 的 set_env.bash。
+调用方可把这两步写入自己的 activate.bash。目标须满足构建制品记录的 CPU 架构、Python ABI、
+Torch/torch_npu 和 CANN 兼容性；不复制构建机器的 Conda 路径或个人环境脚本。
+切换源码或 native 制品后启动新 Python 进程，不在已加载旧库的进程里热替换。
