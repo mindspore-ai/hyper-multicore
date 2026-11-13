@@ -126,7 +126,7 @@ def main() -> int:
         transformer_revisions["mhc"]["commit"],
         _OPS_TRANSFORMER_MHC_PATHS,
     )
-    _apply_locked_adapters(ops_nn_copy, lock["ops_nn"])
+    _apply_locked_adapters(ops_nn_copy, lock["ops_nn"], architecture="arch35" if ops_tensor_source else "arch22")
     _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"])
     _apply_locked_adapters(transformer_mhc_copy, transformer_revisions["mhc"])
 
@@ -214,9 +214,11 @@ def _export_git_tree(
             source.extractall(destination_root)
 
 
-def _apply_locked_adapters(source_root: Path, dependency_lock: dict[str, Any]) -> None:
+def _apply_locked_adapters(source_root: Path, dependency_lock: dict[str, Any], *, architecture: str | None = None) -> None:
     """Verify and apply fusion adapters only to the isolated source copy."""
     for adapter in dependency_lock.get("patches", []):
+        if adapter.get("architectures") and architecture not in adapter["architectures"]:
+            continue
         adapter_path = (_REPO_ROOT / adapter["path"]).resolve()
         actual_hash = _sha256(adapter_path)
         if actual_hash != adapter["sha256"]:

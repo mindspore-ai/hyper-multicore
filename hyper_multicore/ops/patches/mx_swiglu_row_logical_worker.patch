@@ -1,0 +1,28 @@
+--- a/quant/swiglu_mx_quant/op_kernel/arch35/swiglu_mx_quant_last_last.h
++++ b/quant/swiglu_mx_quant/op_kernel/arch35/swiglu_mx_quant_last_last.h
+@@ -35,7 +35,7 @@
+     __aicore__ inline SwigluMxQuantLastLast(){};
+ 
+     __aicore__ inline void Init(GM_ADDR x, GM_ADDR group_index, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace,
+-        const SwigluMxQuantTilingData *__restrict tilingData, AscendC::TPipe *pipe);
++        const SwigluMxQuantTilingData *__restrict tilingData, AscendC::TPipe *pipe, int64_t logicalBlockIndex = -1);
+     __aicore__ inline void Process();
+ 
+ private:
+@@ -243,14 +243,14 @@
+ 
+ template <typename T, typename U, typename T_IDX, bool isGroupIndex>
+ __aicore__ inline void SwigluMxQuantLastLast<T, U, T_IDX, isGroupIndex>::Init(GM_ADDR x, GM_ADDR group_index, GM_ADDR y,
+-    GM_ADDR mxscale, GM_ADDR workspace, const SwigluMxQuantTilingData *__restrict tilingData, AscendC::TPipe *pipe)
++    GM_ADDR mxscale, GM_ADDR workspace, const SwigluMxQuantTilingData *__restrict tilingData, AscendC::TPipe *pipe, int64_t logicalBlockIndex)
+ {
+ #if (__NPU_ARCH__ == 3510)
+     AscendC::SetCtrlSpr<FLOAT_OVERFLOW_MODE_CTRL, FLOAT_OVERFLOW_MODE_CTRL>(0);
+ #endif
+     tiling_ = tilingData;
+     pipe_ = pipe;
+-    blockIdx_ = GetBlockIdx();
++    blockIdx_ = logicalBlockIndex >= 0 ? logicalBlockIndex : GetBlockIdx();
+     xGm_.SetGlobalBuffer((__gm__ T *)x);
+     yGm_.SetGlobalBuffer((__gm__ uint8_t *)y);
+     scaleGm_.SetGlobalBuffer((__gm__ uint8_t *)mxscale);

@@ -57,6 +57,30 @@
             "path": "hyper_multicore/ops/patches/rms_norm_grad_worker_fusion.patch",
             "sha256": "0d6eacd29418c897cd3ac42bd4b62eb331912a62a36fa506a4df80f6fffd1ce2",
             "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
+          },
+          {
+            "path": "hyper_multicore/ops/patches/swiglu_grad_logical_worker.patch",
+            "sha256": "113578566e9f254061f746bd25e0df03d8440c75f46d6b16fdad445ab4120a50",
+            "purpose": "supply a task-local logical vector index without changing SwiGLUGrad mathematics",
+            "architectures": [
+              "arch35"
+            ]
+          },
+          {
+            "path": "hyper_multicore/ops/patches/mx_quant_logical_workers.patch",
+            "sha256": "a664e97ed9394c5ba376febbcfbce89960437f1a8a67346461787fdb69b12d94",
+            "purpose": "supply logical vector indices for standard MX quant and activation kernels",
+            "architectures": [
+              "arch35"
+            ]
+          },
+          {
+            "path": "hyper_multicore/ops/patches/mx_swiglu_row_logical_worker.patch",
+            "sha256": "7e7e3eaa1aeacfb26d0b48225d693beae1b939bd8cc3868f5dacf58acd8079ff",
+            "purpose": "supply logical vector index for the standard row-only activation quant kernel",
+            "architectures": [
+              "arch35"
+            ]
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -162,7 +186,13 @@
         "tree": "f60225e2beb7d59a55c095a7c0c650f46540aa78",
         "git_archive_tar_sha256": "6ac45efc6377f5843a2ba0db908075a0008f1d6679e01646b466990b75e907b4",
         "resolution": "A5 Blaze dependency pinned by ops-transformer dff221330e; all 47 original MX closure files match this Git tree",
-        "patches": [],
+        "patches": [
+          {
+            "path": "hyper_multicore/ops/patches/blaze_logical_workers.patch",
+            "sha256": "2448b5430e9c4a9edd7182bad9551d76e6b20155d71d19da78cca21df8579db4",
+            "purpose": "logical worker and single-problem entry; standard balancing and mathematics unchanged"
+          }
+        ],
         "upgrade_policy": "preserve task-local numerical and resource contracts; verify BF16 and MX independently"
       }
     }

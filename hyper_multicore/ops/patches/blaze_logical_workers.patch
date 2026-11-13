@@ -1,0 +1,54 @@
+--- a/include/blaze/gemm/block/block_scheduler_grouped_matmul.h
++++ b/include/blaze/gemm/block/block_scheduler_grouped_matmul.h
+@@ -66,6 +66,9 @@
+     {
+         blockNum_ = static_cast<int64_t>(AscendC::GetBlockNum());
+     }
++
++    // Task workers use a logical subset of the enclosing mixed launch.
++    __aicore__ inline void SetLogicalCoreCount(int64_t cores) { blockNum_ = cores; }
+ 
+     // Keep the block scheduling interface aligned with BlockSchedulerMatmulBasic.
+     __aicore__ inline int64_t GetBlockNums()
+--- a/include/blaze/gemm/block/block_scheduler_gmm_swat_with_tail_split.h
++++ b/include/blaze/gemm/block/block_scheduler_gmm_swat_with_tail_split.h
+@@ -120,6 +120,13 @@
+         blockNum_ = AscendC::GetBlockNum();
+         blockIdx_ = AscendC::GetBlockIdx() / AscendC::GetTaskRation();
+         endBlockIdx_ = blockNum_ > 0 ? blockNum_ - 1 : 0;
++    }
++
++    __aicore__ inline void SetLogicalWorkers(uint32_t index, uint32_t count)
++    {
++        blockIdx_ = index;
++        blockNum_ = count;
++        endBlockIdx_ = count - 1;
+     }
+ 
+     __aicore__ inline void UpdateNextProblem(const ProblemShape& problemShape)
+--- a/include/blaze/gemm/kernel/kernel_qgmm_mx.h
++++ b/include/blaze/gemm/kernel/kernel_qgmm_mx.h
+@@ -134,6 +134,23 @@
+ 
+     __aicore__ inline void operator()(const Params& params) { Run(params); }
+ 
++    // The caller resolves one group; preserve standard balancing and mathematics.
++    template <class WorkerMapping>
++    __aicore__ inline void RunSingleProblem(const Params& params, uint32_t lane, uint32_t cores,
++                                            WorkerMapping mapping)
++    {
++        Init(params);
++        const auto& t = params.gmmParams;
++        BlockScheduler scheduler(t.baseM, t.baseN, t.baseK);
++        SetSchedulerTailAlign(scheduler);
++        BaseMBalance(scheduler, t.m, t.baseM);
++        const uint64_t blocks = ((t.m + curBaseM_ - 1) / curBaseM_) *
++                                ((t.n + t.baseN - 1) / t.baseN);
++        scheduler.SetLogicalWorkers(mapping(lane, cores, blocks), cores);
++        scheduler.UpdateNextProblem(SchedulerProblemShape{t.m, t.n, t.k, 0});
++        ProcessSingleGroup<false>(scheduler, 0);
++    }
++
+ private:
+     static constexpr uint32_t C0_SIZE = IsFp4<AType>() ? C0_SIZE_B4 : C0_SIZE_B8;
+     using MakeLayoutA = asc::te::frame_layout_format<LayoutA, AscendC::Std::Int<C0_SIZE>>;

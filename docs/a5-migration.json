@@ -69,6 +69,12 @@
     "build_source_checks": {
       "passed": 22,
       "failed": 0
+    },
+    "source_adapter_checks": {
+      "a3_export": "passed",
+      "a5_export_apply_and_reverse_check": "passed",
+      "architecture_isolation_test": "passed",
+      "device_entry_execution": "pending"
     }
   },
   "excluded": [
