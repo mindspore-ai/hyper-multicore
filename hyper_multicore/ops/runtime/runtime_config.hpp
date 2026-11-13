@@ -187,9 +187,29 @@ struct RuntimeHeader {
   uint32_t aiv_profile_record_capacity;
   uint32_t completion_event;
   uint32_t protocol_version;
-  uint32_t vector_ready_queue;
-  uint32_t padding[5];
+  uint32_t queue_layout;
+  uint32_t worker_queue_offset;
+  uint32_t padding[4];
 };
+
+struct WorkerQueue {
+  uint32_t begin;
+  uint32_t end;
+  uint32_t ready_depth;
+  uint32_t reserved;
+};
+
+static_assert(sizeof(WorkerQueue) == 16);
+
+__aicore__ inline uint32_t getQueueLayout(__gm__ uint8_t *tiling) {
+  return reinterpret_cast<__gm__ RuntimeHeader *>(tiling)->queue_layout;
+}
+
+__aicore__ inline WorkerQueue getWorkerQueue(__gm__ uint8_t *tiling, uint32_t worker) {
+  const uint32_t offset = reinterpret_cast<__gm__ RuntimeHeader *>(tiling)->worker_queue_offset;
+  auto record = reinterpret_cast<__gm__ WorkerQueue *>(tiling + offset) + worker;
+  return {record->begin, record->end, record->ready_depth, record->reserved};
+}
 
 static_assert(sizeof(RuntimeHeader) == 64);
 static_assert(sizeof(TensorDesc) == 64);
@@ -461,7 +481,27 @@ __aicore__ inline bool isRuntimeTailValid(__gm__ uint8_t *tiling, uint64_t runti
     return false;
   }
   uint64_t required = prefix + getGroupedMatmulGroupListBytes(tiling) + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
-  return required < RUNTIME_ADDRESS_SPACE_BYTES && runtime_bytes >= required;
+  if (required >= RUNTIME_ADDRESS_SPACE_BYTES || runtime_bytes < required) return false;
+  auto header = reinterpret_cast<__gm__ RuntimeHeader *>(tiling);
+  if (header->queue_layout == 0) return header->worker_queue_offset == 0;
+  if (header->queue_layout != 1 || header->worker_queue_offset != required || header->num_workers % 2 != 0) {
+    return false;
+  }
+  const uint64_t cubes = header->num_workers / 2;
+  const uint64_t workers = cubes + header->num_workers;
+  if (workers == 0 || required + workers * sizeof(WorkerQueue) > runtime_bytes) return false;
+  uint32_t previous = 0;
+  for (uint32_t i = 0; i < workers; ++i) {
+    if (i == cubes) previous = 0;
+    const auto record = getWorkerQueue(tiling, i);
+    const auto kind = i < cubes ? TaskAiCoreType::TASK_AICORE_CUBE : TaskAiCoreType::TASK_AICORE_VECTOR;
+    const uint32_t count = getTaskIndexNumByTaskType(tiling, kind);
+    if (record.begin != previous || record.end < record.begin || record.end > count || record.reserved != 0 ||
+        (record.ready_depth != 0 && record.ready_depth != 1 && record.ready_depth != 8)) return false;
+    previous = record.end;
+    if ((i + 1 == cubes || i + 1 == workers) && previous != count) return false;
+  }
+  return true;
 }
 
 __aicore__ inline bool isRuntimeCapacityValid(__gm__ uint8_t *tiling, uint64_t event_bytes, uint64_t capacity,

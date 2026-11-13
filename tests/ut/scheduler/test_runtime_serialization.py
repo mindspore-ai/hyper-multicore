@@ -469,7 +469,8 @@ class TestRuntimeCppReader(unittest.TestCase):
         cfg = allocate_runtime_config(17)
         cfg.task_num = 17
         data = bytearray(serialize_runtime_config(cfg))
-        data[40:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 40)
+        # Bytes 40..47 now explicitly describe optional per-worker queues.
+        data[48:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 48)
         self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
         struct.pack_into("<I", data, 36, 2)
         self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))

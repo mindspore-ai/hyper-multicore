@@ -76,7 +76,15 @@
       "architecture_isolation_test": "passed",
       "device_entry_execution": "pending"
     },
-    "shmem_1_8_a5_sdk_build": "passed; no NPU execution"
+    "shmem_1_8_a5_sdk_build": "passed; no NPU execution",
+    "worker_queue_abi": {
+      "runtime_and_cpp_reader_tests": 20,
+      "subtests": 199,
+      "profile_and_queue_tests": 26,
+      "profile_subtests": 20,
+      "device_execution": "pending"
+    },
+    "udma_adapter_compile": "passed: actual A5 compiler and SHMEM1.8 headers; no device launch"
   },
   "excluded": [
     "QP8/16/32 controls",
@@ -91,5 +99,11 @@
     "self_copy": "double-buffered local MTE; no QP",
     "qp_owner": "caller-owned per peer/QP0, includes post and quiet",
     "engines": "explicit MTE or UDMA; A3 cannot instantiate UDMA"
+  },
+  "queue_contract": {
+    "representation": "optional typed per-worker intervals appended after the existing dense runtime",
+    "legacy_wire_prefix": "unchanged when queue_layout=0",
+    "ready_depth": "per worker 0/1/8; no communication reorder by the executor",
+    "profile": "normal has no added records; profile reports ReadyQueueWait and sizes by actual queues"
   }
 }

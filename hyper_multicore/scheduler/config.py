@@ -228,8 +228,9 @@ class RuntimeConfigC(ctypes.Structure):
         ("aiv_profile_record_capacity", ctypes.c_uint32),
         ("completion_event", ctypes.c_uint32),
         ("protocol_version", ctypes.c_uint32),
-        ("vector_ready_queue", ctypes.c_uint32),
-        ("_padding", ctypes.c_uint32 * 5),
+        ("queue_layout", ctypes.c_uint32),
+        ("worker_queue_offset", ctypes.c_uint32),
+        ("_padding", ctypes.c_uint32 * 4),
     ]
 
 
@@ -475,9 +476,6 @@ def validate_runtime_config(
     for descriptor_index in range(cfg.task_num):
         task = cfg.all_tasks[descriptor_index]
         task_type = task.task_type
-        validator = getattr(cfg, "task_validator", None)
-        if validator is not None:
-            validator(task)
         if task_type not in (
             TaskType.TASK_SWI_GLU,
             TaskType.TASK_SWI_GLU_GRAD,

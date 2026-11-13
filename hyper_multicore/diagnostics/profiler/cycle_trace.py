@@ -65,6 +65,7 @@ DEFAULT_STAGE_NAMES = {
     0x10000: "WaitDependency",
     0x10006: "TerminateTask",
     0x10007: "TriggerEvent",
+    0x10008: "ReadyQueueWait",
 }
 TASK_TYPE_NAMES = {
     0: "Terminate",
@@ -294,6 +295,15 @@ def _calculate_event_driven_profile_layout(
         int(runtime_config.task_index_num[1]),
         num_workers // vector_worker_stride,
     )
+    if runtime_config.queue_layout == 1:
+        def queue_records(record, indices):
+            # At most one idle episode is emitted between two completed tasks.
+            return sum(_records_for_task(runtime_config.all_tasks[indices[i]]) + 1
+                       for i in range(record.begin, record.end))
+        aic_required_records = max((queue_records(q, runtime_config.cube_task_indices)
+                                    for q in runtime_config.worker_queues[:active_worker_count]), default=0)
+        aiv_required_records = max((queue_records(q, runtime_config.vector_task_indices)
+                                    for q in runtime_config.worker_queues[active_worker_count:]), default=0)
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
@@ -372,7 +382,7 @@ class _PreparedProfileRuntime:
         self._metadata = _ProfileMetadata(
             self._metadata.kernel_name, self._metadata.owner_label, self._metadata.stage_names,
             self._metadata.task_stage_names, _TaskExecutionMode(runtime.spec.execution_mode),
-            runtime.spec.vector_worker_stride,
+            1 if runtime_config.queue_layout == 1 else runtime.spec.vector_worker_stride,
         )
         self._layout = _configure_profile_layout(runtime_config, self._metadata)
         self._rank = runtime.rank
