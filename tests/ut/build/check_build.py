@@ -14,7 +14,7 @@
 # ============================================================================
 """Fast source-build checks using temporary data and no framework or device runtime."""
 
-from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr
+from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import fcntl
 import hashlib
 from itertools import combinations
@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -165,6 +166,7 @@ class BuildChecks(unittest.TestCase):
             def __init__(self, handoff: dict[str, dict[str, object]]) -> None:
                 """Keep the SDK handoff and recorded build commands."""
                 self.handoff, self.calls = handoff, []
+                self.fail_vendor = False
                 self.events = []
                 self.add_event = self.events.append
 
@@ -172,11 +174,16 @@ class BuildChecks(unittest.TestCase):
                 """Accept a command scope without changing command recording."""
                 return nullcontext(name)
 
-            def __call__(self, command: list[str], **kwargs: Any) -> None:
+            def __call__(self, command: list[str], **kwargs: Any) -> str | None:
                 """Record the command and emit the handoff during the common build."""
                 self.calls.append(command)
-                if kwargs.get("label") == "common-resources":
+                if self.fail_vendor and kwargs.get("label", "").startswith("vendor-"):
+                    raise RuntimeError("vendor failed")
+                if kwargs.get("label") == "common-prepare":
                     write(Path(kwargs["env"]["HP_SHMEM_HANDOFF"]), json.dumps({"architectures": self.handoff}))
+                    return json.dumps({"ops_nn_source": "nn", "ops_transformer_source": "transformer",
+                                       "host_input_identity": "f" * 64, "pending": list(self.handoff)})
+                return None
 
         previous_common = None
         for socs, mismatch in (("ascend910b,ascend910_93,ascend950", False),
@@ -220,6 +227,112 @@ class BuildChecks(unittest.TestCase):
                     binding = next(call for call in configured if flag in call)
                     self.assertIn(f"-DSHMEM_OPS_LIB={common}/shmem/lib/{backend}/libhyper_multicore_shmem_ops.so",
                                   binding)
+                if len(sdks) == 2:
+                    commands.calls.clear()
+                    commands.fail_vendor = True
+                    with self.assertRaises(RuntimeError):
+                        BUILD.build_common(args, run, Path(sys.executable))
+                    self.assertFalse(any("merge" in call for call in commands.calls))
+
+    def test_vendor_schedule_overlaps_misses_with_bounded_jobs(self):
+        """Compile only misses, share the job budget and leave serial builds fully funded."""
+        def check_schedule(pending: list[str], jobs: int, expected: list[int]) -> None:
+            """Check one schedule's tasks, quotas and isolated environments."""
+            started = {arch: threading.Event() for arch in pending}
+            calls = []
+            lock = threading.Lock()
+
+            def execute(command: list[str], **kwargs: Any) -> None:
+                """Wait for the other task only when both have a concurrent budget."""
+                arch = command[command.index("--arch") + 1]
+                with lock:
+                    calls.append((arch, int(command[-1]), kwargs["env"]))
+                started[arch].set()
+                if len(pending) == 2 and jobs >= 4:
+                    self.assertTrue(all(event.wait(2) for event in started.values()))
+
+            execute.add_event = lambda _: None
+            execute.scope = lambda _: nullcontext()
+            run = SimpleNamespace(commands=execute)
+            env = {"SDK_HANDOFF": "shared"}
+            BUILD.build_vendors(["vendor"], pending, jobs, run, env)
+            self.assertEqual(sorted((arch, budget) for arch, budget, _ in calls),
+                             sorted(zip(pending, expected)))
+            self.assertTrue(all(selected == env and selected is not env for _, _, selected in calls))
+
+        for pending, jobs, expected in ((["arch22", "arch35"], 9, [5, 4]),
+                                         (["arch22", "arch35"], 3, [3, 3]),
+                                         (["arch35"], 9, [9]), ([], 9, [])):
+            with self.subTest(pending=pending, jobs=jobs):
+                check_schedule(pending, jobs, expected)
+
+    def test_vendor_failure_stops_other_architecture(self):
+        """A failed architecture terminates its peer and preserves the initiating failure."""
+        script = write(self.root / "vendor.py", '''import os, sys, time
+from pathlib import Path
+arch = sys.argv[sys.argv.index("--arch") + 1]
+root = Path(__file__).parent
+print("COMPILER_PROGRESS", flush=True)
+(root / arch).write_text(str(os.getpid()))
+deadline = time.monotonic() + 3
+while not all((root / name).exists() for name in ("arch22", "arch35")):
+    if time.monotonic() > deadline:
+        sys.exit(8)
+    time.sleep(0.01)
+if arch == "arch35":
+    sys.exit(7)
+time.sleep(30)
+''')
+        commands = BUILD.CONSOLE.Commands(self.root / "logs", root=self.root)
+        terminal = io.StringIO()
+        try:
+            with redirect_stdout(terminal), self.assertRaises(RuntimeError) as failure:
+                BUILD.build_vendors([sys.executable, str(script)], ["arch22", "arch35"],
+                                    4, SimpleNamespace(commands=commands), os.environ.copy())
+            self.assertTrue(commands.cancelled.is_set())
+            self.assertIs(commands.failure, failure.exception)
+            self.assertTrue(any(event.get("exit_code") == 7 for event in commands.events))
+            pid = int((self.root / "arch22").read_text())
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+            lines = [line for line in terminal.getvalue().splitlines() if "COMPILER_PROGRESS" in line]
+            self.assertEqual(len(lines), 2)
+            for arch in ("arch22", "arch35"):
+                self.assertTrue(any(line.startswith("[") and arch in line.partition("]")[0] for line in lines))
+        finally:
+            commands.cancel(RuntimeError("test cleanup"))
+
+    def test_captured_stdout_preserves_live_stderr(self):
+        """Display stderr before child exit while returning machine stdout without echoing it."""
+        ready = self.root / "progress-seen"
+        terminal = io.StringIO()
+        original_write = terminal.write
+
+        def display(text: str) -> int:
+            """Acknowledge progress through the same output stream the user sees."""
+            count = original_write(text)
+            if "SDK_PROGRESS" in text:
+                ready.touch()
+            return count
+
+        script = '''import json, sys, time
+from pathlib import Path
+print(json.dumps({"machine_value": 42}), flush=True)
+print("SDK_PROGRESS", file=sys.stderr, flush=True)
+deadline = time.monotonic() + 3
+while not Path(sys.argv[1]).exists():
+    if time.monotonic() > deadline:
+        sys.exit(2)
+    time.sleep(0.01)
+'''
+        commands = BUILD.CONSOLE.Commands(self.root / "logs", root=self.root)
+        with redirect_stdout(terminal), patch.object(terminal, "write", side_effect=display):
+            result = commands([sys.executable, "-c", script, str(ready)], label="common-prepare", capture=True)
+        self.assertEqual(json.loads(result), {"machine_value": 42})
+        self.assertIn("SDK_PROGRESS", terminal.getvalue())
+        self.assertNotIn("machine_value", terminal.getvalue())
+        raw = commands.log.read_text(encoding="utf-8")
+        self.assertEqual(raw.count("SDK_PROGRESS"), 1)
+        self.assertEqual(raw.count("machine_value"), 1)
 
     def test_activation_checks_backends_without_exporting_sdk_search_paths(self):
         """Activation requires all packaged SDKs while only the vendor enters global lookup."""
