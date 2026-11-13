@@ -39,6 +39,7 @@ class LaunchContext:
     parameters: Sequence[Any]
     direction: str
     fallback_event_counters: Any
+    tags: dict[str, str] | None = None
 
     def ordinary_arguments(self) -> LaunchArguments:
         """Reuse the original runtime and counters without allocating device storage."""

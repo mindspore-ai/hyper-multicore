@@ -2,11 +2,31 @@
 """MX task profiling bindings; tensor dumps require a separate physical-view contract."""
 
 from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 from hyper_multicore.diagnostics.api import prepare_mega_kernel_diagnostics
 from hyper_multicore.diagnostics.common.session import _get_active_session
+
+_SCOPE = ContextVar('mx_profile_scope', default=None)
+
+
+@contextmanager
+def mx_profile_scope(*, layer: str, phase: str = 'forward') -> Iterator[None]:
+    """Optional caller labels; no model identity or filtering inside the component."""
+    if not isinstance(layer, str) or not layer or phase not in ('forward', 'recompute', 'backward'):
+        raise ValueError('MX profile scope requires a layer and forward/recompute/backward phase')
+    token = _SCOPE.set({'layer': layer, 'phase': phase})
+    try:
+        yield
+    finally:
+        _SCOPE.reset(token)
+
+
+def current_mx_profile_scope():
+    return _SCOPE.get()
 
 
 @dataclass(frozen=True)
@@ -60,10 +80,10 @@ def prepare_mx_diagnostics(host: Any, spec: Any, device: Any) -> Any:
 
 
 def profile_mx_launch(buffers: Sequence[Any], runtime: Any, events: Any, spec: Any,
-                      direction: str, prepare: Callable, launch: Callable) -> None:
+                      direction: str, prepare: Callable, launch: Callable, *, scope=None) -> None:
     parameters = mx_profile_bindings(buffers, runtime.runtime, events)
     with runtime.diagnostics.launch(
-            parameters, direction=direction, fallback_event_counters=events) as call:
+            parameters, direction=direction, fallback_event_counters=events, tags=scope) as call:
         # Use master's diagnostic lifecycle; normal launches bypass it entirely.
         descriptor = prepare(buffers, call.runtime_config, call.event_counters, spec)
         launch(buffers, call.runtime_config, call.event_counters, call.diagnostic_buffer, descriptor)

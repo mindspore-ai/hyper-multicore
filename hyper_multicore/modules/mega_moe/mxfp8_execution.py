@@ -11,7 +11,7 @@ import torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
 from .mxfp8_function import MXFP8ForwardState
-from .mxfp8_diagnostics import mx_profile_capture_enabled, profile_mx_launch
+from .mxfp8_diagnostics import current_mx_profile_scope, mx_profile_capture_enabled, profile_mx_launch
 from .mxfp8_ops import launch_mxfp8_task_graph, prepare_mxfp8_launch, serialize_mxfp8_launch
 from .mxfp8_weights import MXFP8PhysicalWeight
 from .route import prepare_topk_route
@@ -45,18 +45,24 @@ class MXFP8Execution:
     def __init__(self, resources: Any, *, nograd_no_clone: bool = False) -> None:
         self.resources = resources
         self.nograd_no_clone = nograd_no_clone
+        self._profile_scope = None
 
     def _launch(self, buffers, runtime, events, plan, device, direction="forward", *, swiglu_row_only=False):
         if events.numel() < runtime.event_capacity * 4:
             raise ValueError("MX event storage is smaller than the graph")
         launch_graph = partial(launch_mxfp8_task_graph, direction=direction)
         if mx_profile_capture_enabled():
+            scope = current_mx_profile_scope() or self._profile_scope
+            if direction == 'forward':
+                self._profile_scope = scope
+            elif scope is not None:
+                scope = {**scope, 'phase': 'backward'}
             profile_mx_launch(buffers, runtime, events, plan.spec, direction,
-                              prepare_mxfp8_launch, launch_graph)
+                              prepare_mxfp8_launch, launch_graph, scope=scope)
             return
-        diagnostic = torch.zeros(64, dtype=torch.uint8, device=device)
         launch = prepare_mxfp8_launch(buffers, runtime.runtime, events, plan.spec)
-        launch_graph(buffers, runtime.runtime, events, diagnostic, launch)
+        # Disabled diagnostics never read this binding, matching the BF16 adapter.
+        launch_graph(buffers, runtime.runtime, events, events, launch)
 
     def forward(self, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
                 weight1: MXFP8PhysicalWeight, weight2: MXFP8PhysicalWeight,
