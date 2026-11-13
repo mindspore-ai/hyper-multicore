@@ -20,6 +20,7 @@ ComputeGraph + TaskSplitValue into a binary RuntimeConfigC.  It omits
 graph-specific post-processing (add_terminate, revise_task_queue, etc.) — call
 build_config_for_rank() from a model's gen_runtime_data.py for full generation.
 """
+from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.scheduler.config import (
     RuntimeConfigC,
     TaskSplitValue,
@@ -30,25 +31,28 @@ from hyper_multicore.scheduler.graph import ComputeGraph
 from hyper_multicore.scheduler.runtime import allocate_runtime_config
 
 
-def allocate_graph_config(graph: ComputeGraph, tsv: TaskSplitValue) -> RuntimeConfigC:
+def allocate_graph_config(graph: ComputeGraph, tsv: TaskSplitValue,
+                          num_cube_cores: int = DEFAULT_CORE_SPEC.num_cube_cores) -> RuntimeConfigC:
     """Allocate graph tasks plus the terminal before any fill operation.
 
     Args:
         graph: Graph after split propagation.
         tsv: Topology whose experts determine event storage.
+        num_cube_cores: Available Cube workers whose group lists need scratch.
 
     Returns:
         Zero-initialized runtime with sufficient task, queue and event slots.
     """
     required = 1 + sum(op.task_num for op in graph.topological_sort())
     return allocate_runtime_config(
-        required, mega_moe_event_capacity(tsv.all_expert_num, tsv.ep), tsv.single_rank_expert_num
+        required, mega_moe_event_capacity(tsv.all_expert_num, tsv.ep), tsv.single_rank_expert_num,
+        num_workers=2 * num_cube_cores,
     )
 
 
 def build_runtime_config(graph: ComputeGraph, tsv: TaskSplitValue,
                          rank_id: int = 0,
-                         num_cube_cores: int = 24) -> RuntimeConfigC:
+                         num_cube_cores: int = DEFAULT_CORE_SPEC.num_cube_cores) -> RuntimeConfigC:
     """
     Build RuntimeConfigC for a single rank from a ComputeGraph.
 
@@ -56,12 +60,12 @@ def build_runtime_config(graph: ComputeGraph, tsv: TaskSplitValue,
         graph: A fully-built ComputeGraph after propagate_splits() has been called.
         tsv:   TaskSplitValue with TP/EP/seq topology.
         rank_id: Target rank (written to tsv.rank_id before filling).
-        num_cube_cores: Number of AIC cube cores (910B=24).
+        num_cube_cores: Number of Cube workers.
 
     Returns:
         RuntimeConfigC ready to be serialized with serialize_runtime_config(cfg).
     """
-    cfg = allocate_graph_config(graph, tsv)
+    cfg = allocate_graph_config(graph, tsv, num_cube_cores)
     cfg.num_workers    = 2 * num_cube_cores
 
     init_task_split_value(tsv)

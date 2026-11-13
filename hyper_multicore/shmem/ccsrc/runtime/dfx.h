@@ -14,7 +14,7 @@
 #include <optional>
 #include <vector>
 
-#include "device/device_model.h"
+#include "device/device_identity.h"
 #include "runtime/allocation.h"
 #include "runtime/config.h"
 #include "runtime/types.h"

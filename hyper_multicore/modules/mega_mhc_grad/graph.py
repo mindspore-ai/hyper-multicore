@@ -410,7 +410,7 @@ def build_mega_mhc_grad_graph(
         token_count: Total number of flattened tokens.
         hidden_size: Hidden dimension of every token.
         token_tile: Requested AIV token tile.
-        num_vector_cores: Physical AIV count reported for the target device.
+        num_vector_cores: Number of Vector cores.
 
     Returns:
         Compute graph and its single-rank topology description.

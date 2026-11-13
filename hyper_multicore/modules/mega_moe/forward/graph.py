@@ -14,6 +14,7 @@
 # ============================================================================
 """MoE-FFN forward compute graph."""
 
+from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
 )
@@ -177,7 +178,7 @@ def build_forward_graph(tsv, *,
                         hidden_size:       int = 7168,
                         intermediate_size: int = 2048,
                         dtype_size:        int = 2,
-                        num_cube_cores:    int = 24,
+                        num_cube_cores:    int = DEFAULT_CORE_SPEC.num_cube_cores,
                         swiglu_limit:      float | None = None,
                         expert_weight_layout: str = "EIO") -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.

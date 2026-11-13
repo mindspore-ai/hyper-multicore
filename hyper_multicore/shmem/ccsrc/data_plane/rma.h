@@ -17,6 +17,25 @@
 
 namespace hyper_multicore::shmem::data_plane {
 
+/** @brief Return the calling PE's Root rank. */
+ACLSHMEM_DEVICE int32_t my_pe() { return cann::device::my_pe(); }
+
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+/** @brief Return the initialized number of UDMA QPs per peer. */
+ACLSHMEM_DEVICE uint32_t udma_qp_count() { return cann::device::udma_qp_count(); }
+
+/**
+ * @brief Complete a GET on the caller-selected, exclusively owned QP.
+ * @note Return makes the local data available before the worker publishes completion credits.
+ */
+template <typename T>
+__aicore__ inline void get_udma(GM_ADDR destination, GM_ADDR source, int64_t elements, int32_t source_pe, uint32_t qp) {
+  if (elements != 0) {
+    cann::device::get_udma<T>(destination, source, elements, source_pe, qp);
+  }
+}
+#endif
+
 /**
  * @brief Translate one local symmetric GM address to the corresponding address on a target Root PE.
  *
@@ -82,17 +101,19 @@ __aicore__ inline void put_signal(__gm__ void *remote_dst, __gm__ const void *lo
 }
 
 /**
- * @brief Complete a double-buffered MTE GET with bursts capped at four KiB.
+ * @brief Complete a double-buffered MTE GET with a caller-selected burst cap.
  *
  * @param destination Local GM destination owned by the caller.
  * @param source Symmetric GM source represented by its local address.
  * @param elements Number of T elements to transfer; zero is a no-op.
  * @param source_pe Source in CANN Root WORLD coordinates.
+ * @param max_block_bytes Burst cap in bytes; zero uses each allocated UB half. The default preserves remote-read policy.
  * @pre One worker exclusively owns both halves of the CANN-provided UB range and EVENT_ID0/1 for the call duration.
  * @note Return means the final MTE3 write to destination has completed.
  */
 template <typename T>
-__aicore__ inline void get_pipelined(GM_ADDR destination, GM_ADDR source, int64_t elements, int source_pe) {
+__aicore__ inline void get_pipelined(GM_ADDR destination, GM_ADDR source, int64_t elements, int source_pe,
+                                    uint64_t max_block_bytes = 4 * 1024) {
   if (elements == 0) {
     return;
   }
@@ -107,9 +128,8 @@ __aicore__ inline void get_pipelined(GM_ADDR destination, GM_ADDR source, int64_
   }
   auto *local = reinterpret_cast<__gm__ T *>(destination);
   uint64_t block_bytes = ub_bytes / 2;
-  // Larger remote-read bursts lengthen concurrent GMM execution.
-  constexpr uint64_t max_block_bytes = 4 * 1024;
-  if (block_bytes > max_block_bytes) {
+  // Remote callers retain small bursts; local copies can use their full double buffer.
+  if (max_block_bytes != 0 && block_bytes > max_block_bytes) {
     block_bytes = max_block_bytes;
   }
   uint64_t total_bytes = static_cast<uint64_t>(elements) * sizeof(T);

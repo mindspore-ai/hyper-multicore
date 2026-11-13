@@ -15,9 +15,10 @@
 """RuntimeConfig tests for the fused HyperMegaMhcGrad graph."""
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import call, patch
 
-from hyper_multicore.modules.mega_mhc_grad.function import _resolve_core_counts
+from hyper_multicore.modules.mega_mhc_grad.function import _get_plan_for_shape
 from hyper_multicore.modules.mega_mhc_grad.graph import (
     DEFAULT_GRAD_TOKEN_TILE,
     NATIVE_GRAD_CUBE_TILE,
@@ -48,26 +49,29 @@ class TestMegaMhcGradGraph(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     @patch("hyper_multicore.modules.mega_mhc_grad.function.torch.npu", create=True)
-    def test_resolve_core_counts_uses_device_vector_count(self, mock_npu) -> None:
+    def test_plan_selection_uses_current_device_core_spec(self, mock_npu) -> None:
         """Feature: HyperMegaMhcGrad device core discovery.
 
-        Description: Read distinct AIC and AIV limits reported for a 910B3.
-        Expectation: The execution plan receives the physical 20/40 core counts.
+        Description: Change the Device limits between two requests for the same shape.
+        Expectation: Each plan lookup receives the new Cube and Vector counts.
         """
-        mock_npu.get_device_limit.return_value = {
-            "cube_core_num": NUM_CUBE_CORES,
-            "vector_core_num": NUM_VECTOR_CORES,
-        }
-
-        self.assertEqual(
-            _resolve_core_counts(0),
-            (NUM_CUBE_CORES, NUM_VECTOR_CORES),
-        )
+        mock_npu.get_device_limit.side_effect = [
+            {"cube_core_num": NUM_CUBE_CORES, "vector_core_num": NUM_VECTOR_CORES},
+            {"cube_core_num": 24, "vector_core_num": 48},
+        ]
+        with patch("hyper_multicore.modules.mega_mhc_grad.function._get_cached_plan") as plans:
+            _get_plan_for_shape(128, 5120, SimpleNamespace(index=0), 32)
+            _get_plan_for_shape(128, 5120, SimpleNamespace(index=0), 32)
+        self.assertEqual(plans.call_args_list, [
+            call(128, 5120, 0, NUM_CUBE_CORES, NUM_VECTOR_CORES, 32),
+            call(128, 5120, 0, 24, 48, 32),
+        ])
+        self.assertEqual(mock_npu.get_device_limit.call_args_list, [call(0), call(0)])
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     @patch("hyper_multicore.modules.mega_mhc_grad.function.torch.npu", create=True)
-    def test_resolve_core_counts_rejects_incompatible_mixed_ratio(self, mock_npu) -> None:
+    def test_plan_selection_rejects_incompatible_mixed_ratio(self, mock_npu) -> None:
         """Feature: HyperMegaMhcGrad mixed-kernel core ratio.
 
         Description: Report an AIV limit that is not twice the AIC limit.
@@ -79,7 +83,7 @@ class TestMegaMhcGradGraph(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(RuntimeError, "KERNEL_TYPE_MIX_AIC_1_2"):
-            _resolve_core_counts(0)
+            _get_plan_for_shape(128, 5120, SimpleNamespace(index=0), 32)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

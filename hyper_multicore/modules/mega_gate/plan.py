@@ -30,7 +30,6 @@ from hyper_multicore.scheduler.config import (
     TaskDescC,
     TaskType,
     RuntimeConfigC,
-    NUM_WORKERS_VECTOR,
 )
 from hyper_multicore.scheduler.runtime import allocate_runtime_config
 
@@ -42,7 +41,8 @@ from .diagnostics import (
 )
 
 
-MEGA_GATE_AIV_WORKER_CAPACITY = NUM_WORKERS_VECTOR
+# AIV slot capacity shared with Route/RouteGrad tiling.
+MEGA_GATE_AIV_WORKER_CAPACITY = 48
 MEGA_GATE_ROUTE_TASK_TYPES = (
     TaskType.TASK_GATE_SOFTPLUS,
     TaskType.TASK_GATE_SQRT,

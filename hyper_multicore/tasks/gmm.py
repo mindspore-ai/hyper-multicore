@@ -16,6 +16,7 @@
 from dataclasses import dataclass, field
 from typing import Set
 
+from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
     TaskAiCoreType, TaskType, TaskSplitValue,
@@ -73,7 +74,7 @@ class GmmFillConfig(FillConfig):
         GMM4 bwd: single_rank_expert_num.  GMM3 bwd: 1.
 
     num_cube_cores : int
-        Number of AI Cube cores (910B=24).
+        Number of Cube cores.
     """
     offset_inputs:  Set[int] = field(default_factory=lambda: {0})
     # Shared activation specs retain their producer's interpretation.
@@ -83,7 +84,7 @@ class GmmFillConfig(FillConfig):
     out_offset:     bool     = True
     advance:        str      = "cube"   # "cube" | "cube_only" | "cube_custom"
     event_delta:    int      = 0        # only used when advance="cube_custom"
-    num_cube_cores: int      = 24
+    num_cube_cores: int      = DEFAULT_CORE_SPEC.num_cube_cores
 
     def fill(self, cfg: RuntimeConfigC, op: OperatorNode, tsv: TaskSplitValue) -> None:
         """Serialize operand interpretation and event dependencies.

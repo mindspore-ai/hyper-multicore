@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from threading import RLock
 
 from hyper_multicore._native_manifest import (
-    framework_package, check_integrity, read_manifest, resource_path, select_variant,
+    framework_package, check_integrity, read_manifest, resource_path, select_variant, select_shmem_backend,
 )
 
 _VENDOR_NAME = "hyper_multicore_nn"
@@ -37,6 +37,7 @@ _NATIVE_LOCK = RLock()
 _selection = None
 _native_failure = None
 _loaded_kinds = set()
+_ACL_DEV_ATTR_NPU_ARCH = 601
 
 
 class NativeComponentUnavailableError(RuntimeError):
@@ -50,7 +51,8 @@ def diagnostic_context() -> str:
     for package in ("torch", "torch-npu"):
         try:
             actual[package] = framework_package(package.replace("-", "_"))["version"]
-        except Exception:  # Diagnostics must not replace the original import/load failure.
+        # Diagnostics must not replace the original import/load failure.
+        except Exception:  # pylint: disable=broad-exception-caught
             actual[package] = "unavailable"
     try:
         for line in (Path(os.environ["ASCEND_HOME_PATH"]) / "opp/version.info").read_text().splitlines():
@@ -58,13 +60,13 @@ def diagnostic_context() -> str:
             if separator and key.strip() == "Version":
                 actual["cann_version"] = value.strip()
                 break
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         pass
     try:
         info = json.loads((_component_root().parent / "build_info.json").read_text())
         matrix = [{key: variant.get(key) for key in ("id", "torch_version", "pta_version", "torch_cxx11_abi")}
                   for variant in info.get("variants", [])]
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         matrix = "unavailable"
     return f"runtime={actual} packaged_matrix={matrix}"
 
@@ -81,7 +83,8 @@ def load_torch_npu() -> ModuleType:
     except ModuleNotFoundError as error:
         raise NativeComponentUnavailableError(
             f"[HYPER-MULTICORE-PTA-NOT-INSTALLED] Python={sys.executable}; install torch-npu "
-            f"for your Torch/CANN environment. Inspect hyper_multicore_build_info for packaged branches. {diagnostic_context()}"
+            "for your Torch/CANN environment. Inspect hyper_multicore_build_info for packaged branches. "
+            f"{diagnostic_context()}"
         ) from error
     try:
         return importlib.import_module("torch_npu")
@@ -103,12 +106,10 @@ def require_multicore_environment() -> Path:
         )
     vendor_root = vendor_root.resolve()
     op_api_root = (vendor_root / "op_api" / "lib").resolve()
-    shmem_root = (component_root.parent / "shmem" / "lib").resolve()
-    required_library_roots = (op_api_root, shmem_root, shmem_root / "shmem")
     missing_variables = []
     if not _environment_contains_path("ASCEND_CUSTOM_OPP_PATH", vendor_root):
         missing_variables.append("ASCEND_CUSTOM_OPP_PATH")
-    if not all(_environment_contains_path("LD_LIBRARY_PATH", path) for path in required_library_roots):
+    if not _environment_contains_path("LD_LIBRARY_PATH", op_api_root):
         missing_variables.append("LD_LIBRARY_PATH")
     if missing_variables:
         set_env_script = component_root / "set_env.bash"
@@ -142,11 +143,11 @@ def _runtime_identity() -> dict:
             f"[HYPER-MULTICORE-PTA-NOT-INSTALLED] Python={sys.executable}; "
             "install matching Torch/PTA/CANN; inspect hyper_multicore_build_info."
         ) from error
-    import torch
+    torch = importlib.import_module("torch")
 
     actual = {"torch_version": str(getattr(torch, "__version__", "unknown")), "pta_version": pta,
               "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
-              "host_arch": platform.machine(), "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+              "host_arch": platform.machine(), "torch_cxx11_abi": torch.compiled_with_cxx11_abi(),
               "cann_version": "unknown"}
     try:
         version_file = Path(os.environ["ASCEND_HOME_PATH"]) / "opp/version.info"
@@ -161,7 +162,7 @@ def _runtime_identity() -> dict:
 
 
 def validate_native_compatibility() -> dict:
-    """Choose one internally validated adapter pair; external post/CANN values do not gate it."""
+    """Choose an internally validated framework variant; external post/CANN values do not gate it."""
     global _selection
     actual = _runtime_identity()  # Import the framework outside our native-registration lock.
     with _NATIVE_LOCK:
@@ -177,8 +178,29 @@ def validate_native_compatibility() -> dict:
             raise NativeComponentUnavailableError(
                 f"[HYPER-MULTICORE-ABI-MISMATCH] root={root} runtime={actual}: {error}"
             ) from error
-        _selection = {"root": root, "variant": variant, "actual": actual, "build_info": info}
+        _selection = {"root": root, "variant": variant, "actual": actual, "build_info": info, "manifest": manifest}
         return _selection
+
+
+def query_npu_arch() -> int:
+    """Read visible logical device 0's architecture without creating a device context."""
+    acl = ctypes.CDLL("libascendcl.so", mode=ctypes.RTLD_LOCAL)
+    query = acl.aclrtGetDeviceInfo
+    query.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int64)]
+    query.restype = ctypes.c_int32
+    arch = ctypes.c_int64()
+    status = query(0, _ACL_DEV_ATTR_NPU_ARCH, ctypes.byref(arch))
+    if status != 0:
+        raise NativeComponentUnavailableError(f"aclrtGetDeviceInfo(NPU_ARCH) failed for visible device 0: {status}")
+    return arch.value
+
+
+def select_native_shmem(selected: dict) -> tuple[str, dict]:
+    """Select a packaged backend before any project SHMEM library is loaded."""
+    try:
+        return select_shmem_backend(selected["manifest"], query_npu_arch())
+    except (OSError, AttributeError, ValueError) as error:
+        raise NativeComponentUnavailableError(f"[HP-NATIVE-SHMEM-BACKEND-UNAVAILABLE] {error}") from error
 
 
 def native_ready(kind: str) -> bool:
@@ -208,8 +230,7 @@ def native_loading(kind: str):
         except BaseException as error:
             _native_failure = error
             raise
-        else:
-            _loaded_kinds.add(kind)
+        _loaded_kinds.add(kind)
 
 
 def native_context() -> str:

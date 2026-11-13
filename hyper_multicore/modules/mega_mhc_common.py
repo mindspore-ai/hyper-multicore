@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import torch
 
+from hyper_multicore._core_spec import CoreSpec
+
 
 MHC_STREAMS = 4
 MHC_MAPPINGS = MHC_STREAMS * MHC_STREAMS + 2 * MHC_STREAMS
@@ -199,12 +201,22 @@ def validate_mega_mhc_native_inputs(
         validate_mega_mhc_tensor(name, value, tuple(value.shape), dtype, residual.device)
 
 
+def validate_mega_mhc_core_spec(core_spec: CoreSpec) -> None:
+    """Require the fixed 1:2 topology used by the MHC mixed kernels."""
+    if core_spec.num_vector_cores != 2 * core_spec.num_cube_cores:
+        raise RuntimeError(
+            "HyperMegaMhc requires the KERNEL_TYPE_MIX_AIC_1_2 core ratio, "
+            f"but Device limits report cube_core_num={core_spec.num_cube_cores} and "
+            f"vector_core_num={core_spec.num_vector_cores}."
+        )
+
+
 def validate_mega_mhc_token_count(token_count: int, num_vector_cores: int) -> None:
     """Reject shapes too small for native backward reductions.
 
     Args:
         token_count: Flattened token count.
-        num_vector_cores: Physical AIV count of the target device.
+        num_vector_cores: Number of Vector cores.
     """
     minimum = max(MHC_GRAD_MIN_TOKENS, num_vector_cores)
     if token_count < minimum:

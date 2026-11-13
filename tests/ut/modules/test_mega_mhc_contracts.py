@@ -228,12 +228,13 @@ class TestMegaMhcInvocationState(unittest.TestCase):
             native_outputs = (cache.new_residual, inputs[2], inputs[3], inputs[4], inputs[0],
                               cache.hc_before_norm, cache.inv_rms, cache.sum_out, cache.norm_out,
                               cache.mixed_input, cache.rms_rstd)
-            target = function._hyper_mega_mhc_forward
+            target = function._hyper_mega_mhc_forward  # pylint: disable=protected-access
             args = inputs
             launch_name = "multicore_ops.hyper_mega_mhc"
         with (
             patch.object(function, "validate_mega_mhc_native_inputs"),
-            patch.object(function, "_resolve_core_counts", return_value=(20, 40)),
+            patch.object(function, "get_device_core_spec",
+                         return_value=SimpleNamespace(num_cube_cores=20, num_vector_cores=40)),
             patch.object(function, "_get_cached_plan", return_value=plan),
             patch.object(torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True),
             patch(f"{function.__name__}.{launch_name}", side_effect=_launch),

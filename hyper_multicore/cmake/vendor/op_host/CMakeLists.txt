@@ -64,15 +64,31 @@ set(OP_TILING_SOURCES
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
 )
 
-npu_op_code_gen(
-    SRC ${OP_SCHEMA_SOURCES}
-    PACKAGE ${package_name}
-    OUT_DIR ${ASCEND_AUTOGEN_PATH}
-    JOIN_OP_DEF False
-    COMPILE_OPTIONS
-        -I${CANN_OP_COMMON_INCLUDE}
-        -I${CANN_OP_HOST_INCLUDE}
-)
+function(hp_generate_op_definitions)
+    set(ASCEND_COMPUTE_UNIT ${HP_MULTICORE_REGISTERED_SOCS})
+    npu_op_code_gen(
+        SRC ${OP_SCHEMA_SOURCES}
+        PACKAGE ${package_name}
+        OUT_DIR ${ASCEND_AUTOGEN_PATH}
+        JOIN_OP_DEF False
+        COMPILE_OPTIONS
+            -I${CANN_OP_COMMON_INCLUDE}
+            -I${CANN_OP_HOST_INCLUDE}
+    )
+endfunction()
+hp_generate_op_definitions()
+
+foreach(hp_soc IN LISTS HP_MULTICORE_REGISTERED_SOCS)
+    if(NOT hp_soc STREQUAL ASCEND_COMPUTE_UNIT)
+        set(hp_ops_info "${CMAKE_CURRENT_BINARY_DIR}/aic-${hp_soc}-ops-info.json")
+        add_ops_info_target(TARGET hp_ops_info_${hp_soc}
+            OPS_INFO ${ASCEND_AUTOGEN_PATH}/aic-${hp_soc}-ops-info.ini
+            OUTPUT ${hp_ops_info}
+        )
+        install(FILES ${hp_ops_info} DESTINATION
+            ${HP_VENDOR_STAGE_ROOT}/packages/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/config/${hp_soc})
+    endif()
+endforeach()
 
 set(ACLNN_SOURCES
     ${FWD_HOST}/op_api/aclnn_hyper_mega_moe.cpp

@@ -16,8 +16,7 @@
 
 from typing import Any
 
-import torch
-
+from hyper_multicore._core_spec import get_device_core_spec
 from hyper_multicore.diagnostics.common.graph import bind_graph_tensor_ports
 from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
 from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
@@ -76,7 +75,7 @@ def _row_view(context: L1TensorViewContext) -> L1TensorView:
     if cache_key not in context.parameter_cache:
         cores = int(context.runtime_config.num_workers)
         if tensor.device.type == "npu":
-            cores = min(cores, torch.npu.get_device_limit(tensor.device.index)["vector_core_num"])
+            cores = min(cores, get_device_core_spec(tensor.device.index).num_vector_cores)
         workers = min(tokens, cores)
         context.parameter_cache[cache_key] = (tokens + workers - 1) // workers
     rows_per_worker = context.parameter_cache[cache_key]

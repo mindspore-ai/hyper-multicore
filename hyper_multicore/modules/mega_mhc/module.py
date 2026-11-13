@@ -159,7 +159,7 @@ class MegaMhc(torch.nn.Module):
 
         Note:
             Training uses native autograd. The flattened token count must be
-            at least max(40, physical AIV core count) when backward is needed;
+            at least max(40, configured AIV core count) when backward is needed;
             forward-only execution requires at least one token. Cross-stream
             producers must establish dependencies before this call.
 

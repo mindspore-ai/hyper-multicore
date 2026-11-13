@@ -34,6 +34,7 @@ import argparse
 from dataclasses import dataclass
 import os
 
+from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
@@ -80,15 +81,15 @@ def parse_args() -> argparse.Namespace:
                    help='FFN intermediate dimension after SwiGLU halving (half of up-proj output, e.g. 2048)')
     p.add_argument('--dtype_size',        type=int, default=2,
                    help='Activation bytes per element: bf16=2, fp32=4')
-    p.add_argument('--num_cube_cores',    type=int, default=24,
-                   help='Number of AI Cube cores on target hardware (910B=24)')
+    p.add_argument('--num_cube_cores',    type=int, default=DEFAULT_CORE_SPEC.num_cube_cores,
+                   help=f'Number of Cube cores (default: {DEFAULT_CORE_SPEC.num_cube_cores})')
     p.add_argument('--output_dir',        type=str,
                    default='mega_moe_tp4_ep4_910b')
     return p.parse_args()
 
 
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
-                          num_cube_cores: int = 24) -> RuntimeConfigC:
+                          num_cube_cores: int = DEFAULT_CORE_SPEC.num_cube_cores) -> RuntimeConfigC:
     """Build RuntimeConfig for a single rank.
 
     Args:
@@ -100,8 +101,8 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     Returns:
         Validated runtime image including transport handshakes and profiler metadata.
     """
-    cfg = allocate_graph_config(graph, tsv)
-    cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
+    cfg = allocate_graph_config(graph, tsv, num_cube_cores)
+    cfg.num_workers    = 2 * num_cube_cores   # A 1:2 mixed launch uses two AIVs per Cube.
 
     init_task_split_value(tsv)
     tsv.rank_id = rank_id   # C++ forward never sets rank_id; all ranks use default 0

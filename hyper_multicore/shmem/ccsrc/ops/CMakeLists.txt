@@ -69,6 +69,13 @@ set(CMAKE_CPP_COMPILE_OPTIONS
     "SHELL:-include stddef.h"
 )
 
+set(HP_SHMEM_SOC_TYPE "Ascend910B" CACHE STRING "SHMEM device generation")
+if(HP_SHMEM_SOC_TYPE STREQUAL "Ascend950")
+    set(SHMEM_VECTOR_ARCH dav-c310-vec)
+else()
+    set(SHMEM_VECTOR_ARCH dav-c220-vec)
+endif()
+
 include_directories(
     ${ASCEND_HOME_PATH}/compiler/tikcpp
     ${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw
@@ -96,9 +103,10 @@ set_target_properties(all_gather_kernel PROPERTIES
     OBJECT_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obj"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obj"
 )
-target_compile_options(all_gather_kernel PRIVATE ${CMAKE_CCE_COMPILE_OPTIONS} --cce-aicore-arch=dav-c220-vec)
+target_compile_options(all_gather_kernel PRIVATE ${CMAKE_CCE_COMPILE_OPTIONS} --cce-aicore-arch=${SHMEM_VECTOR_ARCH})
 target_include_directories(all_gather_kernel PRIVATE
     ${SHMEM_HOME_PATH}/shmem/include
+    ${SHMEM_SOURCE_DIR}/src
     ${SHMEM_SOURCE_DIR}/src/device
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
@@ -128,11 +136,16 @@ target_link_options(hyper_multicore_shmem_ops PRIVATE --cce-fatobj-link)
 target_link_libraries(hyper_multicore_shmem_ops PRIVATE hyper_multicore_shmem)
 hp_enable_link_hardening(hyper_multicore_shmem_ops)
 
-install(TARGETS hyper_multicore_shmem_ops LIBRARY DESTINATION lib)
-install(CODE [[
-    file(RPATH_REMOVE FILE "${CMAKE_INSTALL_PREFIX}/lib/libhyper_multicore_shmem_ops.so")
-]])
+set(HP_SHMEM_RESOURCE_ARCH "" CACHE STRING "Architecture directory for private SHMEM resources")
+if(NOT HP_SHMEM_RESOURCE_ARCH MATCHES "^arch[0-9]+$")
+    message(FATAL_ERROR "HP_SHMEM_RESOURCE_ARCH must identify the target architecture")
+endif()
+install(TARGETS hyper_multicore_shmem_ops LIBRARY DESTINATION lib/${HP_SHMEM_RESOURCE_ARCH})
+install(CODE "
+    file(RPATH_REMOVE
+        FILE \"\${CMAKE_INSTALL_PREFIX}/lib/${HP_SHMEM_RESOURCE_ARCH}/libhyper_multicore_shmem_ops.so\")
+")
 # Stage the private SHMEM SDK libraries next to the kernel library so the
 # install tree is self-contained even when the legacy ops phase is removed.
 file(GLOB SHMEM_SO_FILES "${SHMEM_HOME_PATH}/shmem/lib/*")
-install(FILES ${SHMEM_SO_FILES} DESTINATION lib/shmem)
+install(FILES ${SHMEM_SO_FILES} DESTINATION lib/${HP_SHMEM_RESOURCE_ARCH}/shmem)

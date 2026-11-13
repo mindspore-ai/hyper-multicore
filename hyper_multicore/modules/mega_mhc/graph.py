@@ -90,7 +90,7 @@ def resolve_token_tile(token_count: int, requested_tile: int, num_cube_cores: in
     Args:
         token_count: Total flattened token count.
         requested_tile: Preferred token count per task.
-        num_cube_cores: Physical AIC core count.
+        num_cube_cores: Number of Cube cores.
     """
     if token_count <= 0 or requested_tile <= 0 or num_cube_cores <= 0:
         raise ValueError(
@@ -436,7 +436,7 @@ def build_mega_mhc_graph(
     Args:
         token_count: Total flattened token count.
         hidden_size: Hidden dimension.
-        num_cube_cores: Physical AIC core count.
+        num_cube_cores: Number of Cube cores.
         token_tile: Preferred token count per task.
     """
     if token_count <= 0 or hidden_size <= 0 or num_cube_cores <= 0:

@@ -68,7 +68,7 @@ class _TraceAccumulator:
         shift_us = (metadata["anchorCycle"] - self.global_anchor) / metadata["cycleFrequencyMHz"]
         self.dropped_count += metadata["droppedRecordCount"]
         self.record_count += metadata["recordCount"]
-        self.invocation_metadata.append({
+        invocation_metadata = {
             "invocationId": invocation.invocation_id,
             "step": invocation.step,
             "direction": invocation.direction,
@@ -78,7 +78,11 @@ class _TraceAccumulator:
             "anchorCycle": metadata["anchorCycle"],
             "recordCount": metadata["recordCount"],
             "droppedRecordCount": metadata["droppedRecordCount"],
-        })
+        }
+        for key in ('workerCapacities', 'profileBufferBytes'):
+            if key in metadata:
+                invocation_metadata[key] = metadata[key]
+        self.invocation_metadata.append(invocation_metadata)
         self._append_events(trace["traceEvents"], invocation, shift_us)
 
     def _append_events(

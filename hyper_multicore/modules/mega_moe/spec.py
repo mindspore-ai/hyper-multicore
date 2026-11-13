@@ -24,6 +24,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from hyper_multicore._core_spec import get_device_core_spec
+
 
 _COMMUNICATION_SPLIT = 128
 _DEFAULT_CAPACITY_FACTOR = 1.25
@@ -31,7 +33,7 @@ _DEFAULT_CAPACITY_FACTOR = 1.25
 
 @dataclass(frozen=True)
 class MegaMoeSpec:
-    """Shape, capacity, topology, and hardware values bound on first use."""
+    """Shape, capacity, topology, and Device core limits bound on first use."""
 
     local_num_tokens: int
     hidden_size: int
@@ -182,13 +184,7 @@ def bind_mega_moe_spec(
     device_index = (
         device.index if device.index is not None else torch.npu.current_device()
     )
-    device_limits = torch.npu.get_device_limit(device_index)
-    num_cube_cores = device_limits.get("cube_core_num")
-    if not isinstance(num_cube_cores, int) or num_cube_cores <= 0:
-        raise RuntimeError(
-            "torch.npu.get_device_limit() returned an invalid cube_core_num "
-            f"for NPU {device_index}: {num_cube_cores!r}."
-        )
+    core_spec = get_device_core_spec(device_index)
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
@@ -210,7 +206,7 @@ def bind_mega_moe_spec(
         ep_size=ep_size,
         ep_group=ep_group,
         rank_id=rank_id,
-        num_cube_cores=num_cube_cores,
+        num_cube_cores=core_spec.num_cube_cores,
         swiglu_limit=swiglu_limit,
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),

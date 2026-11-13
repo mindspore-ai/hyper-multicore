@@ -33,6 +33,7 @@ inline constexpr std::size_t kMaxBootstrapEndpointBytes = 63U;
 /** @brief Data engines accepted by the first Runtime release. */
 enum class DataEngine : uint8_t {
   Mte,
+  MteUdma,
 };
 
 /** @brief Validated, framework-independent Runtime configuration. */
@@ -44,7 +45,7 @@ struct Config {
 };
 
 /**
- * @brief Load and validate the four HYPER_MULTICORE_SHMEM_* Runtime variables.
+ * @brief Load and validate the HYPER_MULTICORE_SHMEM_* Runtime variables.
  *
  * @return A normalized Config, or ErrorCode::InvalidConfig for an invalid environment value.
  */

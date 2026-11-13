@@ -17,7 +17,6 @@
 import fcntl
 import json
 import os
-import platform
 import re
 import shutil
 import time
@@ -40,11 +39,7 @@ def framework_slot(identity):
     torch, pta = (version_label(identity[name]) for name in ("torch_version", "pta_version"))
     abi = int(identity["torch_cxx11_abi"])
     # CPU is the configured Torch distribution; retain local version labels to avoid collisions.
-    return f"{python}-{arch}-torch{torch.removesuffix('.cpu')}-pt{pta}-abi{abi}"
-
-
-def common_slot(socs):
-    return safe_component(platform.machine() + "-" + socs.replace(",", "-"))
+    return f"{python}-{arch}-pt{torch.removesuffix('.cpu')}-pta{pta}-abi{abi}"
 
 
 def claim_workspace(directory, root):
@@ -60,7 +55,7 @@ def claim_workspace(directory, root):
 
 def check_workspace(directory, root):
     """A human-created directory must never be erased just because its name matches a slot."""
-    if directory.parent.is_symlink() or directory.is_symlink():
+    if any(path.is_symlink() for path in (directory, *directory.parents)):
         raise ValueError(f"Refusing symlinked native workspace: {directory}")
     if not directory.exists() or not any(directory.iterdir()):
         return

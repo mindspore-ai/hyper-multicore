@@ -20,6 +20,7 @@ revise_gmm_task_queue_bwd  — Backward GMM1/GMM4 expert interleave in cube_task
 """
 from __future__ import annotations
 
+from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.scheduler.config import RuntimeConfigC, TaskSplitValue
 
 
@@ -54,7 +55,7 @@ def revise_task_queue(cfg: RuntimeConfigC, tsv: TaskSplitValue,
 
 def revise_gmm_task_queue_bwd(cfg: RuntimeConfigC, tsv: TaskSplitValue,
                                act_grad_task_num: int,
-                               num_cube_cores: int = 24) -> None:
+                               num_cube_cores: int = DEFAULT_CORE_SPEC.num_cube_cores) -> None:
     """
     Backward-only: interleave w2_grad and act_grad experts in cube_task_indices.
 

@@ -35,7 +35,8 @@ from examples._optimizer import Float16OptimizerWithFloat16Params
 from examples._training import _compare_tensor_maps, build_optimizer
 from examples.mhc.model import MhcTransformerConfig, MhcTransformerModel
 from hyper_multicore.modules.mega_mhc_common import validate_mega_mhc_token_count
-from hyper_multicore.modules.mega_mhc_grad.function import _resolve_core_counts
+from hyper_multicore._core_spec import get_device_core_spec
+from hyper_multicore.modules.mega_mhc_common import validate_mega_mhc_core_spec
 
 _RTOL = 2e-2
 _ATOL = 2e-3
@@ -200,7 +201,9 @@ def _build_workloads(args: argparse.Namespace) -> tuple[MhcTransformerConfig, di
         raise ValueError("the dense mHC benchmark uses one device; launch with python, not multi-rank torchrun")
     torch.npu.set_device(args.device_index)
     device = torch.device("npu", args.device_index)
-    _, vector_cores = _resolve_core_counts(args.device_index)
+    core_spec = get_device_core_spec(args.device_index)
+    validate_mega_mhc_core_spec(core_spec)
+    vector_cores = core_spec.num_vector_cores
     validate_mega_mhc_token_count(args.tokens, vector_cores)
     config = MhcTransformerConfig(hidden_size=args.hidden_size, intermediate_size=args.intermediate_size,
                                   num_layers=args.num_layers, max_seq_len=args.tokens)

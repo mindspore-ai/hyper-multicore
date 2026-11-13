@@ -26,6 +26,7 @@ import torch.distributed as dist
 import torch_npu
 
 from hyper_multicore import shmem
+from hyper_multicore._core_spec import get_device_core_spec
 from hyper_multicore._loader import get_multicore_paths, validate_native_compatibility
 from tests.common.multicore._evidence_helpers import source_revision
 from tests.common.port_utils import allocate_port
@@ -71,6 +72,7 @@ def assert_stable_memory(samples: list[dict[str, int]]) -> None:
 def environment_identity() -> dict:
     """Record the exact software, chip and loaded vendor used by a device run."""
     root = Path(os.getenv("HP_VALIDATION_REPO", str(Path(__file__).resolve().parents[3])))
+    core_spec = get_device_core_spec(torch.npu.current_device())
     vendor, adapter = get_multicore_paths()
     cann_root = Path(os.environ["ASCEND_HOME_PATH"])
     version_files = [cann_root / "version.cfg", cann_root / "version.info", cann_root / "opp/version.info"]
@@ -80,8 +82,11 @@ def environment_identity() -> dict:
     }
     native_files = [adapter, *vendor.rglob("*.so"), *vendor.rglob("*.o")]
     selected = validate_native_compatibility()
-    native_files.append(selected["root"] / selected["variant"]["shmem_so"])
-    native_files.extend((selected["root"] / "shmem/lib").rglob("*.so"))
+    sdk_soc_type = shmem.debug_state()["backend_soc_type"]
+    backend = next(name for name, spec in selected["manifest"]["architectures"].items()
+                   if spec["sdk_soc_type"] == sdk_soc_type)
+    native_files.append(selected["root"] / selected["variant"]["shmem_so"][backend])
+    native_files.extend((selected["root"] / selected["manifest"]["architectures"][backend]["shmem_root"]).rglob("*.so"))
     return {
         **source_revision(root),
         "worker_sha256": {
@@ -92,7 +97,10 @@ def environment_identity() -> dict:
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
         "chip": torch.npu.get_device_name(),
-        "device_limits": torch.npu.get_device_limit(torch.npu.current_device()),
+        "device_limits": {
+            "cube_core_num": core_spec.num_cube_cores,
+            "vector_core_num": core_spec.num_vector_cores,
+        },
         "cann_root": str(cann_root),
         "cann_version_files": versions,
         "native_sha256": {

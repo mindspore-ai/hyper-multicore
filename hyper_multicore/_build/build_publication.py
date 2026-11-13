@@ -27,7 +27,8 @@ from pathlib import Path
 import shutil
 import tempfile
 import zipfile
-from . import artifacts
+from packaging.requirements import Requirement
+from .artifacts import _shmem_cpp_test_sources, _source_identity
 from .command_runner import Commands
 from ._bootstrap import load_module
 
@@ -136,8 +137,6 @@ def validate_wheel_metadata(archive, metadata_path, info):
     metadata = BytesParser().parsebytes(archive.read(metadata_path))
     if metadata["Name"].replace("_", "-") != "hyper-multicore" or metadata["Version"] != info["artifact_version"]:
         raise ValueError("Wheel distribution identity mismatch")
-    from packaging.requirements import Requirement
-
     torch = [Requirement(v) for v in metadata.get_all("Requires-Dist", []) if Requirement(v).name.lower() == "torch"]
     if len(torch) != 1 or str(torch[0].specifier) or torch[0].url:
         raise ValueError("Wheel must declare Torch without a version constraint or direct URL")
@@ -175,13 +174,14 @@ class SourceGuard:
             paths.extend(p for p in (self.root / name).rglob("*")
                          if p.is_file() and not {"lib", "__pycache__"}.intersection(p.relative_to(self.root).parts))
         paths.extend(self.root / name for name in
-                     ("setup.py", "MANIFEST.in", "build.sh", "requirements.txt", "tests/ut/shmem/native_log_test.cpp"))
+                     ("setup.py", "MANIFEST.in", "build.sh", "requirements.txt"))
+        paths.extend(_shmem_cpp_test_sources(self.root))
         generations = {}
         for path in paths:
             if path.is_file():
                 stat = path.stat()
                 generations[str(path)] = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-        return artifacts._source_identity(self.root), generations
+        return _source_identity(self.root), generations
 
     def check_source(self):
         if self.observe() != self.frozen:

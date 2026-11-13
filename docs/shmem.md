@@ -129,6 +129,8 @@ SHMEM知道Tensor的shape、dtype、alignment及字节范围，但不知道其�
 
 架构图展示主要调用关系。MegaMoe部分设备代码还直接访问CANN设备状态，这些调用与私有SDK版本存在耦合。
 CANN Adapter负责上游机制适配，业务worker负责通信任务及协议。
+GET由业务worker发起，Device Data Plane使用双缓冲MTE搬运，并等待最后一次MTE3写回完成。
+A5后端另提供调用方独占QP的同步UDMA GET；CANN Device Adapter管理该GET的UB staging、分块和quiet完成等待。
 
 ### 1.6 跨层协作与Root选择
 
@@ -235,11 +237,15 @@ Put、Get和Signal均为stream入队语义，返回不表示远端消费已经�
 Runtime初始化时冻结当前NPU设备。`empty`、`barrier`、`signal`、`wait_signal`以及实际发射设备任务的非零
 `put`、`get`和`all_gather`会拒绝其他设备的stream。零字节Put、Get和AllGather完成本地参数校验后不发射任务。
 
+后端兼容性使用CANN查询的NPU架构判断：910B/910C为`2201`，950PR/950DT为`3510`。
+`device_soc_name`保留`aclrtGetSocName()`返回的完整型号原文。
+
 ### 3.5 诊断
 
 `shmem.debug_state()`只返回Runtime和Allocation事实：
 
 - Runtime状态、Root、引用数和生效配置。
+- 编译时的`backend_soc_type`、当前`device_index`和实机型号`device_soc_name`。
 - heap的请求字节占用、剩余字节和峰值请求字节。
 - 按Allocation ID排序的活动Allocation及其base和bytes。
 - Tensor引用丢失但未经`free()`的泄漏Allocation。
@@ -248,6 +254,7 @@ Runtime初始化时冻结当前NPU设备。`empty`、`barrier`、`signal`、`wai
 干净关闭后生命周期字段为`None`。占用量按请求字节投影；CANN heap按16字节对齐并切分余洞，真实设备侧占用
 可能略高。
 
+<!-- markdownlint-disable-next-line MD033 -->
 <a id="runtime-restart"></a>
 
 ## 4. Runtime restart
@@ -395,10 +402,12 @@ flowchart TB
 | `HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 普通WORLD或单进程初始化endpoint；子组及显式heap初始化使用独立unique ID |
 | `SHMEM_UID_SOCK_IFNAME` | CANN自动选择 | 子组UID bootstrap使用的Host网卡，所有group成员必须可达 |
 | `HYPER_MULTICORE_SHMEM_TIMEOUT_SEC` | 120 | Runtime超时秒数 |
-| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte` | 数据搬移引擎，当前只支持`mte` |
+| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte` | 数据搬移引擎，支持`mte`；Ascend950后端另支持`mte_udma` |
 | `SHMEM_LOG_LEVEL` | `ERROR` | CANN及HP SHMEM日志级别：`DEBUG`、`INFO`、`WARN`、`ERROR`或`FATAL` |
 | `SHMEM_LOG_TO_STDOUT` | `0` | `1`输出到stdout且不落盘；其他值使用文件sink |
 | `SHMEM_LOG_PATH` | `${HOME}/shmem/log` | CANN及HP SHMEM日志的统一落盘目录 |
+
+引擎配置控制SHMEM初始化，`mte_udma`的UDMA QP数固定为1，算子的具体传输路径由设备代码决定。
 
 CANN和HP日志共用SHMEM原生sink，由它统一补充时间戳、级别、TID和PID，并负责级别过滤、stdout选择及文件
 轮转。原始CANN正文保持`[SHM_SHMEM file:line]`格式；HP正文使用
@@ -425,8 +434,12 @@ CANN `aclshmem`具有以下安全属性：
 
 ## 8. 构建与制品
 
-SHMEM没有独立对外构建开关。根 `bash build.sh` 必须构建 Torch Multicore 及其必需的 SHMEM，
-任一组件失败则停止产包。内部 `shmem/build.sh` 依次构建 AllGather kernel、Runtime 和 Torch binding。
+SDK 锁定 CANN SHMEM `v1.8.0`，保留 runtime 符号加载和私有日志接口补丁。
 
-私有库位于`hyper_multicore/shmem/lib`，使用专属SONAME，避免与框架自带的通用SHMEM库冲突。制品不携带
-RPATH或RUNPATH，运行时搜索路径由Multicore `set_env.bash`统一配置。详见[构建与使用](build.md)。
+SHMEM没有独立对外构建开关。根 `bash build.sh` 必须构建 Torch Multicore 及其必需的 SHMEM，
+任一组件失败则停止产包。内部 `shmem/build.sh` 准备 SDK/ops；Runtime 和 Torch binding 由统一构建控制器按框架与架构编译、测试和加载校验。
+
+私有库按设备架构保存于`hyper_multicore/shmem/lib/<arch>/`，使用专属SONAME，避免与框架通用SHMEM库冲突。
+首次使用SHMEM时查询可见逻辑设备0的架构，并按绝对路径加载对应SDK、ops和binding，不创建NPU上下文。
+进程可见设备须属于同一架构；Runtime初始化仍校验调用方当前设备。制品不携带RPATH或RUNPATH，
+`set_env.bash`激活vendor路径，SHMEM库不通过全局搜索路径选择。详见[构建与使用](build.md)。

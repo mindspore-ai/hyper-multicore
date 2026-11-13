@@ -21,6 +21,7 @@ __all__ = [
     "_torch_modules",
 ]
 
+import ctypes
 import importlib.util
 import sys
 from pathlib import Path
@@ -29,13 +30,15 @@ from typing import Any, Final
 from hyper_multicore._loader import (
     NativeComponentUnavailableError, load_torch_npu, native_loading, native_context, native_ready,
     require_multicore_environment, validate_native_compatibility,
+    select_native_shmem,
 )
-from hyper_multicore._native_manifest import resource_path
+from hyper_multicore._native_manifest import SHMEM_DEPENDENCIES, resource_path
 
 
 _NATIVE_MODULE: Final = "hyper_multicore_shmem_torch"
 
 _native: Any | None = None
+_native_libraries: list[Any] = []
 
 
 def _load_native() -> Any:
@@ -47,9 +50,13 @@ def _load_native() -> Any:
     require_multicore_environment()
     load_torch_npu()
     selected = validate_native_compatibility()
-    path = resource_path(selected["root"], selected["variant"]["shmem_so"])
+    backend, resources = select_native_shmem(selected)
+    path = resource_path(selected["root"], selected["variant"]["shmem_so"][backend])
     with native_loading("shmem") as needed:
         if needed:
+            for dependency in SHMEM_DEPENDENCIES:
+                library = resource_path(selected["root"], f"{resources['shmem_root']}/{dependency}")
+                _native_libraries.append(ctypes.CDLL(str(library), mode=ctypes.RTLD_LOCAL))
             cached = sys.modules.get(_NATIVE_MODULE)
             if cached is not None:
                 if Path(getattr(cached, "__file__", "")).resolve() != path:

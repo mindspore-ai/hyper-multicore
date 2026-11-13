@@ -36,8 +36,7 @@ class BuildResult:
 
     payload: Path
     pythons: list[Path]
-    branches: set[str]
-    pairs: int
+    frameworks: int
     started: float
 
 
