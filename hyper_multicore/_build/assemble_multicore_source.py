@@ -43,6 +43,13 @@ _OPS_NN_PATHS = (
     "index/linear_index/op_host/op_api",
 )
 _OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
+_A5_OPS_NN_PATHS = (
+    "common/inc/op_kernel",
+    "quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35",
+    "quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35",
+    "quant/swiglu_mx_quant/op_kernel/arch35",
+    "quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35",
+)
 _OPS_TRANSFORMER_MHC_PATHS = (
     "common/include",
     "mhc/mhc_post/op_kernel/arch22",
@@ -65,6 +72,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ops-nn-source", required=True)
     parser.add_argument("--ops-transformer-source", required=True)
+    parser.add_argument("--ops-tensor-source", help="Locked Blaze source for the A5 task adapters")
     parser.add_argument("--work-dir", required=True)
     return parser.parse_args()
 
@@ -76,10 +84,11 @@ def main() -> int:
     transformer_revisions = dependency_revisions(lock["ops_transformer"])
     ops_nn_source = Path(args.ops_nn_source).resolve()
     ops_transformer_source = Path(args.ops_transformer_source).resolve()
+    ops_tensor_source = Path(args.ops_tensor_source).resolve() if args.ops_tensor_source else None
     work_dir = Path(args.work_dir).resolve()
     _validate_new_work_dir(
         work_dir,
-        (ops_nn_source, ops_transformer_source),
+        (ops_nn_source, ops_transformer_source, *((ops_tensor_source,) if ops_tensor_source else ())),
     )
 
     verify_git_dependency(lock["ops_nn"], ops_nn_source, dependency_name="ops_nn")
@@ -93,6 +102,8 @@ def main() -> int:
         ops_transformer_source,
         dependency_name="ops_transformer.mhc",
     )
+    if ops_tensor_source is not None:
+        verify_git_dependency(lock["ops_tensor"], ops_tensor_source, dependency_name="ops_tensor")
 
     ops_nn_copy = work_dir / "adapter-inputs" / "ops-nn"
     transformer_copy = work_dir / "adapter-inputs" / "ops-transformer"
@@ -101,7 +112,7 @@ def main() -> int:
         ops_nn_source,
         ops_nn_copy,
         lock["ops_nn"]["commit"],
-        _OPS_NN_PATHS,
+        _OPS_NN_PATHS + (_A5_OPS_NN_PATHS if ops_tensor_source else ()),
     )
     _export_git_tree(
         ops_transformer_source,
@@ -126,9 +137,41 @@ def main() -> int:
         transformer_copy,
         transformer_mhc_copy,
     )
+    if ops_tensor_source is not None:
+        tensor_copy = work_dir / "adapter-inputs" / "ops-tensor"
+        _export_git_tree(ops_tensor_source, tensor_copy, lock["ops_tensor"]["commit"], ("include/blaze",))
+        _apply_locked_adapters(tensor_copy, lock["ops_tensor"])
+        _compose_a5_sources(source_root, ops_nn_copy, tensor_copy, lock)
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0
+
+
+def _compose_a5_sources(source_root: Path, ops_nn: Path, ops_tensor: Path, lock: dict[str, Any]) -> None:
+    """Share upstream A5 mathematics without vendoring a second implementation.
+
+    The task adapters may change logical worker identity and entry boundaries;
+    mathematical kernels and relative includes are exported from locked Git trees.
+    The manifest describes actual build input, including any locked adapters.
+    """
+    target = source_root / "a5"
+    shutil.copytree(ops_tensor / "include" / "blaze", target / "include" / "blaze")
+    shutil.copytree(ops_nn / "activation/swi_glu_grad/op_kernel/arch35", target / "swi_glu_grad/arch35")
+    for operator in ("dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
+                     "swiglu_mx_quant", "swiglu_backward_mx_quant_with_dual_axis"):
+        destination = target / operator
+        shutil.copytree(ops_nn / "quant" / operator / "op_kernel/arch35", destination / "arch35")
+    # These are standard relative dependencies of the exported arch35 headers.
+    for operator in ("swi_glu_grad", "dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
+                     "swiglu_mx_quant", "swiglu_backward_mx_quant_with_dual_axis"):
+        shutil.copytree(ops_nn / "common/inc/op_kernel", target / operator / "inc")
+    files = {str(path.relative_to(target)): _sha256(path)
+             for path in sorted(target.rglob("*")) if path.is_file()}
+    manifest = {"components": {name: {"commit": lock[name]["commit"],
+                                     "patches": lock[name].get("patches", [])}
+                               for name in ("ops_nn", "ops_tensor")},
+                "files": files}
+    (target / "sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _validate_new_work_dir(work_dir: Path, inputs: tuple[Path, ...]) -> None:

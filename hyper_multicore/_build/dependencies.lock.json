@@ -152,6 +152,18 @@
         "git_archive_tar_sha256": "0a59c5f4e31190d4ab72e4adaac69a978199c2da1989bfc6273de21f4dc016e4",
         "resolution": "SHMEM Ascend950 topology-reader header dependency; copied only to the isolated SDK source",
         "packaging_policy": "build-only header dependency; not a Python runtime requirement"
+      },
+      "ops_tensor": {
+        "version": "c350b98e15",
+        "repository": "https://gitcode.com/cann/ops-tensor.git",
+        "fetch_ref": "c350b98e15dfd31c9b06464d1dfdfa1ad06a939b",
+        "tag_object": null,
+        "commit": "c350b98e15dfd31c9b06464d1dfdfa1ad06a939b",
+        "tree": "f60225e2beb7d59a55c095a7c0c650f46540aa78",
+        "git_archive_tar_sha256": "6ac45efc6377f5843a2ba0db908075a0008f1d6679e01646b466990b75e907b4",
+        "resolution": "A5 Blaze dependency pinned by ops-transformer dff221330e; all 47 original MX closure files match this Git tree",
+        "patches": [],
+        "upgrade_policy": "preserve task-local numerical and resource contracts; verify BF16 and MX independently"
       }
     }
   },

@@ -1,0 +1,82 @@
+{
+  "baseline": "a11aaff3a97b7bd986c9bbcc434f462c93f6df22",
+  "policy": {
+    "a3_transport": "MTE",
+    "a5_remote_transport": "UDMA",
+    "qps_per_peer": 1,
+    "self_copy": "local MTE",
+    "upstream_math": "locked Git export, no vendored Blaze or SwiGLUGrad implementation",
+    "runtime": "generic queues and events only; op-specific math remains in tasks and operators"
+  },
+  "source_evidence": {
+    "mx_blaze": {
+      "repository": "cann/ops-tensor",
+      "commit": "c350b98e15dfd31c9b06464d1dfdfa1ad06a939b",
+      "matching_original_files": 47,
+      "total_original_files": 47,
+      "introduced_by": "ops-transformer dff221330e cmake/third_party/ops-tensor.cmake"
+    },
+    "bf16_blaze": {
+      "matching_original_files": 22,
+      "total_original_files": 27,
+      "remaining": "two template headers, dispatch policy, common utils and a legacy sync header require review; no equivalence asserted"
+    },
+    "swiglu_grad": {
+      "source": "ops-nn activation/swi_glu_grad/op_kernel/arch35",
+      "already_in_master_lock": true,
+      "legacy_closure_source": "CANN 9.2 installation",
+      "same_original_files": 1,
+      "compared_original_files": 5,
+      "remaining": "classify API/format/implementation differences before task binding"
+    }
+  },
+  "stages": [
+    {
+      "id": 0,
+      "name": "source identity and isolated A5 assembly",
+      "state": "in_progress"
+    },
+    {
+      "id": 1,
+      "name": "minimal math task adapters",
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "name": "shared QP1 transport",
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "name": "DAG and queue integration",
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "name": "correctness lifecycle performance and deployment",
+      "state": "pending"
+    }
+  ],
+  "validation": {
+    "build": "pending",
+    "device": "pending",
+    "native_binary_branch_identity": "unknown",
+    "source_assembly": {
+      "state": "passed",
+      "upstream_sources_modified": false,
+      "a5_manifest_file_count": 143
+    },
+    "build_source_checks": {
+      "passed": 22,
+      "failed": 0
+    }
+  },
+  "excluded": [
+    "QP8/16/32 controls",
+    "legacy SHMEM SDK and v1.7 patch bundle",
+    "fixed solver tables",
+    "unadopted math implementations",
+    "downstream framework imports",
+    "diagnostic observers"
+  ]
+}

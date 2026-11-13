@@ -365,6 +365,7 @@ def build_common(args, run: BuildContext, python: Path):
                    kernel_root=f"lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/{name}")
     env.update(HP_OPS_NN_SOURCE=prepared["ops_nn_source"],
                HP_OPS_TRANSFORMER_SOURCE=prepared["ops_transformer_source"],
+               HP_OPS_TENSOR_SOURCE=prepared.get("ops_tensor_source", ""),
                HP_VENDOR_HOST_IDENTITY=prepared["host_input_identity"])
     build_vendors(command, prepared["pending"], args.jobs, run, env)
     run.commands(command + ["--phase", "merge"], label="common-merge", env=env)
