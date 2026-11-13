@@ -4,6 +4,7 @@ import os
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.modules.mega_moe import function as function_module
@@ -120,5 +121,54 @@ def test_reentrant_no_grad_then_grad() -> None:
         second.float().square().mean().backward()
         assert layer.gate_up_weight.grad is not None
         assert torch.isfinite(layer.gate_up_weight.grad).all()
+    finally:
+        layer.close()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_fp32_native_dw_matches_cpu_fp32_reference() -> None:
+    """Small top-1 expert keeps native FP32 dW equal to a CPU FP32 accumulation."""
+    prepare_multicore_test_environment()
+    torch.npu.set_device(0)
+    device = torch.device("npu", 0)
+    layer = MegaMoeExperts(
+        hidden_size=128, intermediate_size=64, num_experts=2, top_k=1,
+        ep_size=1, expert_weight_layout="EIO",
+    ).to(device=device, dtype=torch.bfloat16)
+    try:
+        tokens = 128
+        x = torch.randn(tokens, 128, device=device, dtype=torch.bfloat16)
+        ids = torch.zeros((tokens, 1), device=device, dtype=torch.int32)
+        probs = torch.ones((tokens, 1), device=device, dtype=torch.float32)
+
+        def fp32_plan(spec, dev, **kwargs):
+            return build_mega_moe_plan(spec, dev, weight_grad_dtype=torch.float32)
+
+        os.environ["HP_MEGA_MOE_CAPTURE_DW"] = "1"
+        function_module._CAPTURED_WEIGHT_GRADS = None  # pylint: disable=protected-access
+        try:
+            with patch.object(module_module, "build_mega_moe_plan", side_effect=fp32_plan):
+                out = layer(x, ids, probs)
+                out.float().square().mean().backward()
+        finally:
+            os.environ.pop("HP_MEGA_MOE_CAPTURE_DW", None)
+        captured = function_module._CAPTURED_WEIGHT_GRADS  # pylint: disable=protected-access
+        assert captured is not None
+
+        w1 = layer.gate_up_weight.detach().cpu().requires_grad_()
+        w2 = layer.down_weight.detach().cpu().requires_grad_()
+        x_cpu = x.cpu()
+        projection = x_cpu @ w1[0].transpose(0, 1)
+        gate, up = projection.chunk(2, dim=-1)
+        activation = F.silu(gate) * up
+        reference = activation @ w2[0]
+        reference.float().square().mean().backward()
+        errors = [
+            (captured[0][0].cpu() - w1.grad.float()).abs().max().item(),
+            (captured[1][0].cpu() - w2.grad.float()).abs().max().item(),
+        ]
+        assert errors[0] <= 5e-2, errors
+        assert errors[1] <= 5e-2, errors
     finally:
         layer.close()

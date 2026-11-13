@@ -1,3 +1,4 @@
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
 /**
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
  * This file is a part of the CANN Open Software.
@@ -122,8 +123,8 @@ class KernelWorkerBase {
     this->core_num = this->vector_num / 2;
     const auto header = reinterpret_cast<__gm__ RuntimeHeader *>(runtimeConfigPtr);
     ready_queue_ = header->vector_ready_queue == 1 && getDiagnosticMode(runtimeConfigPtr) == DiagnosticMode::NORMAL;
-    this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_) ?
-                              this->vector_num : this->vector_num / 2;
+    this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_)
+                              ? this->vector_num : this->vector_num / 2;
   }
 
   __aicore__ inline void Process() {
@@ -376,13 +377,6 @@ class KernelWorkerBase {
       reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[0].input_position])[task.inputs[0].base_ptr_offset];
     int64_t source_offset =
       reinterpret_cast<__gm__ int64_t *>(input_list[task.inputs[2].input_position])[task.inputs[2].base_ptr_offset];
-    if (task.extra_value_1 & VectorTaskFlags::APPLY_PROBABILITIES) {
-      const auto &aux = task.outputs[task.num_outputs - 1];
-      GM_ADDR buffer = input_list[aux.input_position];
-      PullToLocal<float>(ProbabilityPlane(buffer, aux.dim[1], 1) + (destination_offset + start) / hidden * sizeof(float),
-                         ProbabilityPlane(buffer, aux.dim[1], 0) + (source_offset + start) / hidden * sizeof(float),
-                         elements / hidden, source_pe);
-    }
     PullToLocal<T>(input_list[task.outputs[0].input_position] + (destination_offset + start) * sizeof(T),
                    input_list[task.inputs[1].input_position] + (source_offset + start) * sizeof(T), elements,
                    source_pe);
@@ -392,11 +386,10 @@ class KernelWorkerBase {
 #ifdef __DAV_CUBE__
     WaitForDependency(meta.ready_event);
 #else
-    if (this->active_vector_num != this->vector_num && this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
+    if (!IsActiveVectorWorker()) {
       return;
     }
-    const uint32_t leader = this->active_vector_num == this->vector_num ? 0 : 1;
-    if (this->worker_id_ == leader) {
+    if (this->worker_id_ == 1) {
       PublishDeviceReady(meta);
     }
     WaitForDependency(meta.ready_event);
@@ -419,7 +412,7 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline bool IsActiveVectorWorker() const {
-    if constexpr (WorkerPolicy == VectorWorkerPolicy::ALL) {
+    if (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_) {
       return this->worker_id_ < this->active_vector_num;
     }
     return this->worker_id_ % VECTOR_WORKER_STRIDE != 0;
@@ -579,7 +572,6 @@ class KernelWorkerBase {
 
   bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
-  bool ready_queue_ = false;
   uint32_t grouped_matmul_group_list_offset_ = 0;
   uint32_t task_num = 0;
   uint32_t runtime_task_capacity = 0;
@@ -598,9 +590,14 @@ class KernelWorkerBase {
   int64_t core_num = 0;
   int64_t vector_num = 0;
   uint32_t active_vector_num = 0;
+  bool ready_queue_ = false;
   static constexpr uint32_t INVALID_VECTOR_SCHEDULE_INDEX = 0xFFFFFFFF;
 };
 
 }  // namespace MulticoreRuntime
 
 #endif  // HYPER_MULTICORE_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_
+
+#else
+#include "worker_kernel_a3.h"
+#endif

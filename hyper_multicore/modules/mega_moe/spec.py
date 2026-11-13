@@ -24,7 +24,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from hyper_multicore._device import device_core_limit
+from hyper_multicore._core_spec import get_device_core_spec
 
 
 _COMMUNICATION_SPLIT = 128
@@ -52,7 +52,6 @@ class MegaMoeSpec:
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
     swiglu_limit: float | None = None
-    clamp_after_activation: bool = False
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
@@ -61,9 +60,6 @@ class MegaMoeSpec:
     nominal_schedule: bool = False
     apply_probs_before_fc2: bool = False
     clamp_after_activation: bool = False
-    batch_experts: bool = False
-    nominal_schedule: bool = False
-    apply_probs_before_fc2: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -189,7 +185,10 @@ def bind_mega_moe_spec(
             f"ep_group world size ({group_size}) does not match ep_size ({ep_size})."
         )
 
-    num_cube_cores = device_core_limit(device, "cube_core_num")
+    device_index = (
+        device.index if device.index is not None else torch.npu.current_device()
+    )
+    core_spec = get_device_core_spec(device_index)
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
@@ -213,8 +212,6 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=core_spec.num_cube_cores,
         swiglu_limit=swiglu_limit,
-        clamp_after_activation=specification.get("clamp_after_activation", False),
-        apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
@@ -224,4 +221,6 @@ def bind_mega_moe_spec(
         auto_tokens=specification.get("auto_tokens", False),
         batch_experts=specification.get("batch_experts", False),
         nominal_schedule=specification.get("nominal_schedule", False),
+        apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
+        clamp_after_activation=specification.get("clamp_after_activation", False),
     )

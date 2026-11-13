@@ -104,6 +104,7 @@ def _initialize_weights(
 def _new_layers(
     shape: baseline.MoeShape,
     swiglu_limit: float | None, *, clamp_after_activation: bool = False,
+    apply_probs_before_fc2: bool = False,
 ) -> tuple[torch.nn.Module, MegaMoeExperts]:
     """Create reference and MegaMoe layers with identical deterministic weights."""
     common = baseline.new_common_moe(shape)
@@ -114,6 +115,7 @@ def _new_layers(
         top_k=shape.top_k,
         swiglu_limit=swiglu_limit,
         clamp_after_activation=clamp_after_activation,
+        apply_probs_before_fc2=apply_probs_before_fc2,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=baseline.DEVICE, dtype=torch.bfloat16)
@@ -130,6 +132,7 @@ def _run_reference(
     gate_up_weight: torch.Tensor,
     down_weight: torch.Tensor,
     *, limit: float = _CLAMP_LIMIT, clamp_after_activation: bool = False,
+    before_fc2: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Run grouped matmuls around an autograd-visible PyTorch clamp reference."""
     hidden = hidden_states.detach().clone()
@@ -140,15 +143,23 @@ def _run_reference(
     group_list = tokens_per_expert.cumsum(dim=0).to(torch.int64).contiguous()
     gate_up_output = grouped_matmul(routed, gate_up, group_list=group_list)
     gate, up = gate_up_output.chunk(2, dim=-1)
-    activation = (
-        (F.silu(gate.float()).clamp(max=limit) if clamp_after_activation else F.silu(gate.float().clamp(max=limit)))
-        * up.float().clamp(min=-limit, max=limit)
-    ).to(hidden.dtype)
+    if limit is None:
+        activation = (F.silu(gate.float()) * up.float()).to(hidden.dtype)
+    else:
+        activation = (
+            (F.silu(gate.float()).clamp(max=limit) if clamp_after_activation
+             else F.silu(gate.float().clamp(max=limit)))
+            * up.float().clamp(min=-limit, max=limit)
+        ).to(hidden.dtype)
+    if before_fc2:
+        routed_probs = route_weights.new_zeros(route_weights.numel()).scatter(
+            0, mapping.long(), route_weights.flatten()).to(activation.device)
+        activation = (activation.float() * routed_probs[:, None]).to(activation.dtype)
     expert_output = grouped_matmul(activation, down, group_list=group_list)
     output = torch_npu.npu_moe_token_unpermute(
         expert_output,
         mapping,
-        probs=route_weights.float().contiguous(),
+        probs=(torch.ones_like(route_weights) if before_fc2 else route_weights.float().contiguous()),
     )
     output.backward(grad_output)
     torch.npu.synchronize(baseline.DEVICE)
@@ -461,3 +472,31 @@ def test_swiglu_clamp_ub_scratch() -> None:
         actual, expected = comparisons[-1]
         torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.0)
     assert observed_calls == 2, f"Expected 2 inspected backward calls, got {observed_calls}"
+
+
+def test_swiglu_clamp_matrix() -> None:
+    """Validate before/after FC2 weighting across no-clamp and both clamp positions."""
+    # pylint: disable=protected-access
+    shape = _shape()
+    hidden, grad_output = _boundary_inputs(shape)
+    topk_ids, topk_weights, tokens_per_expert = baseline._make_fixed_route(shape, "balanced")
+    modes = (("none", None, False), ("pre", _CLAMP_LIMIT, False), ("post", _CLAMP_LIMIT, True))
+    for before_fc2 in (False, True):
+        for name, limit, after_activation in modes:
+            common, mega = _new_layers(
+                shape, limit, clamp_after_activation=after_activation,
+                apply_probs_before_fc2=before_fc2,
+            )
+            try:
+                expected = _run_reference(
+                    hidden, topk_ids, topk_weights, tokens_per_expert, grad_output,
+                    mega.gate_up_weight, mega.down_weight, limit=limit,
+                    clamp_after_activation=after_activation, before_fc2=before_fc2,
+                )
+                actual = _run_mega(
+                    mega, hidden, topk_ids, topk_weights, tokens_per_expert, grad_output,
+                )
+                _assert_numerical_results(actual, expected)
+            finally:
+                mega.close()
+            print("matrix", before_fc2, name, flush=True)
