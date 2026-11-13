@@ -238,6 +238,7 @@ def _compose_hyper_multicore_ops(
     shutil.copy2(_SHMEM_CCSRC / "cann" / "signal.h", shmem_root / "cann" / "signal.h")
     (shmem_root / "data_plane").mkdir()
     shutil.copy2(_SHMEM_CCSRC / "data_plane" / "rma.h", shmem_root / "data_plane" / "rma.h")
+    shutil.copy2(_SHMEM_CCSRC / "data_plane" / "mte_rma.h", shmem_root / "data_plane" / "mte_rma.h")
     shutil.copy2(_SHMEM_CCSRC / "data_plane" / "sync.h", shmem_root / "data_plane" / "sync.h")
     shutil.copytree(
         transformer_mhc_copy / "common" / "include",
@@ -330,6 +331,7 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_gate_grad" / "op_host" / "op_api" / "linear_index" / "linear_index.cpp",
         source_root / "hyper_mega_gate_grad" / "op_kernel" / "hyper_mega_gate_route_grad.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",
+        source_root / "shmem" / "data_plane" / "mte_rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
         source_root / "hyper_mega_mhc" / "op_host" / "hyper_mega_mhc_def.cpp",
         source_root / "hyper_mega_mhc" / "op_kernel" / "hyper_mega_mhc.cpp",

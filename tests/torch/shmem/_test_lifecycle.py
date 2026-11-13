@@ -35,10 +35,35 @@ def test_binding_single_process_without_distributed() -> None:
     torch.npu.set_device(local_rank)
     assert not dist.is_initialized()
 
+    with pytest.raises(RuntimeError, match=re.escape(ACQUIRE_HINT)):
+        shmem.get_config()
+
     shmem.acquire()
-    allocation = shmem.empty(32, dtype=torch.uint8)
-    shmem.free(allocation)
-    shmem.release()
+    try:
+        config = shmem.get_config()
+        assert config == {
+            "heap_size_bytes": int(os.environ.get("HYPER_MULTICORE_SHMEM_HEAP_SIZE", "1073741824")),
+            "timeout_seconds": int(os.environ.get("HYPER_MULTICORE_SHMEM_TIMEOUT_SEC", "120")),
+            "data_engine": os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE", "mte"),
+            "bootstrap_endpoint_base": os.environ.get(
+                "HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", "tcp://127.0.0.1:8662"
+            ),
+        }
+        with pytest.MonkeyPatch.context() as environment:
+            environment.setenv("HYPER_MULTICORE_SHMEM_TIMEOUT_SEC", "invalid")
+            environment.setenv("HYPER_MULTICORE_SHMEM_DATA_ENGINE", "invalid")
+            assert shmem.get_config() == config
+        changed = shmem.get_config()
+        changed["timeout_seconds"] = 1
+        changed["bootstrap_endpoint_base"] = "changed"
+        assert shmem.get_config() == config
+        allocation = shmem.empty(32, dtype=torch.uint8)
+        shmem.free(allocation)
+    finally:
+        shmem.release()
+
+    with pytest.raises(RuntimeError, match=re.escape(ACQUIRE_HINT)):
+        shmem.get_config()
 
 
 def test_binding_single_process_data_plane_health() -> None:
@@ -219,7 +244,10 @@ def test_binding_init_timeout_injection(capfd: pytest.CaptureFixture[str]) -> No
     )
     assert all(runtime_prefix.match(line) for line in runtime_failures), runtime_failures
     for line in runtime_failures:
-        assert " op=" not in line and " phase=" not in line and " error=" not in line and " msg=" not in line, line
+        assert " op=" not in line, line
+        assert " phase=" not in line, line
+        assert " error=" not in line, line
+        assert " msg=" not in line, line
         assert re.search(r"ACLSHMEM_[A-Z_]+\(-?\d+\)", line), line
         assert "CANN_ERROR" not in line, line
         assert "cann_detail=" not in line and "[SHM_SHMEM " not in line, line

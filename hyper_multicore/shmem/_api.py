@@ -22,6 +22,7 @@ __all__ = [
     "empty",
     "free",
     "get",
+    "get_config",
     "host_barrier",
     "put",
     "signal",
@@ -38,6 +39,15 @@ from ._runtime import _load_native, _torch_modules
 
 if TYPE_CHECKING:
     import torch
+
+
+@_runtime_access
+def get_config() -> dict[str, Any]:
+    """Return an independent copy of the initialized Runtime configuration.
+
+    Requires ``acquire()``. Environment changes take effect in the next lifecycle.
+    """
+    return _load_native()._get_config()  # pylint: disable=protected-access
 
 
 def _normalize_size(size: tuple[Any, ...]) -> tuple[int, ...]:

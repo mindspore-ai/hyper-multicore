@@ -407,6 +407,13 @@ flowchart TB
 | `SHMEM_LOG_TO_STDOUT` | `0` | `1`输出到stdout且不落盘；其他值使用文件sink |
 | `SHMEM_LOG_PATH` | `${HOME}/shmem/log` | CANN及HP SHMEM日志的统一落盘目录 |
 
+`shmem.get_config()`返回已初始化Runtime的生效配置字典，包含`heap_size_bytes`、
+`timeout_seconds`、`data_engine`和`bootstrap_endpoint_base`四个字段。修改返回字典不会改变Runtime；
+环境变量的变更在下一次生命周期初始化时生效。查询前需要调用`shmem.acquire()`。
+
+MegaMoE正反向PUT算子保留分片、AIV同步和Signal发布，双缓冲MTE搬运由Data Plane的`mte_rma`实现，
+通过CANN Adapter访问SDK资源；发布Signal前执行MTE quiet，零长度任务仍发布Signal。
+
 引擎配置控制SHMEM初始化，`mte_udma`的UDMA QP数固定为1，算子的具体传输路径由设备代码决定。
 
 CANN和HP日志共用SHMEM原生sink，由它统一补充时间戳、级别、TID和PID，并负责级别过滤、stdout选择及文件

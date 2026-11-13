@@ -151,6 +151,15 @@ Result<int32_t> Runtime::RootSize() const {
   return Result<int32_t>::Success(root_->root_size);
 }
 
+Result<Config> Runtime::QueryConfig() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const Status state_status = RequireReady();
+  if (state_status.error_code != ErrorCode::Ok) {
+    return Result<Config>::Failure(state_status);
+  }
+  return Result<Config>::Success(*config_);
+}
+
 Status Runtime::ValidateShutdown() {
   std::lock_guard<std::mutex> lock(mutex_);
   const int32_t root_rank = RootRankForDfx();
