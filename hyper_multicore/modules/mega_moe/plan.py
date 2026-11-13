@@ -60,6 +60,10 @@ from hyper_multicore.scheduler.config import (
 from hyper_multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
+from .probability import (
+    PROBABILITY_DTYPE_BYTES, PROBABILITY_PLANES,
+    PROBABILITY_POSITION_BACKWARD, PROBABILITY_POSITION_FORWARD, probability_stride,
+)
 from .spec import MegaMoeSpec
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
 
@@ -159,7 +163,7 @@ def _attach_probability_workspace(config: Any, spec: MegaMoeSpec, *, backward: b
     """
     if not spec.apply_probs_before_fc2:
         return
-    position = 25 if backward else 16
+    position = PROBABILITY_POSITION_BACKWARD if backward else PROBABILITY_POSITION_FORWARD
     for index in config.vector_task_indices[:config.task_index_num[1]]:
         task = config.all_tasks[index]
         mode = 0
@@ -173,10 +177,10 @@ def _attach_probability_workspace(config: Any, spec: MegaMoeSpec, *, backward: b
             continue
         aux = TensorDescC()
         aux.tensor_type = 0
-        aux.data_type = 4
+        aux.data_type = PROBABILITY_DTYPE_BYTES
         aux.input_position = position
-        aux.dim[0] = 4
-        aux.dim[1] = spec.ep_size * spec.plan_tokens * spec.top_k
+        aux.dim[0] = PROBABILITY_PLANES
+        aux.dim[1] = probability_stride(spec)
         task.outputs[task.num_outputs] = aux
         task.num_outputs += 1
         task.extra_value_1 |= mode

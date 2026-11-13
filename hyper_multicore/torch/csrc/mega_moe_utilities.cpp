@@ -105,7 +105,7 @@ std::tuple<at::Tensor,at::Tensor> RouteOffsets(const at::Tensor& counts,int64_t 
   auto run=[=]()->int {
     HmcLaunchRouteMetadata(2*programs,stream,(uint8_t*)counts.data_ptr(),(uint8_t*)offsets.data_ptr(),
       (uint8_t*)sizes.data_ptr(),p,e,rank,stride,group,programs,bytes,row_stride,hidden_size);
-    return 0;
+    return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
   };
   at_npu::native::OpCommand::RunOpApi("HmcRouteOffsets",run);
   return {offsets,sizes};

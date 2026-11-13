@@ -14,7 +14,7 @@
 #include <torch/library.h>
 
 #include <tuple>
-#include "csrc/cached_moe_op_api.h"
+#include "csrc/cached_op_api.h"
 
 namespace {
 
@@ -52,7 +52,7 @@ FwdReturn mega_moe_npu(
     int64_t expert_num,
     int64_t hidden_size,
     int64_t seq_size) {
-    HMC_EXEC_CACHED_MOE_OP(aclnnHyperMegaMoe,
+    HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoe,
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,

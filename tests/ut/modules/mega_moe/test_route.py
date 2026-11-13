@@ -875,7 +875,10 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         workspace = SimpleNamespace(route_header_cache=None)
         producer, consumer, ready = Mock(), Mock(), Mock()
         header = Mock(spec=torch.Tensor)
+        fake_device = Mock()
+        fake_device.type = "npu"
         with (patch.object(route_module, "_upload_route_tensor", return_value=header) as upload,
+              patch.object(torch, "device", return_value=fake_device),
               patch.object(torch, "npu", create=True) as mock_npu):
             mock_npu.current_stream.return_value = producer
             mock_npu.Event.return_value = ready

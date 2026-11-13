@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +26,7 @@ import torch
 from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
+from .probability import PROBABILITY_PLANES, probability_stride
 from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata, restore_topk_output
 from .workspace import MegaMoeWorkspace
@@ -341,6 +344,9 @@ def _save_forward_state(
     workspace.track_graph(ctx)
 
 
+_CAPTURED_WEIGHT_GRADS: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
 def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
     """Keep retained graphs alive; older engines conservatively wait for context GC."""
     # The engine's retention flag avoids unpacking saved tensors or guessing from output references.
@@ -356,8 +362,9 @@ def _diagnostic_parameters(
     """Expose the existing scalar scratch at its real native ABI position."""
     if not plan.spec.apply_probs_before_fc2:
         return parameters
-    stride = plan.spec.ep_size * plan.spec.plan_tokens * plan.spec.top_k
-    planes = workspace.view(torch.float32).reshape(-1)[:4 * stride].view(4, stride)
+    stride = probability_stride(plan.spec)
+    planes = workspace.view(torch.float32).reshape(-1)[:PROBABILITY_PLANES * stride].view(
+        PROBABILITY_PLANES, stride)
     return (*parameters, *tilings, planes)
 
 
@@ -688,6 +695,10 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             # SHMEM remains leased until the current-stream work is recorded.
             grad_weight1 = execution.intermediates.grad_weight1
             grad_weight2 = execution.intermediates.grad_weight2
+            if os.environ.get("HP_MEGA_MOE_CAPTURE_DW") == "1":
+                global _CAPTURED_WEIGHT_GRADS
+                _CAPTURED_WEIGHT_GRADS = (grad_weight1.detach().clone(),
+                                          grad_weight2.detach().clone())
             grad_x = execution.grad_x
             del execution
             grad_input = _restore_input_gradient(ctx, grad_x, permutation_inputs)

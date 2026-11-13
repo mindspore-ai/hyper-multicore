@@ -60,6 +60,10 @@ class MegaMoeSpec:
     batch_experts: bool = False
     nominal_schedule: bool = False
     apply_probs_before_fc2: bool = False
+    clamp_after_activation: bool = False
+    batch_experts: bool = False
+    nominal_schedule: bool = False
+    apply_probs_before_fc2: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -218,4 +222,6 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        batch_experts=specification.get("batch_experts", False),
+        nominal_schedule=specification.get("nominal_schedule", False),
     )

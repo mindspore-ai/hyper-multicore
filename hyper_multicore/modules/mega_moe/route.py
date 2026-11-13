@@ -638,40 +638,66 @@ def _route_descriptor_key(raw: list[list[int]]) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(row[:2] + row[3:]) for row in raw)
 
 
+def _reuse_previous_route(
+    previous: Any, payload: torch.Tensor, source_rows: list | None, device: Any, stream: Any,
+) -> tuple[tuple[int, int, int], list[list[int]], RouteMetadata | None]:
+    """Reuse the last immutable descriptor when only the route snapshot repeated."""
+    if source_rows is not None:
+        source_rows.extend(previous.source_totals)
+    previous.wait(device, stream)
+    return previous.summary, payload.tolist(), previous.metadata
+
+
+def _reuse_cached_route(
+    cached: Any, raw: list[list[int]], spec: MegaMoeSpec, source_rows: list | None,
+    device: Any, stream: Any,
+) -> tuple[tuple[int, int, int], list[list[int]], RouteMetadata | None]:
+    """Validate and reuse one exact cached descriptor."""
+    _validate_dynamic_sizes(raw, spec)
+    if any(row[2] != raw[0][2] for row in raw):
+        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    if source_rows is not None:
+        source_rows.extend(cached.source_totals)
+    cached.wait(device, stream)
+    return cached.summary, raw, cached.metadata
+
+
+def _host_route_cache_available(spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None) -> bool:
+    """Return whether the host descriptor cache is applicable to this route."""
+    return (workspace is not None and spec.auto_tokens
+            and spec.ep_size * spec.num_experts <= _HOST_ROUTE_MAX_COUNTS)
+
+
+def _same_route_topology(previous: Any, signature: tuple) -> bool:
+    """Return whether the newest cached descriptor belongs to this topology."""
+    return previous is not None and previous.signature == signature
+
+
 def _read_cached_route(
     payload: torch.Tensor, spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None, device: Any,
     source_rows: list | None = None, *, stream: Any = None,
 ) -> tuple[tuple[int, int, int], list[list[int]] | None, RouteMetadata | None]:
     """Reuse exact validated geometry without repeating stable Host preparation."""
-    if workspace is None or not spec.auto_tokens or spec.ep_size * spec.num_experts > _HOST_ROUTE_MAX_COUNTS:
+    if not _host_route_cache_available(spec, workspace):
         summary, raw = _read_dynamic_route(payload, spec, source_rows)
         return summary, raw, None
     cache = getattr(workspace, "route_cache", None)
     signature = _route_cache_signature(spec, device)
     previous = next(reversed(cache.values())) if isinstance(cache, OrderedDict) and cache else None
-    same_topology = previous is not None and previous.signature == signature
-    remaining = getattr(workspace, "route_cache_probe_after", 0)
-    if same_topology and remaining > 0:
-        workspace.route_cache_probe_after = remaining - 1
-        return _dynamic_summary(payload, spec, source_rows), None, None
+    same_topology = _same_route_topology(previous, signature)
+    if same_topology:
+        remaining = getattr(workspace, "route_cache_probe_after", 0)
+        if remaining > 0:
+            workspace.route_cache_probe_after = remaining - 1
+            return _dynamic_summary(payload, spec, source_rows), None, None
     workspace.route_cache_probe_after = 0
     raw = payload.tolist()
     if same_topology and previous.raw == raw:
-        if source_rows is not None:
-            source_rows.extend(previous.source_totals)
-        previous.wait(device, stream)
-        return previous.summary, raw, previous.metadata
+        return _reuse_previous_route(previous, payload, source_rows, device, stream)
     key = (signature, _route_descriptor_key(raw))
     cached = cache.get(key) if isinstance(cache, OrderedDict) else None
     if cached is not None:
-        _validate_dynamic_sizes(raw, spec)
-        if any(row[2] != raw[0][2] for row in raw):
-            raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
-        if source_rows is not None:
-            source_rows.extend(cached.source_totals)
-        cache.move_to_end(key)
-        cached.wait(device, stream)
-        return cached.summary, raw, cached.metadata
+        return _reuse_cached_route(cached, raw, spec, source_rows, device, stream)
     summary = _summarize_host_route(raw, spec)
     if source_rows is not None:
         source_rows.extend(sum(row[3:]) for row in raw)
@@ -826,6 +852,65 @@ def _start_dynamic_gather(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[tor
     return gathered, work
 
 
+def _resolve_dynamic_permutation(
+    hidden_states: torch.Tensor, topk_ids: torch.Tensor, spec: MegaMoeSpec,
+    workspace: MegaMoeWorkspace | None, permuted: tuple | None, invalid: bool,
+    route_stream: Any, prepare_workspace: Callable[[int, int], None] | None,
+    gathered: torch.Tensor, work: Any,
+) -> tuple[tuple | None, tuple | None, list | None, RouteMetadata | None, Any]:
+    """Resolve the automatic/pull/ordinary permutation branch after the exchange."""
+    summary, host_rows, metadata = None, None, None
+    if spec.auto_tokens:
+        if work is not None:
+            work.wait()
+            work = None
+        summary, host_rows, metadata = _read_cached_route(
+            gathered, spec, workspace, hidden_states.device, stream=route_stream)
+        if prepare_workspace is None:
+            raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
+        prepare_workspace(summary[1], summary[2])
+    if invalid:
+        permuted = None
+    elif spec.dispatch_mode == "pull":
+        permuted = (_permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if permuted is None else
+                    _publish_staged_pull(permuted, hidden_states, spec, workspace))
+    elif permuted is None:
+        permuted = _permute_topk_input(hidden_states, topk_ids)
+    return permuted, summary, host_rows, metadata, work
+
+
+def _finalize_dynamic_route(
+    permuted: tuple, counts: torch.Tensor, summary: tuple | None, host_rows: list | None,
+    metadata: RouteMetadata | None, work: Any, gathered: torch.Tensor, spec: MegaMoeSpec,
+    workspace: MegaMoeWorkspace | None, device: Any, tokens: int,
+) -> PreparedTopKRoute:
+    """Complete metadata, optional descriptor caching and the public prepared route."""
+    if work is not None:
+        work.wait()
+    if summary is None:
+        summary, host_rows = _read_dynamic_route(gathered, spec)
+    capacity, plan_tokens, maximum = summary
+    if metadata is None:
+        metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, capacity)
+        if host_rows is not None:
+            start = spec.rank_id * spec.local_experts
+            active = all(sum(row[3 + expert] for row in host_rows) > 0
+                         for expert in range(start, start + spec.local_experts))
+            native = metadata._elements
+            metadata = replace(metadata, all_experts_active=active,
+                               _elements=(native[0], replace(native[1], all_experts_active=active)) if native else None)
+        metadata = replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
+        if host_rows is not None:
+            _cache_host_route(workspace, spec, host_rows, summary, metadata, device)
+    received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
+    return PreparedTopKRoute(
+        routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
+        received_counts=received_counts,
+        maximum_received_slots=maximum,
+        metadata=metadata,
+    )
+
+
 def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
@@ -849,47 +934,11 @@ def _prepare_dynamic_route(
     # Ordinary storage remains valid if count agreement triggers a SHMEM restart.
     if permuted is None:
         permuted = _stage_dynamic_permutation(hidden_states, topk_ids, spec, invalid, workspace)
-    summary, host_rows, metadata = None, None, None
-    if spec.auto_tokens:
-        if work is not None:
-            work.wait()
-            work = None
-        summary, host_rows, metadata = _read_cached_route(
-            gathered, spec, workspace, hidden_states.device, stream=route_stream)
-        if prepare_workspace is None:
-            raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
-        prepare_workspace(summary[1], summary[2])
-    if invalid:
-        permuted = None
-    elif spec.dispatch_mode == "pull":
-        permuted = (_permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if permuted is None else
-                    _publish_staged_pull(permuted, hidden_states, spec, workspace))
-    elif permuted is None:
-        permuted = _permute_topk_input(hidden_states, topk_ids)
-    if work is not None:
-        work.wait()
-    if summary is None:
-        summary, host_rows = _read_dynamic_route(gathered, spec)
-    capacity, plan_tokens, maximum = summary
-    if metadata is None:
-        metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, capacity)
-        if host_rows is not None:
-            start = spec.rank_id * spec.local_experts
-            active = all(sum(row[3 + expert] for row in host_rows) > 0
-                         for expert in range(start, start + spec.local_experts))
-            native = metadata._elements
-            metadata = replace(metadata, all_experts_active=active,
-                               _elements=(native[0], replace(native[1], all_experts_active=active)) if native else None)
-        metadata = replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
-        if host_rows is not None:
-            _cache_host_route(workspace, spec, host_rows, summary, metadata, hidden_states.device)
-    received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
-    return PreparedTopKRoute(
-        routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
-        received_counts=received_counts,
-        maximum_received_slots=maximum,
-        metadata=metadata,
-    )
+    permuted, summary, host_rows, metadata, work = _resolve_dynamic_permutation(
+        hidden_states, topk_ids, spec, workspace, permuted, invalid, route_stream,
+        prepare_workspace, gathered, work)
+    return _finalize_dynamic_route(
+        permuted, counts, summary, host_rows, metadata, work, gathered, spec, workspace, hidden_states.device, tokens)
 
 
 class _EmptyTopKOutput(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
