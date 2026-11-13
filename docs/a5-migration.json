@@ -75,7 +75,8 @@
       "a5_export_apply_and_reverse_check": "passed",
       "architecture_isolation_test": "passed",
       "device_entry_execution": "pending"
-    }
+    },
+    "shmem_1_8_a5_sdk_build": "passed; no NPU execution"
   },
   "excluded": [
     "QP8/16/32 controls",
@@ -84,5 +85,11 @@
     "unadopted math implementations",
     "downstream framework imports",
     "diagnostic observers"
-  ]
+  ],
+  "communication_contract": {
+    "completion": "each Put/Get returns after quiet; credit publication remains caller-owned",
+    "self_copy": "double-buffered local MTE; no QP",
+    "qp_owner": "caller-owned per peer/QP0, includes post and quiet",
+    "engines": "explicit MTE or UDMA; A3 cannot instantiate UDMA"
+  }
 }
