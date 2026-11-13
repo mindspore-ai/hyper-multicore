@@ -24,6 +24,12 @@ npu_op_kernel_library(ascendc_kernels
 )
 
 npu_op_kernel_options(ascendc_kernels ALL OPTIONS
+    -I${HP_MULTICORE_SOURCE_ROOT}
+    -I${HP_MULTICORE_SOURCE_ROOT}/a5/include
+    -I${HP_MULTICORE_SOURCE_ROOT}/a5
+    -I${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include
+    -I${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc
+    -I${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include/utils
     -I${CANN_OP_COMMON_INCLUDE}
     -I${HP_SHMEM_SDK_ROOT}/src
     -I${HP_SHMEM_SDK_ROOT}/include
@@ -70,6 +76,19 @@ npu_op_kernel_sources(ascendc_kernels
     SOC_SERIES ${ASCEND_COMPUTE_UNIT}
 )
 
+
+if(EXISTS "${HP_MULTICORE_SOURCE_ROOT}/a5/sources.json")
+    npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperMegaMoeMxfp8
+        KERNEL_DIR ./hyper_mega_moe_mxfp8/op_kernel
+        KERNEL_FILE hyper_mega_moe_mxfp8.cpp
+        SOC_SERIES ${ASCEND_COMPUTE_UNIT})
+    npu_op_kernel_sources(ascendc_kernels
+        OP_TYPE HyperMegaMoeMxfp8Grad
+        KERNEL_DIR ./hyper_mega_moe_mxfp8_grad/op_kernel
+        KERNEL_FILE hyper_mega_moe_mxfp8_grad.cpp
+        SOC_SERIES ${ASCEND_COMPUTE_UNIT})
+endif()
 
 npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels

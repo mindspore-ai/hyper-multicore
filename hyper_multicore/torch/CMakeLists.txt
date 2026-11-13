@@ -72,7 +72,8 @@ add_library(hyper_multicore_torch SHARED
     csrc/moe_token_permute_out.cpp
     csrc/mega_moe_unpermute.cpp
     csrc/mega_gate_registration.cpp
-    csrc/mega_gate.cpp)
+    csrc/mega_gate.cpp
+    csrc/mxfp8_task_graph.cpp)
 hp_apply_torch_cxx_standard(
     hyper_multicore_torch "${TORCH_CXX_STANDARD}")
 # Match the active op-plugin compatibility headers.

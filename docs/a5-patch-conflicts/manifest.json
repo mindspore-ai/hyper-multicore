@@ -1,0 +1,29 @@
+[
+  {
+    "patch": 4,
+    "action": "incoming versions retained for runtime queue conflicts",
+    "paths": [
+      "hyper_multicore/ops/runtime/runtime_config.hpp",
+      "hyper_multicore/ops/runtime/worker_kernel.h",
+      "hyper_multicore/scheduler/config.py",
+      "hyper_multicore/scheduler/runtime.py"
+    ]
+  },
+  {
+    "patch": 5,
+    "unmerged_paths": [
+      "hyper_multicore/__init__.py",
+      "hyper_multicore/modules/mega_moe/module.py",
+      "hyper_multicore/modules/mega_moe/plan.py",
+      "hyper_multicore/modules/mega_moe/spec.py",
+      "hyper_multicore/modules/mega_moe/workspace.py",
+      "hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp",
+      "hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp",
+      "tests/ut/modules/mega_moe/test_heap_manager.py",
+      "tests/ut/modules/mega_moe/test_module.py",
+      "tests/ut/modules/mega_moe/test_workspace.py"
+    ],
+    "rejected_hunks": [],
+    "action": "incoming conflict versions retained; all stages archived for review"
+  }
+]

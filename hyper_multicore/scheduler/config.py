@@ -44,7 +44,7 @@ EVENT_INVALID_ID         = 0xFFFFFFFF
 RUNTIME_PROTOCOL_VERSION = 1
 
 
-def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
+def mega_moe_event_capacity(num_experts: int, ep_size: int, compute_stages: int = 3) -> int:
     """Reserve graph events and the complete atomic write at the last trigger.
 
     Args:
@@ -57,7 +57,7 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
     if ep_size <= 0 or num_experts <= 0 or num_experts % ep_size:
         raise ValueError("num_experts must be positive and divisible by ep_size")
     # Ready and worker completion follow termination with separate atomic lanes.
-    final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
+    final_event = num_experts + compute_stages * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
     required = final_event + ATOMIC_ADD_VALUE_LEN
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
@@ -118,6 +118,11 @@ class TaskType(IntEnum):
     TASK_GATE_GRAD_ADD_SELECTED           = 139
     TASK_GATE_GRAD_ZEROS                  = 140
     TASK_SHMEM_GET_MEM              = 141
+    TASK_MX_GMM                     = 142
+    TASK_MX_QUANT                   = 143
+    TASK_MX_SWIGLU_QUANT             = 145
+    TASK_MX_SWIGLU_GRAD_QUANT        = 146
+    TASK_MX_SWIGLU_ROW_QUANT         = 147
 
 
 class EventType(IntEnum):
@@ -512,7 +517,7 @@ def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
     cfg.all_event_num_triggers[completion_event] = cfg.num_workers
 
 
-def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
+def event_workspace_bytes(ep_size: int, num_experts: int, compute_stages: int = 3) -> int:
     """Return graph counters plus separate ready and completion generations.
 
     Args:
@@ -522,7 +527,7 @@ def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
     Returns:
         Required byte count for one direction's event workspace.
     """
-    counter_bytes = mega_moe_event_capacity(num_experts, ep_size) * ctypes.sizeof(ctypes.c_int32)
+    counter_bytes = mega_moe_event_capacity(num_experts, ep_size, compute_stages) * ctypes.sizeof(ctypes.c_int32)
     if ep_size <= 1:
         return counter_bytes
     return counter_bytes + 2 * (ep_size + 1) * READY_CACHE_LINE_BYTES

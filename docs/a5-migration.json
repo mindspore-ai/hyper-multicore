@@ -19,7 +19,8 @@
     "bf16_blaze": {
       "matching_original_files": 22,
       "total_original_files": 27,
-      "remaining": "two template headers, dispatch policy, common utils and a legacy sync header require review; no equivalence asserted"
+      "remaining": "two template headers, dispatch policy, common utils and a legacy sync header require review; no equivalence asserted",
+      "resolution": "No legacy closure copied. Standard upstream GemmUniversal::ProcessSingleGroup plus logical-worker and raw-pointer entry adapter; numerical equivalence and performance remain device gates."
     },
     "swiglu_grad": {
       "source": "ops-nn activation/swi_glu_grad/op_kernel/arch35",
@@ -27,34 +28,35 @@
       "legacy_closure_source": "CANN 9.2 installation",
       "same_original_files": 1,
       "compared_original_files": 5,
-      "remaining": "classify API/format/implementation differences before task binding"
+      "remaining": "classify API/format/implementation differences before task binding",
+      "resolution": "Use existing pinned ops-nn arch35 with logicalIndex adapter; do not vendor the installed CANN9.2 copy. New upstream/device pairing requires fresh numerical tests."
     }
   },
   "stages": [
     {
       "id": 0,
       "name": "source identity and isolated A5 assembly",
-      "state": "in_progress"
+      "state": "implemented; device qualification pending"
     },
     {
       "id": 1,
       "name": "minimal math task adapters",
-      "state": "pending"
+      "state": "implemented; device qualification pending"
     },
     {
       "id": 2,
       "name": "shared QP1 transport",
-      "state": "pending"
+      "state": "implemented; device qualification pending"
     },
     {
       "id": 3,
       "name": "DAG and queue integration",
-      "state": "pending"
+      "state": "implemented; device qualification pending"
     },
     {
       "id": 4,
       "name": "correctness lifecycle performance and deployment",
-      "state": "pending"
+      "state": "in_progress"
     }
   ],
   "validation": {
@@ -67,7 +69,7 @@
       "a5_manifest_file_count": 143
     },
     "build_source_checks": {
-      "passed": 22,
+      "passed": 23,
       "failed": 0
     },
     "source_adapter_checks": {
@@ -84,7 +86,18 @@
       "profile_subtests": 20,
       "device_execution": "pending"
     },
-    "udma_adapter_compile": "passed: actual A5 compiler and SHMEM1.8 headers; no device launch"
+    "udma_adapter_compile": "passed: actual A5 compiler and SHMEM1.8 headers; no device launch",
+    "host_integration": {
+      "tests_passed": 113,
+      "subtests_passed": 769,
+      "log": "build/migration-all-host-v3.log"
+    },
+    "math_template_compile": {
+      "bf16_gmm_NN_NT_TN": "passed",
+      "mx_gmm": "passed",
+      "bf16_swiglu_grad_and_mx_vector_worker": "passed (device-only compiler pass)",
+      "device_execution": "pending"
+    }
   },
   "excluded": [
     "QP8/16/32 controls",

@@ -56,10 +56,10 @@ class MegaMoeSpec:
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
-    batch_experts: bool = False
-    nominal_schedule: bool = False
-    apply_probs_before_fc2: bool = False
-    clamp_after_activation: bool = False
+    transport_engine: str = "mte"
+    ready_depth: int = 0
+    precision: str = "bf16"
+    swiglu_row_only: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -189,6 +189,11 @@ def bind_mega_moe_spec(
         device.index if device.index is not None else torch.npu.current_device()
     )
     core_spec = get_device_core_spec(device_index)
+    transport_engine = specification.get("transport_engine", "mte")
+    if transport_engine == "udma":
+        from hyper_multicore._loader import query_npu_arch
+        if query_npu_arch() != 3510:
+            raise ValueError("UDMA expert transport requires an A5 device; use MTE on A3")
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
@@ -219,8 +224,8 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
-        batch_experts=specification.get("batch_experts", False),
-        nominal_schedule=specification.get("nominal_schedule", False),
-        apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
-        clamp_after_activation=specification.get("clamp_after_activation", False),
+        transport_engine=transport_engine,
+        ready_depth=specification.get("ready_depth", 0),
+        precision=specification.get("precision", "bf16"),
+        swiglu_row_only=specification.get("swiglu_row_only", False),
     )

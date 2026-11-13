@@ -19,6 +19,8 @@ set(MHC_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_mhc/op_host)
 set(MHC_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_mhc_grad/op_host)
 set(GATE_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate/op_host)
 set(GATE_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate_grad/op_host)
+set(MX_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_host)
+set(MX_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8_grad/op_host)
 set(CANN_PACKAGE_ARCH_ROOT ${ASCEND_CANN_PACKAGE_PATH})
 string(APPEND CANN_PACKAGE_ARCH_ROOT "/${CMAKE_SYSTEM_PROCESSOR}-linux")
 set(MHC_GRAD_TILING
@@ -64,6 +66,16 @@ set(OP_TILING_SOURCES
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
 )
 
+list(APPEND OP_SCHEMA_SOURCES
+    ${MX_HOST}/hyper_mega_moe_mxfp8_def.cpp
+    ${MX_HOST}/hyper_mega_moe_mxfp8_infershape.cpp
+    ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_def.cpp
+    ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_infershape.cpp)
+list(APPEND OP_TILING_SOURCES
+    ${MX_HOST}/hyper_mega_moe_mxfp8_tiling.cpp
+    ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_tiling.cpp)
+include_directories(${MX_HOST} ${MX_GRAD_HOST})
+
 function(hp_generate_op_definitions)
     set(ASCEND_COMPUTE_UNIT ${HP_MULTICORE_REGISTERED_SOCS})
     npu_op_code_gen(
@@ -106,6 +118,10 @@ set(ACLNN_SOURCES
     ${GATE_GRAD_HOST}/op_api/hyper_mega_gate_route_grad_post.cpp
     ${GATE_GRAD_HOST}/op_api/linear_index/linear_index.cpp
 )
+list(APPEND ACLNN_SOURCES
+    ${MX_HOST}/op_api/hyper_mega_moe_mxfp8.cpp
+    ${MX_GRAD_HOST}/op_api/hyper_mega_moe_mxfp8_grad.cpp)
+
 npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
 target_include_directories(cust_opapi PRIVATE
@@ -183,6 +199,8 @@ npu_op_package_add(${package_name}
 npu_op_package_add(${package_name}
     TYPE ACLNN
     FILES
+        ${MX_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8.h
+        ${MX_GRAD_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8_grad.h
         ${FWD_HOST}/op_api/aclnn_hyper_mega_moe.h
         ${BWD_HOST}/op_api/aclnn_hyper_mega_moe_grad.h
         ${MHC_HOST}/op_api/aclnn_hyper_mega_mhc.h

@@ -64,6 +64,8 @@ _HYPER_OPERATORS = (
     "hyper_mega_moe_grad",
     "hyper_mega_gate",
     "hyper_mega_gate_grad",
+    "hyper_mega_moe_mxfp8",
+    "hyper_mega_moe_mxfp8_grad",
 )
 
 
@@ -172,6 +174,8 @@ def _compose_a5_sources(source_root: Path, ops_nn: Path, ops_tensor: Path, lock:
                                for name in ("ops_nn", "ops_tensor")},
                 "files": files}
     (target / "sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    for name in ("mxfp8", "mxfp8_quant", "bf16_gmm", "bf16_swiglu_grad"):
+        shutil.copytree(_MULTICORE_OPS / name, source_root / name)
 
 
 def _validate_new_work_dir(work_dir: Path, inputs: tuple[Path, ...]) -> None:
@@ -276,6 +280,8 @@ def _compose_hyper_multicore_ops(
     transformer_mhc_copy: Path,
 ) -> None:
     """Compose HP operator code with selected adapted upstream kernel sources."""
+    shutil.copytree(_MULTICORE_OPS / "runtime", source_root / "runtime")
+    shutil.copytree(_MULTICORE_OPS / "mega_moe_common", source_root / "mega_moe_common")
     shmem_root = source_root / "shmem"
     shmem_root.mkdir(parents=True)
     (shmem_root / "cann").mkdir()
@@ -293,6 +299,9 @@ def _compose_hyper_multicore_ops(
         shutil.copytree(_MULTICORE_OPS / operator_name, operator_root)
         if operator_name == "hyper_mega_gate":
             shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
+            continue
+        if operator_name in ("hyper_mega_moe_mxfp8", "hyper_mega_moe_mxfp8_grad"):
+            # Share host ABI; MX device code is registered only for A5.
             continue
         if operator_name == "hyper_mega_gate_grad":
             shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")

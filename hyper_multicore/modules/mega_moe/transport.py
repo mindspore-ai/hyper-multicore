@@ -1,0 +1,102 @@
+"""Precision-independent transfer ownership and backend selection for expert DAGs."""
+import os
+from functools import lru_cache
+
+from hyper_multicore.scheduler.config import TaskType
+
+TRANSPORT_TASKS = (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM)
+
+
+@lru_cache(maxsize=1)
+def require_queue_backend():
+    """Reject an old native payload before it can interpret an explicit queue image."""
+    import torch
+    from hyper_multicore.torch.ops import _load_native
+    _load_native()
+    if torch.ops.hyper_multicore.worker_queue_layout_version() != 1:
+        raise RuntimeError("Explicit worker queues require a matching rebuilt native payload")
+
+
+def execution_options(dispatch_mode, dispatch_split, combine_split, default_split):
+    """Resolve public options once; explicit split arguments override environment aliases."""
+    environment_mode = os.environ.get('HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE')
+    if environment_mode not in (None, 'push', 'pull'):
+        raise ValueError("MegaMoE dispatch mode must be push or pull")
+    if environment_mode is not None and dispatch_mode is not None and dispatch_mode != environment_mode:
+        raise ValueError("Explicit MegaMoE dispatch mode conflicts with its environment option")
+    mode = dispatch_mode or environment_mode or 'push'
+    split = os.environ.get('HYPER_MULTICORE_MEGAMOE_COMM_SPLIT',
+                           os.environ.get('HYPER_MULTICORE_MX_COMM_SPLIT', str(default_split)))
+    try:
+        split = int(split)
+    except ValueError as error:
+        raise ValueError("MegaMoE communication split must be an integer") from error
+    return mode, split if dispatch_split is None else dispatch_split, split if combine_split is None else combine_split
+
+
+def requested_transport() -> str:
+    """Match the explicitly initialized SHMEM engine; never mutate process configuration."""
+    engine = os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE", "mte")
+    if engine not in ("mte", "mte_udma"):
+        raise ValueError("SHMEM data engine must be mte or mte_udma")
+    return "udma" if engine == "mte_udma" else "mte"
+
+
+def requested_ready_depth(*, mxfp8=False) -> int:
+    """Capture unified policy once; retain old precision-specific environment aliases."""
+    alias = "HYPER_MULTICORE_MX_READY_DEPTH" if mxfp8 else "HYPER_MULTICORE_BF16_READY_DEPTH"
+    value = os.environ.get("HYPER_MULTICORE_MEGAMOE_READY_DEPTH", os.environ.get(alias, "0"))
+    if value not in ("0", "1", "8"):
+        raise ValueError("MegaMoE ready depth must be 0, 1 or 8")
+    return int(value)
+
+
+def transport_queues(cfg, spec, task_ids):
+    """Preserve RATR order on each QP0 owner and distribute independent self copies.
+
+    This is a MoE planning policy, not a SHMEM hardware requirement. Different
+    peers remain independent; all posts and quiet calls for one peer share one
+    odd AIV owner. Math placement is deliberately outside this function.
+    """
+    lanes = spec.num_cube_cores
+    vectors = [[] for _ in range(2 * lanes)]
+    peer_owners = {peer: 2 * (((peer - spec.rank_id) % spec.ep_size) % lanes) + 1
+                   for peer in range(spec.ep_size) if peer != spec.rank_id}
+    idle = [worker for worker in range(1, 2 * lanes, 2) if worker not in peer_owners.values()]
+    self_workers = idle or list(range(1, 2 * lanes, 2))
+    for tid in task_ids:
+        task = cfg.all_tasks[tid]
+        if task.task_type == TaskType.TASK_TERMINATE:
+            vectors[1].append(tid)
+            continue
+        if task.task_type not in TRANSPORT_TASKS:
+            raise ValueError("Transport queue contains a math task")
+        width = task.task_split_num // spec.ep_size
+        tiles = task.task_split_num // spec.num_experts
+        if width == 0 or tiles == 0:
+            raise ValueError("Invalid MoE transport partition")
+        peer, local_slot = divmod(task.task_index, width)
+        if peer == spec.rank_id:
+            expert, tile = divmod(local_slot, tiles)
+            worker = self_workers[(expert + tile) % len(self_workers)]
+        else:
+            worker = peer_owners[peer]
+        task.extra_value_2 = 1 if spec.transport_engine == 'udma' else 0
+        vectors[worker].append(tid)
+    validate_transport_owners(cfg, spec, vectors)
+    return vectors
+
+
+def validate_transport_owners(cfg, spec, vectors):
+    """Qualify all tasks, including empty fragments, against physical QP ownership."""
+    owners = {}
+    for worker, queue in enumerate(vectors):
+        for tid in queue:
+            task = cfg.all_tasks[tid]
+            if task.task_type not in TRANSPORT_TASKS:
+                continue
+            peer = task.task_index // (task.task_split_num // spec.ep_size)
+            if peer == spec.rank_id:
+                continue
+            if owners.setdefault(peer, worker) != worker:
+                raise ValueError(f"Multiple AIV owners of peer {peer}/QP0")

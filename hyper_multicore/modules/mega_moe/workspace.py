@@ -34,7 +34,6 @@ from hyper_multicore.scheduler.config import (
 )
 from hyper_multicore.shmem import _lifecycle
 
-from .probability import PROBABILITY_PLANES, ProbabilityPlane
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
 # The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
@@ -54,24 +53,19 @@ def _workspace_allocation_specs(
     ep_size: int,
     num_experts: int,
     dtype: torch.dtype,
-    apply_probs_before_fc2: bool = False,
+    compute_stages: int = 3,
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
-    event_bytes = event_workspace_bytes(ep_size, num_experts)
+    event_bytes = event_workspace_bytes(ep_size, num_experts, compute_stages)
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
-    allocations = (
+    return (
         (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
         ("routed_buffer", allocation_spec((routed_slots, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
         ("forward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
         ("backward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
     )
-    if apply_probs_before_fc2:
-        # Cover every lossless destination before expert placement changes rows.
-        allocations += (("probability_workspace", allocation_spec(
-            (PROBABILITY_PLANES, ep_size * routed_slots), torch.float32, _WORKSPACE_ALIGNMENT)),)
-    return allocations
 
 
 def _spec_workspace_bytes(
@@ -96,40 +90,14 @@ def _spec_workspace_bytes(
         hidden_size=specification["hidden_size"],
         ep_size=specification["ep_size"],
         num_experts=specification["num_experts"],
+        compute_stages=6 if specification.get("precision") == 'mxfp8' else 3,
         dtype=dtype,
-        apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
     )
     return sum(
         spec.dtype.itemsize * math.prod(spec.shape)
         + spec.alignment_bytes - 1
         for _, spec in allocations
     )
-
-
-class ProbabilityWorkspace:
-    """Cache scalar-plane aliases for one allocation and one immutable plan stride."""
-
-    def __init__(self, buffer: torch.Tensor, stride: int) -> None:
-        self.buffer = buffer
-        self.stride = stride
-        self.planes = (buffer if buffer.shape[1] == stride else
-                       buffer.reshape(-1)[:PROBABILITY_PLANES * stride].view(PROBABILITY_PLANES, stride))
-        self.raw = buffer.view(torch.uint8).reshape(-1)
-        self.source = self.planes[ProbabilityPlane.SOURCE]
-        self.returned_gradient = self.planes[ProbabilityPlane.RETURNED_GRADIENT]
-
-    def slice(self, rows: int, *, gradient: bool = False) -> torch.Tensor:
-        """Reuse a prefix while keeping each direction's actual row extent local."""
-        if not 0 <= rows <= self.stride:
-            raise ValueError("Probability rows exceed the current plan stride")
-        view = self.returned_gradient if gradient else self.source
-        if view.numel() != rows:
-            view = self.planes[ProbabilityPlane.RETURNED_GRADIENT if gradient else ProbabilityPlane.SOURCE, :rows]
-            if gradient:
-                self.returned_gradient = view
-            else:
-                self.source = view
-        return view
 
 
 @dataclass
@@ -142,18 +110,15 @@ class MegaMoeWorkspace:
     expert_capacity: int = 0
     routed_slots: int = 0
     dispatch_mode: str = "push"
+    transport_engine: str = "mte"
     source_buffer: Any | None = None
     expert_buffer: Any | None = None
     routed_buffer: Any | None = None
     forward_event_counters: Any | None = None
     backward_event_counters: Any | None = None
     gmm_workspace: Any | None = None
-    probability_workspace: Any | None = None
-    probability_views: ProbabilityWorkspace | None = field(default=None, init=False, repr=False)
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
-    completion_stream: Any | None = field(default=None, repr=False)
-    lease_stream: Any | None = field(default=None, repr=False)
     in_use: bool = False
     closing: bool = False
     used: bool = False
@@ -167,18 +132,6 @@ class MegaMoeWorkspace:
     route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
-
-    def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:
-        """Rebind aliases when heap storage or a retained plan's stride changes."""
-        buffer = self.probability_workspace
-        if buffer is None:
-            raise RuntimeError("MegaMoe probability_workspace is not initialized")
-        stride = spec.ep_size * spec.plan_tokens * spec.top_k
-        cached = self.probability_views
-        if cached is None or cached.buffer is not buffer or cached.stride != stride:
-            cached = ProbabilityWorkspace(buffer, stride)
-            self.probability_views = cached
-        return cached
 
     def describe_restart_allocations(
         self,
@@ -196,8 +149,8 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if spec.precision == "mxfp8" else 3,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
         replacement = _lifecycle._AllocationReplacement  # pylint: disable=protected-access
         return tuple(replacement(getattr(self, field_name), target) for field_name, target in targets)
@@ -226,8 +179,8 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if spec.precision == "mxfp8" else 3,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
         if len(replacements) != len(expected):
             raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
@@ -255,21 +208,19 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if spec.precision == "mxfp8" else 3,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
-        self.probability_views = None
         self.source_buffer = None
         self.expert_buffer = None
         for tensor, (field_name, _) in zip(tensors, targets):
             setattr(self, field_name, tensor)
-        self.completion_stream = None
         self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
         self.expert_capacity = receive_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size, 6 if spec.precision == "mxfp8" else 3) * 4
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
 
@@ -288,8 +239,8 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if spec.precision == "mxfp8" else 3,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
         if len(tensors) != len(targets):
             raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
@@ -356,15 +307,15 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if spec.precision == "mxfp8" else 3,
             dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
         self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size, 6 if spec.precision == "mxfp8" else 3) * 4
         try:
             for field_name, allocation in allocations:
                 setattr(self, field_name, shmem.empty(
@@ -378,13 +329,11 @@ class MegaMoeWorkspace:
                 device=device,
             )
             self.swiglu_grad_workspace = torch.empty(
-                ((2 * spec.num_cube_cores * spec.swiglu_split * spec.intermediate_size * dtype.itemsize)
-                 if spec.apply_probs_before_fc2 else _SWIGLU_GRAD_WORKSPACE_BYTES,),
+                (_SWIGLU_GRAD_WORKSPACE_BYTES,),
                 dtype=torch.uint8,
                 device=device,
             )
             self.completion_event = torch.npu.Event()
-            self.completion_stream = None
         except Exception:
             self._free_symmetric_tensors()
             self._free_local_tensors()
@@ -415,51 +364,44 @@ class MegaMoeWorkspace:
             self.backward_ready_initialized = True
         return events
 
-    def _wait_for_completion(self, stream: Any = None) -> None:
-        """FIFO orders the producer stream; another stream still needs its event."""
-        if self.used:
-            if stream is None:
-                stream = torch.npu.current_stream(self.device)
-            if self.completion_stream is None or stream != self.completion_stream:
-                stream.wait_event(self.completion_event)
-
-    def wait_for_reuse(self, *, stream: Any = None) -> None:
+    def wait_for_reuse(self) -> None:
         """Order count exchange after the previous workspace lease."""
         with self._access(), self.lock:
-            self._wait_for_completion(stream)
+            if self.used:
+                torch.npu.current_stream(self.device).wait_event(self.completion_event)
 
     def claim(self) -> None:
-        """Claim serial storage without re-waiting on its own stream."""
+        """Claim the serial workspace and order it after the previous stream."""
         with self._access(), self.lock:
             if self.closing:
                 raise RuntimeError("cannot claim a closing MegaMoe workspace.")
             if self.in_use:
                 raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
-            self.lease_stream = (torch.npu.current_stream(self.device)
-                                 if getattr(self.device, "type", None) == "npu" else None)
-            self._wait_for_completion(self.lease_stream)
+            if self.used:
+                torch.npu.current_stream().wait_event(self.completion_event)
+            if self.transport_engine == "udma":
+                from hyper_multicore.shmem._ordering import udma_submissions
+                udma_submissions.claim(torch.npu.current_stream())
             self.in_use = True
 
-    def release(self, *, stream: Any = None) -> None:
-        """Always record completion, including for a future cross-stream consumer."""
+    def release(self) -> None:
+        """Record completion ordering and release the serial workspace lease."""
         with self._access(), self.lock:
             if not self.in_use:
                 raise RuntimeError("MegaMoe workspace was released without an active lease.")
-            if stream is None:
-                stream = torch.npu.current_stream(self.device)
-            self.completion_event.record(stream)
-            self.completion_stream = stream
+            self.completion_event.record(torch.npu.current_stream())
+            if self.transport_engine == "udma":
+                from hyper_multicore.shmem._ordering import udma_submissions
+                udma_submissions.release(torch.npu.current_stream(), self.completion_event)
             self.in_use = False
-            self.lease_stream = None
             self.used = True
 
     def _free_symmetric_tensors(self) -> None:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
-        self.probability_views = None
         if self.closing:
             remaining = tuple(tensor is not None for tensor in (
                 self.source_buffer, self.expert_buffer, self.routed_buffer,
-                self.forward_event_counters, self.backward_event_counters, self.probability_workspace))
+                self.forward_event_counters, self.backward_event_counters))
             peers = _collective.exchange(
                 remaining,
                 group=self._root_group(),
@@ -473,7 +415,6 @@ class MegaMoeWorkspace:
             "routed_buffer",
             "forward_event_counters",
             "backward_event_counters",
-            "probability_workspace",
         ):
             tensor = getattr(self, field_name)
             if tensor is None:
@@ -514,7 +455,6 @@ class MegaMoeWorkspace:
                 self.forward_event_counters,
                 self.backward_event_counters,
                 self.gmm_workspace,
-                self.probability_workspace,
                 self.swiglu_grad_workspace,
                 self.completion_event,
             ))
@@ -522,7 +462,6 @@ class MegaMoeWorkspace:
             self.closing = True
             self.route_cache = None
             self.route_header_cache = None
-            self.planned_route_cache = None
             self.route_cache_probe_after = 0
         # An empty rank must still participate when peers retain buffers after a failure.
         peers = _collective.exchange(
@@ -553,6 +492,5 @@ class MegaMoeWorkspace:
         self.dtype = None
         self.device = None
         self.completion_event = None
-        self.completion_stream = None
         self.used = False
         self.closing = True

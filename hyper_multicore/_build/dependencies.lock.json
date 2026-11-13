@@ -189,7 +189,7 @@
         "patches": [
           {
             "path": "hyper_multicore/ops/patches/blaze_logical_workers.patch",
-            "sha256": "2448b5430e9c4a9edd7182bad9551d76e6b20155d71d19da78cca21df8579db4",
+            "sha256": "76cd743f4ce1f41cdde5ae1ba8953a32d2535f58f64dcaaa6a56821bd3fd9f36",
             "purpose": "logical worker and single-problem entry; standard balancing and mathematics unchanged"
           }
         ],
