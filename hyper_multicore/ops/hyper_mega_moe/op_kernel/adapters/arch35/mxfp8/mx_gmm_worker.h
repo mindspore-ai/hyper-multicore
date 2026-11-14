@@ -3,8 +3,8 @@
 #define HYPER_MULTICORE_MX_GMM_WORKER_H_
 
 #include "kernel_operator.h"
-#include "mx_gmm_descriptor.h"
-#include "mx_launch_descriptor.h"
+#include "hyper_mega_moe/op_kernel/contracts/mx_gmm_descriptor.h"
+#include "hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h"
 #include "mx_a5_policy.h"
 #include "blaze/gemm/block/block_mmad_qgmm_mx.h"
 #include "blaze/gemm/kernel/kernel_qgmm_mx.h"

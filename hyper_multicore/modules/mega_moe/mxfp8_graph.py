@@ -47,7 +47,7 @@ class MXFP8Runtime:
     quant_descriptors: bytes
     buffer_count: int
     swiglu_row_only: bool = False
-    transport_schedule: str = 'window2/QP1'
+    transport_schedule: str = 'two_expert_pipeline/QP1'
     native_operator: str = 'HyperMegaMoeMxfp8'
 
 
@@ -167,8 +167,8 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool, swiglu_row_only: bo
     cfg.atomic_add_values[0] = 1
     configure_ready_handshake(cfg, values)
     validate_runtime_config(cfg, values, cubes)
-    cfg = configure_expert_queues(cfg, graph, spec, forward=forward, mxfp8=True)
+    cfg = configure_expert_queues(cfg, graph, spec, forward=forward)
     native_operator = 'HyperMegaMoeMxfp8' if forward else 'HyperMegaMoeMxfp8Grad'
     return MXFP8Runtime(graph, cfg, serialize_mx_gmm_descriptors(gmms),
                         serialize_mx_quant_descriptors(quants), 27 if forward else 33,
-                        swiglu_row_only, 'window2/QP1', native_operator)
+                        swiglu_row_only, 'two_expert_pipeline/QP1', native_operator)

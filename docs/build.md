@@ -338,7 +338,7 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 source build/native/payload/hyper_multicore/lib/set_env.bash
 export HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_udma
 export HYPER_MULTICORE_MEGAMOE_COMM_SPLIT=512
-export HYPER_MULTICORE_MEGAMOE_READY_DEPTH=8
+export HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD=8
 export HYPER_MULTICORE_SHMEM_LOG_LEVEL=2
 export SHMEM_LOG_LEVEL=ERROR
 ```
@@ -354,14 +354,17 @@ MX 的物理权重合同见 [architecture.md](architecture.md)。
 | `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（原默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
 | `HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE` | 可选 `push/pull`；若同时传构造参数必须一致 |
 | `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，原 API 默认仍为 128 |
-| `HYPER_MULTICORE_MEGAMOE_READY_DEPTH` | 0 为 FIFO；1/8 为有限 ready 扫描；通信 FIFO 不变，默认 0 |
+| `HYPER_MULTICORE_MEGAMOE_SCHEDULE_POLICY` | 当前仅 `two_expert_pipeline`，两专家交错流水 |
+| `HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD` | 数学任务队列就绪扫描：0为FIFO，1仅检查队首，8有限重排；默认0，通信保持FIFO |
 | `HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY` | 默认 1，仅 no-grad 正向免算 SwiGLU columnwise |
 | `HYPER_MULTICORE_MX_NOGRAD_NO_CLONE` | 默认 1，在 lease 内完成 unpermute 后返回独立输出 |
 | `HYPER_MULTICORE_BF16_NOGRAD_NO_COPY` | 默认 1，A5 UDMA no-grad 免保存 dispatch，并在 lease 内 unpermute |
 | `HYPER_MULTICORE_SHMEM_HEAP_SIZE` | 显式字节预算；按实际模型/路由容量评估，不能用扩大预算代替正确性 |
 
-兼容旧精度别名 `HYPER_MULTICORE_MX_COMM_SPLIT`、`HYPER_MULTICORE_MX_READY_DEPTH` 和
-`HYPER_MULTICORE_BF16_READY_DEPTH`，共用变量优先。QP 固定 1，不需要配置 QP 数量。
+通信分片保留 `HYPER_MULTICORE_MX_COMM_SPLIT` 别名；队列扫描保留
+`HYPER_MULTICORE_MEGAMOE_READY_DEPTH`、`HYPER_MULTICORE_MX_READY_DEPTH` 和
+`HYPER_MULTICORE_BF16_READY_DEPTH` 别名。队列扫描的显式参数和各别名必须一致，
+冲突直接报错。QP固定1，不需要配置QP数量。
 内部 profiling 复用本仓公共 profiler API，normal 不创建 profiling buffer、不记录任务打点。
 下游按层、step、micro 的采样过滤应放在适配层；本组件不导入或识别训练框架。
 
@@ -383,3 +386,25 @@ ASCEND_RT_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --npr
 调用方可把这两步写入自己的 activate.bash。目标须满足构建制品记录的 CPU 架构、Python ABI、
 Torch/torch_npu 和 CANN 兼容性；不复制构建机器的 Conda 路径或个人环境脚本。
 切换源码或 native 制品后启动新 Python 进程，不在已加载旧库的进程里热替换。
+
+### 调度选择与解释
+
+```python
+from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions
+
+schedule = MegaMoeScheduleOptions(policy="two_expert_pipeline", queue_ready_lookahead=8)
+# BF16/MX的既有构造参数不变，新增可选 schedule=schedule。
+# 不传时仍使用现有默认行为；配置在构造时解析，不能通过改环境变量热切换。
+```
+
+```bash
+python -m hyper_multicore.modules.mega_moe.schedule list
+python -m hyper_multicore.modules.mega_moe.schedule describe two_expert_pipeline
+python -m hyper_multicore.modules.mega_moe.schedule compare plan-a.json plan-b.json
+```
+
+对已构建的host配置调用 `explain_schedule(cfg)`，再用 `json.dump` 保存上述plan JSON。
+该函数不读取设备tensor，不启动collective；输出逻辑stage、每核队列、真实依赖、事件阈值、
+计划指纹和runtime字节指纹。normal/profile的计划指纹相同；runtime字节指纹允许随记录模式变化。
+当前registry只包含已实现的两专家流水；不提供异步在途窗口、半核分区或solver导入接口。
+A3/BF16 MTE保留原队列；显式数学队列扫描仅在现有UDMA队列上支持，非零请求会报错。

@@ -853,7 +853,7 @@ _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
 ## A5 MegaMoE 迁移边界
 
 BF16 和 MXFP8 共用 `modules/mega_moe/transport.py` 的 QP0 owner 规划和
-`ops/mega_moe_common/transport_task.h` 的完整传输/信用协议。SHMEM 只提供 MTE、UDMA
+`ops/hyper_mega_moe/op_kernel/adapters/common/transport_task.h` 的完整传输/信用协议。SHMEM 只提供 MTE、UDMA
 及其完成语义，不解释专家、路由或模型层。A3 使用 MTE；A5 可显式选择 MTE 或 UDMA。
 UDMA 每个远端 peer 固定一个 QP，不读取历史的多 QP 配置变量。不同 peer 的 QP0 彼此独立。
 
@@ -861,8 +861,8 @@ UDMA 每个远端 peer 固定一个 QP，不读取历史的多 QP 配置变量�
 双缓冲，不占 QP。完成之前不发布消费者信用。Pull 的源 ready、读完成和源存储复用握手
 仍由公共运行时执行。跨 workspace/stream 的 QP0 使用由现有完成事件排序，不额外添加设备打点。
 
-业务 DAG 和双专家窗口在 `modules/mega_moe/schedule.py`，通用运行时只执行显式的每核队列。
-通信保持 FIFO，数学队列可配置 ready-depth 0/1/8；这不是跨核偷取，也不是固定 solver 表。
+业务 DAG 和两专家交错流水在 `modules/mega_moe/schedule.py`，通用运行时只执行显式的每核队列。
+通信保持 FIFO，数学队列可配置 queue-ready-lookahead 0/1/8；这不是跨核偷取，也不是固定 solver 表。
 每核队列是可选 ABI 扩展，旧队列的二进制前缀保持不变。核数由设备查询，业务层不固定写死为 32。
 当前数学队列采用偶数 AIV、通信采用奇数 AIV 的分工；通用运行时不包含这种分工假设。
 
@@ -889,3 +889,23 @@ Pull 的图计划按静态上界复用，真实负载只改变运行时 metadata
 
 未迁入未采纳的固定 solver 表、半核候选、老 SHMEM SDK、额外故障观察器和多 QP 开关。
 历史阴性实验不能作为否定新架构组合的依据；后续候选应单独提交并与迁移基线比较。
+
+
+### A5任务适配与标准数学边界
+
+`ops/`下的A5私有数学/通信适配收敛到`hyper_mega_moe/op_kernel/`：
+`contracts/`保存布局与descriptor，`adapters/common/`翻译MoE传输任务，
+`adapters/arch35/`绑定锁定的Blaze、SwiGLUGrad及MX量化数学。
+正反向和两种精度共同引用，不在ops顶层维护bf16_gmm或mxfp8小算子目录。
+上游数学源码仍由构建时Git导出，不复制第二份源码树。
+
+本次目录整改保持数学模板、数值规则、tiling参数和完成协议不变。
+当前BF16 GMM固定tile、SwiGLUGrad UB参数以及MX tile/缓冲选择仍是本地选择逻辑，
+不能因此宣称与native完整tiler一致。它们需按锁源可复用函数逐项审查；
+本次没有为缩减行数删掉尾块、空专家dW清零、地址范围校验或源复用保护。
+
+`schedule.py`中逻辑stage绑定与纯队列策略分开；策略只返回数学任务排队结果，
+公共层合并固定owner的通信队列，并验证完整唯一覆盖及QP0所有权。
+数学DAG、传输分片和事件生成不由策略隐式改写。
+用户只有一个队列扫描参数，FIFO/bounded-ready由其内部推导；仍保留现有0/1/8能力。
+MX正反向共享schema、推导和launch封装，保持两个ACLNN名称及Hardware轨道身份。

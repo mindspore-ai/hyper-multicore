@@ -117,7 +117,7 @@ class MxLaunchDescriptor(ctypes.LittleEndianStructure):
 def serialize_mx_launch_metadata(
     buffer_sizes: Sequence[int], *, rank: int, ep: int, experts: int, hidden: int,
     local_tokens: int, cube_count: int, runtime_bytes: int, event_bytes: int,
-    vector_policy: str = 'window2',
+    vector_policy: str = 'two_expert_pipeline',
 ) -> bytes:
     """Build the byte-list launch descriptor without reading any device data."""
     if not 0 < len(buffer_sizes) <= MX_GMM_MAX_BUFFERS or any(size < 0 for size in buffer_sizes):
@@ -130,7 +130,7 @@ def serialize_mx_launch_metadata(
     for name, value in dict(rank=rank, ep=ep, experts=experts, hidden=hidden, local_tokens=local_tokens,
                             cube_count=cube_count, runtime_bytes=runtime_bytes, event_bytes=event_bytes).items():
         setattr(record, name, value)
-    if vector_policy != 'window2':
+    if vector_policy not in ('two_expert_pipeline', 'window2'):
         raise ValueError("MX uses the shared explicit worker queues")
     record.magic = 0x4D584C47
     record.version, record.reserved = 1, 0

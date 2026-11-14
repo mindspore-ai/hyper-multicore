@@ -35,7 +35,8 @@ from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
-from .transport import execution_options, requested_ready_depth, requested_transport
+from .transport import execution_options, requested_transport
+from .schedule import MegaMoeScheduleOptions, resolve_schedule_options
 from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
@@ -193,6 +194,7 @@ class _MegaMoeExecutionResources:
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
             self.spec.transport_engine, self.spec.ready_depth, self.spec.precision, self.spec.swiglu_row_only,
+            self.spec.schedule_policy,
         )
 
     def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
@@ -220,7 +222,7 @@ class _MegaMoeExecutionResources:
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
-                  "transport_engine", "ready_depth", "precision", "swiglu_row_only")
+                  "transport_engine", "ready_depth", "precision", "swiglu_row_only", "schedule_policy")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -353,6 +355,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int | None = None,
         combine_split: int | None = None,
+        schedule: MegaMoeScheduleOptions | None = None,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -372,6 +375,8 @@ class MegaMoeExperts(MulticoreModule):
                 Must be a positive multiple of 128.
             combine_split: Combine tile rows in forward and backward, with the same
                 constraints and default as dispatch_split. Sharing requires equal splits.
+            schedule: Optional policy and local math-queue lookahead, resolved once.
+                Communication remains FIFO. Configure before resource binding.
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
@@ -406,6 +411,7 @@ class MegaMoeExperts(MulticoreModule):
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
+            "schedule": schedule,
         }
         specification["auto_tokens"] = local_num_tokens is None
         specification = self._resolve_specification(specification)
@@ -451,6 +457,9 @@ class MegaMoeExperts(MulticoreModule):
     @classmethod
     def _resolve_specification(cls, specification: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalize configuration before registering an execution owner."""
+        specification = dict(specification)
+        schedule = resolve_schedule_options(specification.pop("schedule", None),
+                                            precision=getattr(cls, "precision", "bf16"))
         expert_weight_layout = specification["expert_weight_layout"]
         if expert_weight_layout not in _EXPERT_WEIGHT_LAYOUTS:
             raise ValueError(
@@ -479,7 +488,8 @@ class MegaMoeExperts(MulticoreModule):
         return {
             **specification,
             "transport_engine": requested_transport(),
-            "ready_depth": requested_ready_depth(mxfp8=getattr(cls, "precision", "bf16") == "mxfp8"),
+            "ready_depth": schedule.queue_ready_lookahead,
+            "schedule_policy": schedule.policy,
             "precision": getattr(cls, "precision", "bf16"),
             "initial_capacity_factor": initial_capacity_factor,
             "capacity_growth_factor": capacity_growth_factor,

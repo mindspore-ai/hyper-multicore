@@ -60,6 +60,7 @@ class MegaMoeSpec:
     ready_depth: int = 0
     precision: str = "bf16"
     swiglu_row_only: bool = False
+    schedule_policy: str = "two_expert_pipeline"
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -226,6 +227,7 @@ def bind_mega_moe_spec(
         auto_tokens=specification.get("auto_tokens", False),
         transport_engine=transport_engine,
         ready_depth=specification.get("ready_depth", 0),
+        schedule_policy=specification.get("schedule_policy", "two_expert_pipeline"),
         precision=specification.get("precision", "bf16"),
         swiglu_row_only=specification.get("swiglu_row_only", False),
     )

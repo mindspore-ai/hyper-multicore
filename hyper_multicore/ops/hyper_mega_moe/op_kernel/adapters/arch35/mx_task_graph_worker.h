@@ -2,14 +2,14 @@
 // Licensed under the Apache License, Version 2.0.
 #pragma once
 #include "kernel_operator.h"
-#include "mx_launch_descriptor.h"
-#include "mx_byte_tensor_list.h"
+#include "hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h"
+#include "hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h"
 #include "runtime/worker_kernel.h"
-#include "mega_moe_common/transport_task.h"
+#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
 #ifdef __DAV_CUBE__
-#include "mx_gmm_worker.h"
+#include "hyper_mega_moe/op_kernel/adapters/arch35/mxfp8/mx_gmm_worker.h"
 #else
-#include "mxfp8_quant/mx_quant_worker.h"
+#include "hyper_mega_moe/op_kernel/adapters/arch35/mxfp8_quant/mx_quant_worker.h"
 #endif
 
 namespace MulticoreRuntime {

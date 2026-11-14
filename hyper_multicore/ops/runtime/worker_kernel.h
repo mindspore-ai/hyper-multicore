@@ -47,8 +47,6 @@ constexpr int64_t SYSTEM_CYCLES_PER_US = 50;
 #endif
 constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_US = 50;
 constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_US = 150;
-// The selected SwiGLU tiling uses baseRowLen=19; smaller dynamic tails must lower it.
-constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
 constexpr int64_t READY_SIGNAL_RADIX = 2;
 
 enum class VectorWorkerPolicy : uint32_t {

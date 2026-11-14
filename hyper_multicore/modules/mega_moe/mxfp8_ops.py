@@ -44,7 +44,7 @@ def serialize_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tenso
         [tensor.numel() * tensor.element_size() for tensor in buffers],
         rank=spec.rank_id, ep=spec.ep_size, experts=spec.num_experts, hidden=spec.hidden_size,
         local_tokens=spec.local_num_tokens, cube_count=spec.num_cube_cores,
-        runtime_bytes=runtime.numel(), event_bytes=events.numel(), vector_policy="window2",
+        runtime_bytes=runtime.numel(), event_bytes=events.numel(), vector_policy="two_expert_pipeline",
     )
 
 
@@ -56,7 +56,7 @@ def prepare_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
 
 def launch_mxfp8_task_graph(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
                            events: torch.Tensor, diagnostic: torch.Tensor, launch: torch.Tensor,
-                           *, vector_policy: str = 'window2', swiglu_row_only: bool = False,
+                           *, vector_policy: str = 'two_expert_pipeline', swiglu_row_only: bool = False,
                            direction: str = 'forward') -> None:
     """Run the native fused task graph with alias-preserving physical arguments."""
     aliases = _byte_aliases(buffers)
@@ -65,6 +65,6 @@ def launch_mxfp8_task_graph(buffers: Sequence[torch.Tensor], runtime: torch.Tens
         raise ValueError('MX native direction must be forward or backward')
     primary = (torch.ops.hyper_multicore.mxfp8_task_graph_grad if direction == 'backward'
                else torch.ops.hyper_multicore.mxfp8_task_graph)
-    if vector_policy != 'window2':
-        raise ValueError('MXFP8 supports the window2 task queue')
+    if vector_policy not in ('two_expert_pipeline', 'window2'):
+        raise ValueError('MXFP8 supports the two_expert_pipeline task queue')
     primary(aliases, runtime, events, diagnostic, launch)

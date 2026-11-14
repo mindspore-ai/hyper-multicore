@@ -20,9 +20,10 @@
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
-#include "mega_moe_common/transport_task.h"
+#include "hyper_mega_moe/op_kernel/contracts/swiglu.h"
+#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
-#include "bf16_gmm/worker.h"
+#include "hyper_mega_moe/op_kernel/adapters/arch35/bf16_gmm/worker.h"
 #endif
 
 using namespace AscendC;
@@ -148,8 +149,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           if (tilingdata_data->rowLen == 0) {
             return;
           }
-          tilingdata_data->baseRowLen = tilingdata_data->rowLen < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT
-                                           ? tilingdata_data->rowLen : SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT;
+          tilingdata_data->baseRowLen = tilingdata_data->rowLen < MulticoreMoE::kSwiGluDynamicTailBaseRows
+                                           ? tilingdata_data->rowLen : MulticoreMoE::kSwiGluDynamicTailBaseRows;
           cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
           PipeBarrier<PIPE_ALL>();
           swi_glu(input_list[task_desc.inputs[0].input_position] + input_0_offset,

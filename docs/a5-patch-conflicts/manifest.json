@@ -42,5 +42,13 @@
     ],
     "rejected_hunks": [],
     "action": "incoming conflict versions retained; all stages archived for review"
+  },
+  {
+    "patch": 9,
+    "unmerged_paths": [
+      "tests/ut/test_multicore_boundary.py"
+    ],
+    "rejected_hunks": [],
+    "action": "incoming conflict versions retained; all stages archived for review"
   }
 ]

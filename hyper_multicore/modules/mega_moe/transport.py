@@ -42,15 +42,6 @@ def requested_transport() -> str:
     return "udma" if engine == "mte_udma" else "mte"
 
 
-def requested_ready_depth(*, mxfp8=False) -> int:
-    """Capture unified policy once; retain old precision-specific environment aliases."""
-    alias = "HYPER_MULTICORE_MX_READY_DEPTH" if mxfp8 else "HYPER_MULTICORE_BF16_READY_DEPTH"
-    value = os.environ.get("HYPER_MULTICORE_MEGAMOE_READY_DEPTH", os.environ.get(alias, "0"))
-    if value not in ("0", "1", "8"):
-        raise ValueError("MegaMoE ready depth must be 0, 1 or 8")
-    return int(value)
-
-
 def transport_queues(cfg, spec, task_ids):
     """Preserve RATR order on each QP0 owner and distribute independent self copies.
 
