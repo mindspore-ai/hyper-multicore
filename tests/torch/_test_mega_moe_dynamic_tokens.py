@@ -81,7 +81,7 @@ def _fp32_oracle(weights: tuple, inputs: tuple) -> tuple:
     return output.detach(), x.grad, probs.grad, w1.grad, w2.grad
 
 
-def _rounded_oracle(weights: tuple, inputs: tuple) -> tuple:
+def _rounded_oracle(weights: tuple, inputs: tuple, *, before_fc2: bool = False) -> tuple:
     """Differentiate grouped Torch/PTA primitives with upstream BF16 boundaries.
 
     CPU approximations of SwiGLU rounding can disagree with upstream expert
@@ -103,8 +103,12 @@ def _rounded_oracle(weights: tuple, inputs: tuple) -> tuple:
         group_list = torch.bincount(ids.reshape(-1).to(torch.int64), minlength=first.shape[0]).cumsum(0)
         projection = grouped_matmul(routed, first, group_list=group_list)
         activation = torch_npu.npu_swiglu(projection, dim=-1)
+        if before_fc2:
+            routed_probs = probs.new_zeros(probs.numel()).scatter(0, mapping.long(), probs.flatten())
+            activation = (activation.float() * routed_probs[:, None]).to(activation.dtype)
         values = grouped_matmul(activation, second, group_list=group_list)
-        output = torch_npu.npu_moe_token_unpermute(values, mapping, probs)
+        output = torch_npu.npu_moe_token_unpermute(
+            values, mapping, torch.ones_like(probs) if before_fc2 else probs)
         gradients = torch.autograd.grad(output, (x, probs, first, second), dy.to(device))
     return tuple(value.detach().cpu() for value in (output, *gradients))
 
@@ -528,8 +532,14 @@ def _run_token_matrix(mega: MegaMoeExperts, fixed: MegaMoeExperts, weights: tupl
     return results, fixed_reports
 
 
+def _latest_cached_route(workspace: object) -> object | None:
+    """Inspect the most recently used entry of the bounded descriptor cache."""
+    cache = workspace.route_cache
+    return next(reversed(cache.values()), None) if cache else None
+
+
 def _check_route_cache_admission(cached: object, previous: object, phase: str) -> None:
-    """Check raw-table admission, confirmed descriptors and immutable cache replacement."""
+    """Check bounded descriptor admission, reuse and count-change invalidation."""
     if cached is None or (phase == "flipped" and cached is not previous):
         raise AssertionError(f"descriptor reuse failed: phase={phase}, old={id(previous)}, new={id(cached)}")
     if phase == "shifted" and cached is previous:
@@ -550,7 +560,7 @@ def _warm_route_cache(mega: MegaMoeExperts, inputs: tuple, rank: int, device: to
         mega.zero_grad(set_to_none=True)
         invocation = _forward(mega, inputs, rank, device, supplied_counts=supplied_counts)
         (invocation[2] * invocation[3]).sum().backward()
-        cached = workspace.route_cache
+        cached = _latest_cached_route(workspace)
         eligible = cached is not None and cached.metadata is not None and workspace.route_cache_probe_after == 0
         if eligible and cached is previous:
             return
@@ -577,7 +587,7 @@ def _same_histogram_routes(mega: MegaMoeExperts, weights: tuple, rank: int,
         invocation = _forward(mega, batch, rank, device)
         _check_gradients(mega, invocation, _rounded_oracle(weights, batch),
                          [129 + index for index in range(world)], rank)
-        cached = workspace.route_cache
+        cached = _latest_cached_route(workspace)
         if host_policy:
             _check_route_cache_admission(cached, previous, phase)
         previous = cached
@@ -596,9 +606,11 @@ def _supplied_count_cache_ownership(mega: MegaMoeExperts, weights: tuple, rank: 
         invocation = _forward(mega, inputs, rank, device, supplied_counts=counts)
         _check_gradients(mega, invocation, _rounded_oracle(weights, inputs), lengths, rank)
     workspace = mega._resource_group.resources.workspace  # pylint: disable=protected-access
-    metadata = getattr(workspace.route_cache, "metadata", None)
+    cached = _latest_cached_route(workspace)
+    assert cached is not None and cached.metadata is not None
+    metadata = cached.metadata
     expected = {name: tensor.cpu().clone() for name, tensor in vars(metadata).items()
-                if isinstance(tensor, torch.Tensor)} if metadata is not None else {}
+                if isinstance(tensor, torch.Tensor)}
     counts.zero_()
     for name, tensor in expected.items():
         torch.testing.assert_close(getattr(metadata, name).cpu(), tensor, rtol=0, atol=0)
@@ -606,6 +618,54 @@ def _supplied_count_cache_ownership(mega: MegaMoeExperts, weights: tuple, rank: 
     mega.zero_grad(set_to_none=True)
     invocation = _forward(mega, current, rank, device, supplied_counts=replacement)
     _check_gradients(mega, invocation, _rounded_oracle(weights, current), lengths, rank)
+
+
+def test_probability_positions() -> None:
+    """Validate both rounding contracts with the same independent reference primitives."""
+    torch.set_num_threads(2)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.npu.set_device(local_rank)
+    dist.init_process_group("hccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    device = torch.device("npu", local_rank)
+    mode = os.environ.get("HP_DYNAMIC_DISPATCH", "push")
+    start_shmem_lifetime()
+    records = []
+    for top_k in (2, 4, 8):
+        experts = world * max(4, top_k)
+        local = experts // world
+        weights = _weights(experts)
+        for layout in ("EIO", "EOI"):
+            for before_fc2 in (False, True):
+                layer = MegaMoeExperts(
+                    hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
+                    num_experts=experts, top_k=top_k, ep_group=dist.group.WORLD,
+                    dispatch_mode=mode, expert_weight_layout=layout,
+                    apply_probs_before_fc2=before_fc2,
+                ).to(device=device, dtype=torch.bfloat16)
+                with torch.no_grad():
+                    for target, value in zip((layer.gate_up_weight, layer.down_weight), weights):
+                        value = value[rank * local:(rank + 1) * local]
+                        target.copy_(value if layout == "EIO" else value.transpose(1, 2))
+                try:
+                    for lengths, hot in (([129] * world, False),
+                                         ([0] + [17] * (world - 1), False),
+                                         ([129 + 128 * r for r in range(world)], True)):
+                        inputs = _inputs(lengths, experts, top_k, hot=hot)
+                        for probabilities in inputs[2]:
+                            probabilities[::2, -1] = 0
+                        expected = _rounded_oracle(weights, inputs, before_fc2=before_fc2)
+                        if layout == "EOI":
+                            expected = (*expected[:3], expected[3].transpose(1, 2), expected[4].transpose(1, 2))
+                        layer.zero_grad(set_to_none=True)
+                        invocation = _forward(layer, inputs, rank, device)
+                        errors = _check_gradients(layer, invocation, expected, lengths, rank)
+                        records.append({"top_k": top_k, "layout": layout, "before_fc2": before_fc2,
+                                        "lengths": lengths, "hot": hot, "errors": errors})
+                finally:
+                    layer.close()
+    write_evidence({"status": "passed", "dispatch_mode": mode, "cases": records})
+    dist.destroy_process_group()
 
 
 def test_dynamic_tokens() -> None:

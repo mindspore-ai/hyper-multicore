@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from hyper_multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
-    TaskAiCoreType, TaskType,
+    VectorTaskFlags, TaskAiCoreType, TaskType,
     MAX_TENSOR_DIMS,
 )
 from hyper_multicore.scheduler.graph import OpType
@@ -61,6 +61,7 @@ class SwiGLUFillConfig(FillConfig):
     """
 
     clamp_limit: float | None = None
+    clamp_after_activation: bool = False
 
     def fill(
         self,
@@ -79,7 +80,7 @@ class SwiGLUFillConfig(FillConfig):
                      else TaskType.TASK_SWI_GLU_GRAD)
         clamp_bits = _encode_clamp_limit(self.clamp_limit)
 
-        num_triggers = tsv.per_expert_seq // op.split_value
+        num_triggers = getattr(op, "compact_lanes", tsv.per_expert_seq // op.split_value)
         task_num     = op.task_num
         param        = op.param_positions
 
@@ -121,6 +122,9 @@ class SwiGLUFillConfig(FillConfig):
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
             task.extra_value_0        = clamp_bits
+            task.extra_value_1        = VectorTaskFlags.CLAMP_AFTER_ACTIVATION if self.clamp_after_activation and clamp_bits else 0
+            if hasattr(op, "compact_lanes"):
+                task.extra_value_1 |= VectorTaskFlags.COMPACT
             task.tiling_data_position = op.tiling_position
 
             cfg.all_tasks[tsv.pre_task_num + i]               = task

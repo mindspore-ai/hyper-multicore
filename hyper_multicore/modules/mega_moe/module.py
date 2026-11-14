@@ -30,7 +30,7 @@ import torch.distributed as dist
 from hyper_multicore import _collective, shmem
 
 from ..module import MulticoreModule
-from .function import execute_mega_moe_with_permutation
+from .function import execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
@@ -152,6 +152,8 @@ class _MegaMoeExecutionResources:
                 self.workspace = MegaMoeWorkspace(shared=shared)
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
+                self.spec = self.heap_manager.workspace_spec(self.workspace)
+                self._token_capacity = self.spec.local_num_tokens
 
             _collective.collective_call(
                 construct, stage="MegaMoe resource construction", group=self.heap_manager.root_group,
@@ -178,7 +180,7 @@ class _MegaMoeExecutionResources:
             "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
-            self.spec.expert_weight_layout,
+            self.spec.expert_weight_layout, self.spec.apply_probs_before_fc2,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
         )
@@ -207,7 +209,8 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens")
+                  "dispatch_split", "combine_split", "swiglu_limit", "clamp_after_activation",
+                  "apply_probs_before_fc2", "expert_weight_layout", "ep_size", "auto_tokens")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -217,12 +220,14 @@ class _MegaMoeExecutionResources:
         if any(value != manifests[0] for value in manifests):
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
-    def plan_for_tokens(self, tokens: int, device: Any) -> Any:
+    def plan_for_tokens(self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
+                        batch_experts: bool = False, nominal_schedule: bool = False) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
             tokens: EP group maximum input rows, already aligned to 128.
             device: Execution device used for the parameters and workspace.
+            weight_grad_dtype: Optional FP32 output for partial expert weight gradients.
 
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
@@ -231,13 +236,21 @@ class _MegaMoeExecutionResources:
             raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
                                f"requested={tokens}, capacity={self._token_capacity}")
         bucket = 1 << (max(128, tokens) - 1).bit_length()
-        plan = self._plans.get(bucket)
+        key = bucket if weight_grad_dtype is None else (bucket, weight_grad_dtype)
+        if batch_experts:
+            key = (key, "batched_experts")
+        if nominal_schedule:
+            key = (key, "nominal_schedule")
+        plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             schedule_tokens = min(bucket, self._token_capacity)
-            plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
+            options = {} if weight_grad_dtype is None else {"weight_grad_dtype": weight_grad_dtype}
+            plan = build_mega_moe_plan(
+                replace(self.spec, schedule_tokens=schedule_tokens, batch_experts=batch_experts,
+                        nominal_schedule=nominal_schedule), device, **options)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
-            self._plans[bucket] = plan
+            self._plans[key] = plan
         return plan
 
     def close(self) -> None:
@@ -327,6 +340,8 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         swiglu_limit: float | None = None,
+        clamp_after_activation: bool = False,
+        apply_probs_before_fc2: bool = False,
         ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -355,11 +370,15 @@ class MegaMoeExperts(MulticoreModule):
                 Must be a positive multiple of 128.
             combine_split: Combine tile rows in forward and backward, with the same
                 constraints and default as dispatch_split. Sharing requires equal splits.
+            apply_probs_before_fc2: Weight BF16 activated features before FC2 instead of
+                weighting expert outputs. False preserves the existing numerical contract.
+            clamp_after_activation: Clip SiLU(gate) instead of clipping the gate input.
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
+            execution: Optional externally composed expert-execution policy.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
                 ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
@@ -369,14 +388,17 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
-        specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+        if not isinstance(apply_probs_before_fc2, bool):
+            raise TypeError("apply_probs_before_fc2 must be a boolean")
+        configuration = {
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
+            "clamp_after_activation": clamp_after_activation,
+            "apply_probs_before_fc2": apply_probs_before_fc2,
             "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
@@ -385,7 +407,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        specification["auto_tokens"] = True
+        specification = {"local_num_tokens": _COMMUNICATION_SPLIT, **configuration, "auto_tokens": True}
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -395,6 +417,7 @@ class MegaMoeExperts(MulticoreModule):
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self._initialize_module_state(specification, create_parameters=create_parameters)
+
 
     def _initialize_module_state(
         self, specification: Mapping[str, Any], *, create_parameters: bool,
@@ -410,6 +433,7 @@ class MegaMoeExperts(MulticoreModule):
         self.dispatch_mode = specification["dispatch_mode"]
         self.dispatch_split = specification["dispatch_split"]
         self.combine_split = specification["combine_split"]
+        self.apply_probs_before_fc2 = specification.get("apply_probs_before_fc2", False)
         self.swiglu_limit = specification["swiglu_limit"]
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
@@ -662,6 +686,10 @@ class MegaMoeExperts(MulticoreModule):
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
             plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            if not torch.is_grad_enabled():
+                return _execute_mega_moe_without_autograd(
+                    topk_weights, *weights, route, plan, resources.workspace,
+                    workspace_claimed=pull).reshape_as(hidden_states)
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
@@ -670,13 +698,13 @@ class MegaMoeExperts(MulticoreModule):
                 route,
                 plan,
                 resources.workspace,
-                topk_weights=topk_weights if pull else None,
+                topk_weights=topk_weights if pull or self.apply_probs_before_fc2 else None,
                 workspace_claimed=pull,
             )
         finally:
             if claimed:
                 resources.workspace.release()
-        if pull:
+        if pull or self.apply_probs_before_fc2:
             return expert_output.reshape_as(hidden_states)
         output = restore_topk_output(
             expert_output,

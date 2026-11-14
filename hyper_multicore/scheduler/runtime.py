@@ -191,7 +191,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     layout = type(cfg)
     address = ctypes.addressof(cfg)
     prefix = struct.pack(
-        "<10I24x",
+        "<11I20x",
         cfg.task_num,
         cfg.num_workers,
         capacity,
@@ -202,6 +202,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         cfg.aiv_profile_record_capacity,
         cfg.completion_event,
         cfg.protocol_version,
+        cfg.vector_ready_queue,
     )
     sections = [
         (layout.all_event_num_triggers.offset, event_capacity * 4),

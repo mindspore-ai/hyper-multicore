@@ -55,6 +55,20 @@ def test_mega_moe_dynamic_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
                            "_test_mega_moe_dynamic_tokens.py", timeout=840)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_probability_positions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Compare TopK 2/4/8, both layouts and rounding positions, including empty and hot sources."""
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
+    _run_acceptance_worker(
+        monkeypatch, tmp_path, "test_probability_positions", 4, "_test_mega_moe_dynamic_tokens.py",
+        heap_bytes=512 * 1024 * 1024,
+    )
+
+
 def _prepare_torch_multicore_test_environment() -> None:
     """Activate multicore and require a payload built for the Torch framework."""
     prepare_multicore_test_environment()
@@ -319,3 +333,11 @@ def test_mega_moe_model_replacement_and_layouts(monkeypatch: pytest.MonkeyPatch,
     """
     _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_model_replacement_and_layouts", 2,
                            "_test_mega_moe_memory.py")
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+def test_mega_moe_saved_permutation_staging() -> None:
+    """Reuse a forward map bitwise, including empty rows and multi-tile payloads."""
+    _prepare_torch_multicore_test_environment()
+    from tests.common.multicore._saved_permutation import run_saved_permutation_staging  # pylint: disable=import-outside-toplevel
+    run_saved_permutation_staging()

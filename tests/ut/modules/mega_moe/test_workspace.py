@@ -163,7 +163,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         Description: Allocate and reuse event storage through the SHMEM API.
         Expectation: Preserve dynamic counters and ready tails without reallocating.
         """
-        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
+        spec = SimpleNamespace(apply_probs_before_fc2=False, receive_capacity=128, routed_slots=256, hidden_size=16,
                                ep_size=64, num_experts=1024, dispatch_mode="push")
         workspace = MegaMoeWorkspace(shared=True)
         with (

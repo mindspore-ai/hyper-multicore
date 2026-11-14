@@ -18,7 +18,7 @@ from enum import Enum
 
 from hyper_multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
-    TaskAiCoreType, TaskType, TaskSplitValue,
+    VectorTaskFlags, TaskAiCoreType, TaskType, TaskSplitValue,
 )
 from hyper_multicore.scheduler.graph import OperatorNode
 from hyper_multicore.tasks.task_base import FillConfig
@@ -136,6 +136,7 @@ class AllToAllFillConfig(FillConfig):
             task.task_index           = i
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
+            task.extra_value_1 = VectorTaskFlags.COMPACT if hasattr(op, "compact_lanes") else 0
             task.tiling_data_position = 0xFFFFFFFF
 
             cfg.all_tasks[tsv.pre_task_num + i] = task
