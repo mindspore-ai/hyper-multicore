@@ -42,6 +42,7 @@ __all__ = [
     "mega_moe_grad",
     "moe_token_permute_grad",
     "moe_token_permute_out",
+    "zero_empty_expert_gradients",
 ]
 
 import torch
@@ -86,7 +87,8 @@ def _load_native() -> None:
             dispatch_alias = schema.arguments[0].alias_info.before_set
             input_grad_alias = schema.arguments[12].alias_info.before_set
             if not dispatch_alias or dispatch_alias != input_grad_alias:
-                raise RuntimeError("adapter does not declare backward dispatch storage reuse; rebuild the Torch adapter")
+                raise RuntimeError("adapter does not declare backward dispatch storage reuse; "
+                                   "rebuild the Torch adapter")
         except (AttributeError, OSError, RuntimeError) as error:
             raise NativeComponentUnavailableError(
                 "[HP-NATIVE-FRAMEWORK-ADAPTER-LOAD-FAILED] component=multicore framework=torch "
@@ -504,6 +506,25 @@ def moe_token_permute_out(
     """
     _load_native()
     torch.ops.hyper_multicore.moe_token_permute_out(tokens, indices, output, mapping)
+
+
+def moe_token_permute_from_mapping_out(
+    tokens: torch.Tensor,
+    mapping: torch.Tensor,
+    probabilities: torch.Tensor,
+    output: torch.Tensor,
+    output_probabilities: torch.Tensor,
+) -> None:
+    """Expand rows and FP32 probabilities using an existing lossless Top-K map.
+
+    ``mapping[token * top_k + slot]`` is the unique destination row returned
+    by the original permutation. Inputs and independently owned outputs must
+    be contiguous; outputs have ``tokens * top_k`` rows. No sorting, host
+    readback or floating-point arithmetic is needed.
+    """
+    _load_native()
+    torch.ops.hyper_multicore.moe_token_permute_from_mapping_out(
+        tokens, mapping, probabilities, output, output_probabilities)
 
 
 def mega_moe_unpermute_grad_out(
@@ -1021,3 +1042,23 @@ def _mega_gate_route_grad(
         top_k,
         routed_scaling_factor,
     )
+
+
+def zero_empty_expert_gradients(
+    first: torch.Tensor, second: torch.Tensor, cumulative_groups: torch.Tensor,
+) -> None:
+    """Clear only cold expert rows before their native gradient producers run.
+
+    The gradients are contiguous BF16/FP32 outputs; their matrix axis order may
+    be EIO or EOI. The cumulative INT64 list comes from the validated route.
+    No token-count readback, temporary gradient clone or host synchronization is used.
+    """
+    _load_native()
+    torch.ops.hyper_multicore.zero_empty_expert_grad_(first, second, cumulative_groups)
+
+
+def route_offsets(counts: torch.Tensor, rank: int, ub_bytes: int,
+                  hidden_size: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build row and element descriptors through the normal framework adapter."""
+    _load_native()
+    return torch.ops.hyper_multicore.route_offsets(counts, rank, ub_bytes, hidden_size)

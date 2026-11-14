@@ -26,6 +26,8 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_func
 
 _NPU_GROUPED_MATMUL = None
+# The fused token permutation requires both index values and the number of indices below this limit.
+_NPU_PERMUTE_INDEX_LIMIT = (1 << 24) - 1
 
 
 def _get_npu_grouped_matmul() -> Any:
@@ -34,7 +36,6 @@ def _get_npu_grouped_matmul() -> Any:
     if _NPU_GROUPED_MATMUL is not None:
         return _NPU_GROUPED_MATMUL
 
-    import torch  # pylint: disable=C0415
     import torch_npu  # pylint: disable=C0415
 
     class _NPUGroupedMatmul(torch.autograd.Function):  # pylint: disable=abstract-method
@@ -118,7 +119,6 @@ def npu_grouped_swiglu(
     if gate_up_weight.shape[0] != tokens_per_expert.numel():
         raise ValueError("tokens_per_expert must contain one count per local expert")
 
-    import torch  # pylint: disable=C0415
     import torch_npu  # pylint: disable=C0415
 
     grouped_matmul = _get_npu_grouped_matmul()
@@ -137,7 +137,7 @@ def npu_grouped_swiglu(
 
 
 def differentiable_all_to_all_single(input_tensor: Tensor, input_splits: Sequence[int],
-                                     output_splits: Sequence[int], group) -> Tensor:
+                                     output_splits: Sequence[int], group: Any) -> Tensor:
     """Variable-split all-to-all with autograd support for EP token dispatch/combine."""
     out_total = sum(output_splits)
     output = torch.empty(
@@ -152,7 +152,7 @@ def differentiable_all_to_all_single(input_tensor: Tensor, input_splits: Sequenc
     )
 
 
-def exchange_splits_via_all_to_all(input_tensor: Tensor, group) -> Tensor:
+def exchange_splits_via_all_to_all(input_tensor: Tensor, group: Any) -> Tensor:
     """All-to-all a per-rank split vector, returning the received counts.
 
     Used by the token dispatchers to learn how many tokens every peer sends
@@ -239,13 +239,27 @@ def _permute(x, tokens_per_expert_group, ep_degree: int, num_local_experts: int)
         - ``permuted_indices``: permutation indices (needed for
           :func:`_unpermute`).
         - ``num_tokens_per_expert``: token count per local expert.
+        - Whether the indices came from the fused NPU permutation.
     """
     original_shape = x.shape
-    (permuted_indices, num_tokens_per_expert) = _generate_permute_indices(tokens_per_expert_group, num_local_experts, ep_degree)
-    permuted_x = x[permuted_indices]
-    return (original_shape, permuted_x, permuted_indices, num_tokens_per_expert)
+    if (x.device.type == "npu" and x.dtype == torch.bfloat16 and x.ndim == 2
+            and 0 < x.shape[0] < _NPU_PERMUTE_INDEX_LIMIT and num_local_experts <= _NPU_PERMUTE_INDEX_LIMIT):
+        import torch_npu  # pylint: disable=C0415
 
-def _unpermute(out, original_shape, permuted_indices):
+        counts = tokens_per_expert_group.reshape(ep_degree, num_local_experts)
+        expert_ids = torch.arange(num_local_experts, dtype=torch.int32, device=x.device).repeat(ep_degree)
+        row_experts = torch.repeat_interleave(
+            expert_ids, tokens_per_expert_group, output_size=x.shape[0],
+        ).reshape(-1, 1)
+        permuted_x, permuted_indices = torch_npu.npu_moe_token_permute(x, row_experts)
+        return original_shape, permuted_x, permuted_indices, counts.sum(dim=0), True
+    permuted_indices, num_tokens_per_expert = _generate_permute_indices(
+        tokens_per_expert_group, num_local_experts, ep_degree,
+    )
+    permuted_x = x[permuted_indices]
+    return original_shape, permuted_x, permuted_indices, num_tokens_per_expert, False
+
+def _unpermute(out, original_shape, permuted_indices, *, fused: bool):
     """Reverse the permutation applied by :func:`_permute`.
 
     Args:
@@ -253,11 +267,16 @@ def _unpermute(out, original_shape, permuted_indices):
             ``[sum(num_tokens_per_expert), *feature_dims]``.
         original_shape: Shape before permutation (from :func:`_permute`).
         permuted_indices: Permutation indices from :func:`_permute`.
+        fused: Whether the indices came from ``npu_moe_token_permute``.
 
     Returns:
         Token tensor restored to the rank-major layout received after
         all-to-all, with shape ``original_shape``.
     """
+    if fused:
+        import torch_npu  # pylint: disable=C0415
+
+        return torch_npu.npu_moe_token_unpermute(out, permuted_indices)
     result = out.new_zeros(*original_shape)
     result[permuted_indices] = out
     return result
@@ -273,6 +292,7 @@ class DispatchContext:
     output_splits: List[int]
     input_shape: tuple[int, ...]
     permuted_indices: Any
+    fused_permutation: bool
     probs_input_shape: Optional[tuple[int, ...]] = None
 
 class AllToAllTokenDispatcher:
@@ -288,7 +308,7 @@ class AllToAllTokenDispatcher:
     """
 
     @staticmethod
-    def dispatch(module: Module, inputs: tuple, group) -> tuple:
+    def dispatch(module: Module, inputs: tuple, group: Any) -> tuple:
         """Dispatch tokens to their assigned ranks via all-to-all.
 
         Called explicitly by the local grouped-expert module.  Receives
@@ -321,15 +341,21 @@ class AllToAllTokenDispatcher:
         input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
         output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
         dispatched = differentiable_all_to_all_single(routed_input, input_splits, output_splits, group=ep_group)
-        (input_shape, permuted, permuted_indices, local_counts) = _permute(dispatched, counts_out, ep_size, num_local_experts)
-        (probs_input_shape, permuted_probs_reordered) = AllToAllTokenDispatcher._exchange_and_reorder_probs(permuted_probs, input_splits, output_splits, counts_out, ep_size, num_local_experts, ep_group)
-        ctx = DispatchContext(input_splits=input_splits, output_splits=output_splits, input_shape=input_shape, permuted_indices=permuted_indices, probs_input_shape=probs_input_shape)
+        input_shape, permuted, permuted_indices, local_counts, fused = _permute(
+            dispatched, counts_out, ep_size, num_local_experts,
+        )
+        probs_input_shape, permuted_probs_reordered = AllToAllTokenDispatcher._exchange_and_reorder_probs(
+            permuted_probs, input_splits, output_splits, permuted_indices, fused, ep_group,
+        )
+        ctx = DispatchContext(input_splits=input_splits, output_splits=output_splits, input_shape=input_shape,
+                              permuted_indices=permuted_indices, fused_permutation=fused,
+                              probs_input_shape=probs_input_shape)
         if permuted_probs is not None:
             return (permuted, local_counts, permuted_probs_reordered, ctx)
         return (permuted, local_counts, ctx)
 
     @staticmethod
-    def _exchange_and_reorder_probs(permuted_probs, input_splits, output_splits, counts_out, ep_size, num_local_experts, ep_group):
+    def _exchange_and_reorder_probs(permuted_probs, input_splits, output_splits, indices, fused, ep_group):
         """Exchange ``permuted_probs`` via a2a and reorder to expert-major.
 
         Returns ``(probs_input_shape, permuted_probs_reordered)``; both are
@@ -338,11 +364,15 @@ class AllToAllTokenDispatcher:
         if permuted_probs is None:
             return (None, None)
         dispatched_probs = differentiable_all_to_all_single(permuted_probs, input_splits, output_splits, group=ep_group)
-        (probs_input_shape, permuted_probs_reordered, _, _) = _permute(dispatched_probs, counts_out, ep_size, num_local_experts)
-        return (probs_input_shape, permuted_probs_reordered)
+        if fused:
+            # The NPU mapping is source -> destination; the CPU indices are destination -> source.
+            reordered = torch.empty_like(dispatched_probs).scatter(0, indices.to(torch.int64), dispatched_probs)
+        else:
+            reordered = dispatched_probs[indices]
+        return dispatched_probs.shape, reordered
 
     @staticmethod
-    def combine(module: Module, routed_output: object, group, ctx: DispatchContext) -> object:
+    def combine(module: Module, routed_output: object, group: Any, ctx: DispatchContext) -> object:
         """Gather expert outputs back to the originating ranks via all-to-all.
 
         Called explicitly after grouped-expert computation.
@@ -362,7 +392,7 @@ class AllToAllTokenDispatcher:
         """
         del module
         ep_group = group
-        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices, fused=ctx.fused_permutation)
         combined = differentiable_all_to_all_single(unpermuted, ctx.output_splits, ctx.input_splits, group=ep_group)
         return combined
 
@@ -538,7 +568,7 @@ class GroupedExperts(nn.Module):
             return _run_experts_grouped_mm_npu(w1, w2, w3, x, num_tokens_per_expert, scores)
         return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert, scores)
 
-    def shard_experts(self, group):
+    def shard_experts(self, group: Any) -> None:
         """Keep the rank-ordered local expert shard and borrow its EP group."""
         self.ep_group = group
         world = dist.get_world_size(group) if dist.is_initialized() else 1
@@ -548,10 +578,10 @@ class GroupedExperts(nn.Module):
         local = self.num_experts // world
         for name in ("w1", "w2", "w3"):
             parameter = getattr(self, name)
-            setattr(self, name, nn.Parameter(parameter.detach().narrow(0, rank * local, local).clone(),
+            setattr(self, name, nn.Parameter(torch.detach(parameter).narrow(0, rank * local, local).clone(),
                                             requires_grad=parameter.requires_grad))
 
-    def forward(self, x, num_tokens_per_expert, scores=None):
+    def forward(self, x: Tensor, num_tokens_per_expert: Tensor, scores: Optional[Tensor] = None) -> Tensor:
         """Dispatch, evaluate local experts and return source-ordered routed rows."""
         group = self.ep_group
         if not dist.is_initialized() or dist.get_world_size(group) == 1:

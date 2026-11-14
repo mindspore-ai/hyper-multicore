@@ -44,10 +44,12 @@ def allocate_graph_config(graph: ComputeGraph, tsv: TaskSplitValue,
         Zero-initialized runtime with sufficient task, queue and event slots.
     """
     required = 1 + sum(op.task_num for op in graph.topological_sort())
-    return allocate_runtime_config(
+    config = allocate_runtime_config(
         required, mega_moe_event_capacity(tsv.all_expert_num, tsv.ep), tsv.single_rank_expert_num,
         num_workers=2 * num_cube_cores,
     )
+    config.task_validator = graph.task_validator
+    return config
 
 
 def build_runtime_config(graph: ComputeGraph, tsv: TaskSplitValue,

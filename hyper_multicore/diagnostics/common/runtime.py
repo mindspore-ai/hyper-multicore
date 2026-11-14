@@ -26,7 +26,7 @@ from hyper_multicore.diagnostics.common.graph import (
 )
 from hyper_multicore.scheduler.config import RuntimeConfigC
 from hyper_multicore.scheduler.graph import ComputeGraph
-from hyper_multicore.scheduler.runtime import serialize_runtime_config
+from hyper_multicore.scheduler.runtime import copy_runtime_config, serialize_runtime_config
 
 
 class DiagnosticMode(IntEnum):
@@ -53,7 +53,7 @@ class PreparedDiagnosticRuntime:
         self.kernel_name = spec.kernel_name
         self.owner_label = spec.owner_label
         self._tensor_factory = tensor_factory
-        self._host_config = type(runtime_config).from_buffer_copy(bytes(runtime_config))
+        self._host_config = copy_runtime_config(runtime_config)
         self._host_config.diagnostic_mode = DiagnosticMode.NORMAL
         self.normal_tensor = tensor_factory(serialize_runtime_config(self._host_config))
         self._metadata: GraphDiagnosticMetadata | None = None
@@ -80,7 +80,7 @@ class PreparedDiagnosticRuntime:
         if self._metadata is None:
             with self._metadata_lock:
                 if self._metadata is None:
-                    config = type(self._host_config).from_buffer_copy(bytes(self._host_config))
+                    config = copy_runtime_config(self._host_config)
                     graph = self._graph
                     if self.spec.graph_adapter is not None:
                         graph = self.spec.graph_adapter(graph, config)
@@ -99,7 +99,7 @@ class PreparedDiagnosticRuntime:
     def copy_host_config(self) -> RuntimeConfigC:
         """Create an independent Host configuration for one tool's device variant."""
         config = self.host_config
-        return type(config).from_buffer_copy(bytes(config))
+        return copy_runtime_config(config)
 
     def tensor_from_config(self, runtime_config: RuntimeConfigC) -> Any:
         """Serialize a tool-owned configuration without changing the normal image.

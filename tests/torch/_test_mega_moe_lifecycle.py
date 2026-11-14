@@ -28,24 +28,24 @@ from hyper_multicore.modules.mega_moe import function as function_module
 from hyper_multicore.scheduler.config import (
     READY_CACHE_LINE_BYTES,
 )
-from tests.torch import _test_mega_moe as baseline
 from tests.common.multicore._mega_moe_utils import (
     assert_stable_memory,
     collect_memory,
     start_shmem_lifetime,
     write_evidence,
 )
+from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts as _MegaMoeExperts
+from tests.torch import _test_mega_moe as baseline
 
 
 def _new_stack(shape: baseline.MoeShape, layers: int = 3) -> list[MegaMoeExperts]:
     """Build distinct expert layers without initializing any native resource."""
     return [
-        MegaMoeExperts(
+        _MegaMoeExperts(
             hidden_size=shape.hidden_size,
             intermediate_size=shape.intermediate_size,
             num_experts=shape.num_experts,
             top_k=shape.top_k,
-            ep_size=shape.ep_size,
             ep_group=dist.group.WORLD,
             dispatch_mode=os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
         ).to(device=baseline.DEVICE, dtype=torch.bfloat16)

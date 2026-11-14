@@ -17,15 +17,35 @@
 import math
 import struct
 from dataclasses import dataclass
+from enum import IntEnum
 
 from hyper_multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
-    TaskAiCoreType, TaskType,
+    TaskAiCoreType, TaskType, TaskSplitValue,
     MAX_TENSOR_DIMS,
 )
-from hyper_multicore.scheduler.graph import OpType
+from hyper_multicore.scheduler.graph import OperatorNode, OpType
 from hyper_multicore.tasks.task_base import FillConfig
 from hyper_multicore.tasks.utils import advance_tsv_vector
+
+
+class SwiGluClampPosition(IntEnum):
+    """Gate-branch clamp position encoded by SwiGLU and SwiGLUGrad tasks."""
+
+    BEFORE_SILU = 0
+    AFTER_SILU = 1
+
+
+class SwiGluTaskIteration(IntEnum):
+    """TILED covers one tile; PERSISTENT_LANES visits tile lane + n * lanes.
+
+    Persistent descriptors encode group * lanes + lane in task_index and
+    groups * lanes in task_split_num. task_split_value is the row tile size.
+    Empty groups do no row work and retain their original completion credit.
+    """
+
+    TILED = 0
+    PERSISTENT_LANES = 2
 
 
 def _encode_clamp_limit(clamp_limit: float | None) -> int:
@@ -61,12 +81,13 @@ class SwiGLUFillConfig(FillConfig):
     """
 
     clamp_limit: float | None = None
+    clamp_after_activation: bool = False
 
     def fill(
         self,
         cfg: RuntimeConfigC,
-        op,
-        tsv,
+        op: OperatorNode,
+        tsv: TaskSplitValue,
     ) -> None:
         """Serialize SwiGLU tasks into the runtime configuration.
 
@@ -79,7 +100,7 @@ class SwiGLUFillConfig(FillConfig):
                      else TaskType.TASK_SWI_GLU_GRAD)
         clamp_bits = _encode_clamp_limit(self.clamp_limit)
 
-        num_triggers = tsv.per_expert_seq // op.split_value
+        num_triggers = getattr(op, "compact_lanes", tsv.per_expert_seq // op.split_value)
         task_num     = op.task_num
         param        = op.param_positions
 
@@ -121,6 +142,10 @@ class SwiGLUFillConfig(FillConfig):
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
             task.extra_value_0        = clamp_bits
+            task.extra_value_1        = (SwiGluClampPosition.AFTER_SILU
+                                        if self.clamp_after_activation and clamp_bits else 0)
+            if hasattr(op, "compact_lanes"):
+                task.extra_value_1 |= SwiGluTaskIteration.PERSISTENT_LANES
             task.tiling_data_position = op.tiling_position
 
             cfg.all_tasks[tsv.pre_task_num + i]               = task

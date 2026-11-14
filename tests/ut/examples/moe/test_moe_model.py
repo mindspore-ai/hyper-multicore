@@ -54,6 +54,7 @@ def _experts_reference(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
+    expert_weights: tuple[torch.Tensor, torch.Tensor],
     tokens_per_expert: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evaluate all local experts explicitly; EP is one in these CPU checks."""
@@ -63,9 +64,9 @@ def _experts_reference(
     if tokens_per_expert is not None:
         expected_counts = torch.bincount(ids.flatten(), minlength=module.num_experts).to(torch.int32)
         torch.testing.assert_close(tokens_per_expert, expected_counts, rtol=0, atol=0)
-    gate_up = torch.einsum("th,ehj->tej", hidden, module.gate_up_weight)
+    gate_up = torch.einsum("th,ehj->tej", hidden, expert_weights[0])
     gate, up = gate_up.chunk(2, dim=-1)
-    output = torch.einsum("tei,eid->ted", F.silu(gate) * up, module.down_weight)
+    output = torch.einsum("tei,eid->ted", F.silu(gate) * up, expert_weights[1])
     scores = torch.zeros(hidden.shape[0], module.num_experts).scatter_add(1, ids, weights)
     return (output.float() * scores.unsqueeze(-1)).sum(dim=1).to(hidden.dtype).reshape(shape)
 
@@ -148,6 +149,9 @@ class TestMoeTransformerExample(unittest.TestCase):
         optimized = self._model(("moe", "gate"))
         self.addCleanup(reference.close)
         self.addCleanup(optimized.close)
+        for model in (reference, optimized):
+            for layer in model.layers:
+                self.assertIs(type(layer.mlp.experts.executor), MegaMoeExperts)
         inputs = torch.arange(128).reshape(1, -1) % 32
         with (
             patch.object(MegaMoeExperts, "forward", _experts_reference),
@@ -197,7 +201,7 @@ class TestMoeTransformerExample(unittest.TestCase):
                 self.assertEqual(model.layers[0].mlp.gate.use_mega_gate, "gate" in selected)
                 self.assertFalse(any(isinstance(module, MegaMhc) for module in model.modules()))
                 for layer in model.layers:
-                    if isinstance(layer.mlp.experts, MegaMoeExperts):
+                    if isinstance(layer.mlp.experts, moe_module.ModelExperts):
                         layer.mlp.experts.close()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -269,10 +273,8 @@ class TestMoeTransformerExample(unittest.TestCase):
         Description: Arguments and topology validation.
         Expectation: Validate selected kernels and reject incompatible workload shapes.
         """
-        args = benchmark.parse_args(["--dispatch-mode", "pull", "--mega-kernels", "gate"])
+        args = benchmark.parse_args(["--mega-kernels", "gate"])
         self.assertEqual(args.mega_kernels, ("gate",))
-        self.assertIsNone(args.initial_capacity_factor)
-        self.assertIsNone(args.capacity_growth_factor)
         self.assertEqual(benchmark.parse_args([]).mega_kernels, ("moe", "gate"))
         self.assertEqual(replace(self._config(), max_seq_len=129).max_seq_len, 129)
         with self.assertRaisesRegex(ValueError, "Unsupported Mega kernels"):
@@ -280,6 +282,10 @@ class TestMoeTransformerExample(unittest.TestCase):
         for value in ("", "moe,", "unknown", "gate,gate", "mhc"):
             with (self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
                 benchmark.parse_args(["--mega-kernels", value])
+        for option, value in (("--dispatch-mode", "pull"), ("--initial-capacity-factor", "1.5"),
+                              ("--capacity-growth-factor", "2.0")):
+            with (self.subTest(option=option), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
+                benchmark.parse_args([option, value])
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -343,19 +349,29 @@ class TestMoeTransformerExample(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_result_records_configured_topology_and_experts(self) -> None:
         """Feature: Configurable MoE benchmark EP.
-        Description: Write a result for an EP16 run using the default expert count.
-        Expectation: JSON records the actual EP and expert shape instead of the old eight-rank constant.
+        Description: Write EP16 results with MegaMoe and ordinary expert backends.
+        Expectation: JSON records the expert shape and reports tuning values only for MegaMoe.
         """
         backends = {name: {"steady_state_optimizer_step_ms": {"median": value}}
                     for name, value in (("common", 2.0), ("mega", 1.0))}
+        mega_model = self._model(("moe", "gate"))
+        self.addCleanup(mega_model.close)
         with tempfile.TemporaryDirectory() as directory:
             args = benchmark.parse_args(["--output", str(Path(directory) / "result.json")])
             config = benchmark._build_config(args, 16)  # pylint: disable=protected-access
             with redirect_stderr(io.StringIO()), patch("builtins.print"), patch.object(benchmark.dist, "barrier"):
-                benchmark._write_result(args, config, 0, {}, backends)  # pylint: disable=protected-access
+                benchmark._write_result(args, config, 0, {}, backends, mega_model)  # pylint: disable=protected-access
             result = json.loads(Path(args.output).read_text(encoding="utf-8"))
+            native_model = SimpleNamespace(layers=[SimpleNamespace(mlp=SimpleNamespace(experts=object()))])
+            args.mega_kernels = ("gate",)
+            with redirect_stderr(io.StringIO()), patch("builtins.print"), patch.object(benchmark.dist, "barrier"):
+                benchmark._write_result(args, config, 0, {}, backends, native_model)  # pylint: disable=protected-access
+            native_result = json.loads(Path(args.output).read_text(encoding="utf-8"))
         self.assertEqual(result["topology"], {"world_size": 16, "tp": 1, "ep": 16})
         self.assertEqual((result["shape"]["num_experts"], result["shape"]["top_k"]), (96, 8))
+        names = ("dispatch_mode", "initial_capacity_factor", "capacity_growth_factor")
+        self.assertEqual(tuple(result["shape"][name] for name in names), ("push", 1.25, 1.25))
+        self.assertEqual(tuple(native_result["shape"][name] for name in names), (None, None, None))
 
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

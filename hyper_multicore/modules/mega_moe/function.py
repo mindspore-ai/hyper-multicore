@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import os
+
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -24,8 +26,9 @@ import torch
 from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
+from .probability import PROBABILITY_PLANES, probability_stride
 from .plan import MegaMoePlan, record_plan_stream
-from .route import PreparedTopKRoute, RouteMetadata
+from .route import PreparedTopKRoute, RouteMetadata, restore_topk_output
 from .workspace import MegaMoeWorkspace
 
 
@@ -109,8 +112,42 @@ def _dispatch_and_source(spec: Any, workspace: Any, rows: Any, capacity: int) ->
     return dispatch, source
 
 
+def _kernel_workspace(workspace: MegaMoeWorkspace, spec: Any) -> torch.Tensor:
+    """Use the reserved native scratch port for declared probability planes."""
+    if spec.apply_probs_before_fc2:
+        return workspace.probabilities(spec).raw
+    return _workspace_tensor(workspace.gmm_workspace, "gmm_workspace")
+
+
+def _stage_probabilities(
+    workspace: MegaMoeWorkspace, mapping: torch.Tensor, probs: torch.Tensor, spec: Any,
+) -> None:
+    """Publish source probabilities in the current expert-major permutation."""
+    if probs.numel():
+        # Preserve local input bounds: the upstream scatter tiling depends on this shape.
+        load_torch_npu().npu_scatter_nd_update_(
+            workspace.probabilities(spec).slice(probs.numel()),
+            mapping.view(-1, 1), probs.reshape(-1))
+
+
+def _restore_unweighted_output(rows: torch.Tensor, mapping: torch.Tensor, top_k: int) -> torch.Tensor:
+    """The transpose of token expansion sums Top-K rows without weighting again."""
+    return multicore_ops.moe_token_permute_grad(rows, mapping, rows.shape[0] // top_k, top_k)
+
+
 def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple[Any, ...]) -> tuple[Any, Any]:
-    """Write pull dY into SHMEM before expert scratch allocation."""
+    """Stage backward tokens and probabilities before expert scratch allocation."""
+    if ctx.plan.spec.apply_probs_before_fc2:
+        mapping, probs = permutation_inputs
+        source = (ctx.workspace.source_buffer[:ctx.source_rows]
+                  if ctx.plan.spec.dispatch_mode == "pull" else grad_output.new_empty(
+                      (ctx.source_rows, ctx.plan.spec.hidden_size)))
+        if ctx.source_rows:
+            # Consume the saved exact permutation instead of sorting expert IDs again.
+            multicore_ops.moe_token_permute_from_mapping_out(
+                grad_output.contiguous(), mapping, probs, source,
+                ctx.workspace.probabilities(ctx.plan.spec).slice(ctx.source_rows))
+        return source, None
     if getattr(ctx.plan.spec, "dispatch_mode", "push") == "push":
         return grad_output, None
     source = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[:ctx.source_rows]
@@ -152,10 +189,20 @@ def _allocate_backward_intermediates(
     weight1: Any,
     weight2: Any,
     reusable_dispatch: Any | None = None,
+    *, weight_grad_dtype: torch.dtype | None = None,
+    group_list: torch.Tensor | None = None,
+    all_experts_active: bool = False,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    grad_weight1 = torch.zeros_like(weight1)
-    grad_weight2 = torch.zeros_like(weight2)
+    if group_list is None:
+        # Without count metadata, cold rows cannot be identified; initialize every expert.
+        grad_weight1 = torch.zeros_like(weight1, dtype=weight_grad_dtype)
+        grad_weight2 = torch.zeros_like(weight2, dtype=weight_grad_dtype)
+    else:
+        grad_weight1 = torch.empty_like(weight1, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
+        grad_weight2 = torch.empty_like(weight2, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
+        if not all_experts_active:
+            multicore_ops.zero_empty_expert_gradients(grad_weight1, grad_weight2, group_list)
     act_grad = torch.empty(
         (capacity, spec.intermediate_size),
         dtype=grad_output.dtype,
@@ -201,7 +248,7 @@ def _prepare_forward_execution(
         source=source,
         combine=combine,
         event_counters=workspace.prepare_event_counters(forward=True),
-        gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
+        gmm_workspace=_kernel_workspace(workspace, plan.spec),
         intermediates=_allocate_forward_intermediates(
             plan.spec,
             capacity,
@@ -216,6 +263,7 @@ def _prepare_backward_execution(
     plan: MegaMoePlan,
     saved: _SavedBackwardState,
     grad_output: Any,
+    *, all_experts_active: bool = False,
 ) -> _BackwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for backward."""
     dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
@@ -225,7 +273,7 @@ def _prepare_backward_execution(
         dispatch=dispatch,
         grad_x=grad_x,
         event_counters=workspace.prepare_event_counters(forward=False),
-        gmm_workspace=_workspace_tensor(workspace.gmm_workspace, "gmm_workspace"),
+        gmm_workspace=_kernel_workspace(workspace, plan.spec),
         swiglu_workspace=_workspace_tensor(
             workspace.swiglu_grad_workspace,
             "swiglu_grad_workspace",
@@ -237,6 +285,9 @@ def _prepare_backward_execution(
             saved.weight1,
             saved.weight2,
             dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
+            weight_grad_dtype=plan.weight_grad_dtype,
+            group_list=saved.group_list,
+            all_experts_active=all_experts_active,
         ),
     )
 
@@ -269,10 +320,24 @@ def _save_forward_state(
     weight1: Any,
     weight2: Any,
     metadata: RouteMetadata,
-    permutation_inputs: tuple[Any, ...] = (),
-) -> None:
-    """Save owned forward tensors and route state for backward."""
+    permutation_inputs: tuple[Any, ...],
+    output: Any,
+    topk_weights: torch.Tensor | None,
+) -> Any:
+    """Restore the owned output and save its backward state in the existing call."""
+    if ctx.has_unpermute:
+        spec = plan.spec
+        if not spec.apply_probs_before_fc2:
+            probs = topk_weights.float().contiguous()
+            permutation_inputs += (output, probs)
+        ctx.topk_dtype = topk_weights.dtype
+        if spec.apply_probs_before_fc2:
+            output = _restore_unweighted_output(output, permutation_inputs[0], spec.top_k)
+        else:
+            output = (load_torch_npu().npu_moe_token_unpermute(output, permutation_inputs[0], probs=probs)
+                      if ctx.source_rows else output[:0])
     ctx.plan = plan
+    ctx.all_experts_active = metadata.all_experts_active
     ctx.workspace = workspace
     ctx.save_for_backward(
         saved_dispatch,
@@ -290,6 +355,10 @@ def _save_forward_state(
         *permutation_inputs,
     )
     workspace.track_graph(ctx)
+    return output
+
+
+_CAPTURED_WEIGHT_GRADS: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
@@ -300,6 +369,19 @@ def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
         workspace.release_graph(ctx)
 
 
+def _diagnostic_parameters(
+    plan: MegaMoePlan, parameters: tuple[Any, ...], workspace: torch.Tensor,
+    tilings: tuple[Any, ...] = (),
+) -> tuple[Any, ...]:
+    """Expose the existing scalar scratch at its real native ABI position."""
+    if not plan.spec.apply_probs_before_fc2:
+        return parameters
+    stride = probability_stride(plan.spec)
+    planes = workspace.view(torch.float32).reshape(-1)[:PROBABILITY_PLANES * stride].view(
+        PROBABILITY_PLANES, stride)
+    return (*parameters, *tilings, planes)
+
+
 def _launch_forward_kernel(
     plan: MegaMoePlan,
     metadata: RouteMetadata,
@@ -307,15 +389,16 @@ def _launch_forward_kernel(
     weight1: Any,
     weight2: Any,
     execution: _ForwardExecution,
+    *, stream: Any = None,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
     kernel_parameters = (
         execution.dispatch,
-        metadata.dispatch_target_off * spec.hidden_size,
+        metadata.dispatch_target_off,
         _native_source(routed_tokens),
-        metadata.dispatch_src_off * spec.hidden_size,
-        metadata.dispatch_size * spec.hidden_size,
+        metadata.dispatch_src_off,
+        metadata.dispatch_size,
         weight1,
         metadata.group_list,
         execution.intermediates.up_proj,
@@ -324,12 +407,12 @@ def _launch_forward_kernel(
         metadata.group_list,
         execution.intermediates.down_proj,
         execution.combine,
-        metadata.combine_target_off * spec.hidden_size,
-        metadata.combine_src_off * spec.hidden_size,
-        metadata.combine_size * spec.hidden_size,
+        metadata.combine_target_off,
+        metadata.combine_src_off,
+        metadata.combine_size,
     )
     if not plan.fwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.fwd_runtime_config)
+        record_plan_stream(plan, plan.fwd_runtime_config, stream=stream)
         multicore_ops.mega_moe(
             *kernel_parameters,
             execution.gmm_workspace,
@@ -347,11 +430,11 @@ def _launch_forward_kernel(
         return
 
     with plan.fwd_diagnostics.launch(
-        kernel_parameters,
+        _diagnostic_parameters(plan, kernel_parameters, execution.gmm_workspace),
         direction="forward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config)
+        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
         multicore_ops.mega_moe_with_diagnostic_buffer(
             *kernel_parameters,
             execution.gmm_workspace,
@@ -374,16 +457,17 @@ def _launch_backward_kernel(
     saved: _SavedBackwardState,
     grad_output: Any,
     execution: _BackwardExecution,
+    *, stream: Any = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
     gradients = execution.intermediates
     kernel_parameters = (
         execution.dispatch,
-        saved.dispatch_target_off * spec.hidden_size,
+        saved.dispatch_target_off,
         _native_source(grad_output),
-        saved.dispatch_src_off * spec.hidden_size,
-        saved.dispatch_size * spec.hidden_size,
+        saved.dispatch_src_off,
+        saved.dispatch_size,
         saved.activation,
         gradients.grad_weight2,
         saved.weight2,
@@ -393,15 +477,15 @@ def _launch_backward_kernel(
         saved.weight1,
         gradients.gate_dx,
         execution.grad_x,
-        saved.combine_target_off * spec.hidden_size,
-        saved.combine_src_off * spec.hidden_size,
-        saved.combine_size * spec.hidden_size,
+        saved.combine_target_off,
+        saved.combine_src_off,
+        saved.combine_size,
         saved.dispatch,
         gradients.grad_weight1,
         saved.group_list,
     )
     if not plan.bwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.bwd_runtime_config)
+        record_plan_stream(plan, plan.bwd_runtime_config, stream=stream)
         multicore_ops.mega_moe_grad(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -422,11 +506,13 @@ def _launch_backward_kernel(
         return
 
     with plan.bwd_diagnostics.launch(
-        kernel_parameters,
+        _diagnostic_parameters(plan, kernel_parameters, execution.gmm_workspace, (
+            plan.act_grad_tiling, plan.gate_grad_tiling, plan.w1_grad_tiling,
+            plan.w2_grad_tiling, plan.swiglu_grad_tiling)),
         direction="backward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config)
+        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
         multicore_ops.mega_moe_grad_with_diagnostic_buffer(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -493,12 +579,17 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             workspace_claimed: Whether the caller owns the forward workspace lease.
 
         Returns:
-            Owned expert-major output rows.
+            Owned token-major rows with integrated unpermutation, otherwise expert-major rows.
         """
         spec = plan.spec
-        if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
-            raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
-        metadata = route
+        if topk_weights is not None and (
+            permutation is None or (spec.dispatch_mode != "pull" and not spec.apply_probs_before_fc2)
+        ):
+            raise ValueError("Integrated output unpermutation requires pull dispatch or pre-FC2 weighting, "
+                             "and an input permutation.")
+        if spec.apply_probs_before_fc2 and topk_weights is None:
+            raise ValueError("Pre-FC2 weighting requires the original Top-K probabilities and permutation.")
+        metadata = route.for_kernel(spec.hidden_size)
         permutation_inputs = ()
         if permutation is not None:
             routed_tokens, _, unpermute_mapping = permutation
@@ -525,28 +616,27 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 routed_tokens,
                 capacity,
             )
+            if spec.apply_probs_before_fc2:
+                probs = topk_weights.float().contiguous()
+                _stage_probabilities(workspace, unpermute_mapping, probs, spec)
+                permutation_inputs += (probs,)
             _launch_forward_kernel(
                 plan,
                 metadata,
                 execution.source,
                 weight1,
                 weight2,
-                execution,
-            )
-            output = execution.combine[:ctx.source_rows].clone()
+                execution, stream=workspace.lease_stream)
+            output = execution.combine[:ctx.source_rows]
+            if not spec.apply_probs_before_fc2:
+                output = output.clone()
             if spec.dispatch_mode == "pull":
                 saved_dispatch = execution.dispatch
             else:
                 # Combine has consumed down_proj before SHMEM dispatch is reused.
                 execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
                 saved_dispatch = execution.intermediates.down_proj
-            if ctx.has_unpermute:
-                probs = topk_weights.float().contiguous()
-                ctx.topk_dtype = topk_weights.dtype
-                permutation_inputs += (output, probs)
-                output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
-                          if ctx.source_rows else output[:0])
-            _save_forward_state(
+            return _save_forward_state(
                 ctx,
                 plan,
                 workspace,
@@ -555,13 +645,11 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution.intermediates.activation,
                 weight1,
                 weight2,
-                metadata,
-                permutation_inputs,
+                metadata, permutation_inputs, output, topk_weights,
             )
-            return output
         finally:
             if not workspace_claimed:
-                workspace.release()
+                workspace.release(stream=workspace.lease_stream)
 
     @staticmethod
     # pylint: disable-next=arguments-differ
@@ -586,32 +674,42 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         workspace.claim()
         try:
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
+            saved_probabilities = permutation_inputs[-1] if plan.spec.apply_probs_before_fc2 else None
             permutation_inputs = permutation_inputs[:1]
             execution = _prepare_backward_execution(
                 workspace,
                 plan,
                 saved,
                 grad_output,
+                all_experts_active=ctx.all_experts_active,
             )
             _launch_backward_kernel(
                 plan,
                 saved,
                 source,
-                execution,
-            )
+                execution, stream=workspace.lease_stream)
+            if plan.spec.apply_probs_before_fc2 and ctx.needs_input_grad[7]:
+                grad_topk_weights = (
+                    workspace.probabilities(plan.spec).slice(ctx.source_rows, gradient=True).index_select(
+                    0, permutation_inputs[0]).reshape_as(saved_probabilities).to(ctx.topk_dtype)
+                    if ctx.source_rows else saved_probabilities.new_empty(
+                        saved_probabilities.shape, dtype=ctx.topk_dtype))
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
-            execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
-                execution.intermediates.grad_weight1,
-                execution.intermediates.grad_weight2,
-                None, None, None,
-            ))
-            grad_input = _restore_input_gradient(ctx, execution.grad_x, permutation_inputs)
+            grad_weight1 = execution.intermediates.grad_weight1
+            grad_weight2 = execution.intermediates.grad_weight2
+            if os.environ.get("HP_MEGA_MOE_CAPTURE_DW") == "1":
+                global _CAPTURED_WEIGHT_GRADS
+                _CAPTURED_WEIGHT_GRADS = (grad_weight1.detach().clone(),
+                                          grad_weight2.detach().clone())
+            grad_x = execution.grad_x
+            del execution
+            grad_input = _restore_input_gradient(ctx, grad_x, permutation_inputs)
             _release_completed_graph(ctx, workspace)
             return (
                 grad_input,
-                execution.intermediates.grad_weight1,
-                execution.intermediates.grad_weight2,
+                grad_weight1,
+                grad_weight2,
                 None,
                 None,
                 None,
@@ -620,7 +718,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
             )
         finally:
-            workspace.release()
+            workspace.release(stream=workspace.lease_stream)
 
 
 def execute_mega_moe(
@@ -700,3 +798,48 @@ def execute_mega_moe_with_permutation(
         topk_weights,
         workspace_claimed,
     )
+
+
+def _execute_mega_moe_without_autograd(
+    topk_weights: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    route: PreparedTopKRoute,
+    plan: MegaMoePlan,
+    workspace: MegaMoeWorkspace,
+    *, workspace_claimed: bool = False,
+) -> torch.Tensor:
+    """Restore owned token outputs before releasing inference-only scratch.
+
+    Initial reentrant-checkpoint forwards need neither a backward dispatch copy
+    nor an owned expert-major intermediate. Consume both SHMEM views on their
+    leased stream; only the unpermuted, independently owned output escapes.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError("The no-autograd path requires a no_grad context")
+    if workspace_claimed:
+        if not workspace.in_use:
+            raise RuntimeError("Inference requires the caller-held workspace lease")
+    else:
+        if not plan.spec.auto_tokens:
+            workspace.ensure(plan.spec, route.routed_tokens.dtype, route.routed_tokens.device)
+        workspace.claim()
+    try:
+        execution = _prepare_forward_execution(
+            workspace, plan, route.routed_tokens, route.metadata.expert_capacity)
+        if plan.spec.apply_probs_before_fc2:
+            _stage_probabilities(workspace, route.unpermute_mapping, topk_weights.float().contiguous(), plan.spec)
+        _launch_forward_kernel(
+            plan, route.metadata.for_kernel(plan.spec.hidden_size), execution.source,
+            _native_weight_operand(weight1, plan),
+            _native_weight_operand(weight2, plan), execution, stream=workspace.lease_stream)
+        rows = route.routed_tokens.shape[0]
+        if not rows:
+            return route.routed_tokens.new_empty((0, plan.spec.hidden_size))
+        if plan.spec.apply_probs_before_fc2:
+            return _restore_unweighted_output(execution.combine[:rows], route.unpermute_mapping, plan.spec.top_k)
+        return restore_topk_output(
+            execution.combine[:rows], route.unpermute_mapping, topk_weights)
+    finally:
+        if not workspace_claimed:
+            workspace.release(stream=workspace.lease_stream)

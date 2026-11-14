@@ -21,6 +21,9 @@
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
+#include "common/mega_moe/transport.h"
+#include "common/mega_moe/task_options.h"
+#include "common/mega_moe/routing_probabilities.h"
 
 using namespace AscendC;
 
@@ -34,7 +37,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   static constexpr uint32_t TILING_IDX              = 30;
   static constexpr uint32_t EVENT_IDX               = 31;
   static constexpr uint32_t DIAGNOSTIC_IDX          = 32;
-  static constexpr uint32_t WORKSPACE_IDX           = 25;
+  static constexpr uint32_t WORKSPACE_IDX           = ProbabilityLayout::BACKWARD_POSITION;
   static constexpr uint32_t SWIGLU_GRAD_WORKSPACE_IDX = 26;
   static constexpr uint32_t SWIGLU_DYNAMIC_FIELDS_OFFSET =
     static_cast<uint32_t>(offsetof(SwiGluTilingData, rowLen));
@@ -52,6 +55,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
+    if (!IsMoeTaskOptionsValid(task_desc, WORKSPACE_IDX)) AscendC::Trap();
     switch (task_desc.task_type) {
       case TaskType::TASK_BEGIN_TASK_GRAPH:
         break;
@@ -65,7 +69,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteShmemPutMem(task_desc);
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
-        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
         break;
       case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);
@@ -93,10 +97,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     if (length <= 0) {
       return;
     }
-    __gm__ uint8_t *start =
-      (__gm__ uint8_t *)((int64_t)sourceAddr / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
-    __gm__ uint8_t *end =
-      (__gm__ uint8_t *)(((int64_t)sourceAddr + length - 1) / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
+    const int64_t base = reinterpret_cast<int64_t>(sourceAddr);
+    auto start = reinterpret_cast<__gm__ uint8_t *>(
+      base / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
+    auto end = reinterpret_cast<__gm__ uint8_t *>(
+      (base + length - 1) / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
     AscendC::GlobalTensor<uint8_t> global;
     global.SetGlobalBuffer(start);
     for (uint32_t i = 0; i <= end - start; i += AscendC::CACHE_LINE_SIZE) {
@@ -108,6 +113,58 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
   __aicore__ inline void ExecuteSwiGluGrad(const TaskDesc &task_desc) {
+    if (GetSwiGluTaskIteration(task_desc) == SwiGluTaskIteration::TILED) {
+      ExecuteSwiGluGradLegacy(task_desc);
+      return;
+    }
+    DynamicData data;
+    getDynamicData(this->runtimeConfigPtr, &data);
+    const uint32_t lanes = task_desc.task_split_num / data.dynamic_group_size;
+    const uint32_t expert = task_desc.task_index / lanes;
+    const uint32_t lane = task_desc.task_index % lanes;
+    GlobalTensor<int64_t> groups;
+    groups.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(input_list[data.dynamic_input_position]),
+                           data.dynamic_group_size);
+    const int64_t start = expert == 0 ? 0 : groups.GetValue(expert - 1);
+    const int64_t rows = groups.GetValue(expert) - start;
+    const uint32_t tiles = static_cast<uint32_t>((rows + task_desc.task_split_value - 1) /
+                                                task_desc.task_split_value);
+    const uint32_t legacy_tiles = tiles > 0 ? tiles : 1;
+    TaskDesc tile = task_desc;
+    tile.extra_value_1 &= ~static_cast<uint32_t>(SwiGluTaskIteration::PERSISTENT_LANES);
+    tile.task_split_num = legacy_tiles * data.dynamic_group_size;
+    for (uint32_t index = lane; index < tiles; index += lanes) {
+      tile.task_index = expert * legacy_tiles + index;
+      ExecuteSwiGluGradLegacy(tile);
+    }
+  }
+
+  __aicore__ inline void RunSwiGluGrad(const TaskDesc &task, int64_t row, int64_t rows,
+                                         GM_ADDR gradient, GM_ADDR input, GM_ADDR output, GM_ADDR tiling) {
+    if (GetMegaMoeActivationWeighting(task) == MegaMoeActivationWeighting::BEFORE_FC2) {
+      const auto &aux = task.outputs[task.num_outputs - 1];
+      const int64_t width = task.inputs[0].dim[1];
+      GM_ADDR activation = input_list[SWIGLU_GRAD_WORKSPACE_IDX] + static_cast<int64_t>(this->worker_id_) *
+                                                                       task.task_split_value * width *
+                                                                       sizeof(DTYPE_DISPATCH_TARGET);
+      // Recompute only a worker tile, not a per-graph activation tensor.
+      swi_glu(input, activation, nullptr, tiling, GetSwiGluClampLimit(task),
+              GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+      {
+        RoutingProbabilityTile<DTYPE_DISPATCH_TARGET> operation;
+        operation.Backward(
+            gradient, activation,
+            ProbabilityPlane(input_list[aux.input_position], aux.dim[1], ProbabilityLayout::RECEIVED) +
+                row * sizeof(float),
+            ProbabilityPlane(input_list[aux.input_position], aux.dim[1], ProbabilityLayout::RECEIVED_GRADIENT) +
+                row * sizeof(float), rows, width);
+      }
+    }
+    swi_glu_grad(gradient, input, output, input_list[SWIGLU_GRAD_WORKSPACE_IDX], tiling,
+                 GetSwiGluClampLimit(task), GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+  }
+
+  __aicore__ inline void ExecuteSwiGluGradLegacy(const TaskDesc &task_desc) {
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.outputs[0].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
@@ -145,12 +202,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                     ? base_ptr_offset * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
         if (start + current_seq_end <= end) {
-          swi_glu_grad(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset,
-                       input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
-                       GetSwiGluClampLimit(task_desc));
+          RunSwiGluGrad(task_desc, base_ptr_offset, task_desc.task_split_value,
+                        input_list[task_desc.inputs[0].input_position] + input_0_offset,
+                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
+                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
+                        input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
           return;
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
@@ -164,14 +220,27 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
           PipeBarrier<PIPE_ALL>();
 
-          swi_glu_grad(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset,
-                       input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       tiling_data_addr, GetSwiGluClampLimit(task_desc));
+          RunSwiGluGrad(task_desc, base_ptr_offset, end - base_ptr_offset,
+                        input_list[task_desc.inputs[0].input_position] + input_0_offset,
+                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
+                        input_list[task_desc.outputs[0].input_position] + output_0_offset, tiling_data_addr);
         }
       }
       return;
+    }
+  }
+
+  __aicore__ inline void PrepareGroupedMatmulList(
+      GlobalTensor<int64_t> &groups, GlobalTensor<int64_t> &scratch, GM_ADDR scratch_address,
+      int64_t experts, uint32_t index, int64_t rows, bool batched, bool single_group) {
+    if (single_group) {
+      scratch.SetValue(0, rows);
+      cacheWriteThrough(scratch_address, sizeof(int64_t));
+    } else {
+      for (uint32_t expert = 0; expert < experts; ++expert) {
+        scratch.SetValue(expert, batched ? groups.GetValue(expert) : (expert >= index ? rows : 0));
+      }
+      cacheWriteThrough(scratch_address, experts * sizeof(int64_t));
     }
   }
 
@@ -192,7 +261,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         GlobalTensor<int64_t> grouped_list_tensor_real;
         grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
-        int64_t value = grouped_list_tensor.GetValue(data_index);
+        const bool batched = IsBatchedGroupedMatmulTask(task_desc);
+        if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
+          for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
+            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.extra_value_2);
+          }
+        }
+        int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index);
         int64_t start = 0;
         if (data_index != 0) {
           value = value - grouped_list_tensor.GetValue(data_index - 1);
@@ -201,16 +276,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         if (value == 0) {
           return;
         }
-        for (uint32_t i = 0; i < expert_num_single_rank; i++) {
-          if (i > data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else if (i == data_index) {
-            grouped_list_tensor_real.SetValue(i, value);
-          } else {
-            grouped_list_tensor_real.SetValue(i, 0);
-          }
-        }
-        cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
+        const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
+        PrepareGroupedMatmulList(grouped_list_tensor, grouped_list_tensor_real, grouped_list_real,
+                                 expert_num_single_rank, data_index, value, batched, single_group);
 
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
         __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
@@ -228,22 +296,25 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         }
         PipeBarrier<PIPE_ALL>();
 
-        int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
-                                   ? start * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
-                                   : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
-        int64_t input_1_offset = task_desc.inputs[1].dynamic_shape == 1
-                                   ? start * task_desc.inputs[1].dim[1] * task_desc.inputs[1].data_type
-                                   : task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type;
-        int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
-                                    ? start * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
-                                    : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
+        int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
+        int64_t input_1_offset = GmmRowOffset(task_desc.inputs[1], start);
+        int64_t output_0_offset = GmmRowOffset(task_desc.outputs[0], start);
 
+        if (single_group && task_desc.inputs[1].dynamic_shape != 1) {
+          input_1_offset = static_cast<int64_t>(data_index) * task_desc.inputs[1].dim[1] *
+                           task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+        }
+        if (single_group && task_desc.outputs[0].dynamic_shape != 1) {
+          output_0_offset = static_cast<int64_t>(data_index) * task_desc.inputs[0].dim[1] *
+                            task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+        }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                        input_list[task_desc.inputs[1].input_position] + input_1_offset, nullptr, nullptr, nullptr,
                        nullptr, nullptr, grouped_list_real, nullptr,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
-                       getTransposeData(task_desc.inputs[1].transpose_flag));
+                       getTransposeData(task_desc.inputs[1].transpose_flag),
+                        task_desc.outputs[0].data_type == sizeof(float));
       }
       return;
     }
@@ -267,11 +338,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                                task_desc.inputs[2].base_ptr_offset * task_desc.inputs[2].data_type));
     int32_t size_ = *((__gm__ int32_t *)(input_list[task_desc.inputs[3].input_position] +
                                          task_desc.inputs[3].base_ptr_offset * task_desc.inputs[3].data_type));
-    int32_t send_data_size_ = task_desc.task_split_value * hidden_size;
-
-    int32_t value = task_desc.task_index % single_expert_task_num;
-    int32_t start = value * task_desc.task_split_value * hidden_size;
-    int32_t end = (value + 1) * task_desc.task_split_value * hidden_size;
+    int64_t partition_rows = task_desc.task_split_value;
+    if (GetShmemTaskPartition(task_desc) == ShmemTaskPartition::RUNTIME_ROWS) {
+      const int64_t rows = static_cast<int64_t>(size_) / hidden_size;
+      partition_rows = (rows + single_expert_task_num - 1) / single_expert_task_num;
+    }
+    int64_t send_data_size_ = partition_rows * hidden_size;
+    const int64_t start = (task_desc.task_index % single_expert_task_num) * send_data_size_;
+    const int64_t end = start + send_data_size_;
     if (start >= size_) {
       aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
                           target_pe);
@@ -284,6 +358,25 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     target_offset_ = target_offset_ + static_cast<int64_t>(start);
     src_offset_ = src_offset_ + static_cast<int64_t>(start);
     send_data_size_ = static_cast<int64_t>(send_data_size_);
+
+    if (GetMegaMoeTransportPayload(task_desc) != MegaMoeTransportPayload::TOKENS) {
+      const auto &aux = task_desc.outputs[task_desc.num_outputs - 1];
+      GM_ADDR buffer = input_list[aux.input_position];
+      const bool returning =
+          GetMegaMoeTransportPayload(task_desc) == MegaMoeTransportPayload::TOKENS_WITH_PROBABILITY_GRADIENTS;
+      hyper_multicore::PutMemSignalKernel<float> scalar_transfer;
+      scalar_transfer.Init(ProbabilityPlane(buffer, aux.dim[1],
+                                           returning ? ProbabilityLayout::RETURNED_GRADIENT
+                                                     : ProbabilityLayout::RECEIVED),
+                           target_offset_ / hidden_size,
+                           ProbabilityPlane(buffer, aux.dim[1],
+                                            returning ? ProbabilityLayout::RECEIVED_GRADIENT
+                                                      : ProbabilityLayout::SOURCE),
+                           src_offset_ / hidden_size, send_data_size_ / hidden_size,
+                           signal, task_desc.trigger_event, 0, 1, target_pe, false, nullptr);
+      // Only the following X/dX transfer publishes the original completion event.
+      scalar_transfer.Process(false);
+    }
 
     put_mem_signal_kernel(input_list[task_desc.outputs[0].input_position] +
                             task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type,

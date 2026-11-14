@@ -23,6 +23,16 @@ import unittest
 from pathlib import Path
 
 import hyper_multicore
+from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
+from hyper_multicore.tasks.alltoall import ShmemTaskPartition
+from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
+from hyper_multicore.modules.mega_moe.probability import (
+    ProbabilityPlane, ProbabilityLayout, PROBABILITY_PLANES, PROBABILITY_DTYPE_BYTES,
+    PROBABILITY_POSITION_FORWARD, PROBABILITY_POSITION_BACKWARD,
+)
+from hyper_multicore.modules.mega_moe.task_options import (
+    MegaMoeActivationWeighting, MegaMoeTransportPayload, validate_task_options,
+)
 from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
 )
@@ -230,6 +240,56 @@ class TestRuntimeCppReader(unittest.TestCase):
         cls.reader.valid_runtime_from_launch.restype = ctypes.c_bool
         cls.reader.read_transport_and_kernel_task_types.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
         cls.reader.read_transport_and_kernel_task_types.restype = None
+
+    def test_mega_moe_task_encodings_match_cpp(self) -> None:
+        """Named payloads keep their existing wire values on both sides of the ABI."""
+        values = (ctypes.c_uint32 * 15)()
+        self.reader.read_task_option_values.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        self.reader.read_task_option_values.restype = None
+        self.reader.read_task_option_values(values)
+        expected = tuple(int(value) for value in (
+            *GroupedMatmulTaskMode, *SwiGluClampPosition, *SwiGluTaskIteration, *ShmemTaskPartition,
+            *MegaMoeActivationWeighting, *MegaMoeTransportPayload,
+        ))
+        self.assertEqual(expected, (0, 1, 2, 3, 0, 1, 0, 2, 0, 2, 0, 4, 0, 4, 8))
+        self.assertEqual(tuple(values), expected)
+
+    def test_task_option_validation_matches_cpp(self) -> None:
+        """Exercise real host and native decoders over legal and malformed flags."""
+        self.reader.valid_moe_task.argtypes = [ctypes.POINTER(TaskDescC), ctypes.c_uint32]
+        self.reader.valid_moe_task.restype = ctypes.c_bool
+        for kind in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD,
+                     TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM,
+                     TaskType.TASK_GROUPED_MATMUL):
+            for flags in (*range(32), 1 << 31):
+                for stride in (0, 512):
+                    task = TaskDescC()
+                    task.task_type = kind
+                    task.extra_value_0 = 0x3f800000
+                    task.extra_value_1 = flags
+                    position = 25 if kind == TaskType.TASK_SWI_GLU_GRAD else 16
+                    task.num_inputs = (1 if kind == TaskType.TASK_SWI_GLU else
+                                       2 if kind == TaskType.TASK_SWI_GLU_GRAD else
+                                       3 if kind == TaskType.TASK_GROUPED_MATMUL else 4)
+                    weighted = flags & (4 if kind in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD) else 12)
+                    task.num_outputs = 2 if weighted and kind != TaskType.TASK_GROUPED_MATMUL else 1
+                    task.outputs[1] = ProbabilityLayout(stride, position).descriptor()
+                    try:
+                        validate_task_options(task)
+                        valid = True
+                    except ValueError:
+                        valid = False
+                    with self.subTest(kind=kind, flags=flags, stride=stride):
+                        self.assertEqual(self.reader.valid_moe_task(ctypes.byref(task), position), valid)
+
+    def test_probability_layout_matches_cpp(self) -> None:
+        """Read scalar plane units and parameter ports from the production native ABI."""
+        values = (ctypes.c_uint32 * 8)()
+        self.reader.read_probability_layout.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        self.reader.read_probability_layout(values)
+        self.assertEqual(tuple(values), (PROBABILITY_PLANES, PROBABILITY_DTYPE_BYTES,
+                                        PROBABILITY_POSITION_FORWARD, PROBABILITY_POSITION_BACKWARD,
+                                        *ProbabilityPlane))
 
     def test_transport_and_kernel_task_types_match_cpp(self) -> None:
         """Keep transport, MHC and MegaGate tasks on distinct C++ dispatch IDs."""
