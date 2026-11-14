@@ -117,7 +117,7 @@ def _build_bwd_tensor_specs(
 
 
 def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
-                         swiglu_sv, num_cube_cores, swiglu_limit=None, expert_weight_layout="EIO"):
+                         swiglu_sv, num_cube_cores, clamp_after_activation=False, swiglu_limit=None, expert_weight_layout="EIO"):
     """Create dispatch, act_grad, w2_grad, swiglu_grad operator nodes."""
     (target, target_offset, src, src_offset, size_d,
      w2_grad_x1, w2_grad_y, act_grad_weight, act_grad_y,
@@ -176,7 +176,7 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
             task_num_fn=lambda tsv: (tsv.per_expert_seq // swiglu_sv) * tsv.single_rank_expert_num,
         ),
         tiling_position=_TILING_POS_SWIGLU_GRAD,
-        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit),
+        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit, clamp_after_activation=clamp_after_activation),
     )
     return dispatch, act_grad, w2_grad, swiglu_grad
 
@@ -245,7 +245,8 @@ def build_backward_graph(tsv: TaskSplitValue, *,
                          dtype_size:        int = 2,
                          num_cube_cores:    int = DEFAULT_CORE_SPEC.num_cube_cores,
                          swiglu_limit:      Optional[float] = None,
-                         expert_weight_layout: str = "EIO") -> ComputeGraph:
+                         expert_weight_layout: str = "EIO",
+                        clamp_after_activation: bool = False) -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
     Execution order:
@@ -292,7 +293,7 @@ def build_backward_graph(tsv: TaskSplitValue, *,
         tsv, specs,
         dispatch_sv=dispatch_sv, act_grad_sv=act_grad_sv,
         w2_grad_sv=w2_grad_sv, swiglu_sv=swiglu_sv, num_cube_cores=num_cube_cores,
-        swiglu_limit=swiglu_limit,
+        swiglu_limit=swiglu_limit, clamp_after_activation=clamp_after_activation,
         expert_weight_layout=expert_weight_layout,
     )
     gate_grad, combine, w1_grad = _build_bwd_ops_second(

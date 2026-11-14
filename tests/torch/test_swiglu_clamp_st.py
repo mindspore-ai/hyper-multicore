@@ -62,3 +62,4 @@ def test_swiglu_clamp_numerics() -> None:
         run_multicore_case(_WORKER, "test_swiglu_clamp_numerics", num_proc=1)
         run_multicore_case(_WORKER, "test_swiglu_clamp_input_gradient", num_proc=1)
         run_multicore_case(_WORKER, "test_swiglu_clamp_ub_scratch", num_proc=1)
+        run_multicore_case(_WORKER, "test_swiglu_clamp_matrix", num_proc=1)

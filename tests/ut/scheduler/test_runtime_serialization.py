@@ -37,7 +37,9 @@ from hyper_multicore.modules.mega_moe.forward.graph import (
     build_forward_graph,
 )
 from hyper_multicore.scheduler.config import (
-    MIN_CUBE_WORKER_CAPACITY,
+    GmmTaskMode,
+    VectorTaskFlags,
+    NUM_WORKERS_CUBE,
     RuntimeConfigC,
     TaskDescC,
     TaskSplitValue,
@@ -230,6 +232,16 @@ class TestRuntimeCppReader(unittest.TestCase):
         cls.reader.valid_runtime_from_launch.restype = ctypes.c_bool
         cls.reader.read_transport_and_kernel_task_types.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
         cls.reader.read_transport_and_kernel_task_types.restype = None
+
+    def test_mega_moe_task_encodings_match_cpp(self) -> None:
+        """Named payloads keep their existing wire values on both sides of the ABI."""
+        values = (ctypes.c_uint32 * 8)()
+        self.reader.read_mega_moe_task_flags.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        self.reader.read_mega_moe_task_flags.restype = None
+        self.reader.read_mega_moe_task_flags(values)
+        expected = tuple(int(value) for value in (*GmmTaskMode, *VectorTaskFlags))
+        self.assertEqual(expected, (0, 1, 2, 3, 1, 2, 4, 8))
+        self.assertEqual(tuple(values), expected)
 
     def test_transport_and_kernel_task_types_match_cpp(self) -> None:
         """Keep transport, MHC and MegaGate tasks on distinct C++ dispatch IDs."""
