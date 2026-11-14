@@ -29,6 +29,33 @@ from tests.common.mark_utils import arg_mark
 class TestMulticoreBoundary(unittest.TestCase):
     """Check the component contract without initializing a native runtime."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_experimental_options_preserve_lazy_business_imports(self) -> None:
+        """Feature: Public experimental tuning options.
+        Description: Import the options and the single executor class in a fresh CPU-only process.
+        Expectation: Options do not import the executor or NPU runtime, and the old private entry is absent.
+        """
+        code = """
+import sys
+import hyper_multicore
+assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
+from hyper_multicore.experimental import MegaMoeTuningOptions
+import hyper_multicore.experimental as experimental
+assert MegaMoeTuningOptions().dispatch_mode == 'push'
+assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
+assert 'MegaMoeTuningOptions' not in hyper_multicore.__all__
+assert not hasattr(experimental, 'MegaMoeExecutionOptions')
+assert not hasattr(hyper_multicore, '_MegaMoeExperts')
+from hyper_multicore import MegaMoeExperts
+assert MegaMoeExperts.__name__ == 'MegaMoeExperts'
+assert 'torch_npu' not in sys.modules
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code], check=False, capture_output=True, text=True,
+            env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -40,11 +67,11 @@ class TestMulticoreBoundary(unittest.TestCase):
         Expectation: The package exports its business modules and diagnostic helpers.
         """
         self.assertCountEqual(multicore.__all__, [
-            "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+            "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaKernelDiagnostics",
             "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
         ])
         self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))
-        for name in ("MegaMhc", "MegaGate", "MegaMoeExperts"):
+        for name in ("MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions"):
             self.assertTrue(callable(getattr(multicore, name)))
         for name in ("MhcState", "MegaMhcOutput", "GateOutput", "GateBackend"):
             self.assertFalse(hasattr(multicore, name))
@@ -89,7 +116,8 @@ assert router(torch.ones(1, 2, 4))[2].shape == (2, 1)
 assert MegaMhc(128).norm_weight.shape == (128,)
 experts = MegaMoeExperts(hidden_size=4, intermediate_size=4, num_experts=2, top_k=1)
 try:
-    experts(torch.ones(1, 2, 4, dtype=torch.bfloat16), torch.zeros(2, 1, dtype=torch.int32), torch.ones(2, 1))
+    experts(torch.ones(1, 2, 4, dtype=torch.bfloat16), torch.zeros(2, 1, dtype=torch.int32), torch.ones(2, 1),
+            expert_weights=(torch.empty(2, 4, 8, dtype=torch.bfloat16), torch.empty(2, 4, 4, dtype=torch.bfloat16)))
 except TypeError as error:
     assert "NPU hidden states" in str(error)
 else:

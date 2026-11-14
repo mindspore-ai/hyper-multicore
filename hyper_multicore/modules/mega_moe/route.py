@@ -79,6 +79,22 @@ class RouteMetadata:
             _elements=None,
         )
 
+    def record_stream(self, stream: Any) -> None:
+        """Retain row descriptors and cached element descriptors on their consumer stream."""
+        views = (self,) if self._elements is None else (self, self._elements[1])
+        for view in views:
+            for value in vars(view).values():
+                if isinstance(value, torch.Tensor):
+                    value.record_stream(stream)
+
+    def with_active_experts(self, active: bool, tokens: int, plan_tokens: int) -> RouteMetadata:
+        """Bind source rows and activity to both immutable descriptor views."""
+        native = self._elements
+        return replace(
+            self, all_experts_active=active, local_num_tokens=tokens, plan_tokens=plan_tokens,
+            _elements=(native[0], replace(native[1], all_experts_active=active)) if native else None,
+        )
+
 
 @dataclass(frozen=True)
 class PreparedTopKRoute:
@@ -92,13 +108,7 @@ class PreparedTopKRoute:
     maximum_received_slots: int = 0
 
 
-def _record_metadata_stream(metadata: RouteMetadata, stream: Any) -> None:
-    """Retain row descriptors and cached element descriptors on their consumer stream."""
-    views = (metadata,) if metadata._elements is None else (metadata, metadata._elements[1])
-    for view in views:
-        for value in vars(view).values():
-            if isinstance(value, torch.Tensor):
-                value.record_stream(stream)
+_record_metadata_stream = RouteMetadata.record_stream
 
 
 @dataclass(frozen=True)
@@ -302,31 +312,32 @@ def _compute_route_metadata(
 ) -> RouteMetadata:
     """Build exact element offsets without padding or route truncation."""
     if counts_by_source.device.type == "npu" and counts_by_source.dtype == torch.int32:
-        from hyper_multicore._device import device_ub_bytes
+        from hyper_multicore._device import device_ub_bytes  # pylint: disable=import-outside-toplevel
         ub = device_ub_bytes(counts_by_source.device.index)
-        e,p,l = spec.num_experts,spec.ep_size,spec.local_experts
+        e,p,local = spec.num_experts,spec.ep_size,spec.local_experts
         stride=(e+31)//32*32
         span = (p - 1) * counts_by_source.stride(0) + e
         if (counts_by_source.stride(1) == 1 and counts_by_source.stride(0) >= e
-                and ((span+7)//8*8+3*stride+2*((l+7)//8*8))*4 <= ub//4*3):
+                and ((span+7)//8*8+3*stride+2*((local+7)//8*8))*4 <= ub//4*3):
             off,sz=multicore_ops.route_offsets(counts_by_source, spec.rank_id, ub, spec.hidden_size)
             pull = spec.dispatch_mode == "pull"
-            offset_count = 4 * stride + l
+            offset_count = 4 * stride + local
             # Split once in ATen instead of dispatching a Python slice for
             # every field. Both row and element descriptors remain public views
             # of this invocation's storage; no cache can outlive its contents.
             units = 1 if off.numel() == offset_count else 2
-            offsets = off.split((e, stride - e) * 4 + (l,) if units == 1
-                                else ((e, stride - e) * 4 + (l,)) * 2)
+            offsets = off.split((e, stride - e) * 4 + (local,) if units == 1
+                                else ((e, stride - e) * 4 + (local,)) * 2)
             sizes = sz.split((e, stride - e) * (2 * units))
 
-            def describe(unit):
-                o, s = 9 * unit, 4 * unit
-                src, target, length = offsets[o + 4], offsets[o + 6], sizes[s + 2]
+            def describe(unit: int) -> RouteMetadata:
+                """Describe row or element offsets from the packed native output."""
+                offset_index, size_index = 9 * unit, 4 * unit
+                src, target, length = offsets[offset_index + 4], offsets[offset_index + 6], sizes[size_index + 2]
                 return RouteMetadata(
-                    target if pull else offsets[o], src if pull else offsets[o + 2],
-                    length if pull else sizes[s], src, target, length,
-                    offsets[o + 8], expert_capacity,
+                    target if pull else offsets[offset_index], src if pull else offsets[offset_index + 2],
+                    length if pull else sizes[size_index], src, target, length,
+                    offsets[offset_index + 8], expert_capacity,
                 )
 
             rows = describe(0)
@@ -563,10 +574,15 @@ def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
                            f"actual={[row[1] for row in rows]}")
 
 
+_INVALID_WEIGHT_MASK = 1 << 5
+
+
 def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
     """Validate every rank before any automatic allocation or SHMEM write."""
     _validate_dynamic_sizes(rows, spec)
-    if any(row[2] != rows[0][2] for row in rows):
+    if rows[0][2] & _INVALID_WEIGHT_MASK or any(row[2] != rows[0][2] for row in rows):
+        if any(row[2] & _INVALID_WEIGHT_MASK for row in rows):
+            raise ValueError("expert weights do not match the bound layout on all EP ranks")
         raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
     if any(not _valid_route_counts(row, spec.top_k) for row in rows):
         raise RuntimeError("MegaMoe counts must describe the actual distinct Top-K routes")
@@ -639,13 +655,13 @@ def _route_descriptor_key(raw: list[list[int]]) -> tuple[tuple[int, ...], ...]:
 
 
 def _reuse_previous_route(
-    previous: Any, payload: torch.Tensor, source_rows: list | None, device: Any, stream: Any,
+    previous: Any, raw: list[list[int]], source_rows: list | None, device: Any, stream: Any,
 ) -> tuple[tuple[int, int, int], list[list[int]], RouteMetadata | None]:
     """Reuse the last immutable descriptor when only the route snapshot repeated."""
     if source_rows is not None:
         source_rows.extend(previous.source_totals)
     previous.wait(device, stream)
-    return previous.summary, payload.tolist(), previous.metadata
+    return previous.summary, raw, previous.metadata
 
 
 def _reuse_cached_route(
@@ -654,7 +670,10 @@ def _reuse_cached_route(
 ) -> tuple[tuple[int, int, int], list[list[int]], RouteMetadata | None]:
     """Validate and reuse one exact cached descriptor."""
     _validate_dynamic_sizes(raw, spec)
-    if any(row[2] != raw[0][2] for row in raw):
+    expected_mask = raw[0][2] & ~_INVALID_WEIGHT_MASK
+    if any(row[2] != expected_mask for row in raw):
+        if any(row[2] & _INVALID_WEIGHT_MASK for row in raw):
+            raise ValueError("expert weights do not match the bound layout on all EP ranks")
         raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
     if source_rows is not None:
         source_rows.extend(cached.source_totals)
@@ -693,10 +712,11 @@ def _read_cached_route(
     workspace.route_cache_probe_after = 0
     raw = payload.tolist()
     if same_topology and previous.raw == raw:
-        return _reuse_previous_route(previous, payload, source_rows, device, stream)
+        return _reuse_previous_route(previous, raw, source_rows, device, stream)
     key = (signature, _route_descriptor_key(raw))
     cached = cache.get(key) if isinstance(cache, OrderedDict) else None
     if cached is not None:
+        cache.move_to_end(key)
         return _reuse_cached_route(cached, raw, spec, source_rows, device, stream)
     summary = _summarize_host_route(raw, spec)
     if source_rows is not None:
@@ -738,7 +758,8 @@ def _dynamic_route_metadata(
     spec: MegaMoeSpec, capacity: int,
 ) -> RouteMetadata:
     """Keep wider cache misses on device instead of rebuilding large Host descriptors."""
-    if counts.device.type != "npu" and host_rows is not None and spec.ep_size * spec.num_experts <= _HOST_DESCRIPTOR_MAX_COUNTS:
+    if (counts.device.type != "npu" and host_rows is not None
+            and spec.ep_size * spec.num_experts <= _HOST_DESCRIPTOR_MAX_COUNTS):
         return _host_route_metadata(host_rows, spec, capacity, counts.device)
     counts_by_source = gathered[:, 3:]
     # The native offsets kernel reads only the source matrix. Materialize the
@@ -896,10 +917,9 @@ def _finalize_dynamic_route(
             start = spec.rank_id * spec.local_experts
             active = all(sum(row[3 + expert] for row in host_rows) > 0
                          for expert in range(start, start + spec.local_experts))
-            native = metadata._elements
-            metadata = replace(metadata, all_experts_active=active,
-                               _elements=(native[0], replace(native[1], all_experts_active=active)) if native else None)
-        metadata = replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
+            metadata = metadata.with_active_experts(active, tokens, plan_tokens)
+        else:
+            metadata = replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
         if host_rows is not None:
             _cache_host_route(workspace, spec, host_rows, summary, metadata, device)
     received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
@@ -946,6 +966,7 @@ class _EmptyTopKOutput(torch.autograd.Function):  # pylint: disable=abstract-met
 
     @staticmethod
     def forward(ctx: Any, expert_output: torch.Tensor, probabilities: torch.Tensor) -> torch.Tensor:
+        """Return empty token output while retaining Router gradient metadata."""
         ctx.probability_shape = probabilities.shape
         ctx.probability_dtype = probabilities.dtype
         ctx.probability_device = probabilities.device
@@ -953,6 +974,7 @@ class _EmptyTopKOutput(torch.autograd.Function):  # pylint: disable=abstract-met
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Preserve requested expert and empty probability gradients."""
         grad_experts = grad_output if ctx.needs_input_grad[0] else None
         grad_probabilities = (grad_output.new_empty(ctx.probability_shape, dtype=ctx.probability_dtype,
                                                   device=ctx.probability_device)

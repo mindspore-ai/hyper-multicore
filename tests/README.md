@@ -146,15 +146,28 @@ launcher 已经负责启动分布式 worker，以下 pytest 命令不要再套�
 | --- | --- | --- |
 | [test_mega_gate.py](torch/test_mega_gate.py) | 1 | text/vision 路由、正反向、数学顺序、动态形状、训练图和符号解析并发 |
 | [test_mega_mhc.py](torch/test_mega_mhc.py) | 1 | 同形状前向/反向在多 stream 下与串行 native 执行结果一致 |
-| [test_mega_moe.py](torch/test_mega_moe.py) | 按用例为 2、4 或 8 | 输出及完整梯度、SGD、push/pull、Router、容量、生命周期、subgroup 和动态 token |
-| [test_swiglu_clamp_st.py](torch/test_swiglu_clamp_st.py) | 1 | clipped SwiGLU 数值 |
+| [test_mega_moe.py](torch/test_mega_moe.py) | 按用例为 2、4 或 8 | 输出及完整梯度、概率/clamp 位置、checkpoint 重算、SGD、push/pull、Router、容量、生命周期、subgroup 和动态 token |
+| [test_swiglu_clamp_st.py](torch/test_swiglu_clamp_st.py) | 1 | SiLU 前后 clamp 的前向与反向数值、边界梯度 |
 | [test_mega_moe_profiling.py](torch/test_mega_moe_profiling.py)、[test_mega_moe_tensor_dump.py](torch/test_mega_moe_tensor_dump.py) | 2 | kernel trace 和 tensor dump |
 | [shmem/test_binding.py](torch/shmem/test_binding.py) | 按用例为 1 或 2 | 分配、释放、通信、stream 顺序、错误及原生日志 |
 | [shmem/test_all_gather.py](torch/shmem/test_all_gather.py) | 按用例为 1、2、4 或 8 | all-gather 边界、数据正确性、stream 可见性和设备 guard |
 
-MoE 基础精度用例需要 2 卡，Router、subgroup、group-list 和计时 smoke 需要 4 卡，
+MoE 基础精度和 `test_mega_moe_numerical_modes` 用例需要 2 卡，Router、subgroup、group-list 和计时 smoke 需要 4 卡，
 自动 token 用例需要 8 卡，包含变长/空 rank、容量增长及保留图回归。SHMEM 的设备 guard 用例虽然只有一个 worker，也需要两张可见卡。
 `allcards` 标记不等于固定需要 8 卡，实际数量以 launcher 的 `num_proc`/`num_devices` 为准。
+
+`test_mega_moe_native_bitwise` 是需要源码中 `examples/` 的 8 卡 level1 用例，
+直接对照 `examples.moe.experts.NativeExperts`。测试图只包含 routed experts，
+不含 attention、norm 或 shared expert；Torch/NPU 确定性关闭，HCCL 确定性环境变量清除。
+push/pull 分别运行 4 步，使用 E64、top-k 8、4096 tokens/rank、H=5120、I=1792、B0、无 clamp。
+每步先检查 Native A/A，再对输出、dX、路由概率梯度和两组专家权重梯度进行完整逐字节比较，
+随后检查相同 FP32 master AdamW 的权重、状态以及回写的 BF16 参数。
+任一 rank 不一致即失败，不使用误差容限；此用例不代表任意形状或整网训练的 bitwise 保证。
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+python -m pytest tests/torch/test_mega_moe.py::test_mega_moe_native_bitwise -v -s
+```
 
 ### 查看将要运行的用例
 
@@ -173,9 +186,21 @@ python -m pytest tests/torch/test_mega_gate.py::test_mega_gate_basic_parity -v -
 # 双卡 MoE 精度。
 export ASCEND_RT_VISIBLE_DEVICES=0,1
 python -m pytest tests/torch/test_mega_moe.py::test_mega_moe_level0_precision -v -s
+
+# 双卡 MoE 数值模式：概率前后位置 × 三种 clamp 配置。
+python -m pytest tests/torch/test_mega_moe.py::test_mega_moe_numerical_modes -v -s
 ```
 
 参数化用例的具体 ID 以 collect 输出为准。复制该 ID 并加引号，可以只运行其中一项。
+
+`test_mega_moe_numerical_modes` 在一个双卡 worker 中覆盖六种配置：
+通过公开的 `MegaMoeNumericsOptions` 配置 `apply_probs_before_fc2=False/True`，
+分别搭配不 clamp、SiLU 前 clamp、SiLU 后 clamp，使用 `numerics_options=` 传给执行器。
+每种配置分别执行普通 forward/backward 和 non-reentrant checkpoint，检查输出、输入梯度、
+路由概率梯度及两组专家权重梯度，并确认 checkpoint 实际触发重算。
+六种配置中分配 push/pull 和 EIO/EOI 覆盖，不表示这些维度的完整笛卡尔积。
+输入包含 `gate=0.625, limit=0.5` 的位置判别值、up clamp 边界、选中概率为零及冷专家。
+该入口的收集或 CPU 检查只能验证测试接线；数值结果须以匹配 native payload 的真实两卡运行日志为准。
 
 ### 组件或完整套件
 

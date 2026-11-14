@@ -38,10 +38,10 @@ example_dir=$(mktemp -d)
 cp examples/mega_moe_minimal.py "$example_dir/"
 cd "$example_dir"
 export ASCEND_RT_VISIBLE_DEVICES=0,1
-torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py --dispatch-mode push
+torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py
 ```
 
-Use `--dispatch-mode pull` for pull dispatch. The example runs forward and
+The example runs forward and
 backward and prints its shape, native build identity and elapsed time.
 Use `--warmup` and `--iterations` to increase sampling. The [examples guide](examples/README.md)
 provides complete [MoE](examples/moe/README.md) and [MHC](examples/mhc/README.md)
@@ -53,6 +53,13 @@ Applications import the public components directly:
 from hyper_multicore import MegaMoeExperts, MegaGate, MegaMhc
 from hyper_multicore.diagnostics import MegaKernelDiagnostics
 ```
+
+`MegaMoeExperts` provides one stable entry point for model inputs; the public, stable
+`MegaMoeNumericsOptions` configures numerical semantics through `numerics_options=`.
+Client tuning uses the public, API-unstable `hyper_multicore.experimental.MegaMoeTuningOptions`
+through `tuning_options=`; its fields do not carry cross-version compatibility guarantees.
+See the [MegaMoE component guide](hyper_multicore/README.md#megamoeexperts) for numerical options,
+default execution policies and migration details.
 
 See the [component guide](hyper_multicore/README.md) for configuration and usage.
 Activate native paths before starting a Python process that uses the operators.

@@ -21,11 +21,12 @@ import os
 
 import torch
 import torch.distributed as dist
-import torch_npu  # pylint: disable=unused-import
+import torch_npu  # noqa: F401  # pylint: disable=unused-import
 
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.diagnostics import schedule
 from hyper_multicore.diagnostics import dump as tensor_dump
+from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts as _MegaMoeExperts
 from tests.torch import _test_mega_moe as common
 
 
@@ -45,13 +46,12 @@ _DUMP_TENSORS = (
 
 def _build_layer(shape: common.MoeShape) -> MegaMoeExperts:
     """Construct the small representative two-rank MegaMoe layer."""
-    return MegaMoeExperts(
+    return _MegaMoeExperts(
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
         dispatch_mode=os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
-        ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=common.DEVICE, dtype=torch.bfloat16)
 

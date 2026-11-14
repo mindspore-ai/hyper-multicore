@@ -17,8 +17,10 @@ import math
 from collections import Counter, defaultdict
 
 from typing import Any
+from dataclasses import dataclass
 
-from hyper_multicore.scheduler.config import GmmTaskMode, RuntimeConfigC, TaskSplitValue, TaskType
+from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
+from hyper_multicore.scheduler.config import RuntimeConfigC, TaskSplitValue, TaskType
 from hyper_multicore.scheduler.graph import ComputeGraph, OpType
 
 
@@ -105,14 +107,19 @@ def pipeline_cube_queue(
     """Keep producer/consumer projections near each other for bounded expert lookahead."""
     ids = list(config.cube_task_indices[:config.task_index_num[0]])
     stages = defaultdict(lambda: defaultdict(list))
+    roles = {}
+    start = 0
+    for operator in graph.topological_sort():
+        for task_id in range(start, start + operator.task_num):
+            roles[task_id] = operator.name
+        start += operator.task_num
     for task_id in ids:
         task = config.all_tasks[task_id]
-        stages[task.outputs[0].input_position][task.task_index // workers].append(task_id)
+        stages[roles[task_id]][task.task_index // workers].append(task_id)
     backward = any(op.name == "swiglu_grad" for op in graph.topological_sort())
     first_ops = ("w2_grad", "act_grad") if backward else ("up_proj",)
     second_ops = ("gate_grad", "w1_grad") if backward else ("down_proj",)
-    first = tuple(graph.get_op(name).param_positions[-1] for name in first_ops)
-    second = tuple(graph.get_op(name).param_positions[-1] for name in second_ops)
+    first, second = first_ops, second_ops
     reordered = []
     for expert in range(topology.single_rank_expert_num):
         for stage in first:
@@ -141,7 +148,7 @@ def collapse_batched_tasks(config: Any, num_cube_cores: int) -> None:
         if task.task_index < num_cube_cores:
             # Current native ABI: 2 waits for the original per-expert producer;
             # BATCHED_READY consumes the already-collapsed stage event.
-            task.extra_value_1 = GmmTaskMode.BATCHED
+            task.extra_value_1 = GroupedMatmulTaskMode.BATCHED
             retained.append(task_id)
             stages.setdefault(stage, task.trigger_event)
         else:
@@ -159,7 +166,7 @@ def collapse_batched_tasks(config: Any, num_cube_cores: int) -> None:
         if task.dependent_event in mapping:
             task.dependent_event = mapping[task.dependent_event]
             if task.task_type == TaskType.TASK_GROUPED_MATMUL:
-                task.extra_value_1 = GmmTaskMode.BATCHED_READY
+                task.extra_value_1 = GroupedMatmulTaskMode.BATCHED_READY
     config.task_index_num[0] = len(retained)
     for index, task_id in enumerate(retained):
         config.cube_task_indices[index] = task_id
@@ -167,3 +174,33 @@ def collapse_batched_tasks(config: Any, num_cube_cores: int) -> None:
         task = config.all_tasks[task_id]
         if task.dependent_event:
             assert config.all_event_num_triggers[task.dependent_event] > 0
+
+
+@dataclass(frozen=True)
+class MegaMoeSchedulePolicy:
+    """Independent task ordering and ready selection after granularity lowering."""
+
+    vector_ready_queue: bool = False
+    pipeline_vector: bool = False
+    pipeline_cube: bool = False
+    batch_experts: bool = False
+    dependency_poll_interval: int = 5
+
+    def apply(self, config: RuntimeConfigC, graph: ComputeGraph, topology: TaskSplitValue, workers: int) -> None:
+        """Schedule existing typed stages while preserving their task/credit contract."""
+        if self.batch_experts and (self.pipeline_vector or self.pipeline_cube):
+            raise ValueError("expert batching and per-expert pipeline ordering are separate policies")
+        queue = list(config.cube_task_indices[:config.task_index_num[0]])
+        queue += list(config.vector_task_indices[:config.task_index_num[1]])
+        for task_id in queue:
+            config.all_tasks[task_id].extra_value_2 = self.dependency_poll_interval
+        config.vector_ready_queue = int(self.vector_ready_queue)
+        if self.batch_experts:
+            collapse_batched_tasks(config, workers)
+            return
+        if self.pipeline_vector:
+            pipeline_vector_queue(config, graph, topology)
+        if self.pipeline_cube:
+            pipeline_cube_queue(config, graph, topology, workers)
+            for task_id in config.cube_task_indices[:config.task_index_num[0]]:
+                config.all_tasks[task_id].extra_value_1 = GroupedMatmulTaskMode.SINGLE_GROUP

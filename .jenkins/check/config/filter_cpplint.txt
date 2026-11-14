@@ -1,3 +1,12 @@
 # CANN SDK and assembled operator headers use flat or adjacent include paths.
 "hyper-multicore/hyper_multicore/ops"                      "build/include_subdir"
 "hyper-multicore/hyper_multicore/shmem/ccsrc/cann"         "build/include_subdir"
+
+# Match the existing CPPLINT.cfg policy for fused CANN implementation includes.
+"hyper-multicore/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp"       "build/include"
+"hyper-multicore/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp"  "build/include"
+# AscendC namespace imports follow the included SDK kernel implementation style.
+"hyper-multicore/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp"       "build/namespaces"
+"hyper-multicore/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp"  "build/namespaces"
+"hyper-multicore/hyper_multicore/ops/hyper_mega_moe/op_kernel/put_mem_signal/put_mem_signal_kernel.cpp"       "build/namespaces"
+"hyper-multicore/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/put_mem_signal/put_mem_signal_kernel.cpp"  "build/namespaces"

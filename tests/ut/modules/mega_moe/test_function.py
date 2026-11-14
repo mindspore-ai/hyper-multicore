@@ -15,7 +15,6 @@
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
 import unittest
-from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -259,6 +258,7 @@ class TestMegaMoeFunction(unittest.TestCase):
 
         def release_workspace(*, stream=None) -> None:
             """Make accidental reads after the lease immediately observable."""
+            self.assertIs(stream, workspace.lease_stream)
             workspace.expert_buffer.fill_(float("nan"))
             workspace.routed_buffer.fill_(float("nan"))
 

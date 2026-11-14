@@ -257,6 +257,7 @@ def _compose_hyper_multicore_ops(
             )
             continue
         shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
+        shutil.copytree(_MULTICORE_OPS / "common", operator_root / "op_kernel" / "common")
         shutil.copytree(
             ops_nn_copy / "activation" / "swi_glu" / "op_kernel",
             operator_root / "op_kernel" / "swi_glu",

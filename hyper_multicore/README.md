@@ -146,6 +146,17 @@ Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家，当前支持
 先按[构建与交付](../docs/build.md)运行 `bash build.sh`，激活 CANN 和 native payload，
 并为所有 EP rank 配置相同的 `HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT`（如 `tcp://<rank-zero-ip>:<port>`）。
 
+模型执行和数值配置从 `hyper_multicore` 导入，执行调优配置从 `hyper_multicore.experimental` 导入：
+
+| 公开接口 | 用途 | 使用约定 |
+| --- | --- | --- |
+| `MegaMoeExperts` | 配置模型尺寸和 EP 组，执行专家前反向并管理执行资源 | 公开稳定 API；专家参数由调用方持有，每次 forward 传入。 |
+| `MegaMoeNumericsOptions` | 配置 SwiGLU 裁剪及路由概率的应用位置 | 公开稳定 API；通过 `numerics_options=` 传入，按来源模型选择数值语义。 |
+| `MegaMoeTuningOptions` | 配置通信模式、容量倍数和通信分片 | 公开实验 API；通过 `tuning_options=` 传入。字段、可选值及默认执行策略不保证跨版本兼容，升级时须重新验证。 |
+
+实验 API 同样校验参数和支持范围；API 稳定性不等于跨硬件或跨版本逐 bit 数值一致。
+概率与 clamp 的位置由调用方明确选择，调度器不会自动改变这些数值语义。
+
 在业务进程中选定当前 NPU、初始化 HCCL 进程组后，以下为两卡 EP 示例：
 
 ```python
@@ -158,19 +169,22 @@ experts = MegaMoeExperts(
     intermediate_size=128,
     num_experts=4,
     top_k=2,
-    ep_size=dist.get_world_size(),
     ep_group=dist.group.WORLD,
-).to(device="npu", dtype=torch.bfloat16)
+)
 
-output = experts(hidden_states, topk_ids, topk_weights)
+# 当前 EP rank 的模型参数，FSDP 场景需在专家模块的 unshard 后取得。
+gate_up_weight = torch.nn.Parameter(torch.empty(2, 512, 256, device="npu", dtype=torch.bfloat16))
+down_weight = torch.nn.Parameter(torch.empty(2, 128, 512, device="npu", dtype=torch.bfloat16))
+torch.nn.init.normal_(gate_up_weight, std=0.02)
+torch.nn.init.normal_(down_weight, std=0.02)
+output = experts(hidden_states, topk_ids, topk_weights, expert_weights=(gate_up_weight, down_weight))
 ```
 
-`ep_group` may also be a PP/DP-local EP subgroup; `ep_size` is inferred from it.
-If supplied explicitly, `ep_size` must match the group size.
-MegaMoE uses group-local expert ownership and does not take a TP-size argument.
-Subgroups exchange independent CANN bootstrap IDs internally and do not use a
-shared WORLD rendezvous port. See the [SHMEM lifecycle](../docs/shmem.md) for
-cross-node interface selection and group-local shutdown requirements.
+`ep_group` 也可以是 PP/DP 内的 EP 子组，本地专家数量及归属由该组的大小和组内 rank 顺序确定。
+EP 大小从 `ep_group` 推导。独立单 rank 可省略 `ep_group`，
+已初始化的多 rank 作业必须显式传入，包括使用单成员 EP 子组的情况。
+MegaMoe 不接受 TP 大小参数。子组内部交换各自的 CANN bootstrap ID，不使用共享 WORLD rendezvous 端口。
+跨节点网卡选择及组内关闭要求见 [SHMEM 生命周期](../docs/shmem.md)。
 
 ### 下游模型集成
 
@@ -188,11 +202,13 @@ DSV4.1、Qwen 和 TP/SP/CP/EP/FSDP 模型适配器及其集成测试由 HyperPar
 - 可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram。
   省略时内部统计；传入时由调用方保证与当前 ID 一致。contiguous INT32 可直接使用，
   INT64 或非连续输入会转换。
-- 默认 `expert_weight_layout="EIO"`：`gate_up_weight: [E/EP, H, 2I]`、
-  `down_weight: [E/EP, I, H]`。EIO 非连续权重每次执行时转换为连续存储，梯度回到原参数。
-  `expert_weight_layout="EOI"`：`gate_up_weight: [E/EP, 2I, H]`、`down_weight: [E/EP, H, I]`，
-  必须使用连续存储，native 直接读取，梯度按相同物理布局返回。
-  gate/up 顺序、SwiGLU 定义和 `swiglu_limit` 必须与来源模型一致。
+- 每次 forward 必须传入调用方持有的 `expert_weights=(gate_up_weight, down_weight)`。
+  两个本地权重须采用相同布局：EIO 为 `([E/EP, H, 2I], [E/EP, I, H])`，EOI 为
+  `([E/EP, 2I, H], [E/EP, H, I])`。首次使用时依据两组形状自动识别并绑定布局；
+  同一资源组和对应 EP rank 后续须保持相同布局。形状不能证明方阵是否被错误转置，
+  gate/up 顺序、SwiGLU 定义、clamp 位置和概率应用位置仍须由调用方与来源模型对齐。
+  EIO 非连续权重每次执行时转换为连续存储，梯度回到原参数；EOI 须连续，native 直接读取。
+  执行器不拥有参数或优化器状态；FSDP 应在参数所属模块的 forward 内传入当前 unshard 权重。
 
 Router 已有精确计数时，可直接传入：
 
@@ -201,49 +217,164 @@ output = experts(
     hidden_states,
     topk_ids,
     topk_weights,
+    expert_weights=(gate_up_weight, down_weight),
     tokens_per_expert=tokens_per_expert,
 )
 ```
 
-### 自动 token 与通信容量
+### 模型数学与数值语义
 
+`MegaMoeNumericsOptions` 是公开稳定的数值配置接口，可直接从 `hyper_multicore` 导入。
+类型定义位于 `modules/mega_moe/numerics.py`，由 MegaMoE 模块管理。
+通过 `MegaMoeExperts(..., numerics_options=...)` 按模型逐层配置以下三个字段：
+
+| 字段 | 默认值 | 语义 |
+| --- | --- | --- |
+| `swiglu_limit` | `None` | 不进行 clamp；提供时须为正、有限且可由 FP32 表示的值。gate 分支只截上界，up 分支截到 `[-limit, limit]`。 |
+| `clamp_after_silu` | `False` | `False` 在 SiLU 前截 gate；`True` 在 SiLU(gate) 后、乘 up 前截 gate 激活。仅在提供 `swiglu_limit` 时生效。 |
+| `apply_probs_before_fc2` | `False` | `False` 在 FC2 后对专家输出加权；`True` 对 BF16 SwiGLU 激活加权，再送入 FC2。 |
+
+```python
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+
+# 按来源模型选择数值语义；这里仅演示配置方式。
+numerics = MegaMoeNumericsOptions(
+    swiglu_limit=7.0,
+    clamp_after_silu=True,
+    apply_probs_before_fc2=True,
+)
+experts = MegaMoeExperts(
+    hidden_size=512, intermediate_size=128, num_experts=4, top_k=2,
+    ep_group=ep_group,
+    numerics_options=numerics,
+)
+```
+
+`clamp_after_silu` 和 `apply_probs_before_fc2` 必须是布尔值。
+数值配置和调优配置都是不可变的 frozen dataclass；执行器在构造时校验并规范化配置，
+不支持通过修改实例属性切换数值路径。省略 `numerics_options` 与传入
+`MegaMoeNumericsOptions()` 使用相同的默认语义。
+执行器保留 `swiglu_limit`、`clamp_after_silu` 和 `apply_probs_before_fc2` 三个只读查询属性；
+改变语义应创建新的配置和执行器。
+
+设 FC1 的 BF16 gate/up 输出为 `g`、`u`，clamp 上限为 `L`。转为 FP32 后，
+两种 clamp 的计算顺序可写成：
+
+```python
+gate, up = g.float(), u.float()
+
+# clamp_after_silu=False
+activation = torch.nn.functional.silu(gate.clamp(max=L)) * up.clamp(-L, L)
+
+# clamp_after_silu=True
+activation = torch.nn.functional.silu(gate).clamp(max=L) * up.clamp(-L, L)
+```
+
+这里的 after 指 SiLU 之后，不是对完整 SwiGLU 乘积截断。两者定义不同的函数和梯度；
+backward 和重算使用对应的 clamp 位置。`swiglu_limit=None` 时两种位置都走不截断路径。
+
+`apply_probs_before_fc2=True` 保留两处 BF16 舍入：先将 SwiGLU 激活写为 BF16，
+再以 FP32 乘对应路由概率，舍入为 BF16 后供 FC2 使用。其顺序可写成：
+
+```python
+activation_bf16 = activation.to(torch.bfloat16)
+fc2_input = (activation_bf16.float() * probability.float()).to(torch.bfloat16)
+```
+
+`probability` 在此示意中按专家行广播。把概率直接融合进尚未舍入的 FP32 激活，再只转换一次，
+会改变这个数值契约。FC2 前后乘概率即使在实数运算中等价，BF16 路径的舍入也可能不同。
+默认的 `None`、`False`、`False` 表示不截断、FC2 后加权；需要其他语义时须显式设置，
+并同时检查输出、输入梯度、权重梯度和路由概率梯度。
+
+FC2 前加权的反向使用未加权、已经舍入的 BF16 激活计算 `dp`，再将 FC2 输入梯度以
+FP32 乘 `p` 并舍入为 BF16。它通过重算恢复未加权激活，不执行除以 `p`；因此 `p=0`
+时仍计算对应的 `dp`。`dW2` 使用前向实际送入 FC2 的加权激活。checkpoint 重算执行
+相同的裁剪位置、概率位置和两处 BF16 舍入。
+
+裁剪梯度在等号边界保留：gate 在裁剪变量不大于 `L` 时传递梯度，up 在
+`-L <= u <= L` 时传递梯度；越过边界后相应分支梯度为零。SiLU 前模式的 gate
+裁剪变量为 `g`，SiLU 后模式为 `SiLU(g)`。跨实现验收需同时核对这些边界和规约顺序。
+
+底层 plan 的 `weight_grad_dtype` 控制专家权重 partial dW 的写出 buffer 精度，属于内部框架对接选项。
+它不由当前公共构造器暴露，也不保证 BF16 叶子参数的最终 `.grad` 为 FP32；
+autograd、分布式梯度归并及优化器状态各自还有精度契约。
+
+### 自动 token 与通信容量
 
 MegaMoe 从实际 forward 输入自动维护容量，无需 token 上限或动态/静态模式开关。
 构造时不分配通信 workspace，首次绑定从128行的最小 source token 容量开始，按实际需求增长并保留高水位。
 调度计划按几何桶缓存，待反向图保留原计划；桶大小不改变真实 token 激活形状。
 初次绑定、进入新桶及扩容有额外成本；稳定容量和已缓存计划可复用。
 
-`dispatch_mode="push"` 为默认值，也可选择 `"pull"`；两者的 combine 都使用 PUT。
-模式须在 EP rank 间一致，不能在同一 workspace 上切换。pull 在容量准备和 claim 后才写 source。
+默认使用 push 分发，接收容量初始及增长倍数均为 `1.25`，内部自动扩容，路由不丢 token。
+通信模式、容量倍数和切分大小通过下方的公开实验调优配置设置；省略 `tuning_options`
+或传入默认的 `MegaMoeTuningOptions()` 使用相同的有效配置。
 
-当前自动 token 模式下，push/pull 均要求 eager 执行，不支持 NPU graph capture；
+当前自动 token 模式要求 eager 执行，不支持 NPU graph capture；
 即使 token 数和容量已稳定，检测到当前 stream 正在捕获时仍会抛出 `RuntimeError`。
 
-| 参数 | push 默认值 | 作用 |
-| --- | --- | --- |
-| `initial_capacity_factor` | `1.25` | 首次接收容量相对预留 source 路由行数的倍数 |
-| `capacity_growth_factor` | `1.25` | 接收容量增长倍数；`1.0` 仅满足当次需求 |
-
-两个因子须是有限数且不小于1；省略或 `None` 采用默认值。pull 不接受显式容量因子。
-即使 token 数固定，热点也可能触发 push 接收区扩容；路由不丢 token。
+即使 token 数固定，热点也可能触发 push 接收区扩容。
 source 容量、调度行数与实际 owner 接收量分别维护：source/返回区按预留容量，
 计算中间张量及待反向激活按实际接收量分配，空 owner 保留一行 ABI 占位。
-pull 的接收区位于普通 HBM，不属于 SHMEM source/返回区。
 
 扩容可能集体重启同一 SHMEM root 的 runtime，再恢复受管 workspace；外部专家参数不移动。
 `HYPER_MULTICORE_SHMEM_HEAP_SIZE` 可设置固定字节预算；预算不足或不能安全重启时明确失败。
 容量策略、固定预算和失败恢复的完整契约见 [SHMEM runtime restart](../docs/shmem.md#4-runtime-restart)。
+
+### 公开实验性调优配置
+
+普通模型使用 `MegaMoeExperts` 的默认配置。需要调优时，从 `hyper_multicore.experimental`
+显式导入 `MegaMoeTuningOptions`，仍使用同一个 `MegaMoeExperts` 入口。
+配置对象是不可变的 frozen dataclass，目前包含以下五个字段：
+
+| 参数 | 默认值 | 作用与约束 |
+| --- | --- | --- |
+| `dispatch_mode` | `"push"` | `"push"` 用 PUT 分发，`"pull"` 用 GET 分发；两者的 combine 均使用 PUT。 |
+| `initial_capacity_factor` | `None`；push 实际为 `1.25` | push 初始接收行数相对预留 source 路由行数的倍率；须为有限数且不小于 `1.0`，pull 不接受显式值。 |
+| `capacity_growth_factor` | `None`；push 实际为 `1.25` | push 中 source token 和接收容量的扩容倍率；`1.0` 按当次需求对齐扩容。须为有限数且不小于 `1.0`，pull 不接受显式值。 |
+| `dispatch_split` | `128` | 正反向 dispatch 的通信分片行数，须为 `128` 的正整数倍。 |
+| `combine_split` | `128` | 正反向 combine 的通信分片行数，须为 `128` 的正整数倍。 |
+
+push 初始接收容量按 `ceil(min(initial_capacity_factor, EP) × 预留 source token 数 × top_k)`
+计算后向上对齐到 `128` 行，`EP` 为 `ep_group` 的成员数；首次绑定的预留 source token 数为 `128`。
+两个容量因子不接受布尔值。
+自动 token 模式下，pull 的 source 容量仍由内部按 `1.25` 增长；显式 heap 预算不足以支持几何扩容时，
+运行时会尝试只满足本次最小需求，仍不足则报错。不同策略的性能取决于实际负载，须分别测量。
+
+```python
+import torch.distributed as dist
+from hyper_multicore import MegaMoeExperts
+from hyper_multicore.experimental import MegaMoeTuningOptions
+
+experts = MegaMoeExperts(
+    hidden_size=512, intermediate_size=128, num_experts=4, top_k=2,
+    ep_group=dist.group.WORLD,
+    tuning_options=MegaMoeTuningOptions(
+        dispatch_mode="pull", dispatch_split=128, combine_split=128,
+    ),
+)
+```
+
+执行器在构造时绑定配置，改变执行策略应创建新的配置和执行器。
+同一个 EP 组的对应层必须使用一致的有效配置，同一个 workspace 不能切换通信模式。
+`batch_experts`、`nominal_schedule` 及 native task options 由内部计划和调度策略管理，
+不属于公开调优配置。参数、checkpoint 与优化器状态由外层模型管理，接入方式见
+[Checkpoint 与参数归属](../examples/README.md#checkpoint与参数归属)。
 
 ### 资源共享与关闭
 
 相同配置的串行层可在首次 forward 前共享 workspace，各层参数、梯度和待反向激活仍独立：
 
 ```python
-MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.layers)
+MegaMoeExperts.share_execution_resources(layer.mlp.experts.executor for layer in model.layers)
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-两条路径支持 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
+共享组内的层必须具有相同的具体类型、规范化有效配置和权重布局；各 EP rank 对应层也须一致。
+配置比较使用规范化后的字段值，不依赖 `MegaMoeNumericsOptions` 或 `MegaMoeTuningOptions`
+的对象身份；省略配置与显式默认配置可以共享。
+概率位置、clamp 位置和上限参与配置匹配，数值语义不同的层不能共享同一执行资源组。
+支持 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
 关闭。模块 GC 仅登记使用权释放，不执行 collective；下一个资源组
 首次 forward 时，所有 SHMEM Root rank 一起核对资源表，只复用各 rank 都无成员且无待反向图的兼容
 workspace，其余可回收的孤儿 workspace 当场释放。此协调不在已绑定模型的每步 forward 中执行。
@@ -286,8 +417,8 @@ MegaKernel 内部阶段采集方式见 [Profiling 指南](../docs/profiling.md)�
 
 ### 从已有模块接入
 
-`MegaMoeExperts.from_module(source, top_k=..., ep_group=...)` 接受已 materialize 的本地
-SwiGLU `w1/w3/w2` 权重并复制为 EIO 或 EOI Parameters；不会迁移优化器状态。
+`MegaMoeExperts` 不创建或转换专家参数。已有模型应在参数持有模块的 forward 内传入当前本地专家权重；
+若 gate/up 分开保存，模型侧需按正确顺序合并或调整参数布局，并处理对应的 checkpoint 与优化器状态。
 `MegaGate.from_module(source, ...)` 绑定原 Router 的投影与修正偏置 Parameters，
 `MegaMhc.from_module(source)` 绑定原四流 mHC 的参数与数学配置，不替换这些参数对象。
 应在模块替换后创建优化器。Gate 修正偏置及 MHC 映射参数在 `.bfloat16()` / `.to()` 时保留 FP32。

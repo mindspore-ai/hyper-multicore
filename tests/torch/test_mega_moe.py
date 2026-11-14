@@ -69,6 +69,32 @@ def test_mega_moe_probability_positions(
     )
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
+def test_mega_moe_numerical_modes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Check all six probability/clamp modes and full gradients with real checkpoint replay."""
+    _run_acceptance_worker(
+        monkeypatch, tmp_path, "test_numerical_modes", 2, "_test_mega_moe_dynamic_tokens.py",
+    )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_native_bitwise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Compare pure routed experts with the example Native EP, including AdamW, without determinism."""
+    if not (Path(__file__).resolve().parents[2] / "examples" / "_native.py").is_file():
+        pytest.skip("the NativeExperts baseline requires the source-tree examples")
+    monkeypatch.delenv("HCCL_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("HCCL_DETERMINISTIC_OP_EXPANSION", raising=False)
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
+    _run_acceptance_worker(
+        monkeypatch, tmp_path, "test_mega_moe_native_bitwise", 8, "_test_mega_moe_native_bitwise.py",
+    )
+
+
 def _prepare_torch_multicore_test_environment() -> None:
     """Activate multicore and require a payload built for the Torch framework."""
     prepare_multicore_test_environment()
@@ -100,6 +126,14 @@ def _run_precision_worker(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_mega_moe_level0_precision(monkeypatch) -> None:
     """Compare EIO/EOI output, input/route/expert gradients and SGD with common MoE."""
     _run_precision_worker(monkeypatch)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_mega_moe_auto_weight_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Validate external EIO/EOI weights, resource reuse and rank-wide rejection."""
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_auto_weight_layout", 2,
+                           "_test_mega_moe_runtime.py")
 
 
 def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:

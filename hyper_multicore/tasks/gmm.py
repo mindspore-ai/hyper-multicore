@@ -14,6 +14,7 @@
 # ============================================================================
 """GMM fill config: all GroupedMatMul variants (fwd up_proj/down_proj, bwd act/gate/w1/w2 grad)."""
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Set
 
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
@@ -27,6 +28,15 @@ from hyper_multicore.scheduler.graph import OperatorNode
 from hyper_multicore.tasks.utils import (
     advance_tsv_cube, advance_tsv_cube_only,
 )
+
+
+class GroupedMatmulTaskMode(IntEnum):
+    """Mutually exclusive grouped-matmul coverage modes in extra_value_1."""
+
+    PER_EXPERT = 0
+    SINGLE_GROUP = 1
+    BATCHED = 2
+    BATCHED_READY = 3
 
 
 @dataclass

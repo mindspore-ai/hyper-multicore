@@ -34,6 +34,7 @@ from hyper_multicore.scheduler.config import (
 )
 from hyper_multicore.shmem import _lifecycle
 
+from .probability import PROBABILITY_PLANES, ProbabilityPlane
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
 # The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
@@ -69,7 +70,7 @@ def _workspace_allocation_specs(
     if apply_probs_before_fc2:
         # Cover every lossless destination before expert placement changes rows.
         allocations += (("probability_workspace", allocation_spec(
-            (4, ep_size * routed_slots), torch.float32, _WORKSPACE_ALIGNMENT)),)
+            (PROBABILITY_PLANES, ep_size * routed_slots), torch.float32, _WORKSPACE_ALIGNMENT)),)
     return allocations
 
 
@@ -112,10 +113,10 @@ class ProbabilityWorkspace:
         self.buffer = buffer
         self.stride = stride
         self.planes = (buffer if buffer.shape[1] == stride else
-                       buffer.reshape(-1)[:4 * stride].view(4, stride))
+                       buffer.reshape(-1)[:PROBABILITY_PLANES * stride].view(PROBABILITY_PLANES, stride))
         self.raw = buffer.view(torch.uint8).reshape(-1)
-        self.source = self.planes[0]
-        self.returned_gradient = self.planes[3]
+        self.source = self.planes[ProbabilityPlane.SOURCE]
+        self.returned_gradient = self.planes[ProbabilityPlane.RETURNED_GRADIENT]
 
     def slice(self, rows: int, *, gradient: bool = False) -> torch.Tensor:
         """Reuse a prefix while keeping each direction's actual row extent local."""
@@ -123,7 +124,7 @@ class ProbabilityWorkspace:
             raise ValueError("Probability rows exceed the current plan stride")
         view = self.returned_gradient if gradient else self.source
         if view.numel() != rows:
-            view = self.planes[3 if gradient else 0, :rows]
+            view = self.planes[ProbabilityPlane.RETURNED_GRADIENT if gradient else ProbabilityPlane.SOURCE, :rows]
             if gradient:
                 self.returned_gradient = view
             else:

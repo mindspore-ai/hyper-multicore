@@ -25,14 +25,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch_npu
 
-from tests.common.multicore.moe_reference import grouped_matmul
-from hyper_multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
 from hyper_multicore.modules.mega_moe import function as mega_function
 from hyper_multicore.modules.mega_moe.function import execute_mega_moe
 from hyper_multicore.modules.mega_moe.route import (
     PreparedTopKRoute,
     prepare_topk_route,
 )
+from tests.common.multicore.moe_reference import grouped_matmul
+from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts
 from tests.torch import _test_mega_moe as baseline
 
 
@@ -103,20 +104,19 @@ def _initialize_weights(
 
 def _new_layers(
     shape: baseline.MoeShape,
-    swiglu_limit: float | None, *, clamp_after_activation: bool = False,
+    swiglu_limit: float | None, *, clamp_after_silu: bool = False,
     apply_probs_before_fc2: bool = False,
 ) -> tuple[torch.nn.Module, MegaMoeExperts]:
     """Create reference and MegaMoe layers with identical deterministic weights."""
     common = baseline.new_common_moe(shape)
-    mega = MegaMoeExperts(
+    mega = OwnedMegaMoeExperts(
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
-        swiglu_limit=swiglu_limit,
-        clamp_after_activation=clamp_after_activation,
-        apply_probs_before_fc2=apply_probs_before_fc2,
-        ep_size=shape.ep_size,
+        numerics_options=MegaMoeNumericsOptions(
+            swiglu_limit=swiglu_limit, clamp_after_silu=clamp_after_silu,
+            apply_probs_before_fc2=apply_probs_before_fc2),
         ep_group=dist.group.WORLD,
     ).to(device=baseline.DEVICE, dtype=torch.bfloat16)
     _initialize_weights(common, mega, shape)
@@ -131,7 +131,7 @@ def _run_reference(
     grad_output: torch.Tensor,
     gate_up_weight: torch.Tensor,
     down_weight: torch.Tensor,
-    *, limit: float = _CLAMP_LIMIT, clamp_after_activation: bool = False,
+    *, limit: float = _CLAMP_LIMIT, clamp_after_silu: bool = False,
     before_fc2: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Run grouped matmuls around an autograd-visible PyTorch clamp reference."""
@@ -147,7 +147,7 @@ def _run_reference(
         activation = (F.silu(gate.float()) * up.float()).to(hidden.dtype)
     else:
         activation = (
-            (F.silu(gate.float()).clamp(max=limit) if clamp_after_activation
+            (F.silu(gate.float()).clamp(max=limit) if clamp_after_silu
              else F.silu(gate.float().clamp(max=limit)))
             * up.float().clamp(min=-limit, max=limit)
         ).to(hidden.dtype)
@@ -362,12 +362,12 @@ def test_swiglu_clamp_numerics() -> None:
     limit = 0.5
     hidden[::2, 0] = 0.625
     hidden[::2, 1] = 0.25
-    _, post = _new_layers(shape, limit, clamp_after_activation=True)
+    _, post = _new_layers(shape, limit, clamp_after_silu=True)
     try:
         actual = _run_mega(post, hidden, topk_ids, topk_weights, tokens_per_expert, grad_output)
         expected = _run_reference(hidden, topk_ids, topk_weights, tokens_per_expert,
                                   grad_output, post.gate_up_weight, post.down_weight,
-                                  limit=limit, clamp_after_activation=True)
+                                  limit=limit, clamp_after_silu=True)
         _assert_numerical_results(actual, expected)
     finally:
         post.close()
@@ -483,15 +483,15 @@ def test_swiglu_clamp_matrix() -> None:
     modes = (("none", None, False), ("pre", _CLAMP_LIMIT, False), ("post", _CLAMP_LIMIT, True))
     for before_fc2 in (False, True):
         for name, limit, after_activation in modes:
-            common, mega = _new_layers(
-                shape, limit, clamp_after_activation=after_activation,
+            _, mega = _new_layers(
+                shape, limit, clamp_after_silu=after_activation,
                 apply_probs_before_fc2=before_fc2,
             )
             try:
                 expected = _run_reference(
                     hidden, topk_ids, topk_weights, tokens_per_expert, grad_output,
                     mega.gate_up_weight, mega.down_weight, limit=limit,
-                    clamp_after_activation=after_activation, before_fc2=before_fc2,
+                    clamp_after_silu=after_activation, before_fc2=before_fc2,
                 )
                 actual = _run_mega(
                     mega, hidden, topk_ids, topk_weights, tokens_per_expert, grad_output,

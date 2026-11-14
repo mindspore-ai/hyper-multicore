@@ -1,6 +1,19 @@
-# Copyright 2026 Huawei Technologies Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Pre-FC2 probability placement, storage and schedule contracts."""
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
@@ -8,9 +21,12 @@ from unittest.mock import patch
 
 import torch
 
+from hyper_multicore import _collective
 from hyper_multicore.modules.mega_moe import function as function_module
 
-from hyper_multicore.modules.mega_moe.function import _stage_probabilities, _kernel_workspace
+from hyper_multicore.modules.mega_moe.function import (
+    _execute_mega_moe_without_autograd, _kernel_workspace, _stage_backward_source, _stage_probabilities,
+)
 from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.workspace import MegaMoeWorkspace, _workspace_allocation_specs
@@ -26,8 +42,12 @@ from hyper_multicore.scheduler.graph import TensorSpec
 
 
 class TestProbabilityWeighting(unittest.TestCase):
+    """Validate probability planes and their routing, gradient and storage contracts."""
+
     def setUp(self) -> None:
-        def scatter_nd_update(target, indices, updates):
+        """Execute the standard scatter on CPU while retaining the production staging path."""
+        def scatter_nd_update(target: torch.Tensor, indices: torch.Tensor, updates: torch.Tensor) -> torch.Tensor:
+            """Apply the real saved route order to the bounded scalar destination."""
             self.assertEqual(indices.dtype, torch.int32)
             self.assertEqual(target.numel(), updates.numel())
             target[indices[:, 0].long()] = updates
@@ -43,9 +63,9 @@ class TestProbabilityWeighting(unittest.TestCase):
         for mode in ("push", "pull"):
             for ep, topk in ((2, 2), (4, 4), (8, 8)):
                 with self.subTest(mode=mode, ep=ep, topk=topk):
-                    common = dict(dispatch_mode=mode, routed_slots=256 * topk,
-                                  hidden_size=1024, ep_size=ep, num_experts=ep * 8,
-                                  dtype=torch.bfloat16)
+                    common = {"dispatch_mode": mode, "routed_slots": 256 * topk,
+                              "hidden_size": 1024, "ep_size": ep, "num_experts": ep * 8,
+                              "dtype": torch.bfloat16}
                     expected = None
                     for received in (128, ep * 256 * topk):
                         allocations = dict(_workspace_allocation_specs(
@@ -139,8 +159,12 @@ class TestProbabilityWeighting(unittest.TestCase):
         workspace.probability_workspace = torch.zeros(4, 1024)
         self.assertIsNot(planes, workspace.probabilities(spec).planes)
         self.assertEqual(_kernel_workspace(workspace, spec).data_ptr(), workspace.probability_workspace.data_ptr())
-        with patch("hyper_multicore.modules.mega_moe.workspace.shmem.free"):
-            workspace._free_symmetric_tensors()
+        workspace.heap_manager = SimpleNamespace(root_group=None, access=nullcontext)
+        with (patch("hyper_multicore.modules.mega_moe.workspace.shmem.free"),
+              patch("hyper_multicore.modules.mega_moe.workspace.shmem.host_barrier"),
+              patch.object(torch, "npu", create=True),
+              patch.object(_collective.dist, "is_initialized", return_value=False)):
+            workspace.close()
         self.assertIsNone(workspace.probability_views)
         self.assertIsNone(workspace.probability_workspace)
 
@@ -161,7 +185,7 @@ class TestProbabilityWeighting(unittest.TestCase):
         with torch.no_grad(), patch.object(function_module, "_prepare_forward_execution", return_value=execution), \
                 patch.object(function_module, "_launch_forward_kernel"), \
                 patch.object(function_module.multicore_ops, "moe_token_permute_grad", return_value=rows[:2]) as restore:
-            output = function_module._execute_mega_moe_without_autograd(
+            output = _execute_mega_moe_without_autograd(
                 probs, rows, rows, route, SimpleNamespace(spec=spec), workspace, workspace_claimed=True)
         torch.testing.assert_close(workspace.probability_workspace[0, mapping.long()], probs.flatten())
         torch.testing.assert_close(output, rows[:2])
@@ -231,6 +255,14 @@ class TestProbabilityWeighting(unittest.TestCase):
             parameters[16] = torch.zeros(4, 512)
             inputs = [SimpleNamespace(param_position=n, shape=[2, 4]) for n in range(4)]
             operator = SimpleNamespace(inputs=inputs, outputs=[SimpleNamespace(shape=[260, 4])])
+            mode = "pull" if kind == TaskType.TASK_SHMEM_GET_MEM else "push"
+            spec = MegaMoeSpec(128, 4, 512, 4, 2, 1.25 if mode == "push" else None,
+                               512, 2, None, 0, 20, dispatch_mode=mode, apply_probs_before_fc2=True)
+            forward, _, backward, _ = _build_runtime_artifacts(spec)
+            graph = backward if kind == TaskType.TASK_SWI_GLU_GRAD or flag == 8 else forward
+            role = ("swiglu_grad" if kind == TaskType.TASK_SWI_GLU_GRAD else
+                    "swiglu" if kind == TaskType.TASK_SWI_GLU else "combine" if flag == 8 else "dispatch")
+            operator.tensor_effects = graph.get_op(role).tensor_effects
             task = SimpleNamespace(
                 task_type=kind, task_split_num=4, task_split_value=128, task_index=3, extra_value_1=flag,
             )
@@ -281,14 +313,16 @@ class TestProbabilityWeighting(unittest.TestCase):
                                    ep_size=2, plan_tokens=4, top_k=2, hidden_size=3)
             ctx = SimpleNamespace(plan=SimpleNamespace(spec=spec), workspace=workspace, source_rows=4)
 
-            def permute(tokens, inverse, probabilities, output, output_probabilities):
+            def permute(tokens: torch.Tensor, inverse: torch.Tensor, probabilities: torch.Tensor,
+                        output: torch.Tensor, output_probabilities: torch.Tensor) -> None:
+                """Observe the exact saved mapping used by the backward bridge."""
                 self.assertIs(inverse, mapping)
                 output[inverse.long()] = tokens.repeat_interleave(2, dim=0)
                 output_probabilities[inverse.long()] = probabilities.flatten()
 
             with patch.object(function_module.multicore_ops, "moe_token_permute_from_mapping_out", permute), \
                     patch.object(function_module.multicore_ops, "moe_token_permute_out") as sort:
-                result, grad_probs = function_module._stage_backward_source(ctx, grad, (mapping, probs))
+                result, grad_probs = _stage_backward_source(ctx, grad, (mapping, probs))
             sort.assert_not_called()
             self.assertIsNone(grad_probs)
             torch.testing.assert_close(result[mapping.long()], grad.repeat_interleave(2, dim=0))

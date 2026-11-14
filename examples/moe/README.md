@@ -61,7 +61,12 @@ bash examples/moe/run_benchmark.sh \
 未设置 `ASCEND_RT_VISIBLE_DEVICES` 时，脚本按 `NPROC_PER_NODE` 生成 `0,...,15`；
 若已设置，保留用户指定的设备顺序，并检查设备 ID 唯一且数量不少于本机进程数。
 逻辑 NPU 数须至少为16；不能在8个逻辑 NPU 上通过重复设备 ID 启动 EP16。
-`--dispatch-mode pull` 可选择 pull，默认 push。JSON 的 `topology` 应为 `world_size=16, tp=1, ep=16`。
+本例使用 `MegaMoeExperts` 的默认执行策略。JSON 的 `topology` 应为 `world_size=16, tp=1, ep=16`。
+用户调优使用公开实验性的 `MegaMoeTuningOptions`，字段及约束见
+[组件指南](../../hyper_multicore/README.md#公开实验性调优配置)。
+模型数值语义通过从 `hyper_multicore` 导入的公开稳定接口 `MegaMoeNumericsOptions`
+和 `numerics_options=` 设置，字段及示例见[数值语义](../../hyper_multicore/README.md#模型数学与数值语义)；
+本示例保持不 clamp、FC2 后乘概率的默认语义。
 
 ### 参数
 
@@ -74,8 +79,6 @@ bash examples/moe/run_benchmark.sh \
 | `--learning-rate` / `--weight-decay` | `1e-3` / `0.01` | FP32 master 参数 AdamW 的共同设置 |
 | `--seed` | 42 | 参数和输入的共同 seed |
 | `--output` | `output/moe_transformer_benchmark.json` | rank0 JSON 路径 |
-| `--dispatch-mode` | `push` / `pull`，默认 `push` | 专家通信策略 |
-| `--initial-capacity-factor` / `--capacity-growth-factor` | 省略，push 默认均为 `1.25` | 高级接收容量策略，pull 不接受显式数值 |
 
 例如 `--mega-kernels gate` 仍运行相同 EP 大小的 MoE 网络，只改变 Router 的实现；
 common 后端使用普通 Router/EP，两个后端保持相同的普通残差结构。
@@ -85,16 +88,20 @@ EP 为 `NNODES × NPROC_PER_NODE`，由启动进程数确定。
 运行前须自行激活环境并设置 SHMEM bootstrap endpoint。
 `ASCEND_RT_VISIBLE_DEVICES` 选择本机设备，省略时默认 `0,...,NPROC_PER_NODE-1`；
 `NATIVE_ENV_FILE` 选择匹配的激活脚本；启动器支持源码 payload 或已安装的组件。
-JSON 的 `topology.world_size`、`topology.ep` 和专家形状记录实际配置。
+JSON 的 `topology.world_size`、`topology.ep` 和专家形状记录实际配置；选用 MegaMoe 专家时，
+`shape` 中的通信模式和容量因子来自实际模块配置，仅选普通专家时这些字段为 `null`。
 
 ## 验证范围
 
 benchmark 的目标 loss 为各来源 rank 本地 loss 的均值：dense 梯度归约后平均，owner 专家梯度已汇总所有来源，
 只在本地除以 EP 一次。对照初始参数、完整模型 logits/loss、全部梯度及 AdamW 更新后，记录最慢 rank 的整步耗时。
+普通 EP 基线在源端分发和结果合并时使用 `npu_moe_token_permute/unpermute`；all-to-all 接收后的 BF16
+token 也使用这对算子在 rank 顺序与本地专家顺序之间重排，并根据接收计数生成每行的本地专家 ID。
+CPU、空接收、不支持该算子的数据类型和超出算子索引上限的接收保留普通 Torch 重排路径。
 不存在切换到共同 mHC 后再做精度对照的流程；JSON 也不含 mHC 的实现或验证范围。
 复制梯度的验证步不作为稳态计时，性能顺序为 common → mega；需固定源/制品和负载，排除外部设备进程。
 
 CPU 接线测试位于 [test_moe_model.py](../../tests/ut/examples/moe/test_moe_model.py)，
 覆盖普通残差、Router、专家梯度/更新和导入隔离。组件边界、动态 token 与 SHMEM 生命周期仍由
 [NPU 用例](../../tests/torch/)验证，执行方式见[测试指南](../../tests/README.md)。
-本例不恢复旧 checkpoint 的优化器状态，完整续训边界见[迁移指南](../README.md#checkpoint与参数归属)。
+本例不恢复旧 checkpoint 的优化器状态，完整续训边界见[Checkpoint 与参数归属](../README.md#checkpoint与参数归属)。

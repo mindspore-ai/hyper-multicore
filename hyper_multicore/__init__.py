@@ -16,6 +16,7 @@
 
 from typing import TYPE_CHECKING, Any
 
+from hyper_multicore.modules.mega_moe.numerics import MegaMoeNumericsOptions
 from hyper_multicore.diagnostics import (
     MegaKernelDiagnostics, prepare_mega_kernel_diagnostics, validate_mega_kernel_diagnostic_contract,
 )
@@ -26,13 +27,13 @@ if TYPE_CHECKING:
     from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
 
 __all__ = [
-    "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaKernelDiagnostics",
+    "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaKernelDiagnostics",
     "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
 ]
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
-    """Load optional multicore modules only when their public API is requested."""
+    """Load optional multicore modules only when their API is requested."""
     if name == "MegaMhc":
         from hyper_multicore.modules.mega_mhc.module import (  # pylint: disable=import-outside-toplevel
             MegaMhc as value,

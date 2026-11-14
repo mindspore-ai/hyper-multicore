@@ -39,8 +39,14 @@
         "patches": [
           {
             "path": "hyper_multicore/ops/patches/swi_glu_fusion.patch",
-            "sha256": "7d7f9b176fdf0cd3048b71d254911cfb4fa8245ce0f529599aa698aa4854e859",
-            "purpose": "expose inline SwiGLU forward/backward with optional pre/post-activation clipping"
+            "sha256": "ca4cacfad1299b3b37fffeec43d8047fb6325eb4f0fdccdf475f855f45173bef",
+            "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
+          },
+          {
+            "path": "hyper_multicore/ops/patches/swi_glu_clamp.patch",
+            "sha256": "76b7b95498bee3560bb1068a6592e672aa326aa4b06c0d2459d4217864faeb06",
+            "allow_zero_context": true,
+            "purpose": "add optional pre/post-SiLU clipping and dynamic tail bounds"
           },
           {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",

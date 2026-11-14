@@ -17,17 +17,19 @@
 __all__ = []
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
+from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
+from hyper_multicore.tasks.swiglu import SwiGluTaskIteration
 from hyper_multicore.scheduler.config import (
-    GmmTaskMode, VectorTaskFlags,
     RuntimeConfigC,
     TaskDescC,
     TaskType,
     TaskSplitValue,
 )
-from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, TensorSpec
+from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType
+
 
 
 MEGA_MOE_OWNER_LABEL = "Expert"
@@ -60,7 +62,7 @@ def _resolve_expert_owner(
     rank_owner_base = topology.rank_id * topology.single_rank_expert_num
 
     if operator.op_type == OpType.GMM:
-        if task_desc.extra_value_1 in (GmmTaskMode.BATCHED, GmmTaskMode.BATCHED_READY):
+        if task_desc.extra_value_1 in (GroupedMatmulTaskMode.BATCHED, GroupedMatmulTaskMode.BATCHED_READY):
             return None
         return rank_owner_base + task_desc.task_index // context.num_cube_cores
 
@@ -68,7 +70,7 @@ def _resolve_expert_owner(
         if task_desc.task_split_value == 0:
             raise ValueError("SwiGLU diagnostic owner requires a non-zero task_split_value")
         num_triggers = (task_desc.task_split_num // topology.single_rank_expert_num
-                        if task_desc.extra_value_1 & VectorTaskFlags.COMPACT else
+                        if task_desc.extra_value_1 & SwiGluTaskIteration.PERSISTENT_LANES else
                         topology.per_expert_seq // task_desc.task_split_value)
         if num_triggers == 0:
             raise ValueError("SwiGLU diagnostic owner resolved a zero task count per expert")
@@ -120,16 +122,6 @@ def _adapt_mega_moe_diagnostic_graph(graph: ComputeGraph, config: RuntimeConfigC
         end = start + operator.task_num
         kept = [task_id for task_id in range(start, end) if task_id in scheduled]
         operator.task_num = len(kept)
-        if kept:
-            first = config.all_tasks[kept[0]]
-            if int(first.num_outputs) == len(operator.outputs) + 1 and first.extra_value_1 & (VectorTaskFlags.APPLY_PROBABILITIES | VectorTaskFlags.RETURN_PROBABILITY_GRADIENTS):
-                aux = first.outputs[first.num_outputs - 1]
-                operand = TensorSpec("probability_workspace", [int(aux.dim[0]), int(aux.dim[1])],
-                                     int(aux.input_position), dtype_size=int(aux.data_type))
-                operator.outputs.append(operand)
-                operator.param_positions.append(operand.param_position)
-                operator.split_spec = replace(
-                    operator.split_spec, split_output_dims=[*operator.split_spec.split_output_dims, -1])
         for task_id in kept:
             mapping[task_id] = len(tasks)
             tasks.append(bytes(config.all_tasks[task_id]))

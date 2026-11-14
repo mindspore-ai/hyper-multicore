@@ -19,11 +19,13 @@ from __future__ import annotations
 from math import prod
 from typing import Any
 
+from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.scheduler.config import (
-    GmmTaskMode, VectorTaskFlags,
     TaskType,
 )
 from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
+
+from .probability import PROBABILITY_DTYPE_BYTES, probability_capture_plane
 
 
 def _group_counts(context: L1TensorViewContext) -> tuple[int, int, int]:
@@ -63,7 +65,7 @@ def _resolve_grouped_matmul(context: L1TensorViewContext) -> L1TensorView:
             f"MegaMoe L1 cannot snapshot {context.stage!r} output atomically across Cube cores; "
             "select the downstream stage input after its dependency instead"
         )
-    if context.task_desc.extra_value_1 in (GmmTaskMode.BATCHED, GmmTaskMode.BATCHED_READY):
+    if context.task_desc.extra_value_1 in (GroupedMatmulTaskMode.BATCHED, GroupedMatmulTaskMode.BATCHED_READY):
         shape = list(context.tensor_spec.shape)
         if context.tensor_desc.dynamic_shape:
             data = context.runtime_config.dynamic_data
@@ -160,13 +162,12 @@ def _resolve_probability_workspace(context: L1TensorViewContext) -> L1TensorView
     task_type = int(context.task_desc.task_type)
     if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
         source_row, rows = _swiglu_rows(context)
-        plane = 1 if task_type == TaskType.TASK_SWI_GLU else 2
     else:
         source_row, rows, _ = _alltoall_rows(context)
-        plane = 1 if task_type == TaskType.TASK_SHMEM_GET_MEM else (2 if context.task_desc.extra_value_1 & VectorTaskFlags.RETURN_PROBABILITY_GRADIENTS else 0)
+    plane = probability_capture_plane(context.operator)
     stride = int(context.tensor_spec.shape[1])
     return context.make_view(
-        (rows,), source_offset_bytes=(plane * stride + source_row) * 4 if rows else 0,
+        (rows,), source_offset_bytes=(plane * stride + source_row) * PROBABILITY_DTYPE_BYTES if rows else 0,
         note="task-local routing probability or probability-gradient slice",
     )
 

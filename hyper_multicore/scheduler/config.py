@@ -63,24 +63,6 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
-class GmmTaskMode(IntEnum):
-    """extra_value_1 modes, interpreted only by grouped-matmul tasks."""
-
-    PER_EXPERT = 0
-    SINGLE_GROUP = 1
-    BATCHED = 2
-    BATCHED_READY = 3
-
-
-class VectorTaskFlags(IntEnum):
-    """extra_value_1 bits for transport and SwiGLU tasks, not GMM modes."""
-
-    CLAMP_AFTER_ACTIVATION = 1
-    COMPACT = 2
-    APPLY_PROBABILITIES = 4
-    RETURN_PROBABILITY_GRADIENTS = 8
-
-
 class TaskAiCoreType(IntEnum):
     """Worker core categories encoded in RuntimeConfig."""
 
@@ -493,6 +475,9 @@ def validate_runtime_config(
     for descriptor_index in range(cfg.task_num):
         task = cfg.all_tasks[descriptor_index]
         task_type = task.task_type
+        validator = getattr(cfg, "task_validator", None)
+        if validator is not None:
+            validator(task)
         if task_type not in (
             TaskType.TASK_SWI_GLU,
             TaskType.TASK_SWI_GLU_GRAD,

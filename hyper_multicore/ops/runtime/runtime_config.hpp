@@ -46,21 +46,6 @@ constexpr uint32_t TASK_AICORE_INDEX_TYPE_COUNT = 3;
 
 using TaskId = uint32_t;
 
-// TaskType is the tag: GMM modes are enums; vector tasks use independent bits.
-struct GmmTaskMode {
-  static constexpr uint32_t PER_EXPERT = 0;
-  static constexpr uint32_t SINGLE_GROUP = 1;
-  static constexpr uint32_t BATCHED = 2;
-  static constexpr uint32_t BATCHED_READY = 3;
-};
-
-struct VectorTaskFlags {
-  static constexpr uint32_t CLAMP_AFTER_ACTIVATION = 1;
-  static constexpr uint32_t COMPACT = 2;
-  static constexpr uint32_t APPLY_PROBABILITIES = 4;
-  static constexpr uint32_t RETURN_PROBABILITY_GRADIENTS = 8;
-};
-
 enum class DiagnosticMode : uint32_t {
   NORMAL = 0,
   PROFILE = 1,

@@ -51,18 +51,17 @@ from hyper_multicore.modules.mega_moe.forward.tiling_tables import (
 )
 from hyper_multicore.scheduler.config import (
     FAST_DEPENDENCY_POLL_INTERVAL_US,
-    GmmTaskMode,
     TaskSplitValue,
-    TaskType,
-    TensorDescC,
-    VectorTaskFlags,
 )
 from hyper_multicore.scheduler.graph import ComputeGraph
 
 from .diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
 from .probability import (
-    PROBABILITY_DTYPE_BYTES, PROBABILITY_PLANES,
-    PROBABILITY_POSITION_BACKWARD, PROBABILITY_POSITION_FORWARD, probability_stride,
+    PROBABILITY_POSITION_FORWARD, PROBABILITY_POSITION_BACKWARD,
+)
+
+from .schedule_policy import (
+    MegaMoeSchedulePolicy, compact_graph,
 )
 from .spec import MegaMoeSpec
 from .tensor_dump import attach_mega_moe_l1_view_resolvers
@@ -100,23 +99,27 @@ class MegaMoePlan:
         return self.bwd_diagnostics.runtime_config
 
 
-def record_plan_stream(plan: MegaMoePlan, runtime_config: Any, *, stream: Any = None) -> None:
-    """Register immutable plan storage once per stream, preserving allocator lifetime."""
-    if not isinstance(runtime_config, torch.Tensor) or runtime_config.device.type != "npu":
-        return
-    if stream is None:
-        stream = torch.npu.current_stream(runtime_config.device)
-    key = (runtime_config.device, stream.npu_stream)
-    if key not in plan._recorded_streams:
-        tensors = [value for value in vars(plan).values() if isinstance(value, torch.Tensor)]
-        tensors.extend((plan.fwd_runtime_config, plan.bwd_runtime_config))
-        for tensor in tensors:
-            if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
-                tensor.record_stream(stream)
-        plan._recorded_streams.add(key)
-    if runtime_config is not plan.fwd_runtime_config and runtime_config is not plan.bwd_runtime_config:
-        # Diagnostic buffers are per invocation and cannot share the ordinary cache.
-        runtime_config.record_stream(stream)
+    def record_stream(self, runtime_config: Any, *, stream: Any = None) -> None:
+        """Register immutable plan storage once per stream, preserving allocator lifetime."""
+        if not isinstance(runtime_config, torch.Tensor) or runtime_config.device.type != "npu":
+            return
+        if stream is None:
+            stream = torch.npu.current_stream(runtime_config.device)
+        key = (runtime_config.device, stream.npu_stream)
+        if key not in self._recorded_streams:
+            tensors = [value for value in vars(self).values() if isinstance(value, torch.Tensor)]
+            tensors.extend((self.fwd_runtime_config, self.bwd_runtime_config))
+            for tensor in tensors:
+                if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
+                    tensor.record_stream(stream)
+            self._recorded_streams.add(key)
+        if runtime_config is not self.fwd_runtime_config and runtime_config is not self.bwd_runtime_config:
+            # Diagnostic buffers are per invocation and cannot share the ordinary cache.
+            runtime_config.record_stream(stream)
+
+
+# Keep the existing free-function call sites without another Python wrapper call.
+record_plan_stream = MegaMoePlan.record_stream
 
 
 def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
@@ -153,39 +156,6 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     )
 
 
-def _attach_probability_workspace(config: Any, spec: MegaMoeSpec, *, backward: bool) -> None:
-    """Declare scalar workspace on existing tasks without changing their DAG.
-
-    The legacy GMM scratch port is unused by composed Cube kernels. This mode
-    supplies four symmetric FP32 planes there: source p, received p, received
-    dp and source dp. An auxiliary output descriptor carries their layout;
-    input limits, task counts and all completion events remain unchanged.
-    """
-    if not spec.apply_probs_before_fc2:
-        return
-    position = PROBABILITY_POSITION_BACKWARD if backward else PROBABILITY_POSITION_FORWARD
-    for index in config.vector_task_indices[:config.task_index_num[1]]:
-        task = config.all_tasks[index]
-        mode = 0
-        if task.task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
-            mode = VectorTaskFlags.APPLY_PROBABILITIES
-        elif task.task_type in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
-            output = task.outputs[0].input_position
-            mode = (VectorTaskFlags.APPLY_PROBABILITIES if output == 0 else
-                    VectorTaskFlags.RETURN_PROBABILITY_GRADIENTS if backward and output == 13 else 0)
-        if not mode:
-            continue
-        aux = TensorDescC()
-        aux.tensor_type = 0
-        aux.data_type = PROBABILITY_DTYPE_BYTES
-        aux.input_position = position
-        aux.dim[0] = PROBABILITY_PLANES
-        aux.dim[1] = probability_stride(spec)
-        task.outputs[task.num_outputs] = aux
-        task.num_outputs += 1
-        task.extra_value_1 |= mode
-
-
 def _build_runtime_artifacts(
     spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None,
 ) -> tuple[Any, Any, Any, Any]:
@@ -201,12 +171,11 @@ def _build_runtime_artifacts(
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
         clamp_after_activation=spec.clamp_after_activation,
+        apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
     )
-    from .schedule_policy import (
-        collapse_batched_tasks, compact_graph, pipeline_cube_queue, pipeline_vector_queue,
-    )
-    compact = spec.dispatch_mode == "push" and spec.intermediate_size < 2048 and compact_graph(forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
+    compact = (spec.dispatch_mode == "push" and spec.intermediate_size < 2048
+               and compact_graph(forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule))
     forward_graph.propagate_splits(task_values)
     attach_mega_moe_l1_view_resolvers(forward_graph)
     forward_data = build_forward_config(
@@ -225,6 +194,7 @@ def _build_runtime_artifacts(
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
         clamp_after_activation=spec.clamp_after_activation,
+        apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
     )
     if weight_grad_dtype == torch.float32:
@@ -240,30 +210,15 @@ def _build_runtime_artifacts(
         spec.rank_id,
         spec.num_cube_cores,
     )
-    _attach_probability_workspace(forward_data, spec, backward=False)
-    _attach_probability_workspace(backward_data, spec, backward=True)
-    # Producer tiles often finish before the legacy 50/150-us refresh delay.
-    # Apply the existing short polling policy to every MegaMoE schedule.
-    for config in (forward_data, backward_data):
-        queue = list(config.cube_task_indices[:config.task_index_num[0]])
-        queue += list(config.vector_task_indices[:config.task_index_num[1]])
-        for task_id in queue:
-            config.all_tasks[task_id].extra_value_2 = FAST_DEPENDENCY_POLL_INTERVAL_US
-    if spec.batch_experts:
-        for config in (forward_data, backward_data):
-            # Compact dispatch retains its ready queue and all Vector workers.
-            # Collapsing Cube tasks does not change Vector dependency scheduling.
-            config.vector_ready_queue = int(compact)
-            collapse_batched_tasks(config, spec.num_cube_cores)
-    elif compact:
-        for graph, config in ((forward_graph, forward_data), (backward_graph, backward_data)):
-            config.vector_ready_queue = 1
-            pipeline_vector_queue(config, graph, task_values)
-            pipeline_cube_queue(config, graph, task_values, spec.num_cube_cores)
-            # Each Cube descriptor selects exactly one expert. A one-group tiling
-            # avoids scanning the remaining experts inside every local projection.
-            for task_id in config.cube_task_indices[:config.task_index_num[0]]:
-                config.all_tasks[task_id].extra_value_1 = GmmTaskMode.SINGLE_GROUP
+    policy = MegaMoeSchedulePolicy(
+        vector_ready_queue=bool(compact),
+        pipeline_vector=bool(compact) and not spec.batch_experts,
+        pipeline_cube=bool(compact) and not spec.batch_experts,
+        batch_experts=spec.batch_experts,
+        dependency_poll_interval=FAST_DEPENDENCY_POLL_INTERVAL_US,
+    )
+    for graph, config in ((forward_graph, forward_data), (backward_graph, backward_data)):
+        policy.apply(config, graph, task_values, spec.num_cube_cores)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -287,9 +242,11 @@ def _prepare_diagnostics(
     }
     return (
         prepare_mega_kernel_diagnostics(
-            forward_graph, forward_config, parameter_count=17 if spec.apply_probs_before_fc2 else 16, **options),
+            forward_graph, forward_config,
+            parameter_count=PROBABILITY_POSITION_FORWARD + 1 if spec.apply_probs_before_fc2 else 16, **options),
         prepare_mega_kernel_diagnostics(
-            backward_graph, backward_config, parameter_count=26 if spec.apply_probs_before_fc2 else 20, **options),
+            backward_graph, backward_config,
+            parameter_count=PROBABILITY_POSITION_BACKWARD + 1 if spec.apply_probs_before_fc2 else 20, **options),
     )
 
 

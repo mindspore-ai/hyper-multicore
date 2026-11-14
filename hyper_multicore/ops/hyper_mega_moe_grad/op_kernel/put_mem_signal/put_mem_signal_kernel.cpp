@@ -119,11 +119,9 @@ class PutMemSignalKernel {
     auto signal_ptr = signal_ + signal_offset_;
     shmem_data_plane::fence();
 
-    if (publish_signal) {
-      shmem_data_plane::signal(signal_ptr, signal_value_,
-                               signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
-                               target_pe_);
-    }
+    shmem_data_plane::signal(signal_ptr, signal_value_,
+                              signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
+                              target_pe_);
   }
 
  private:

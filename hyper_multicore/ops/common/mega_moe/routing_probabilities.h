@@ -1,14 +1,12 @@
 // Copyright 2026 Huawei Technologies Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
-#ifndef HYPER_MULTICORE_ROUTING_PROBABILITIES_H_
-#define HYPER_MULTICORE_ROUTING_PROBABILITIES_H_
+#ifndef HYPER_MULTICORE_OPS_COMMON_MEGA_MOE_ROUTING_PROBABILITIES_H_
+#define HYPER_MULTICORE_OPS_COMMON_MEGA_MOE_ROUTING_PROBABILITIES_H_
 #include "kernel_operator.h"
+#include "probability_workspace.h"
+#include "../swiglu_task_options.h"
 
 namespace MulticoreRuntime {
-
-__aicore__ inline GM_ADDR ProbabilityPlane(GM_ADDR workspace, int64_t stride, uint32_t plane) {
-  return workspace + static_cast<int64_t>(plane) * stride * sizeof(float);
-}
 
 // Operate after the existing SwiGLU kernel's BF16 store. This preserves both
 // rounding boundaries of (activation_bf16 * probability_fp32).to(bfloat16).

@@ -17,6 +17,8 @@
 from typing import Optional
 
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
+from hyper_multicore.modules.mega_moe.probability import declare_probability_dataflow
+from hyper_multicore.modules.mega_moe.task_options import validate_task_options
 from hyper_multicore.scheduler.config import TaskSplitValue
 from hyper_multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
@@ -117,7 +119,8 @@ def _build_bwd_tensor_specs(
 
 
 def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
-                         swiglu_sv, num_cube_cores, clamp_after_activation=False, swiglu_limit=None, expert_weight_layout="EIO"):
+                         swiglu_sv, num_cube_cores, clamp_after_activation=False,
+                         swiglu_limit=None, expert_weight_layout="EIO"):
     """Create dispatch, act_grad, w2_grad, swiglu_grad operator nodes."""
     (target, target_offset, src, src_offset, size_d,
      w2_grad_x1, w2_grad_y, act_grad_weight, act_grad_y,
@@ -246,7 +249,8 @@ def build_backward_graph(tsv: TaskSplitValue, *,
                          num_cube_cores:    int = DEFAULT_CORE_SPEC.num_cube_cores,
                          swiglu_limit:      Optional[float] = None,
                          expert_weight_layout: str = "EIO",
-                        clamp_after_activation: bool = False) -> ComputeGraph:
+                        clamp_after_activation: bool = False,
+                        apply_probs_before_fc2: bool = False) -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
     Execution order:
@@ -303,6 +307,7 @@ def build_backward_graph(tsv: TaskSplitValue, *,
         expert_weight_layout=expert_weight_layout,
     )
     graph = ComputeGraph()
+    graph.task_validator = validate_task_options
     (graph.add_op(dispatch).add_op(act_grad).add_op(w2_grad)
           .add_op(swiglu_grad).add_op(gate_grad).add_op(combine).add_op(w1_grad)
           .add_edge(dispatch,    act_grad)
@@ -311,4 +316,7 @@ def build_backward_graph(tsv: TaskSplitValue, *,
           .add_edge(swiglu_grad, gate_grad)
           .add_edge(gate_grad,   combine)
           .add_edge(gate_grad,   w1_grad))
+    if apply_probs_before_fc2:
+        declare_probability_dataflow(graph, tsv.ep * tsv.per_rank_seq,
+                                     backward=True, pull=tsv.dispatch_mode == "pull")
     return graph

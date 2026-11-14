@@ -320,9 +320,22 @@ def _save_forward_state(
     weight1: Any,
     weight2: Any,
     metadata: RouteMetadata,
-    permutation_inputs: tuple[Any, ...] = (),
-) -> None:
-    """Save owned forward tensors and route state for backward."""
+    permutation_inputs: tuple[Any, ...],
+    output: Any,
+    topk_weights: torch.Tensor | None,
+) -> Any:
+    """Restore the owned output and save its backward state in the existing call."""
+    if ctx.has_unpermute:
+        spec = plan.spec
+        if not spec.apply_probs_before_fc2:
+            probs = topk_weights.float().contiguous()
+            permutation_inputs += (output, probs)
+        ctx.topk_dtype = topk_weights.dtype
+        if spec.apply_probs_before_fc2:
+            output = _restore_unweighted_output(output, permutation_inputs[0], spec.top_k)
+        else:
+            output = (load_torch_npu().npu_moe_token_unpermute(output, permutation_inputs[0], probs=probs)
+                      if ctx.source_rows else output[:0])
     ctx.plan = plan
     ctx.all_experts_active = metadata.all_experts_active
     ctx.workspace = workspace
@@ -342,6 +355,7 @@ def _save_forward_state(
         *permutation_inputs,
     )
     workspace.track_graph(ctx)
+    return output
 
 
 _CAPTURED_WEIGHT_GRADS: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -605,6 +619,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             if spec.apply_probs_before_fc2:
                 probs = topk_weights.float().contiguous()
                 _stage_probabilities(workspace, unpermute_mapping, probs, spec)
+                permutation_inputs += (probs,)
             _launch_forward_kernel(
                 plan,
                 metadata,
@@ -621,18 +636,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 # Combine has consumed down_proj before SHMEM dispatch is reused.
                 execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
                 saved_dispatch = execution.intermediates.down_proj
-            if ctx.has_unpermute:
-                if not spec.apply_probs_before_fc2:
-                    probs = topk_weights.float().contiguous()
-                ctx.topk_dtype = topk_weights.dtype
-                # The exact mapping already saved above is sufficient for pre-FC2 backward.
-                permutation_inputs += ((probs,) if spec.apply_probs_before_fc2 else (output, probs))
-                if spec.apply_probs_before_fc2:
-                    output = _restore_unweighted_output(output, unpermute_mapping, spec.top_k)
-                else:
-                    output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
-                              if ctx.source_rows else output[:0])
-            _save_forward_state(
+            return _save_forward_state(
                 ctx,
                 plan,
                 workspace,
@@ -641,10 +645,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution.intermediates.activation,
                 weight1,
                 weight2,
-                metadata,
-                permutation_inputs,
+                metadata, permutation_inputs, output, topk_weights,
             )
-            return output
         finally:
             if not workspace_claimed:
                 workspace.release(stream=workspace.lease_stream)
@@ -687,7 +689,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 source,
                 execution, stream=workspace.lease_stream)
             if plan.spec.apply_probs_before_fc2 and ctx.needs_input_grad[7]:
-                grad_topk_weights = (workspace.probabilities(plan.spec).slice(ctx.source_rows, gradient=True).index_select(
+                grad_topk_weights = (
+                    workspace.probabilities(plan.spec).slice(ctx.source_rows, gradient=True).index_select(
                     0, permutation_inputs[0]).reshape_as(saved_probabilities).to(ctx.topk_dtype)
                     if ctx.source_rows else saved_probabilities.new_empty(
                         saved_probabilities.shape, dtype=ctx.topk_dtype))

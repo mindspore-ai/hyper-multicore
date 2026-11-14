@@ -15,6 +15,9 @@
 """MoE-FFN forward compute graph."""
 
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
+from hyper_multicore.modules.mega_moe.probability import declare_probability_dataflow
+from hyper_multicore.modules.mega_moe.task_options import validate_task_options
+from hyper_multicore.scheduler.config import TaskSplitValue
 from hyper_multicore.scheduler.graph import (
     ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType,
 )
@@ -169,7 +172,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     return dispatch, up_proj, swiglu, down_proj, combine
 
 
-def build_forward_graph(tsv, *,
+def build_forward_graph(tsv: TaskSplitValue, *,
                         dispatch_sv:  int = 128,
                         up_proj_sv:   int = 4096,
                         swiglu_sv:    int = 128,
@@ -181,7 +184,8 @@ def build_forward_graph(tsv, *,
                         num_cube_cores:    int = DEFAULT_CORE_SPEC.num_cube_cores,
                         swiglu_limit:      float | None = None,
                         expert_weight_layout: str = "EIO",
-                        clamp_after_activation: bool = False) -> ComputeGraph:
+                        clamp_after_activation: bool = False,
+                        apply_probs_before_fc2: bool = False) -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
 
     Operator execution order and param_positions (C++ memory slots):
@@ -221,9 +225,13 @@ def build_forward_graph(tsv, *,
         swiglu_limit=swiglu_limit, clamp_after_activation=clamp_after_activation,
     )
     graph = ComputeGraph()
+    graph.task_validator = validate_task_options
     (graph.add_op(dispatch).add_op(up_proj).add_op(swiglu).add_op(down_proj).add_op(combine)
           .add_edge(dispatch,  up_proj)
           .add_edge(up_proj,   swiglu)
           .add_edge(swiglu,    down_proj)
           .add_edge(down_proj, combine))
+    if apply_probs_before_fc2:
+        declare_probability_dataflow(graph, tsv.ep * tsv.per_rank_seq,
+                                     backward=False, pull=tsv.dispatch_mode == "pull")
     return graph
