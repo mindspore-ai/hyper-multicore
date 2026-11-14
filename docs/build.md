@@ -343,8 +343,9 @@ export HYPER_MULTICORE_SHMEM_LOG_LEVEL=2
 export SHMEM_LOG_LEVEL=ERROR
 ```
 
-然后导入 `from hyper_multicore import MegaMoeExperts, MXFP8MegaMoeExperts`。
-BF16 原有自动 token API 保留，可选 `local_num_tokens` 建立固定计划；MX 当前要求显式传入
+然后导入 `from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions`。
+统一入口以 `precision="bf16"`（默认）或 `precision="mxfp8"` 选择数学后端，forward 的参数保持一致。
+BF16 原有自动 token API 保留，可选 `local_num_tokens` 建立固定计划；MX 当前要求 `create_parameters=False`，并显式传入
 `local_num_tokens`，并且 H/I 均为 64 的倍数。两者都可传 `dispatch_mode="push"` 或 `"pull"`；
 Pull 不传容量因子。外部权重每次用 `expert_weights=(root1, root2)` 传入。
 MX 的物理权重合同见 [architecture.md](architecture.md)。
@@ -354,12 +355,31 @@ MX 的物理权重合同见 [architecture.md](architecture.md)。
 | `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（原默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
 | `HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE` | 可选 `push/pull`；若同时传构造参数必须一致 |
 | `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，原 API 默认仍为 128 |
-| `HYPER_MULTICORE_MEGAMOE_SCHEDULE_POLICY` | 当前仅 `two_expert_pipeline`，两专家交错流水 |
+| `HYPER_MULTICORE_MEGAMOE_SCHEDULE_POLICY` | `two_expert_pipeline`（默认，两专家交错）或 `builder_order`（保留 builder 数学顺序） |
 | `HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD` | 数学任务队列就绪扫描：0为FIFO，1仅检查队首，8有限重排；默认0，通信保持FIFO |
-| `HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY` | 默认 1，仅 no-grad 正向免算 SwiGLU columnwise |
 | `HYPER_MULTICORE_MX_NOGRAD_NO_CLONE` | 默认 1，在 lease 内完成 unpermute 后返回独立输出 |
 | `HYPER_MULTICORE_BF16_NOGRAD_NO_COPY` | 默认 1，A5 UDMA no-grad 免保存 dispatch，并在 lease 内 unpermute |
 | `HYPER_MULTICORE_SHMEM_HEAP_SIZE` | 显式字节预算；按实际模型/路由容量评估，不能用扩大预算代替正确性 |
+
+
+两种策略共用安全 QP0 owner、通信 FIFO 和数学任务核归属。`builder_order` 只改变数学
+队列顺序，不恢复旧通信队列或更改 DAG。它是诊断对照，不代表性能更优；A3 BF16 MTE
+保留原隐式队列。可在构造前设置上述环境变量，或显式传入：
+
+```python
+experts = MegaMoeExperts(
+    precision="mxfp8", local_num_tokens=4096, hidden_size=5120,
+    intermediate_size=1792, num_experts=384, top_k=8,
+    ep_group=ep_group, create_parameters=False,
+    schedule=MegaMoeScheduleOptions(policy="two_expert_pipeline", queue_ready_lookahead=8),
+)
+y = experts(x, topk_ids, topk_weights, expert_weights=(root1, root2))
+```
+
+MXFP8 不再提供独立的 public Experts 类，也不自动转换权重精度。调用方仍须提供每次
+FSDP gather 后的原始量化权重 root。BF16 的 `from_module` 仅转换 BF16 权重，不生成 MX 物理存储。
+SwiGLU row-only 分支已移除：no-grad 也使用完整 dual-axis 数学；no-clone 保持独立开关。
+旧 `HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY=1` 会报明确错误，应从启动环境删除。
 
 通信分片保留 `HYPER_MULTICORE_MX_COMM_SPLIT` 别名；队列扫描保留
 `HYPER_MULTICORE_MEGAMOE_READY_DEPTH`、`HYPER_MULTICORE_MX_READY_DEPTH` 和

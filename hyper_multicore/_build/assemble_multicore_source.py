@@ -47,7 +47,6 @@ _A5_OPS_NN_PATHS = (
     "common/inc/op_kernel",
     "quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35",
     "quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35",
-    "quant/swiglu_mx_quant/op_kernel/arch35",
     "quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35",
 )
 _OPS_TRANSFORMER_MHC_PATHS = (
@@ -142,7 +141,7 @@ def main() -> int:
     if ops_tensor_source is not None:
         tensor_copy = work_dir / "adapter-inputs" / "ops-tensor"
         _export_git_tree(ops_tensor_source, tensor_copy, lock["ops_tensor"]["commit"], ("include/blaze",))
-        _apply_locked_adapters(tensor_copy, lock["ops_tensor"])
+        _apply_locked_adapters(tensor_copy, lock["ops_tensor"], architecture="arch35")
         _compose_a5_sources(source_root, ops_nn_copy, tensor_copy, lock)
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
@@ -160,12 +159,12 @@ def _compose_a5_sources(source_root: Path, ops_nn: Path, ops_tensor: Path, lock:
     shutil.copytree(ops_tensor / "include" / "blaze", target / "include" / "blaze")
     shutil.copytree(ops_nn / "activation/swi_glu_grad/op_kernel/arch35", target / "swi_glu_grad/arch35")
     for operator in ("dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
-                     "swiglu_mx_quant", "swiglu_backward_mx_quant_with_dual_axis"):
+                     "swiglu_backward_mx_quant_with_dual_axis"):
         destination = target / operator
         shutil.copytree(ops_nn / "quant" / operator / "op_kernel/arch35", destination / "arch35")
     # These are standard relative dependencies of the exported arch35 headers.
     for operator in ("swi_glu_grad", "dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
-                     "swiglu_mx_quant", "swiglu_backward_mx_quant_with_dual_axis"):
+                     "swiglu_backward_mx_quant_with_dual_axis"):
         shutil.copytree(ops_nn / "common/inc/op_kernel", target / operator / "inc")
     files = {str(path.relative_to(target)): _sha256(path)
              for path in sorted(target.rglob("*")) if path.is_file()}

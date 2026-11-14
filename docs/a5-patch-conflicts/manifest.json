@@ -50,5 +50,13 @@
     ],
     "rejected_hunks": [],
     "action": "incoming conflict versions retained; all stages archived for review"
+  },
+  {
+    "patch": 10,
+    "unmerged_paths": [
+      "tests/ut/scheduler/test_runtime_serialization.py"
+    ],
+    "rejected_hunks": [],
+    "action": "incoming conflict versions retained; all stages archived for review"
   }
 ]

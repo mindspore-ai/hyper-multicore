@@ -1,7 +1,7 @@
 """Backward must resolve freshly gathered physical storage on the original root."""
 import torch
 
-from hyper_multicore.modules.mega_moe.mxfp8_function import MXFP8ForwardState, execute_mxfp8_experts
+from hyper_multicore.modules.mega_moe.backends.mxfp8.autograd import MXFP8ForwardState, execute_mxfp8_experts
 
 
 def physical(root, shape):

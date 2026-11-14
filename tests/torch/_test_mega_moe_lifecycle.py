@@ -24,7 +24,7 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from hyper_multicore import MegaMoeExperts, shmem
-from hyper_multicore.modules.mega_moe import function as function_module
+from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
 from hyper_multicore.scheduler.config import (
     READY_CACHE_LINE_BYTES,
 )

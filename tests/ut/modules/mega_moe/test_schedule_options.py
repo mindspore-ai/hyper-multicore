@@ -7,15 +7,17 @@ from unittest.mock import patch
 import pytest
 
 from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions
-from hyper_multicore.modules.mega_moe.mxfp8_graph import build_mxfp8_runtime
+from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
 from hyper_multicore.modules.mega_moe.schedule import (
     describe_schedule_policy, explain_schedule, list_schedule_policies, resolve_schedule_options,
 )
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
+from hyper_multicore.scheduler.runtime import serialize_runtime_config
 
 
-def test_only_implemented_policy_is_available():
-    assert list_schedule_policies() == ('two_expert_pipeline',)
+def test_only_implemented_policies_are_available():
+    assert list_schedule_policies() == ('two_expert_pipeline', 'builder_order')
     assert describe_schedule_policy('two_expert_pipeline')['transport_fifo']
     with pytest.raises(ValueError, match='Unknown'):
         resolve_schedule_options(MegaMoeScheduleOptions(policy='half16'))
@@ -77,3 +79,33 @@ def test_explain_is_read_only_and_profile_uses_same_queues():
                if queue['kind'] == 'aiv' and queue['worker'] % 2)
     alternative = build_mxfp8_runtime(replace(spec, ready_depth=1), forward=True)
     assert ordinary['queues'] != explain_schedule(alternative.config)['queues']
+
+
+@pytest.mark.parametrize('precision,mode', [('bf16', 'push'), ('bf16', 'pull'),
+                                           ('mxfp8', 'push'), ('mxfp8', 'pull')])
+def test_builder_order_preserves_task_owners_events_and_transport(precision, mode):
+    spec = MegaMoeSpec(512, 512, 128, 24, 8, 1.25, 8192, 4, None, 0, 32,
+                       precision=precision, dispatch_mode=mode, transport_engine='udma',
+                       dispatch_split=512, combine_split=512)
+
+    def configs(selected):
+        if precision == 'bf16':
+            _, fwd, _, bwd = _build_runtime_artifacts(selected)
+            return fwd, bwd
+        return tuple(build_mxfp8_runtime(selected, forward=value).config for value in (True, False))
+
+    baseline = configs(spec)
+    candidate = configs(replace(spec, schedule_policy='builder_order'))
+    changed = False
+    for left, right in zip(baseline, candidate):
+        a, b = explain_schedule(left), explain_schedule(right)
+        assert a['tasks'] == b['tasks']
+        assert a['event_triggers'] == b['event_triggers']
+        assert a['layout'] == b['layout']
+        for first, second in zip(a['queues'], b['queues']):
+            assert sorted(first['tasks']) == sorted(second['tasks'])
+            if first['kind'] == 'aiv' and first['worker'] % 2:
+                assert first == second
+            changed |= first['tasks'] != second['tasks']
+        assert serialize_runtime_config(right)
+    assert changed

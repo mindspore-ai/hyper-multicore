@@ -10,7 +10,6 @@ constexpr uint32_t MX_QUANT_MAGIC = 0x4D585154;
 constexpr uint32_t MX_QUANT_TASK = 143;
 constexpr uint32_t MX_SWIGLU_TASK = 145;
 constexpr uint32_t MX_SWIGLU_GRAD_TASK = 146;
-constexpr uint32_t MX_SWIGLU_ROW_TASK = 147;
 
 struct MxQuantDescriptor {
   uint32_t magic;
@@ -28,12 +27,12 @@ __aicore__
 #endif
 inline bool IsMxQuantDescriptorValid(const MxQuantDescriptor& r) {
   const bool supported = r.task_type == MX_QUANT_TASK || r.task_type == MX_SWIGLU_TASK
-                        || r.task_type == MX_SWIGLU_GRAD_TASK || r.task_type == MX_SWIGLU_ROW_TASK;
+                        || r.task_type == MX_SWIGLU_GRAD_TASK;
   const uint32_t block_columns = r.task_type == MX_SWIGLU_GRAD_TASK ? 128 : 256;
   return r.magic == MX_QUANT_MAGIC && r.version == 1 && r.size == sizeof(r) && r.input_bytes == 2
     && r.columns > 0 && r.columns % 64 == 0 && r.worker_count > 0 && r.worker_index < r.worker_count
     && supported && (r.task_type != MX_SWIGLU_GRAD_TASK || r.columns % 128 == 0)
-    && r.block_rows == (r.task_type == MX_SWIGLU_ROW_TASK ? 16 : 64)
+    && r.block_rows == 64
     && r.block_columns == block_columns;
 }
 }  // namespace MulticoreMx

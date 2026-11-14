@@ -27,14 +27,17 @@ import torch
 
 from hyper_multicore import _automatic, _collective
 from hyper_multicore.modules.mega_moe import module as mega_moe_module
-from hyper_multicore.modules.mega_moe.backward.graph import build_backward_graph
-from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import build_config_for_rank
-from hyper_multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
-from hyper_multicore.modules.mega_moe.backward.tiling_tables import (
+from hyper_multicore.modules.mega_moe import resources as common_resources
+from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16_resources
+from hyper_multicore.modules.mega_moe.backends.bf16 import execution as bf16_execution
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.graph import build_backward_graph
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.gen_runtime_data import build_config_for_rank
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.storage import can_reuse_backward_dispatch
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.tiling_tables import (
     get_act_grad_tiling_bytes, get_gate_grad_tiling_bytes, get_w1_grad_tiling_bytes, get_w2_grad_tiling_bytes,
 )
-from hyper_multicore.modules.mega_moe.forward.graph import build_forward_graph
-from hyper_multicore.modules.mega_moe.forward.tiling_tables import get_down_proj_tiling_bytes, get_up_proj_tiling_bytes
+from hyper_multicore.modules.mega_moe.backends.bf16.forward.graph import build_forward_graph
+from hyper_multicore.modules.mega_moe.backends.bf16.forward.tiling_tables import get_down_proj_tiling_bytes, get_up_proj_tiling_bytes
 from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.scheduler.config import TaskSplitValue
@@ -49,7 +52,7 @@ class TestMegaMoeExperts(unittest.TestCase):
     @staticmethod
     def _cache_resources(capacity: int, *, automatic: bool = False, mode: str = "push") -> Any:
         """Create a lazy resource with an explicit committed source reservation."""
-        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources = bf16_resources.BF16Resources.__new__(bf16_resources.BF16Resources)
         resources.spec = MegaMoeSpec(capacity, 16, 8, 4, 2, None, capacity * 2, 1, None, 0, 24,
                                     max_local_num_tokens=None if automatic else capacity,
                                     auto_tokens=automatic, dispatch_mode=mode)
@@ -104,7 +107,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         ):
             with self.subTest(lengths=lengths):
                 resources = self._cache_resources(8192)
-                with patch.object(mega_moe_module, "build_mega_moe_plan",
+                with patch.object(bf16_resources, "build_mega_moe_plan",
                                   side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
                     first = [resources.plan_for_tokens(tokens, "cpu") for tokens in lengths]
                     for _ in range(3):
@@ -128,7 +131,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             with self.subTest(public_bound=public_bound):
                 resources = self._cache_resources(reserved)
                 resources.spec = replace(resources.spec, max_local_num_tokens=public_bound)
-                with patch.object(mega_moe_module, "build_mega_moe_plan",
+                with patch.object(bf16_resources, "build_mega_moe_plan",
                                   side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
                     for requested in (0, 128, reserved):
                         plan = resources.plan_for_tokens(requested, "cpu")
@@ -156,7 +159,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 resources.heap_manager.ensure_token_capacity.return_value = physical
                 tensor = torch.empty(1, 16, dtype=torch.bfloat16)
                 resources.prepare_auto_workspace(4096, 32768, tensor)
-                with patch.object(mega_moe_module, "build_mega_moe_plan",
+                with patch.object(bf16_resources, "build_mega_moe_plan",
                                   side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
                     plan = resources.plan_for_tokens(4096, "cpu")
                     self.assertEqual(plan.spec.plan_tokens, 4096)
@@ -175,11 +178,11 @@ class TestMegaMoeExperts(unittest.TestCase):
         """
         resources = self._cache_resources(128, automatic=True)
         resources._token_capacity = 384
-        with patch.object(mega_moe_module, "build_mega_moe_plan",
+        with patch.object(bf16_resources, "build_mega_moe_plan",
                           side_effect=lambda spec, device: SimpleNamespace(spec=spec)):
             retained = resources.plan_for_tokens(384, "cpu")
             resources._token_capacity = 512
-            with (patch.object(mega_moe_module, "build_mega_moe_plan", side_effect=RuntimeError("build failed")),
+            with (patch.object(bf16_resources, "build_mega_moe_plan", side_effect=RuntimeError("build failed")),
                   self.assertRaisesRegex(RuntimeError, "build failed")):
                 resources.plan_for_tokens(512, "cpu")
             self.assertIs(resources._plans[512], retained)
@@ -208,7 +211,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "workspace failed"):
             resources.prepare_auto_workspace(4096, 8192, torch.empty(1, 16))
         self.assertEqual(resources._token_capacity, 128)
-        with (patch.object(mega_moe_module, "build_mega_moe_plan") as build,
+        with (patch.object(bf16_resources, "build_mega_moe_plan") as build,
               self.assertRaisesRegex(RuntimeError, "requested=4096, capacity=128")):
             resources.plan_for_tokens(4096, "cpu")
         build.assert_not_called()
@@ -224,7 +227,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         capacity = ((2**31 - 1) // 16 // 128) * 128
         resources = self._cache_resources(capacity)
         lengths = [2**power for power in range(7, 27)] + [capacity]
-        with patch.object(mega_moe_module, "build_mega_moe_plan",
+        with patch.object(bf16_resources, "build_mega_moe_plan",
                           side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
             for tokens in lengths * 3:
                 resources.plan_for_tokens(tokens, "cpu")
@@ -239,7 +242,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         Description: Inject a different manifest, legacy wire version or incompatible expert-weight layout.
         Expectation: Every mismatch fails before symmetric allocation or count exchange.
         """
-        resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+        resources = bf16_resources.BF16Resources.__new__(bf16_resources.BF16Resources)
         resources.spec = SimpleNamespace(ep_size=2, ep_group=object())
         for mismatch in ("configuration", "wire", "layout"):
             def gather(output: list, value: Any, kind: str = mismatch, **kwargs: Any) -> None:
@@ -536,13 +539,13 @@ class TestMegaMoeExperts(unittest.TestCase):
             patch.object(torch, "npu", Mock(is_current_stream_capturing=Mock(return_value=False)), create=True),
             patch.object(experts, "_get_execution_resources", return_value=resources),
             patch.object(
-                mega_moe_module, "prepare_topk_route", return_value=route
+                bf16_execution, "prepare_topk_route", return_value=route
             ) as mock_prepare,
             patch.object(
-                mega_moe_module, "execute_mega_moe_with_permutation", return_value=expert_output
+                bf16_execution, "execute_mega_moe_with_permutation", return_value=expert_output
             ) as mock_execute,
             patch.object(
-                mega_moe_module, "restore_topk_output", return_value=expected
+                bf16_execution, "restore_topk_output", return_value=expected
             ) as mock_restore,
         ):
             actual = experts(
@@ -705,19 +708,18 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         with (
             patch.object(
-                mega_moe_module,
-                "bind_mega_moe_spec",
+                common_resources, "bind_mega_moe_spec",
                 return_value=bound_spec,
             ),
-            patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
+            patch.object(common_resources, "_get_heap_manager", return_value=manager),
             patch.object(
-                mega_moe_module, "build_mega_moe_plan", return_value=object()
+                bf16_resources, "build_mega_moe_plan", return_value=object()
             ) as mock_build_plan,
-            patch.object(mega_moe_module, "MegaMoeWorkspace", return_value=workspace),
+            patch.object(common_resources, "MegaMoeWorkspace", return_value=workspace),
             patch.object(_automatic._CLEANUP, "root_group", object()),
             patch.object(_collective, "exchange", wraps=_collective.exchange) as exchange,
         ):
-            resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+            resources = bf16_resources.BF16Resources(  # pylint: disable=protected-access
                 {},
                 SimpleNamespace(device="npu:0", dtype=torch.bfloat16, element_size=lambda: 2),
                 shared=False,
@@ -752,19 +754,17 @@ class TestMegaMoeExperts(unittest.TestCase):
         manager.attach_runtime.return_value = True
         with (
             patch.object(
-                mega_moe_module,
-                "bind_mega_moe_spec",
+                common_resources, "bind_mega_moe_spec",
                 return_value=bound_spec,
             ),
-            patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
+            patch.object(common_resources, "_get_heap_manager", return_value=manager),
             patch.object(
-                mega_moe_module,
-                "build_mega_moe_plan",
+                bf16_resources, "build_mega_moe_plan",
                 side_effect=RuntimeError("plan failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "plan failed"),
         ):
-            mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+            bf16_resources.BF16Resources(  # pylint: disable=protected-access
                 {},
                 SimpleNamespace(device="npu:0", dtype=torch.bfloat16, element_size=lambda: 2),
                 shared=False,
@@ -800,13 +800,13 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         manager.reserve.side_effect = reserve
         with (
-            patch.object(mega_moe_module, "bind_mega_moe_spec", return_value=bound_spec),
-            patch.object(mega_moe_module, "_workspace_layout", return_value=object()),
-            patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
-            patch.object(mega_moe_module, "build_mega_moe_plan", side_effect=RuntimeError("plan failed")),
+            patch.object(common_resources, "bind_mega_moe_spec", return_value=bound_spec),
+            patch.object(common_resources, "_workspace_layout", return_value=object()),
+            patch.object(common_resources, "_get_heap_manager", return_value=manager),
+            patch.object(bf16_resources, "build_mega_moe_plan", side_effect=RuntimeError("plan failed")),
             self.assertRaisesRegex(RuntimeError, "plan failed"),
         ):
-            mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+            bf16_resources.BF16Resources(  # pylint: disable=protected-access
                 specification,
                 SimpleNamespace(device="npu:0", dtype=torch.bfloat16, element_size=lambda: 2),
                 shared=False,
@@ -826,8 +826,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         Description: Keep the resource open until manager-owned workspace close succeeds.
         Expectation: A failed close remains open and succeeds on a later retry.
         """
-        resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
-            mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
+        resources = bf16_resources.BF16Resources.__new__(  # pylint: disable=protected-access
+            bf16_resources.BF16Resources  # pylint: disable=protected-access
         )
         resources.workspace = Mock()
         resources._workspace_closed = False  # pylint: disable=protected-access

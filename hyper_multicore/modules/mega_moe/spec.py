@@ -59,7 +59,6 @@ class MegaMoeSpec:
     transport_engine: str = "mte"
     ready_depth: int = 0
     precision: str = "bf16"
-    swiglu_row_only: bool = False
     schedule_policy: str = "two_expert_pipeline"
 
     @property
@@ -229,5 +228,4 @@ def bind_mega_moe_spec(
         ready_depth=specification.get("ready_depth", 0),
         schedule_policy=specification.get("schedule_policy", "two_expert_pipeline"),
         precision=specification.get("precision", "bf16"),
-        swiglu_row_only=specification.get("swiglu_row_only", False),
     )

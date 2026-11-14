@@ -108,7 +108,6 @@ enum class TaskType : uint32_t {
   TASK_MX_QUANT = 143,
   TASK_MX_SWIGLU_QUANT = 145,
   TASK_MX_SWIGLU_GRAD_QUANT = 146,
-  TASK_MX_SWIGLU_ROW_QUANT = 147,
 };
 
 enum class EventType : uint32_t {

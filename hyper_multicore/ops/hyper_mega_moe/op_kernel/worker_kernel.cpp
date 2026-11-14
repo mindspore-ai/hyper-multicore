@@ -23,7 +23,7 @@
 #include "hyper_mega_moe/op_kernel/contracts/swiglu.h"
 #include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
-#include "hyper_mega_moe/op_kernel/adapters/arch35/bf16_gmm/worker.h"
+#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h"
 #endif
 
 using namespace AscendC;

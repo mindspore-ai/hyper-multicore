@@ -24,8 +24,8 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from hyper_multicore.diagnostics import MegaKernelDiagnostics
-from hyper_multicore.modules.mega_moe import function as function_module
-from hyper_multicore.modules.mega_moe.function import _MegaMoeFunction
+from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
+from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _MegaMoeFunction
 from tests.common.mark_utils import arg_mark
 
 

@@ -884,7 +884,7 @@ A5 数学实现从锁定的 CANN Git 源码装配，不在仓库内保存第二�
 MX 权重由调用方持有原始 Tensor/Parameter，提供当前 `col_data/col_scale`，反向还需
 `row_data/row_scale`。数据为 E4M3FN，scale 为 uint8 物理 E8M0 布局，逻辑权重为 EIO。
 反向重新从原始 root 解析物理存储，禁止缓存 FSDP gather 后的临时 view。
-正向 no-grad 的 SwiGLU 可只计算 rowwise；需要反向的首轮/重算仍生成完整 columnwise。
+正向 no-grad、首轮/重算使用同一个 SwiGLU dual-axis 数学实现；no-grad no-clone 单独控制输出生命周期。
 Pull 的图计划按静态上界复用，真实负载只改变运行时 metadata，不生成逐路由队列表。
 
 未迁入未采纳的固定 solver 表、半核候选、老 SHMEM SDK、额外故障观察器和多 QP 开关。
@@ -909,3 +909,21 @@ Pull 的图计划按静态上界复用，真实负载只改变运行时 metadata
 数学DAG、传输分片和事件生成不由策略隐式改写。
 用户只有一个队列扫描参数，FIFO/bounded-ready由其内部推导；仍保留现有0/1/8能力。
 MX正反向共享schema、推导和launch封装，保持两个ACLNN名称及Hardware轨道身份。
+
+
+### 精度后端与算子任务命名
+
+公共 `MegaMoeExperts` 接口、spec、transport、schedule、route、heap/workspace 和资源生命周期
+位于 `modules/mega_moe/`。BF16、MXFP8 在同级 `backends/bf16/` 与 `backends/mxfp8/`
+实现数学图、autograd、tiling/launch 和物理权重合同。后端以普通 Python 模块分发，
+不嵌套 nn.Module，BF16 参数名保持 `gate_up_weight` / `down_weight`，外部权重 root 不由执行器持有参数副本。
+两种精度的 descriptor、激活保存及反向权重来源不同，因此不强行合并 autograd/launch ABI。
+
+任务按算子职责命名：`tasks/gmm_mxfp8.py`、`quantization_mxfp8.py`、`swiglu_mxfp8.py`。
+MoE launch 头放在 `backends/mxfp8/launch_contract.py`，不混入 GMM 数学 descriptor。
+私有 device adapter 按 `gmm/`、`swiglu/`、`quantization/` 组织在 arch35 下；GMM 逻辑核轮转
+由 `adapters/common/gmm_logical_workers.h` 供两种精度共用。
+
+`blaze_gmm_logical_workers.patch` 适配 ops-tensor 的 Blaze GMM，当前消费者为 arch35。
+`grouped_matmul_fusion.patch` 适配 ops-transformer 的 GMMProcess，两者的上游目录、接口不同，
+保持分别锁定和应用。补丁名标明算子，不把架构信息重复写进文件名；适用架构记录在锁源清单。

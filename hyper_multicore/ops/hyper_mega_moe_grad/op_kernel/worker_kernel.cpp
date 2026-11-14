@@ -25,9 +25,9 @@
 #include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
 #ifdef __DAV_CUBE__
-#include "hyper_mega_moe/op_kernel/adapters/arch35/bf16_gmm/worker.h"
+#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h"
 #else
-#include "hyper_mega_moe/op_kernel/adapters/arch35/bf16_swiglu_grad/worker.h"
+#include "hyper_mega_moe/op_kernel/adapters/arch35/swiglu/bf16_grad_worker.h"
 #endif
 #endif
 

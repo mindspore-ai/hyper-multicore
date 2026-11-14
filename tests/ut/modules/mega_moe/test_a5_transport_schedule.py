@@ -5,11 +5,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.transport import TRANSPORT_TASKS, validate_transport_owners
 from hyper_multicore.shmem._ordering import SubmissionOrder
-from hyper_multicore.modules.mega_moe.mxfp8_graph import build_mxfp8_runtime
+from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
 
 
@@ -61,7 +61,6 @@ def test_mx_graph_coverage_and_shared_protocol(ep, mode):
                        num_cube_cores=32, dispatch_mode=mode, dispatch_split=4096, combine_split=4096,
                        transport_engine='udma', ready_depth=8, precision='mxfp8')
     phases = [build_mxfp8_runtime(spec, forward=True),
-              build_mxfp8_runtime(spec, forward=True, swiglu_row_only=True),
               build_mxfp8_runtime(spec, forward=False)]
     for plan in phases:
         cfg = plan.config

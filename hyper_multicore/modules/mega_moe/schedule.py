@@ -11,6 +11,7 @@ from hyper_multicore.scheduler.worker_queues import install_worker_queues
 from .transport import TRANSPORT_TASKS, transport_queues, validate_transport_owners
 
 TWO_EXPERT_PIPELINE = 'two_expert_pipeline'
+BUILDER_ORDER = 'builder_order'
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,8 @@ class ExpertStages:
     cores: int
     experts: int
     forward: bool
+    original_cubes: tuple
+    original_vectors: tuple
 
     def tasks(self, role, expert, lane):
         begin, count = self.ranges[role]
@@ -68,7 +71,7 @@ class ExpertStages:
         return range(begin + expert * width + lane, begin + (expert + 1) * width, self.cores)
 
 
-def _expert_stages(graph, spec, forward):
+def _expert_stages(graph, spec, forward, cfg):
     # These are mathematical roles, not descriptor ports or physical worker IDs.
     aliases = ({'up': 'up_proj', 'down': 'down_proj', 'activation': 'swiglu',
                 'dw_down': 'w2_grad', 'da': 'act_grad', 'dx': 'gate_grad',
@@ -88,7 +91,20 @@ def _expert_stages(graph, spec, forward):
         offsets[op.name] = (offset, op.task_num)
         offset += op.task_num
     ranges = {role: offsets[aliases.get(role, role)] for role in (*cubes, *vectors)}
-    return ExpertStages(MappingProxyType(ranges), cubes, vectors, spec.num_cube_cores, spec.local_experts, forward)
+    def project(indices, roles):
+        queues = [[] for _ in range(spec.num_cube_cores)]
+        for tid in indices:
+            for role in roles:
+                begin, count = ranges[role]
+                if begin <= tid < begin + count:
+                    width = count // spec.local_experts
+                    queues[(tid - begin) % width % spec.num_cube_cores].append(int(tid))
+                    break
+        return tuple(tuple(queue) for queue in queues)
+    return ExpertStages(MappingProxyType(ranges), cubes, vectors, spec.num_cube_cores,
+                        spec.local_experts, forward,
+                        project(cfg.cube_task_indices[:cfg.task_index_num[0]], cubes),
+                        project(cfg.vector_task_indices[:cfg.task_index_num[1]], vectors))
 
 
 def _two_expert_pipeline(stages):
@@ -113,8 +129,16 @@ def _two_expert_pipeline(stages):
     return cubes, vectors
 
 
+def _builder_order(stages):
+    """Keep builder math order on the shared fixed owners; no legacy QP rollback."""
+    vectors = [[] for _ in range(2 * stages.cores)]
+    for lane, queue in enumerate(stages.original_vectors):
+        vectors[2 * lane] = list(queue)
+    return [list(queue) for queue in stages.original_cubes], vectors
+
+
 # Add implemented policies here; no placeholder strategies or dynamic plugins.
-_POLICIES = {TWO_EXPERT_PIPELINE: _two_expert_pipeline}
+_POLICIES = {TWO_EXPERT_PIPELINE: _two_expert_pipeline, BUILDER_ORDER: _builder_order}
 
 
 def list_schedule_policies():
@@ -135,7 +159,7 @@ def configure_expert_queues(cfg, graph, spec, *, forward):
         if spec.ready_depth:
             raise ValueError('BF16 MTE legacy queues do not support explicit math queue ready selection')
         return cfg
-    stages = _expert_stages(graph, spec, forward)
+    stages = _expert_stages(graph, spec, forward, cfg)
     describe_schedule_policy(spec.schedule_policy)
     cubes, math = _POLICIES[spec.schedule_policy](stages)
     communication = [tid for tid in cfg.vector_task_indices[:cfg.task_index_num[1]]
