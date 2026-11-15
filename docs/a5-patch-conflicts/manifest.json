@@ -69,5 +69,19 @@
     ],
     "rejected_hunks": [],
     "action": "incoming conflict versions retained; all stages archived for review"
+  },
+  {
+    "patch": 13,
+    "unmerged_paths": [
+      "hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp",
+      "hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp",
+      "hyper_multicore/ops/runtime/runtime_config.hpp",
+      "hyper_multicore/ops/runtime/worker_kernel.h",
+      "hyper_multicore/scheduler/runtime.py",
+      "hyper_multicore/scheduler/worker_queues.py",
+      "tests/ut/scheduler/test_worker_queues.py"
+    ],
+    "rejected_hunks": [],
+    "action": "incoming conflict versions retained; all stages archived for review"
   }
 ]

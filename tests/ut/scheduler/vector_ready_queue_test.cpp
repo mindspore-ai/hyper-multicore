@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 #define __aicore__
-#include "hyper_multicore/ops/runtime/vector_ready_queue.h"
+#include "hyper_multicore/ops/runtime/worker_ready_queue.h"
 
 struct Queue {
   std::vector<uint32_t> executed;
@@ -21,14 +21,15 @@ struct Queue {
 };
 
 int main() {
+  for (uint32_t depth : {0U, 1U, 8U, 32U, 256U}) {
   for (uint32_t tasks : {0U, 1U, 255U, 256U, 257U, 18001U}) {
     for (uint32_t stride : {1U, 20U, 40U}) {
       std::vector<uint32_t> covered(tasks);
       for (uint32_t first = 0; first < stride; ++first) {
         Queue normal, profile;
         profile.profile = true;
-        MulticoreRuntime::RunVectorReadyQueue(normal, first, tasks, stride);
-        MulticoreRuntime::RunVectorReadyQueue(profile, first, tasks, stride);
+        MulticoreRuntime::RunWorkerQueue(normal, first, tasks, stride, depth);
+        MulticoreRuntime::RunWorkerQueue(profile, first, tasks, stride, depth);
         assert(normal.executed == profile.executed);
         assert(normal.records == 0 && profile.records == profile.executed.size());
         for (auto task : normal.executed) {
@@ -38,5 +39,6 @@ int main() {
       }
       for (auto count : covered) assert(count == 1);
     }
+  }
   }
 }

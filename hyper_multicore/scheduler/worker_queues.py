@@ -1,54 +1,58 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ============================================================================
-"""Explicit per-worker queues; policies and operator stage names stay outside runtime."""
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+"""Component-independent contiguous/strided worker queues and ready contracts."""
 from collections import Counter
 import ctypes
-from functools import lru_cache
 
 from .config import RuntimeConfigC
 
+WAIT_HEAD = 0
+RESCAN_WINDOW = 1
+MAX_READY_LOOKAHEAD = 256
+
 
 class WorkerQueueC(ctypes.Structure):
-    """A contiguous interval in one task-kind queue and its bounded ready lookahead."""
-    _fields_ = [(name, ctypes.c_uint32) for name in ("begin", "end", "ready_depth", "reserved")]
+    """A task-index view plus selection and waiting, independent of placement."""
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "begin", "end", "ready_depth", "stride", "wait_mode", "poll_interval_us")]
 
 
-@lru_cache(maxsize=16)
-def _queued_type(base: type, workers: int) -> type:
-    return type("Queued" + base.__name__, (base,), {"_fields_": [("worker_queues", WorkerQueueC * workers)]})
+def _attach(cfg, records):
+    cfg.worker_queues = (WorkerQueueC * len(records))(*records)
+    cfg.queue_layout = 2
+    if cfg.completion_event:
+        cfg.all_event_num_triggers[cfg.completion_event] = len(records)
+    serialize_worker_queues(cfg)
+    return cfg
+
+
+def install_strided_worker_queues(cfg: RuntimeConfigC, *, vector_ready_depth: int = 256) -> RuntimeConfigC:
+    """Preserve all-worker round-robin placement without rewriting task indices.
+
+    The compatibility wait observes the head with the upstream 5us parameter.
+    Cube queues remain FIFO. Selection does not implicitly enable any workers:
+    this placement operation explicitly supplies the complete participant set.
+    """
+    records = []
+    for count, workers, depth in ((cfg.task_index_num[0], cfg.num_workers // 2, 0),
+                                  (cfg.task_index_num[1], cfg.num_workers, vector_ready_depth)):
+        records.extend(WorkerQueueC(min(worker, count), count, depth, workers, WAIT_HEAD, 5)
+                       for worker in range(workers))
+    return _attach(cfg, records)
 
 
 def install_worker_queues(cfg: RuntimeConfigC, cubes: list[list[int]], vectors: list[list[int]], *,
                           cube_ready_depth: int = 0, vector_ready_depths: list[int] | None = None) -> RuntimeConfigC:
-    """Return a runtime with complete, unique work and no padding tasks.
-
-    Per-worker ready depths are explicit: communication owners can remain FIFO
-    while independent math workers use local lookahead. No worker parity or
-    operator type is assumed by this representation.
-    """
+    """Place every task once; communication can stay FIFO while math selects ready work."""
     if cfg.num_workers % 2 or len(cubes) != cfg.num_workers // 2 or len(vectors) != cfg.num_workers:
         raise ValueError("Worker queues must match the runtime's AIC/AIV resources")
     depths = [0] * len(vectors) if vector_ready_depths is None else vector_ready_depths
-    if len(depths) != len(vectors) or any(d not in (0, 1, 8) for d in [cube_ready_depth, *depths]):
-        raise ValueError("Worker ready depths must be 0, 1 or 8")
-    total_workers = len(cubes) + len(vectors)
-    result = _queued_type(type(cfg), total_workers)()
+    if len(depths) != len(vectors):
+        raise ValueError("One ready lookahead is required for each vector worker")
+    result = type(cfg)()
     ctypes.memmove(ctypes.addressof(result), ctypes.addressof(cfg), ctypes.sizeof(cfg))
     result.__dict__.update(cfg.__dict__)
-    queue_record = 0
-    for kind, queues, indices, per_worker_depths in (
+    records = []
+    for kind, queues, indices, per_depths in (
         (0, cubes, result.cube_task_indices, [cube_ready_depth] * len(cubes)),
         (1, vectors, result.vector_task_indices, depths),
     ):
@@ -57,34 +61,32 @@ def install_worker_queues(cfg: RuntimeConfigC, cubes: list[list[int]], vectors: 
         if Counter(flat) != Counter(old) or len(flat) != len(set(flat)):
             raise ValueError("Worker queues must cover the original work exactly once")
         begin = 0
-        for queue, depth in zip(queues, per_worker_depths):
+        for queue, depth in zip(queues, per_depths):
+            if not isinstance(depth, int) or isinstance(depth, bool) or not 0 <= depth <= MAX_READY_LOOKAHEAD:
+                raise ValueError("Worker ready lookahead must be an integer in [0, 256]")
             end = begin + len(queue)
             for position, task in enumerate(queue, begin):
                 indices[position] = task
-            result.worker_queues[queue_record] = WorkerQueueC(begin, end, depth, 0)
-            queue_record += 1
+            records.append(WorkerQueueC(begin, end, depth, 1, RESCAN_WINDOW, 10))
             begin = end
-    result.queue_layout = 1
-    if result.completion_event:
-        result.all_event_num_triggers[result.completion_event] = total_workers
-    return result
+    return _attach(result, records)
 
 
 def serialize_worker_queues(cfg: RuntimeConfigC) -> bytes:
-    """Validate the typed queue extension before appending it to the dense wire image."""
+    """Validate complete unique index coverage before serializing the queue table."""
     records = cfg.worker_queues
     cubes = cfg.num_workers // 2
-    if len(records) != cubes + cfg.num_workers:
-        raise ValueError("Worker queue record count does not match runtime resources")
-    previous = 0
-    for i, record in enumerate(records):
-        if i == cubes:
-            previous = 0
-        kind = 0 if i < cubes else 1
-        if (record.begin != previous or record.end < record.begin or record.end > cfg.task_index_num[kind]
-                or record.ready_depth not in (0, 1, 8) or record.reserved != 0):
-            raise ValueError("Invalid worker queue interval or ready policy")
-        previous = record.end
-        if i in (cubes - 1, len(records) - 1) and previous != cfg.task_index_num[kind]:
-            raise ValueError("Worker queues do not cover the complete task-kind queue")
+    if cfg.num_workers % 2 or len(records) != cubes + cfg.num_workers:
+        raise ValueError("Worker queue count does not match runtime resources")
+    for kind, group in ((0, records[:cubes]), (1, records[cubes:])):
+        count = cfg.task_index_num[kind]
+        positions = []
+        for record in group:
+            if (record.end > count or record.begin > record.end or not record.stride
+                    or record.ready_depth > MAX_READY_LOOKAHEAD or record.wait_mode not in (WAIT_HEAD, RESCAN_WINDOW)
+                    or (record.wait_mode == RESCAN_WINDOW and not record.poll_interval_us)):
+                raise ValueError("Invalid worker queue view or ready/wait policy")
+            positions.extend(range(record.begin, record.end, record.stride))
+        if len(positions) != count or set(positions) != set(range(count)):
+            raise ValueError("Worker queues must cover every original index exactly once")
     return bytes(records)

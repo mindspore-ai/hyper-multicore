@@ -180,7 +180,7 @@ class TaskDescC(ctypes.Structure):
         ("task_split_value",     ctypes.c_uint32),
         ("extra_value_0",        ctypes.c_uint32),
         ("extra_value_1",        ctypes.c_uint32),
-        ("extra_value_2",        ctypes.c_uint32),
+        ("dependency_poll_interval_us",        ctypes.c_uint32),
         ("profile_desc_id",      ctypes.c_uint32),
         ("profile_owner_id",     ctypes.c_uint32),
     ]

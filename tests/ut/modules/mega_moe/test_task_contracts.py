@@ -133,5 +133,5 @@ class TestTaskContracts(unittest.TestCase):
         self.assertEqual(list(moved.cube_task_indices), list(config.cube_task_indices))
         policy = MegaMoeSchedulePolicy(vector_ready_queue=False, pipeline_vector=True, pipeline_cube=True)
         policy.apply(moved, graph, topology, spec.num_cube_cores)
-        self.assertEqual(moved.vector_ready_queue, 0)
+        self.assertEqual(moved.queue_layout, 0)
         self.assertEqual(list(moved.cube_task_indices), list(config.cube_task_indices))

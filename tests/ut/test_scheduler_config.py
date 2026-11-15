@@ -57,7 +57,7 @@ class TestSchedulerConfig(unittest.TestCase):
         )
         self.assertEqual(
             config_module.TaskDescC.profile_desc_id.offset,
-            config_module.TaskDescC.extra_value_2.offset + ctypes.sizeof(ctypes.c_uint32),
+            config_module.TaskDescC.dependency_poll_interval_us.offset + ctypes.sizeof(ctypes.c_uint32),
             msg="profile_desc_id does not reuse the first reserved tail slot",
         )
         self.assertEqual(

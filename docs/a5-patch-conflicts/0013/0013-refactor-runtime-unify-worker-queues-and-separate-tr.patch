@@ -1,0 +1,968 @@
+From 48bbb78549612b5737a391f7d8a7bb70b58c183a Mon Sep 17 00:00:00 2001
+From: hedongdong <hdd475375904@126.com>
+Date: Sun, 15 Nov 2026 17:25:31 +0800
+Subject: [PATCH 13/27] refactor(runtime): unify worker queues and separate
+ transfer options from polling
+
+---
+ .../modules/mega_mhc_grad/graph.py            |  2 +-
+ .../modules/mega_moe/schedule_policy.py       | 13 ++-
+ .../modules/mega_moe/task_options.py          |  4 +-
+ .../ops/common/mega_moe/task_options.h        |  3 +-
+ .../ops/common/shmem_task_options.h           |  5 +
+ .../op_kernel/worker_kernel.cpp               |  2 +-
+ .../op_kernel/worker_kernel.cpp               |  2 +-
+ .../ops/runtime/runtime_config.hpp            | 50 +++++++++-
+ .../ops/runtime/vector_ready_queue.h          | 41 --------
+ hyper_multicore/ops/runtime/worker_kernel.h   | 85 ++++++++---------
+ .../ops/runtime/worker_ready_queue.h          | 44 +++++++++
+ hyper_multicore/scheduler/config.py           | 19 ++--
+ hyper_multicore/scheduler/runtime.py          | 14 ++-
+ hyper_multicore/scheduler/worker_queues.py    | 92 ++++++++++++++++++
+ hyper_multicore/tasks/alltoall.py             | 14 +++
+ .../mega_mhc_grad/test_mega_mhc_grad_graph.py |  4 +-
+ .../modules/mega_moe/test_task_contracts.py   |  2 +-
+ .../scheduler/test_runtime_serialization.py   |  3 +-
+ tests/ut/scheduler/test_worker_queues.py      | 95 +++++++++++++++++++
+ .../ut/scheduler/vector_ready_queue_test.cpp  |  8 +-
+ tests/ut/test_scheduler_config.py             |  2 +-
+ 21 files changed, 386 insertions(+), 118 deletions(-)
+ delete mode 100644 hyper_multicore/ops/runtime/vector_ready_queue.h
+ create mode 100644 hyper_multicore/ops/runtime/worker_ready_queue.h
+ create mode 100644 hyper_multicore/scheduler/worker_queues.py
+ create mode 100644 tests/ut/scheduler/test_worker_queues.py
+
+diff --git a/hyper_multicore/modules/mega_mhc_grad/graph.py b/hyper_multicore/modules/mega_mhc_grad/graph.py
+index d257bea..309a2e2 100644
+--- a/hyper_multicore/modules/mega_mhc_grad/graph.py
++++ b/hyper_multicore/modules/mega_mhc_grad/graph.py
+@@ -194,7 +194,7 @@ def _append_task(
+     task.task_split_value = split_value
+     # Reuse the current runtime ABI's third task-specific value for the
+     # dependency polling interval required by the 4-task backward pipeline.
+-    task.extra_value_2 = dependency_poll_interval_us
++    task.dependency_poll_interval_us = dependency_poll_interval_us
+     task_id = tsv.pre_task_num
+     cfg.all_tasks[task_id] = task
+     if core_type == TaskAiCoreType.TASK_AICORE_CUBE:
+diff --git a/hyper_multicore/modules/mega_moe/schedule_policy.py b/hyper_multicore/modules/mega_moe/schedule_policy.py
+index 69ba128..a27cb8c 100644
+--- a/hyper_multicore/modules/mega_moe/schedule_policy.py
++++ b/hyper_multicore/modules/mega_moe/schedule_policy.py
+@@ -188,13 +188,19 @@ class MegaMoeSchedulePolicy:
+ 
+     def apply(self, config: RuntimeConfigC, graph: ComputeGraph, topology: TaskSplitValue, workers: int) -> None:
+         """Schedule existing typed stages while preserving their task/credit contract."""
++        if not self.vector_ready_queue:
++            config.queue_layout = 0
++            config.worker_queue_offset = 0
++            if hasattr(config, "worker_queues"):
++                del config.worker_queues
++            if config.completion_event:
++                config.all_event_num_triggers[config.completion_event] = config.num_workers
+         if self.batch_experts and (self.pipeline_vector or self.pipeline_cube):
+             raise ValueError("expert batching and per-expert pipeline ordering are separate policies")
+         queue = list(config.cube_task_indices[:config.task_index_num[0]])
+         queue += list(config.vector_task_indices[:config.task_index_num[1]])
+         for task_id in queue:
+-            config.all_tasks[task_id].extra_value_2 = self.dependency_poll_interval
+-        config.vector_ready_queue = int(self.vector_ready_queue)
++            config.all_tasks[task_id].dependency_poll_interval_us = self.dependency_poll_interval
+         if self.batch_experts:
+             collapse_batched_tasks(config, workers)
+             return
+@@ -204,3 +210,6 @@ class MegaMoeSchedulePolicy:
+             pipeline_cube_queue(config, graph, topology, workers)
+             for task_id in config.cube_task_indices[:config.task_index_num[0]]:
+                 config.all_tasks[task_id].extra_value_1 = GroupedMatmulTaskMode.SINGLE_GROUP
++        if self.vector_ready_queue:
++            from hyper_multicore.scheduler.worker_queues import install_strided_worker_queues
++            install_strided_worker_queues(config)
+diff --git a/hyper_multicore/modules/mega_moe/task_options.py b/hyper_multicore/modules/mega_moe/task_options.py
+index a43dda9..6c35b71 100644
+--- a/hyper_multicore/modules/mega_moe/task_options.py
++++ b/hyper_multicore/modules/mega_moe/task_options.py
+@@ -17,7 +17,7 @@ from enum import IntEnum
+ from typing import Any
+ 
+ from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
+-from hyper_multicore.tasks.alltoall import ShmemTaskPartition
++from hyper_multicore.tasks.alltoall import ShmemTaskPartition, ShmemTransferEngine
+ from hyper_multicore.scheduler.config import TaskType
+ from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
+ from .probability_abi import ProbabilityLayout
+@@ -62,7 +62,7 @@ def _activation_options(task: Any) -> bool:
+ 
+ def _transport_options(task: Any) -> bool:
+     allowed = int(ShmemTaskPartition.RUNTIME_ROWS | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES
+-                  | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS)
++                  | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS | ShmemTransferEngine.UDMA)
+     if task.extra_value_1 & ~allowed:
+         raise ValueError(f"invalid transport flags {task.extra_value_1:#x}")
+     payload = transport_payload(task)
+diff --git a/hyper_multicore/ops/common/mega_moe/task_options.h b/hyper_multicore/ops/common/mega_moe/task_options.h
+index 0c00af6..c93588d 100644
+--- a/hyper_multicore/ops/common/mega_moe/task_options.h
++++ b/hyper_multicore/ops/common/mega_moe/task_options.h
+@@ -69,7 +69,8 @@ __aicore__ inline bool IsActivationTaskOptionsValid(const TaskDesc &task, uint32
+ __aicore__ inline bool IsTransportTaskOptionsValid(const TaskDesc &task, uint32_t probability_position) {
+   constexpr uint32_t scalar_bits = static_cast<uint32_t>(MegaMoeTransportPayload::TOKENS_WITH_PROBABILITIES) |
+       static_cast<uint32_t>(MegaMoeTransportPayload::TOKENS_WITH_PROBABILITY_GRADIENTS);
+-  constexpr uint32_t allowed = static_cast<uint32_t>(ShmemTaskPartition::RUNTIME_ROWS) | scalar_bits;
++  constexpr uint32_t allowed = static_cast<uint32_t>(ShmemTaskPartition::RUNTIME_ROWS) | scalar_bits |
++      static_cast<uint32_t>(ShmemTransferEngine::UDMA);
+   if ((task.extra_value_1 & ~allowed) != 0) return false;
+   const auto payload = GetMegaMoeTransportPayload(task);
+   if (static_cast<uint32_t>(payload) == scalar_bits) return false;
+diff --git a/hyper_multicore/ops/common/shmem_task_options.h b/hyper_multicore/ops/common/shmem_task_options.h
+index 53dc60e..d5d8286 100644
+--- a/hyper_multicore/ops/common/shmem_task_options.h
++++ b/hyper_multicore/ops/common/shmem_task_options.h
+@@ -3,6 +3,7 @@
+ #ifndef HYPER_MULTICORE_OPS_COMMON_SHMEM_TASK_OPTIONS_H_
+ #define HYPER_MULTICORE_OPS_COMMON_SHMEM_TASK_OPTIONS_H_
+ #include <cstdint>
++#include "../runtime/runtime_config.hpp"
+ 
+ namespace MulticoreRuntime {
+ // Mirrors the option definitions in tasks/alltoall.py.
+@@ -10,5 +11,9 @@ enum class ShmemTaskPartition : uint32_t {
+   FIXED_ROWS = 0,
+   RUNTIME_ROWS = 2,
+ };
++enum class ShmemTransferEngine : uint32_t { MTE = 0, UDMA = 16 };
++inline __aicore__ ShmemTransferEngine GetShmemTransferEngine(const TaskDesc &task) {
++  return static_cast<ShmemTransferEngine>(task.extra_value_1 & 16U);
++}
+ }  // namespace MulticoreRuntime
+ #endif  // HYPER_MULTICORE_OPS_COMMON_SHMEM_TASK_OPTIONS_H_
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp b/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
+index c2a8fe2..87f5113 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
+@@ -224,7 +224,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
+         const bool batched = IsBatchedGroupedMatmulTask(task_desc);
+         if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
+           for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
+-            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.extra_value_2);
++            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.dependency_poll_interval_us);
+           }
+         }
+         int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index);
+diff --git a/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp b/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
+index 93ebf9b..4af85de 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
+@@ -264,7 +264,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
+         const bool batched = IsBatchedGroupedMatmulTask(task_desc);
+         if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
+           for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
+-            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.extra_value_2);
++            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.dependency_poll_interval_us);
+           }
+         }
+         int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index);
+diff --git a/hyper_multicore/ops/runtime/runtime_config.hpp b/hyper_multicore/ops/runtime/runtime_config.hpp
+index beda631..3885ab0 100644
+--- a/hyper_multicore/ops/runtime/runtime_config.hpp
++++ b/hyper_multicore/ops/runtime/runtime_config.hpp
+@@ -104,6 +104,10 @@ enum class TaskType : uint32_t {
+   TASK_GATE_GRAD_ADD_SELECTED = 139,
+   TASK_GATE_GRAD_ZEROS = 140,
+   TASK_SHMEM_GET_MEM = 141,
++  TASK_MX_GMM = 142,
++  TASK_MX_QUANT = 143,
++  TASK_MX_SWIGLU_QUANT = 145,
++  TASK_MX_SWIGLU_GRAD_QUANT = 146,
+ };
+ 
+ enum class EventType : uint32_t {
+@@ -166,7 +170,7 @@ struct TaskDesc {
+   uint32_t task_split_value;
+   uint32_t extra_value_0;
+   uint32_t extra_value_1;
+-  uint32_t extra_value_2;
++  uint32_t dependency_poll_interval_us;
+   uint32_t profile_desc_id;
+   uint32_t profile_owner_id;
+ };
+@@ -187,10 +191,30 @@ struct RuntimeHeader {
+   uint32_t aiv_profile_record_capacity;
+   uint32_t completion_event;
+   uint32_t protocol_version;
+-  uint32_t vector_ready_queue;
+-  uint32_t padding[5];
++  uint32_t queue_layout;
++  uint32_t worker_queue_offset;
++  uint32_t padding[4];
+ };
+ 
++// One queue contract for contiguous and strided task views.
++struct WorkerQueue {
++  uint32_t begin;
++  uint32_t end;
++  uint32_t ready_depth;
++  uint32_t stride;
++  uint32_t wait_mode;  // 0: wait for head, 1: periodically rescan the window.
++  uint32_t poll_interval_us;
++};
++static_assert(sizeof(WorkerQueue) == 24);
++__aicore__ inline uint32_t getQueueLayout(__gm__ uint8_t *tiling) {
++  return reinterpret_cast<__gm__ RuntimeHeader *>(tiling)->queue_layout;
++}
++__aicore__ inline WorkerQueue getWorkerQueue(__gm__ uint8_t *tiling, uint32_t worker) {
++  const uint32_t offset = reinterpret_cast<__gm__ RuntimeHeader *>(tiling)->worker_queue_offset;
++  auto r = reinterpret_cast<__gm__ WorkerQueue *>(tiling + offset) + worker;
++  return {r->begin, r->end, r->ready_depth, r->stride, r->wait_mode, r->poll_interval_us};
++}
++
+ static_assert(sizeof(RuntimeHeader) == 64);
+ static_assert(sizeof(TensorDesc) == 64);
+ static_assert(sizeof(TaskDesc) == 576);
+@@ -314,7 +338,7 @@ __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData,
+   start_size += UINT32_T_SIZE;
+   tilingData->extra_value_1 = (*(__gm__ uint32_t *)(tiling + start_size));
+   start_size += UINT32_T_SIZE;
+-  tilingData->extra_value_2 = (*(__gm__ uint32_t *)(tiling + start_size));
++  tilingData->dependency_poll_interval_us = (*(__gm__ uint32_t *)(tiling + start_size));
+   start_size += UINT32_T_SIZE;
+   tilingData->profile_desc_id = (*(__gm__ uint32_t *)(tiling + start_size));
+   start_size += UINT32_T_SIZE;
+@@ -461,7 +485,23 @@ __aicore__ inline bool isRuntimeTailValid(__gm__ uint8_t *tiling, uint64_t runti
+     return false;
+   }
+   uint64_t required = prefix + getGroupedMatmulGroupListBytes(tiling) + ATOMIC_ADD_VALUE_LEN * INT32_T_SIZE;
+-  return required < RUNTIME_ADDRESS_SPACE_BYTES && runtime_bytes >= required;
++  if (required >= RUNTIME_ADDRESS_SPACE_BYTES || runtime_bytes < required) return false;
++  auto header = reinterpret_cast<__gm__ RuntimeHeader *>(tiling);
++  if (header->queue_layout == 0) return header->worker_queue_offset == 0;
++  if (header->queue_layout != 2 || header->worker_queue_offset != required || header->num_workers % 2 != 0) {
++    return false;
++  }
++  const uint64_t cubes = header->num_workers / 2;
++  const uint64_t workers = cubes + header->num_workers;
++  if (workers == 0 || required + workers * sizeof(WorkerQueue) > runtime_bytes) return false;
++  for (uint32_t i = 0; i < workers; ++i) {
++    const auto r = getWorkerQueue(tiling, i);
++    const auto kind = i < cubes ? TaskAiCoreType::TASK_AICORE_CUBE : TaskAiCoreType::TASK_AICORE_VECTOR;
++    const uint32_t count = getTaskIndexNumByTaskType(tiling, kind);
++    if (r.end > count || r.begin > r.end || r.stride == 0 || r.ready_depth > 256 ||
++        r.wait_mode > 1 || (r.wait_mode == 1 && r.poll_interval_us == 0)) return false;
++  }
++  return true;
+ }
+ 
+ __aicore__ inline bool isRuntimeCapacityValid(__gm__ uint8_t *tiling, uint64_t event_bytes, uint64_t capacity,
+diff --git a/hyper_multicore/ops/runtime/vector_ready_queue.h b/hyper_multicore/ops/runtime/vector_ready_queue.h
+deleted file mode 100644
+index 31ae9ae..0000000
+--- a/hyper_multicore/ops/runtime/vector_ready_queue.h
++++ /dev/null
+@@ -1,41 +0,0 @@
+-// Copyright 2026 Huawei Technologies Co., Ltd.
+-// SPDX-License-Identifier: Apache-2.0
+-#ifndef HYPER_MULTICORE_OPS_RUNTIME_VECTOR_READY_QUEUE_H_
+-#define HYPER_MULTICORE_OPS_RUNTIME_VECTOR_READY_QUEUE_H_
+-#include <cstdint>
+-
+-namespace MulticoreRuntime {
+-// Queue owns execution/recording. Selection and worker placement are identical
+-// for ordinary, profiled and tensor-dump invocations.
+-template <typename Queue>
+-__aicore__ inline void RunVectorReadyQueue(Queue &queue, uint32_t first, uint32_t tasks, uint32_t stride) {
+-  constexpr uint32_t words = 4;
+-  constexpr uint32_t bits = 64 * words;
+-  if (first >= tasks) return;
+-  const uint32_t slots = (tasks - first + stride - 1) / stride;
+-  uint64_t completed[words] = {};
+-  uint32_t head = 0;
+-  while (head < slots) {
+-    const uint32_t head_bit = head % bits;
+-    if ((completed[head_bit / 64] & (1ULL << (head_bit % 64))) != 0) {
+-      completed[head_bit / 64] &= ~(1ULL << (head_bit % 64));
+-      ++head;
+-      continue;
+-    }
+-    bool issued = false;
+-    const uint32_t limit = head + bits < slots ? head + bits : slots;
+-    for (uint32_t index = head; index < limit; ++index) {
+-      const uint32_t bit = index % bits;
+-      if ((completed[bit / 64] & (1ULL << (bit % 64))) != 0) continue;
+-      const uint32_t task = queue.TaskAt(first + index * stride);
+-      if (!queue.IsReady(task)) continue;
+-      queue.Execute(task);
+-      completed[bit / 64] |= 1ULL << (bit % 64);
+-      issued = true;
+-      break;
+-    }
+-    if (!issued) queue.Wait(queue.TaskAt(first + head * stride));
+-  }
+-}
+-}  // namespace MulticoreRuntime
+-#endif
+diff --git a/hyper_multicore/ops/runtime/worker_kernel.h b/hyper_multicore/ops/runtime/worker_kernel.h
+index b6a6b8f..4ae7dc2 100644
+--- a/hyper_multicore/ops/runtime/worker_kernel.h
++++ b/hyper_multicore/ops/runtime/worker_kernel.h
+@@ -31,7 +31,7 @@
+ #include "runtime_storage_bounds.h"
+ #include "cycle_trace_recorder.h"
+ #include "l1_tensor_dump.h"
+-#include "vector_ready_queue.h"
++#include "worker_ready_queue.h"
+ 
+ 
+ using namespace AscendC;  // NOLINT(build/namespaces)
+@@ -127,8 +127,8 @@ class KernelWorkerBase {
+     this->vector_num = getNumWorkers(this->runtimeConfigPtr);
+     this->core_num = this->vector_num / 2;
+     const auto header = reinterpret_cast<__gm__ RuntimeHeader *>(runtimeConfigPtr);
+-    ready_queue_ = header->vector_ready_queue == 1;
+-    this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_)
++    explicit_queues_ = header->queue_layout == 1;
++    this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL || explicit_queues_)
+                               ? this->vector_num : this->vector_num / 2;
+   }
+ 
+@@ -157,15 +157,15 @@ class KernelWorkerBase {
+   // Share the compute call site across diagnostics. Replicating the entire
+   // inlined task dispatcher for each mode exceeds the AIV scalar stack limit.
+   __aicore__ inline void ProcessTasks(DiagnosticMode mode, CycleTraceRecorder &recorder) {
++    if (explicit_queues_) {
++      ProcessWorkerQueue(mode, recorder);
++      return;
++    }
+ #ifdef HMC_RUNTIME_CUBE
+     uint32_t block_idx = this->worker_id_;
+     const uint32_t count = this->cube_task_num;
+     const uint32_t stride = this->core_num;
+ #else
+-    if (ready_queue_) {
+-      ProcessVectorReady(mode, recorder);
+-      return;
+-    }
+     uint32_t block_idx = GetVectorScheduleIndex();
+     if (block_idx == INVALID_VECTOR_SCHEDULE_INDEX) return;
+     const uint32_t count = this->vector_task_num;
+@@ -194,23 +194,42 @@ class KernelWorkerBase {
+     KernelWorkerBase &worker;
+     DiagnosticMode mode;
+     CycleTraceRecorder &recorder;
++    WorkerQueue view;
++    uint64_t idle_start = 0;
+     __aicore__ inline TaskId TaskAt(uint32_t index) { return worker.GetTaskIndex(index); }
+     __aicore__ inline bool IsReady(TaskId task) { return worker.IsQueuedTaskReady(task); }
+     __aicore__ inline void Execute(TaskId task) {
++      if (mode == DiagnosticMode::PROFILE && idle_start != 0) {
++        TaskDesc desc;
++        getTaskDesc(worker.runtimeConfigPtr, &desc, task);
++        recorder.Record(0x10008, task, desc.task_index, getTaskProfileOwnerId(worker.runtimeConfigPtr, task),
++                        idle_start, recorder.Now());
++        idle_start = 0;
++      }
+       worker.ExecuteTask(task, mode, recorder);
+     }
+     __aicore__ inline void Wait(TaskId task) {
+-      const uint32_t dependent = *reinterpret_cast<__gm__ uint32_t *>(worker.runtimeConfigPtr +
+-        getAllTasksOffset(worker.runtimeConfigPtr) + task * sizeof(TaskDesc) + offsetof(TaskDesc, dependent_event));
+-      worker.WaitForDependency(dependent, 5);
++      if (view.wait_mode == 0) {
++        const uint32_t dependent = *reinterpret_cast<__gm__ uint32_t *>(worker.runtimeConfigPtr +
++          getAllTasksOffset(worker.runtimeConfigPtr) + task * sizeof(TaskDesc) + offsetof(TaskDesc, dependent_event));
++        worker.WaitForDependency(dependent, view.poll_interval_us);
++      } else {
++        if (mode == DiagnosticMode::PROFILE && idle_start == 0) idle_start = recorder.Now();
++        const int64_t until = AscendC::GetSystemCycle() + view.poll_interval_us * SYSTEM_CYCLES_PER_US;
++        while (AscendC::GetSystemCycle() < until) {}
++      }
+     }
+   };
+ 
+-  __aicore__ inline void ProcessVectorReady(DiagnosticMode mode, CycleTraceRecorder &recorder) {
+-    const uint32_t first = GetVectorScheduleIndex();
+-    if (first == INVALID_VECTOR_SCHEDULE_INDEX) return;
+-    ReadyExecution execution{*this, mode, recorder};
+-    RunVectorReadyQueue(execution, first, this->vector_task_num, this->active_vector_num);
++  __aicore__ inline void ProcessWorkerQueue(DiagnosticMode mode, CycleTraceRecorder &recorder) {
++#ifdef HMC_RUNTIME_CUBE
++    const uint32_t index = this->worker_id_;
++#else
++    const uint32_t index = this->core_num + this->worker_id_;
++#endif
++    const WorkerQueue view = getWorkerQueue(this->runtimeConfigPtr, index);
++    ReadyExecution execution{*this, mode, recorder, view};
++    RunWorkerQueue(execution, view.begin, view.end, view.stride, view.ready_depth);
+   }
+ 
+   __aicore__ inline bool LoadReadyHandshakeMeta(ReadyHandshakeMeta *meta) {
+@@ -256,7 +275,6 @@ class KernelWorkerBase {
+ #endif
+   }
+ 
+-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+   __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
+ #ifndef HMC_RUNTIME_CUBE
+     if (!IsActiveVectorWorker()) {
+@@ -273,27 +291,6 @@ class KernelWorkerBase {
+     }
+ #endif
+   }
+-#else
+-  __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
+-#ifndef HMC_RUNTIME_CUBE
+-    if (this->worker_id_ % 2 == 0) {
+-      return;
+-    }
+-#endif
+-    TriggerEvent(meta.completion_event);
+-#ifndef HMC_RUNTIME_CUBE
+-    if (this->worker_id_ == 1) {
+-      WaitForDependency(meta.completion_event);
+-      if (meta.ready_event != 0) {
+-        PublishDeviceReady(meta, true);
+-      }
+-    }
+-#endif
+-  }
+-#endif
+-
+-
+-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+   __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
+ #ifdef HMC_RUNTIME_CUBE
+     WaitForDependency(meta.ready_event);
+@@ -333,7 +330,7 @@ class KernelWorkerBase {
+   }
+ 
+   __aicore__ inline uint32_t GetVectorScheduleIndex() {
+-    if (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_) {
++    if (WorkerPolicy == VectorWorkerPolicy::ALL || explicit_queues_) {
+       return this->worker_id_ < this->active_vector_num ? this->worker_id_ : INVALID_VECTOR_SCHEDULE_INDEX;
+     }
+     return this->worker_id_ % 2 == 0 ? INVALID_VECTOR_SCHEDULE_INDEX : this->worker_id_ / 2;
+@@ -341,7 +338,7 @@ class KernelWorkerBase {
+ 
+ #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+   __aicore__ inline bool IsActiveVectorWorker() const {
+-    if (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_) {
++    if (WorkerPolicy == VectorWorkerPolicy::ALL || explicit_queues_) {
+       return this->worker_id_ < this->active_vector_num;
+     }
+     return this->worker_id_ % VECTOR_WORKER_STRIDE != 0;
+@@ -411,7 +408,7 @@ class KernelWorkerBase {
+     const uint32_t owner_id = profile ? getTaskProfileOwnerId(this->runtimeConfigPtr, task_id) : 0;
+     if (task_desc.dependent_event != EVENT_INVALID_ID) {
+       const uint64_t start = profile ? recorder.Now() : 0;
+-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
++      WaitForDependency(task_desc.dependent_event, task_desc.dependency_poll_interval_us);
+       if (profile) {
+         recorder.Record(Derived::PROFILE_DESC_WAIT_DEPENDENCY, task_id, task_desc.task_index, owner_id,
+                         start, recorder.Now());
+@@ -487,9 +484,7 @@ class KernelWorkerBase {
+ 
+   bool pull_protocol_ = false;
+   uint32_t worker_id_ = 0;
+-#if !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
+-  bool ready_queue_ = false;
+-#endif
++  bool explicit_queues_ = false;
+   uint32_t grouped_matmul_group_list_offset_ = 0;
+   uint32_t task_num = 0;
+   uint32_t runtime_task_capacity = 0;
+@@ -508,9 +503,7 @@ class KernelWorkerBase {
+   int64_t core_num = 0;
+   int64_t vector_num = 0;
+   uint32_t active_vector_num = 0;
+-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+-  bool ready_queue_ = false;
+-#endif
++
+   static constexpr uint32_t INVALID_VECTOR_SCHEDULE_INDEX = 0xFFFFFFFF;
+ };
+ 
+diff --git a/hyper_multicore/ops/runtime/worker_ready_queue.h b/hyper_multicore/ops/runtime/worker_ready_queue.h
+new file mode 100644
+index 0000000..64f1496
+--- /dev/null
++++ b/hyper_multicore/ops/runtime/worker_ready_queue.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 Huawei Technologies Co., Ltd.
++// SPDX-License-Identifier: Apache-2.0
++#ifndef HYPER_MULTICORE_OPS_RUNTIME_WORKER_READY_QUEUE_H_
++#define HYPER_MULTICORE_OPS_RUNTIME_WORKER_READY_QUEUE_H_
++#include <cstdint>
++
++namespace MulticoreRuntime {
++// Selection is independent of core kind, placement, waiting and diagnostics.
++// The bitmap tracks completed slots in this worker's view, never other workers.
++template <typename Queue>
++__aicore__ inline void RunWorkerQueue(Queue &queue, uint32_t first, uint32_t end,
++                                    uint32_t stride, uint32_t depth) {
++  if (first >= end) return;
++  const uint32_t slots = (end - first + stride - 1) / stride;
++  uint64_t completed[4] = {};
++  uint32_t head = 0;
++  while (head < slots) {
++    uint32_t selected = head;
++    if (depth != 0) {
++      const uint32_t head_bit = head % 256;
++      if (completed[head_bit / 64] & (1ULL << (head_bit % 64))) {
++        completed[head_bit / 64] &= ~(1ULL << (head_bit % 64));
++        ++head;
++        continue;
++      }
++      selected = slots;
++      const uint32_t limit = slots - head < depth ? slots : head + depth;
++      for (uint32_t i = head; i < limit; ++i) {
++        const uint32_t bit = i % 256;
++        if (completed[bit / 64] & (1ULL << (bit % 64))) continue;
++        if (queue.IsReady(queue.TaskAt(first + i * stride))) { selected = i; break; }
++      }
++      if (selected == slots) { queue.Wait(queue.TaskAt(first + head * stride)); continue; }
++    }
++    queue.Execute(queue.TaskAt(first + selected * stride));
++    if (depth == 0) ++head;
++    else {
++      const uint32_t bit = selected % 256;
++      completed[bit / 64] |= 1ULL << (bit % 64);
++    }
++  }
++}
++}  // namespace MulticoreRuntime
++#endif
+diff --git a/hyper_multicore/scheduler/config.py b/hyper_multicore/scheduler/config.py
+index a48d30f..60ce52a 100644
+--- a/hyper_multicore/scheduler/config.py
++++ b/hyper_multicore/scheduler/config.py
+@@ -44,7 +44,7 @@ EVENT_INVALID_ID         = 0xFFFFFFFF
+ RUNTIME_PROTOCOL_VERSION = 1
+ 
+ 
+-def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
++def mega_moe_event_capacity(num_experts: int, ep_size: int, compute_stages: int = 3) -> int:
+     """Reserve graph events and the complete atomic write at the last trigger.
+ 
+     Args:
+@@ -57,7 +57,7 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
+     if ep_size <= 0 or num_experts <= 0 or num_experts % ep_size:
+         raise ValueError("num_experts must be positive and divisible by ep_size")
+     # Ready and worker completion follow termination with separate atomic lanes.
+-    final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
++    final_event = num_experts + compute_stages * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
+     required = final_event + ATOMIC_ADD_VALUE_LEN
+     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
+ 
+@@ -118,6 +118,10 @@ class TaskType(IntEnum):
+     TASK_GATE_GRAD_ADD_SELECTED           = 139
+     TASK_GATE_GRAD_ZEROS                  = 140
+     TASK_SHMEM_GET_MEM              = 141
++    TASK_MX_GMM                     = 142
++    TASK_MX_QUANT                   = 143
++    TASK_MX_SWIGLU_QUANT             = 145
++    TASK_MX_SWIGLU_GRAD_QUANT        = 146
+ 
+ 
+ class EventType(IntEnum):
+@@ -176,7 +180,7 @@ class TaskDescC(ctypes.Structure):
+         ("task_split_value",     ctypes.c_uint32),
+         ("extra_value_0",        ctypes.c_uint32),
+         ("extra_value_1",        ctypes.c_uint32),
+-        ("extra_value_2",        ctypes.c_uint32),
++        ("dependency_poll_interval_us",        ctypes.c_uint32),
+         ("profile_desc_id",      ctypes.c_uint32),
+         ("profile_owner_id",     ctypes.c_uint32),
+     ]
+@@ -228,8 +232,9 @@ class RuntimeConfigC(ctypes.Structure):
+         ("aiv_profile_record_capacity", ctypes.c_uint32),
+         ("completion_event", ctypes.c_uint32),
+         ("protocol_version", ctypes.c_uint32),
+-        ("vector_ready_queue", ctypes.c_uint32),
+-        ("_padding", ctypes.c_uint32 * 5),
++        ("queue_layout", ctypes.c_uint32),
++        ("worker_queue_offset", ctypes.c_uint32),
++        ("_padding", ctypes.c_uint32 * 4),
+     ]
+ 
+ 
+@@ -514,7 +519,7 @@ def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
+     cfg.all_event_num_triggers[completion_event] = cfg.num_workers
+ 
+ 
+-def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
++def event_workspace_bytes(ep_size: int, num_experts: int, compute_stages: int = 3) -> int:
+     """Return graph counters plus separate ready and completion generations.
+ 
+     Args:
+@@ -524,7 +529,7 @@ def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
+     Returns:
+         Required byte count for one direction's event workspace.
+     """
+-    counter_bytes = mega_moe_event_capacity(num_experts, ep_size) * ctypes.sizeof(ctypes.c_int32)
++    counter_bytes = mega_moe_event_capacity(num_experts, ep_size, compute_stages) * ctypes.sizeof(ctypes.c_int32)
+     if ep_size <= 1:
+         return counter_bytes
+     return counter_bytes + 2 * (ep_size + 1) * READY_CACHE_LINE_BYTES
+diff --git a/hyper_multicore/scheduler/runtime.py b/hyper_multicore/scheduler/runtime.py
+index 961a6d8..7461067 100644
+--- a/hyper_multicore/scheduler/runtime.py
++++ b/hyper_multicore/scheduler/runtime.py
+@@ -169,7 +169,9 @@ def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
+ def copy_runtime_config(cfg: RuntimeConfigC) -> RuntimeConfigC:
+     """Copy wire storage and retain the graph-owned host validation contract."""
+     result = type(cfg).from_buffer_copy(bytes(cfg))
+-    result.task_validator = getattr(cfg, "task_validator", None)
++    result.__dict__.update(cfg.__dict__)
++    if hasattr(cfg, "worker_queues"):
++        result.worker_queues = type(cfg.worker_queues).from_buffer_copy(bytes(cfg.worker_queues))
+     return result
+ 
+ 
+@@ -202,7 +204,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
+     layout = type(cfg)
+     address = ctypes.addressof(cfg)
+     prefix = struct.pack(
+-        "<11I20x",
++        "<12I16x",
+         cfg.task_num,
+         cfg.num_workers,
+         capacity,
+@@ -213,7 +215,8 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
+         cfg.aiv_profile_record_capacity,
+         cfg.completion_event,
+         cfg.protocol_version,
+-        cfg.vector_ready_queue,
++        cfg.queue_layout,
++        expected if cfg.queue_layout == 2 else 0,
+     )
+     sections = [
+         (layout.all_event_num_triggers.offset, event_capacity * 4),
+@@ -230,4 +233,9 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
+     data = prefix + b"".join(ctypes.string_at(address + offset, size) for offset, size in sections)
+     if len(data) != expected:
+         raise RuntimeError(f"runtime serialization produced {len(data)} bytes, expected {expected}")
++    if cfg.queue_layout == 2:
++        from hyper_multicore.scheduler.worker_queues import serialize_worker_queues
++        data += serialize_worker_queues(cfg)
++    elif cfg.queue_layout != 0:
++        raise ValueError(f"Unknown worker queue layout: {cfg.queue_layout}")
+     return data
+diff --git a/hyper_multicore/scheduler/worker_queues.py b/hyper_multicore/scheduler/worker_queues.py
+new file mode 100644
+index 0000000..145785d
+--- /dev/null
++++ b/hyper_multicore/scheduler/worker_queues.py
+@@ -0,0 +1,92 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
++"""Component-independent contiguous/strided worker queues and ready contracts."""
++from collections import Counter
++import ctypes
++
++from .config import RuntimeConfigC
++
++WAIT_HEAD = 0
++RESCAN_WINDOW = 1
++MAX_READY_LOOKAHEAD = 256
++
++
++class WorkerQueueC(ctypes.Structure):
++    """A task-index view plus selection and waiting, independent of placement."""
++    _fields_ = [(name, ctypes.c_uint32) for name in (
++        "begin", "end", "ready_depth", "stride", "wait_mode", "poll_interval_us")]
++
++
++def _attach(cfg, records):
++    cfg.worker_queues = (WorkerQueueC * len(records))(*records)
++    cfg.queue_layout = 2
++    if cfg.completion_event:
++        cfg.all_event_num_triggers[cfg.completion_event] = len(records)
++    serialize_worker_queues(cfg)
++    return cfg
++
++
++def install_strided_worker_queues(cfg: RuntimeConfigC, *, vector_ready_depth: int = 256) -> RuntimeConfigC:
++    """Preserve all-worker round-robin placement without rewriting task indices.
++
++    The compatibility wait observes the head with the upstream 5us parameter.
++    Cube queues remain FIFO. Selection does not implicitly enable any workers:
++    this placement operation explicitly supplies the complete participant set.
++    """
++    records = []
++    for count, workers, depth in ((cfg.task_index_num[0], cfg.num_workers // 2, 0),
++                                  (cfg.task_index_num[1], cfg.num_workers, vector_ready_depth)):
++        records.extend(WorkerQueueC(min(worker, count), count, depth, workers, WAIT_HEAD, 5)
++                       for worker in range(workers))
++    return _attach(cfg, records)
++
++
++def install_worker_queues(cfg: RuntimeConfigC, cubes: list[list[int]], vectors: list[list[int]], *,
++                          cube_ready_depth: int = 0, vector_ready_depths: list[int] | None = None) -> RuntimeConfigC:
++    """Place every task once; communication can stay FIFO while math selects ready work."""
++    if cfg.num_workers % 2 or len(cubes) != cfg.num_workers // 2 or len(vectors) != cfg.num_workers:
++        raise ValueError("Worker queues must match the runtime's AIC/AIV resources")
++    depths = [0] * len(vectors) if vector_ready_depths is None else vector_ready_depths
++    if len(depths) != len(vectors):
++        raise ValueError("One ready lookahead is required for each vector worker")
++    result = type(cfg)()
++    ctypes.memmove(ctypes.addressof(result), ctypes.addressof(cfg), ctypes.sizeof(cfg))
++    result.__dict__.update(cfg.__dict__)
++    records = []
++    for kind, queues, indices, per_depths in (
++        (0, cubes, result.cube_task_indices, [cube_ready_depth] * len(cubes)),
++        (1, vectors, result.vector_task_indices, depths),
++    ):
++        old = list((cfg.cube_task_indices if kind == 0 else cfg.vector_task_indices)[:cfg.task_index_num[kind]])
++        flat = [task for queue in queues for task in queue]
++        if Counter(flat) != Counter(old) or len(flat) != len(set(flat)):
++            raise ValueError("Worker queues must cover the original work exactly once")
++        begin = 0
++        for queue, depth in zip(queues, per_depths):
++            if not isinstance(depth, int) or isinstance(depth, bool) or not 0 <= depth <= MAX_READY_LOOKAHEAD:
++                raise ValueError("Worker ready lookahead must be an integer in [0, 256]")
++            end = begin + len(queue)
++            for position, task in enumerate(queue, begin):
++                indices[position] = task
++            records.append(WorkerQueueC(begin, end, depth, 1, RESCAN_WINDOW, 10))
++            begin = end
++    return _attach(result, records)
++
++
++def serialize_worker_queues(cfg: RuntimeConfigC) -> bytes:
++    """Validate complete unique index coverage before serializing the queue table."""
++    records = cfg.worker_queues
++    cubes = cfg.num_workers // 2
++    if cfg.num_workers % 2 or len(records) != cubes + cfg.num_workers:
++        raise ValueError("Worker queue count does not match runtime resources")
++    for kind, group in ((0, records[:cubes]), (1, records[cubes:])):
++        count = cfg.task_index_num[kind]
++        positions = []
++        for record in group:
++            if (record.end > count or record.begin > record.end or not record.stride
++                    or record.ready_depth > MAX_READY_LOOKAHEAD or record.wait_mode not in (WAIT_HEAD, RESCAN_WINDOW)
++                    or (record.wait_mode == RESCAN_WINDOW and not record.poll_interval_us)):
++                raise ValueError("Invalid worker queue view or ready/wait policy")
++            positions.extend(range(record.begin, record.end, record.stride))
++        if len(positions) != count or set(positions) != set(range(count)):
++            raise ValueError("Worker queues must cover every original index exactly once")
++    return bytes(records)
+diff --git a/hyper_multicore/tasks/alltoall.py b/hyper_multicore/tasks/alltoall.py
+index 40dcd18..eeb61ab 100644
+--- a/hyper_multicore/tasks/alltoall.py
++++ b/hyper_multicore/tasks/alltoall.py
+@@ -160,3 +160,17 @@ class AllToAllFillConfig(FillConfig):
+             advance_tsv_vector(tsv, task_num, event_group_size=self.event_group)
+         else:   # "vector_only"
+             advance_tsv_vector_only(tsv, task_num)
++
++
++class ShmemTransferEngine(IntEnum):
++    """Transport-owned engine bit; independent of dependency polling and payload."""
++    MTE = 0
++    UDMA = 16
++
++
++def set_transfer_engine(task: TaskDescC, engine: str) -> None:
++    """Encode an engine without touching partition, scalar payload or runtime fields."""
++    if engine not in ("mte", "udma"):
++        raise ValueError("SHMEM transfer engine must be mte or udma")
++    task.extra_value_1 = (task.extra_value_1 & ~16) | int(
++        ShmemTransferEngine.UDMA if engine == "udma" else ShmemTransferEngine.MTE)
+diff --git a/tests/ut/modules/mega_mhc_grad/test_mega_mhc_grad_graph.py b/tests/ut/modules/mega_mhc_grad/test_mega_mhc_grad_graph.py
+index 749600e..05824db 100644
+--- a/tests/ut/modules/mega_mhc_grad/test_mega_mhc_grad_graph.py
++++ b/tests/ut/modules/mega_mhc_grad/test_mega_mhc_grad_graph.py
+@@ -142,14 +142,14 @@ class TestMegaMhcGradGraph(unittest.TestCase):
+             self.assertEqual(task.dependent_event, layout.init_done)
+             self.assertEqual(task.trigger_event, layout.rms_ready_base + index)
+             self.assertEqual(
+-                task.extra_value_2,
++                task.dependency_poll_interval_us,
+                 FAST_DEPENDENCY_POLL_INTERVAL_US,
+             )
+         for index, task in enumerate(prepare_tasks):
+             self.assertEqual(task.task_type, TaskType.TASK_MHC_GRAD_PREV_A_AND_MAPPING)
+             self.assertEqual(task.task_split_value, DEFAULT_GRAD_TOKEN_TILE)
+             self.assertEqual(
+-                task.extra_value_2,
++                task.dependency_poll_interval_us,
+                 FAST_DEPENDENCY_POLL_INTERVAL_US,
+             )
+             self.assertEqual(task.dependent_event, layout.rms_ready_base + index)
+diff --git a/tests/ut/modules/mega_moe/test_task_contracts.py b/tests/ut/modules/mega_moe/test_task_contracts.py
+index 7f31a2c..1ac354e 100644
+--- a/tests/ut/modules/mega_moe/test_task_contracts.py
++++ b/tests/ut/modules/mega_moe/test_task_contracts.py
+@@ -133,5 +133,5 @@ class TestTaskContracts(unittest.TestCase):
+         self.assertEqual(list(moved.cube_task_indices), list(config.cube_task_indices))
+         policy = MegaMoeSchedulePolicy(vector_ready_queue=False, pipeline_vector=True, pipeline_cube=True)
+         policy.apply(moved, graph, topology, spec.num_cube_cores)
+-        self.assertEqual(moved.vector_ready_queue, 0)
++        self.assertEqual(moved.queue_layout, 0)
+         self.assertEqual(list(moved.cube_task_indices), list(config.cube_task_indices))
+diff --git a/tests/ut/scheduler/test_runtime_serialization.py b/tests/ut/scheduler/test_runtime_serialization.py
+index 7bb62a2..a8bc2da 100644
+--- a/tests/ut/scheduler/test_runtime_serialization.py
++++ b/tests/ut/scheduler/test_runtime_serialization.py
+@@ -469,7 +469,8 @@ class TestRuntimeCppReader(unittest.TestCase):
+         cfg = allocate_runtime_config(17)
+         cfg.task_num = 17
+         data = bytearray(serialize_runtime_config(cfg))
+-        data[40:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 40)
++        # Bytes 40..47 now explicitly describe optional per-worker queues.
++        data[48:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 48)
+         self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
+         struct.pack_into("<I", data, 36, 2)
+         self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
+diff --git a/tests/ut/scheduler/test_worker_queues.py b/tests/ut/scheduler/test_worker_queues.py
+new file mode 100644
+index 0000000..4b045a7
+--- /dev/null
++++ b/tests/ut/scheduler/test_worker_queues.py
+@@ -0,0 +1,95 @@
++# Copyright 2026 Huawei Technologies Co., Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ============================================================================
++"""Exercise the real Python/C++ queue ABI, coverage and uneven per-worker schedules."""
++import ctypes
++import struct
++
++import pytest
++
++from hyper_multicore.scheduler.runtime import allocate_runtime_config, serialize_runtime_config, copy_runtime_config
++from hyper_multicore.scheduler.worker_queues import install_worker_queues
++from tests.ut.scheduler import test_runtime_serialization as abi
++
++
++def configuration():
++    cfg = allocate_runtime_config(16, num_workers=4)
++    cfg.task_num = 6
++    cfg.task_index_num[0] = 2
++    cfg.task_index_num[1] = 4
++    cfg.cube_task_indices[:2] = [0, 1]
++    cfg.vector_task_indices[:4] = [2, 3, 4, 5]
++    return cfg
++
++
++def test_explicit_intervals_preserve_original_work():
++    cfg = configuration()
++    result = install_worker_queues(cfg, [[0, 1], []], [[2], [], [3, 4, 5], []],
++                                   cube_ready_depth=8, vector_ready_depths=[0, 0, 8, 0])
++    assert cfg.queue_layout == 0
++    assert [(q.begin, q.end, q.ready_depth) for q in result.worker_queues] == [
++        (0, 2, 8), (2, 2, 8), (0, 1, 0), (1, 1, 0), (1, 4, 8), (4, 4, 0)]
++    raw = serialize_runtime_config(result)
++    clone = copy_runtime_config(result)
++    assert serialize_runtime_config(clone) == raw
++    offset = struct.unpack_from('<I', raw, 44)[0]
++    assert len(raw) == offset + 6 * 24
++    assert struct.unpack_from('<6I', raw, offset + 4 * 24) == (1, 4, 8, 1, 1, 10)
++
++
++@pytest.mark.parametrize('cubes,vectors', [([[0], [0]], [[2], [3], [4], [5]]),
++                                         ([[0], [1]], [[2], [3], [4], []])])
++def test_missing_or_duplicate_tasks_rejected(cubes, vectors):
++    with pytest.raises(ValueError, match='exactly once'):
++        install_worker_queues(configuration(), cubes, vectors)
++
++
++def test_extended_image_is_accepted_by_production_cpp_reader():
++    # Compile and run the same production header used by the independent ABI suite.
++    abi.TestRuntimeCppReader.setUpClass()
++    reader = abi.TestRuntimeCppReader.reader
++    cfg = install_worker_queues(configuration(), [[0], [1]], [[2, 3], [], [4, 5], []])
++    raw = serialize_runtime_config(cfg)
++    assert reader.valid_runtime(ctypes.create_string_buffer(raw), len(raw), 4096)
++    assert not reader.valid_runtime(ctypes.create_string_buffer(raw), len(raw) - 1, 4096)
++    damaged = bytearray(raw)
++    offset = struct.unpack_from('<I', damaged, 44)[0]
++    struct.pack_into('<I', damaged, offset + 4, 99)
++    assert not reader.valid_runtime(ctypes.create_string_buffer(bytes(damaged)), len(raw), 4096)
++
++
++def test_strided_views_preserve_master_placement_and_wait_contract():
++    from hyper_multicore.scheduler.worker_queues import install_strided_worker_queues
++    cfg = configuration()
++    install_strided_worker_queues(cfg)
++    assert cfg.queue_layout == 2
++    assert [(q.begin, q.end, q.stride, q.ready_depth, q.wait_mode, q.poll_interval_us)
++            for q in cfg.worker_queues] == [
++        (0, 2, 2, 0, 0, 5), (1, 2, 2, 0, 0, 5),
++        (0, 4, 4, 256, 0, 5), (1, 4, 4, 256, 0, 5),
++        (2, 4, 4, 256, 0, 5), (3, 4, 4, 256, 0, 5)]
++    raw = serialize_runtime_config(cfg)
++    abi.TestRuntimeCppReader.setUpClass()
++    assert abi.TestRuntimeCppReader.reader.valid_runtime(ctypes.create_string_buffer(raw), len(raw), 4096)
++    old = bytearray(raw)
++    struct.pack_into('<I', old, 40, 1)
++    assert not abi.TestRuntimeCppReader.reader.valid_runtime(ctypes.create_string_buffer(bytes(old)), len(raw), 4096)
++
++
++def test_copy_keeps_queues_independent():
++    cfg = install_worker_queues(configuration(), [[0], [1]], [[2, 3], [], [4, 5], []])
++    clone = copy_runtime_config(cfg)
++    clone.worker_queues[0].ready_depth = 8
++    assert cfg.worker_queues[0].ready_depth == 0
++    assert clone.worker_queues[0].ready_depth == 8
+diff --git a/tests/ut/scheduler/vector_ready_queue_test.cpp b/tests/ut/scheduler/vector_ready_queue_test.cpp
+index dffde2c..e1ba138 100644
+--- a/tests/ut/scheduler/vector_ready_queue_test.cpp
++++ b/tests/ut/scheduler/vector_ready_queue_test.cpp
+@@ -4,7 +4,7 @@
+ #include <cstdint>
+ #include <vector>
+ #define __aicore__
+-#include "hyper_multicore/ops/runtime/vector_ready_queue.h"
++#include "hyper_multicore/ops/runtime/worker_ready_queue.h"
+ 
+ struct Queue {
+   std::vector<uint32_t> executed;
+@@ -21,14 +21,15 @@ struct Queue {
+ };
+ 
+ int main() {
++  for (uint32_t depth : {0U, 1U, 8U, 32U, 256U}) {
+   for (uint32_t tasks : {0U, 1U, 255U, 256U, 257U, 18001U}) {
+     for (uint32_t stride : {1U, 20U, 40U}) {
+       std::vector<uint32_t> covered(tasks);
+       for (uint32_t first = 0; first < stride; ++first) {
+         Queue normal, profile;
+         profile.profile = true;
+-        MulticoreRuntime::RunVectorReadyQueue(normal, first, tasks, stride);
+-        MulticoreRuntime::RunVectorReadyQueue(profile, first, tasks, stride);
++        MulticoreRuntime::RunWorkerQueue(normal, first, tasks, stride, depth);
++        MulticoreRuntime::RunWorkerQueue(profile, first, tasks, stride, depth);
+         assert(normal.executed == profile.executed);
+         assert(normal.records == 0 && profile.records == profile.executed.size());
+         for (auto task : normal.executed) {
+@@ -39,4 +40,5 @@ int main() {
+       for (auto count : covered) assert(count == 1);
+     }
+   }
++  }
+ }
+diff --git a/tests/ut/test_scheduler_config.py b/tests/ut/test_scheduler_config.py
+index 68a6cc2..befd0b7 100644
+--- a/tests/ut/test_scheduler_config.py
++++ b/tests/ut/test_scheduler_config.py
+@@ -57,7 +57,7 @@ class TestSchedulerConfig(unittest.TestCase):
+         )
+         self.assertEqual(
+             config_module.TaskDescC.profile_desc_id.offset,
+-            config_module.TaskDescC.extra_value_2.offset + ctypes.sizeof(ctypes.c_uint32),
++            config_module.TaskDescC.dependency_poll_interval_us.offset + ctypes.sizeof(ctypes.c_uint32),
+             msg="profile_desc_id does not reuse the first reserved tail slot",
+         )
+         self.assertEqual(
+-- 
+2.54.0
+

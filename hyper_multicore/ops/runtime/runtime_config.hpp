@@ -170,7 +170,7 @@ struct TaskDesc {
   uint32_t task_split_value;
   uint32_t extra_value_0;
   uint32_t extra_value_1;
-  uint32_t extra_value_2;
+  uint32_t dependency_poll_interval_us;
   uint32_t profile_desc_id;
   uint32_t profile_owner_id;
 };
@@ -196,23 +196,23 @@ struct RuntimeHeader {
   uint32_t padding[4];
 };
 
+// One queue contract for contiguous and strided task views.
 struct WorkerQueue {
   uint32_t begin;
   uint32_t end;
   uint32_t ready_depth;
-  uint32_t reserved;
+  uint32_t stride;
+  uint32_t wait_mode;  // 0: wait for head, 1: periodically rescan the window.
+  uint32_t poll_interval_us;
 };
-
-static_assert(sizeof(WorkerQueue) == 16);
-
+static_assert(sizeof(WorkerQueue) == 24);
 __aicore__ inline uint32_t getQueueLayout(__gm__ uint8_t *tiling) {
   return reinterpret_cast<__gm__ RuntimeHeader *>(tiling)->queue_layout;
 }
-
 __aicore__ inline WorkerQueue getWorkerQueue(__gm__ uint8_t *tiling, uint32_t worker) {
   const uint32_t offset = reinterpret_cast<__gm__ RuntimeHeader *>(tiling)->worker_queue_offset;
-  auto record = reinterpret_cast<__gm__ WorkerQueue *>(tiling + offset) + worker;
-  return {record->begin, record->end, record->ready_depth, record->reserved};
+  auto r = reinterpret_cast<__gm__ WorkerQueue *>(tiling + offset) + worker;
+  return {r->begin, r->end, r->ready_depth, r->stride, r->wait_mode, r->poll_interval_us};
 }
 
 static_assert(sizeof(RuntimeHeader) == 64);
@@ -338,7 +338,7 @@ __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData,
   start_size += UINT32_T_SIZE;
   tilingData->extra_value_1 = (*(__gm__ uint32_t *)(tiling + start_size));
   start_size += UINT32_T_SIZE;
-  tilingData->extra_value_2 = (*(__gm__ uint32_t *)(tiling + start_size));
+  tilingData->dependency_poll_interval_us = (*(__gm__ uint32_t *)(tiling + start_size));
   start_size += UINT32_T_SIZE;
   tilingData->profile_desc_id = (*(__gm__ uint32_t *)(tiling + start_size));
   start_size += UINT32_T_SIZE;
@@ -488,22 +488,18 @@ __aicore__ inline bool isRuntimeTailValid(__gm__ uint8_t *tiling, uint64_t runti
   if (required >= RUNTIME_ADDRESS_SPACE_BYTES || runtime_bytes < required) return false;
   auto header = reinterpret_cast<__gm__ RuntimeHeader *>(tiling);
   if (header->queue_layout == 0) return header->worker_queue_offset == 0;
-  if (header->queue_layout != 1 || header->worker_queue_offset != required || header->num_workers % 2 != 0) {
+  if (header->queue_layout != 2 || header->worker_queue_offset != required || header->num_workers % 2 != 0) {
     return false;
   }
   const uint64_t cubes = header->num_workers / 2;
   const uint64_t workers = cubes + header->num_workers;
   if (workers == 0 || required + workers * sizeof(WorkerQueue) > runtime_bytes) return false;
-  uint32_t previous = 0;
   for (uint32_t i = 0; i < workers; ++i) {
-    if (i == cubes) previous = 0;
-    const auto record = getWorkerQueue(tiling, i);
+    const auto r = getWorkerQueue(tiling, i);
     const auto kind = i < cubes ? TaskAiCoreType::TASK_AICORE_CUBE : TaskAiCoreType::TASK_AICORE_VECTOR;
     const uint32_t count = getTaskIndexNumByTaskType(tiling, kind);
-    if (record.begin != previous || record.end < record.begin || record.end > count || record.reserved != 0 ||
-        (record.ready_depth != 0 && record.ready_depth != 1 && record.ready_depth != 8)) return false;
-    previous = record.end;
-    if ((i + 1 == cubes || i + 1 == workers) && previous != count) return false;
+    if (r.end > count || r.begin > r.end || r.stride == 0 || r.ready_depth > 256 ||
+        r.wait_mode > 1 || (r.wait_mode == 1 && r.poll_interval_us == 0)) return false;
   }
   return true;
 }

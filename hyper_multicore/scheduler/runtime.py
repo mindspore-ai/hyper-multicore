@@ -166,6 +166,15 @@ def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
     return capacity
 
 
+def copy_runtime_config(cfg: RuntimeConfigC) -> RuntimeConfigC:
+    """Copy wire storage and retain the graph-owned host validation contract."""
+    result = type(cfg).from_buffer_copy(bytes(cfg))
+    result.__dict__.update(cfg.__dict__)
+    if hasattr(cfg, "worker_queues"):
+        result.worker_queues = type(cfg.worker_queues).from_buffer_copy(bytes(cfg.worker_queues))
+    return result
+
+
 def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     """Serialize dense tasks and queues up to their actual required capacity.
 
@@ -180,6 +189,10 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         Bytes for a matching native runtime reader.
     """
     capacity = runtime_config_task_capacity(cfg)
+    validator = getattr(cfg, "task_validator", None)
+    if validator is not None:
+        for task in cfg.all_tasks[:capacity]:
+            validator(task)
     event_capacity = len(cfg.all_event_num_triggers)
     if len(cfg.all_events) != event_capacity:
         raise ValueError("runtime event and trigger arrays must have equal capacity")
@@ -203,7 +216,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         cfg.completion_event,
         cfg.protocol_version,
         cfg.queue_layout,
-        expected if cfg.queue_layout == 1 else 0,
+        expected if cfg.queue_layout == 2 else 0,
     )
     sections = [
         (layout.all_event_num_triggers.offset, event_capacity * 4),
@@ -220,7 +233,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     data = prefix + b"".join(ctypes.string_at(address + offset, size) for offset, size in sections)
     if len(data) != expected:
         raise RuntimeError(f"runtime serialization produced {len(data)} bytes, expected {expected}")
-    if cfg.queue_layout == 1:
+    if cfg.queue_layout == 2:
         from hyper_multicore.scheduler.worker_queues import serialize_worker_queues
         data += serialize_worker_queues(cfg)
     elif cfg.queue_layout != 0:
