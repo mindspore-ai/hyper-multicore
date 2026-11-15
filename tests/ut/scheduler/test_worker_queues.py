@@ -93,3 +93,18 @@ def test_copy_keeps_queues_independent():
     clone.worker_queues[0].ready_depth = 8
     assert cfg.worker_queues[0].ready_depth == 0
     assert clone.worker_queues[0].ready_depth == 8
+
+
+def test_device_dispatch_recognizes_the_same_queue_abi_as_the_reader():
+    abi.TestRuntimeCppReader.setUpClass()
+    select = abi.TestRuntimeCppReader.reader.uses_explicit_worker_queues
+    select.argtypes = [ctypes.c_void_p]
+    select.restype = ctypes.c_bool
+    cfg = configuration()
+    assert not select(ctypes.create_string_buffer(serialize_runtime_config(cfg)))
+    cfg = install_worker_queues(cfg, [[0], [1]], [[2, 3], [], [4, 5], []])
+    raw = serialize_runtime_config(cfg)
+    assert select(ctypes.create_string_buffer(raw))
+    legacy = bytearray(raw)
+    struct.pack_into('<I', legacy, 40, 1)
+    assert not select(ctypes.create_string_buffer(bytes(legacy)))

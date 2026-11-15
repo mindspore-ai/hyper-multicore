@@ -209,6 +209,9 @@ static_assert(sizeof(WorkerQueue) == 24);
 __aicore__ inline uint32_t getQueueLayout(__gm__ uint8_t *tiling) {
   return reinterpret_cast<__gm__ RuntimeHeader *>(tiling)->queue_layout;
 }
+__aicore__ inline bool usesExplicitWorkerQueues(__gm__ uint8_t *tiling) {
+  return getQueueLayout(tiling) == 2;
+}
 __aicore__ inline WorkerQueue getWorkerQueue(__gm__ uint8_t *tiling, uint32_t worker) {
   const uint32_t offset = reinterpret_cast<__gm__ RuntimeHeader *>(tiling)->worker_queue_offset;
   auto r = reinterpret_cast<__gm__ WorkerQueue *>(tiling + offset) + worker;

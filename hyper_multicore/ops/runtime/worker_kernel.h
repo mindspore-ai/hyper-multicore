@@ -126,8 +126,7 @@ class KernelWorkerBase {
     // for operators whose sixth field is not the AIC count (for example mHC).
     this->vector_num = getNumWorkers(this->runtimeConfigPtr);
     this->core_num = this->vector_num / 2;
-    const auto header = reinterpret_cast<__gm__ RuntimeHeader *>(runtimeConfigPtr);
-    explicit_queues_ = header->queue_layout == 1;
+    explicit_queues_ = usesExplicitWorkerQueues(this->runtimeConfigPtr);
     this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL || explicit_queues_)
                               ? this->vector_num : this->vector_num / 2;
   }
