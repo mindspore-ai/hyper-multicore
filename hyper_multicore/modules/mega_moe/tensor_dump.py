@@ -19,10 +19,13 @@ from __future__ import annotations
 from math import prod
 from typing import Any
 
+from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.scheduler.config import (
     TaskType,
 )
 from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
+
+from .probability import PROBABILITY_DTYPE_BYTES, probability_capture_plane
 
 
 def _group_counts(context: L1TensorViewContext) -> tuple[int, int, int]:
@@ -62,6 +65,13 @@ def _resolve_grouped_matmul(context: L1TensorViewContext) -> L1TensorView:
             f"MegaMoe L1 cannot snapshot {context.stage!r} output atomically across Cube cores; "
             "select the downstream stage input after its dependency instead"
         )
+    if context.task_desc.extra_value_1 in (GroupedMatmulTaskMode.BATCHED, GroupedMatmulTaskMode.BATCHED_READY):
+        shape = list(context.tensor_spec.shape)
+        if context.tensor_desc.dynamic_shape:
+            data = context.runtime_config.dynamic_data
+            counts = context.parameter_cpu(int(data.dynamic_input_position)).reshape(-1)
+            shape[0] = int(counts[int(data.dynamic_group_size) - 1])
+        return context.make_view(shape, source_offset_bytes=0, note="batched GMM input across local experts")
     local_owner, start, end = _group_counts(context)
     shape = list(context.tensor_spec.shape)
     if context.tensor_desc.dynamic_shape:
@@ -83,24 +93,48 @@ def _resolve_grouped_matmul(context: L1TensorViewContext) -> L1TensorView:
     return context.default_view
 
 
+def _swiglu_rows(context: L1TensorViewContext) -> tuple[int, int]:
+    """Resolve the first contiguous tile owned by this vector task."""
+    _, start, end = _group_counts(context)
+    groups = int(context.runtime_config.dynamic_data.dynamic_group_size)
+    lanes = int(context.task_desc.task_split_num) // groups
+    if lanes <= 0:
+        raise ValueError("MegaMoe L1 SwiGLU task count per expert must be positive")
+    row_start = int(context.task_desc.task_index) % lanes * int(context.task_desc.task_split_value)
+    rows = min(int(context.task_desc.task_split_value), max(end - start - row_start, 0))
+    return start + row_start, rows
+
+
 def _resolve_swiglu(context: L1TensorViewContext) -> L1TensorView:
     """Resolve a SwiGLU task's contiguous expert-local token rows."""
-    _, start, end = _group_counts(context)
-    group_count = int(context.runtime_config.dynamic_data.dynamic_group_size)
-    tasks_per_expert = int(context.task_desc.task_split_num) // group_count
-    if tasks_per_expert <= 0:
-        raise ValueError("MegaMoe L1 SwiGLU task count per expert must be positive")
-    local_task_index = int(context.task_desc.task_index) % tasks_per_expert
-    row_start = local_task_index * int(context.task_desc.task_split_value)
-    rows = min(int(context.task_desc.task_split_value), max(end - start - row_start, 0))
+    source_row, rows = _swiglu_rows(context)
     shape = list(context.tensor_spec.shape)
     shape[0] = rows
-    source_offset_bytes = (start + row_start) * int(shape[1]) * int(context.tensor_desc.data_type)
     return context.make_view(
-        shape,
-        source_offset_bytes=source_offset_bytes if rows else 0,
+        shape, source_offset_bytes=source_row * int(shape[1]) * int(context.tensor_desc.data_type) if rows else 0,
         note="expert-local SwiGLU tile captured at its task boundary",
     )
+
+
+def _alltoall_rows(context: L1TensorViewContext) -> tuple[int, int, int]:
+    """Resolve the local payload span independently of the selected operand."""
+    is_pull = int(context.task_desc.task_type) == TaskType.TASK_SHMEM_GET_MEM
+    payload = context.operator.outputs[0] if is_pull else context.operator.inputs[1]
+    hidden_size = int(payload.shape[1])
+    expert_count = int(context.operator.inputs[3].shape[0])
+    tasks_per_expert = int(context.task_desc.task_split_num) // expert_count
+    if tasks_per_expert <= 0:
+        raise ValueError("MegaMoe L1 AllToAll task count per expert must be positive")
+    expert = int(context.task_desc.task_index) // tasks_per_expert
+    tile = int(context.task_desc.task_index) % tasks_per_expert
+    sizes = context.parameter_cpu(int(context.operator.inputs[3].param_position)).reshape(-1)
+    offsets = context.parameter_cpu(int(context.operator.inputs[0 if is_pull else 2].param_position)).reshape(-1)
+    tile_start = tile * int(context.task_desc.task_split_value) * hidden_size
+    count = max(0, min(int(context.task_desc.task_split_value) * hidden_size, int(sizes[expert]) - tile_start))
+    source_offset = int(offsets[expert]) + tile_start
+    if count % hidden_size or source_offset % hidden_size:
+        raise ValueError("MegaMoe L1 AllToAll payload and offset must be row-aligned")
+    return source_offset // hidden_size, count // hidden_size, hidden_size
 
 
 def _resolve_alltoall(context: L1TensorViewContext) -> L1TensorView:
@@ -114,35 +148,27 @@ def _resolve_alltoall(context: L1TensorViewContext) -> L1TensorView:
             "select its local consumer input instead"
         )
     if context.io == "input" and context.index != 1:
-        return context.make_view(
-            (1,),
-            note="task-local AllToAll metadata scalar",
-        )
-
-    all_expert_num = int(context.operator.inputs[3].shape[0])
-    tasks_per_expert = int(context.task_desc.task_split_num) // all_expert_num
-    if tasks_per_expert <= 0:
-        raise ValueError("MegaMoe L1 AllToAll task count per expert must be positive")
-    expert_group = int(context.task_desc.task_index) // tasks_per_expert
-    local_task_index = int(context.task_desc.task_index) % tasks_per_expert
-    size_position = int(context.operator.inputs[3].param_position)
-    source_offset_position = int(context.operator.inputs[0 if is_pull else 2].param_position)
-    sizes = context.parameter_cpu(size_position).reshape(-1)
-    source_offsets = context.parameter_cpu(source_offset_position).reshape(-1)
-    size = int(sizes[expert_group])
-    tile_start = local_task_index * int(context.task_desc.task_split_value) * int(context.tensor_spec.shape[1])
-    tile_end = tile_start + int(context.task_desc.task_split_value) * int(context.tensor_spec.shape[1])
-    element_count = min(tile_end, size) - tile_start if tile_start < size else 0
-    hidden_size = int(context.tensor_spec.shape[1])
-    if element_count % hidden_size:
-        raise ValueError(
-            f"MegaMoe L1 AllToAll payload is not row-aligned: elements={element_count}, hidden={hidden_size}"
-        )
-    source_offset_elements = int(source_offsets[expert_group]) + tile_start
+        return context.make_view((1,), note="task-local AllToAll metadata scalar")
+    source_row, rows, hidden_size = _alltoall_rows(context)
     return context.make_view(
-        (element_count // hidden_size, hidden_size),
-        source_offset_bytes=source_offset_elements * int(context.tensor_desc.data_type) if element_count else 0,
+        (rows, hidden_size),
+        source_offset_bytes=source_row * hidden_size * int(context.tensor_desc.data_type) if rows else 0,
         note="local pull receive tile" if is_pull else "local AllToAll send tile before remote transfer",
+    )
+
+
+def _resolve_probability_workspace(context: L1TensorViewContext) -> L1TensorView:
+    """Capture only the stable local scalar slice used or produced by this task."""
+    task_type = int(context.task_desc.task_type)
+    if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
+        source_row, rows = _swiglu_rows(context)
+    else:
+        source_row, rows, _ = _alltoall_rows(context)
+    plane = probability_capture_plane(context.operator)
+    stride = int(context.tensor_spec.shape[1])
+    return context.make_view(
+        (rows,), source_offset_bytes=(plane * stride + source_row) * PROBABILITY_DTYPE_BYTES if rows else 0,
+        note="task-local routing probability or probability-gradient slice",
     )
 
 
@@ -156,6 +182,8 @@ def resolve_mega_moe_l1_tensor_view(context: Any) -> L1TensorView:
         raise TypeError(
             f"MegaMoe L1 view context must be L1TensorViewContext, got {type(context).__name__}"
         )
+    if context.tensor_spec.name == "probability_workspace":
+        return _resolve_probability_workspace(context)
     task_type = int(context.task_desc.task_type)
     if task_type == TaskType.TASK_GROUPED_MATMUL:
         return _resolve_grouped_matmul(context)

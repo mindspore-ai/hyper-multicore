@@ -40,7 +40,29 @@ foreach(required_path IN ITEMS
     endif()
 endforeach()
 
+# Compile existing AscendC utility kernels separately from framework C++ headers.
+# Both supported products (910B and 910_93) use the dav-2201 device architecture.
+set(CANN_ROOT "$ENV{ASCEND_HOME_PATH}")
+find_program(ASCEND_BISHENG bisheng HINTS "${CANN_ROOT}/tools/bisheng_compiler/bin" REQUIRED)
+find_library(ASCENDC_HOST_RUNTIME ascendc_runtime
+    PATHS "${CANN_ROOT}/lib64" "${CANN_ROOT}/aarch64-linux/lib64" REQUIRED NO_DEFAULT_PATH)
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
+    COMMAND "${ASCEND_BISHENG}" -x asc --npu-arch=dav-2201 --cce-auto-sync=off
+        -std=c++17 -O2 -fPIC -c "${CMAKE_CURRENT_SOURCE_DIR}/csrc/mega_moe_utilities.asc"
+        -o "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
+        "-I${CANN_ROOT}/asc" "-I${CANN_ROOT}/asc/include"
+        "-I${CANN_ROOT}/asc/include/interface" "-I${CANN_ROOT}/asc/include/utils"
+        "-I${CANN_ROOT}/asc/impl" "-I${CANN_ROOT}/include"
+        "-I${CANN_ROOT}/include/runtime" "-I${CANN_ROOT}/pkg_inc"
+        "-I${CANN_ROOT}/pkg_inc/runtime"
+    DEPENDS csrc/mega_moe_utilities.asc VERBATIM)
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+
 add_library(hyper_multicore_torch SHARED
+    csrc/mega_moe_utilities.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
     csrc/registration.cpp
     csrc/registration_mhc.cpp
     csrc/mega_mhc.cpp
@@ -67,8 +89,11 @@ target_include_directories(hyper_multicore_torch PRIVATE
     ${OP_PLUGIN_ROOT}
     ${OP_PLUGIN_ROOT}/op_plugin/include
     ${HP_MULTICORE_VENDOR_ROOT}/op_api/include)
+target_link_directories(hyper_multicore_torch PRIVATE "${CANN_ROOT}/lib64")
+target_include_directories(hyper_multicore_torch BEFORE PRIVATE "${CANN_ROOT}/include")
 target_link_libraries(hyper_multicore_torch PRIVATE
-    ${TORCH_LINK_LIBRARIES})
+    ${TORCH_LINK_LIBRARIES}
+    "${ASCENDC_HOST_RUNTIME}" profapi mmpa c_sec unified_dlog ascendcl runtime)
 hp_enable_elf_hardening(hyper_multicore_torch)
 
 install(TARGETS hyper_multicore_torch DESTINATION .)

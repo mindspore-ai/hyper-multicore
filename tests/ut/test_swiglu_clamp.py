@@ -76,6 +76,19 @@ class TestSwiGLUClamp(unittest.TestCase):
                     all(task.extra_value_0 == expected_bits for task in clamp_tasks)
                 )
 
+    def test_post_activation_serializes_in_both_directions(self) -> None:
+        """Keep clipping order distinct from the magnitude in both plans."""
+        for builder, kind in ((build_forward_graph, TaskType.TASK_SWI_GLU),
+                              (build_backward_graph, TaskType.TASK_SWI_GLU_GRAD)):
+            values = TaskSplitValue(tp=1, ep=1, seq_size=128, all_expert_num=4, top_k=2)
+            graph = builder(values, hidden_size=16, intermediate_size=8, num_cube_cores=20,
+                            swiglu_limit=0.5, clamp_after_activation=True)
+            graph.propagate_splits(values)
+            config = build_runtime_config(graph, values, num_cube_cores=20)
+            tasks = [t for t in config.all_tasks[:config.task_num] if t.task_type == kind]
+            self.assertTrue(tasks)
+            self.assertTrue(all(t.extra_value_1 == 1 for t in tasks))
+
     def test_preserves_zero_discriminator_for_legacy_tasks(self) -> None:
         """Feature: preserve the legacy unclamped task discriminator.
 

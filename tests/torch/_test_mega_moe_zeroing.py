@@ -45,8 +45,8 @@ def poison_overwritten_buffers(value: float) -> Iterator[None]:
             tensor.fill_(value)
         return tensors
 
-    def _backward(*args):
-        tensors = allocate_backward(*args)
+    def _backward(*args, **kwargs):
+        tensors = allocate_backward(*args, **kwargs)
         for tensor in (tensors.act_grad, tensors.swiglu_grad, tensors.gate_dx):
             tensor.fill_(value)
         return tensors

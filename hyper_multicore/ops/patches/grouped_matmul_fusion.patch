@@ -36,7 +36,7 @@ index fbd7b6c..13692ca 100644
 
  namespace {
      __aicore__ inline static constexpr MatmulApiStaticTiling GetGmmMatmulApiTiling(bool isND2NZ, bool transB) {
-@@ -379,18 +379,26 @@ namespace {
+@@ -379,18 +379,39 @@ namespace {
          op.Process(workspace, &tPipe);                                                                 \
      } while (0)
 
@@ -47,13 +47,26 @@ index fbd7b6c..13692ca 100644
                                                       GM_ADDR offset, GM_ADDR antiquantScale, GM_ADDR antiquantOffset,
                                                       GM_ADDR groupList, GM_ADDR perTokenScale, GM_ADDR y,
 -                                                     GM_ADDR workspace, GM_ADDR tiling)
-+                                                     GM_ADDR workspace, GM_ADDR tiling, bool transA, bool transB)
++                                                     GM_ADDR workspace, GM_ADDR tiling, bool transA, bool transB,
++                                                     bool fp32Output = false)
  {
      TPipe tPipe;
      AscendCUtils::SetOverflow(1);
      KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
      GM_ADDR user1 = GetUserWorkspace(workspace);
 
++    if (fp32Output) {
++        using yType = MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>;
++        if (transA) {
++            GMM_CUBE_IMP(GMMProcess, true, false, false, matmulCFG);
++        } else if (transB) {
++            GMM_CUBE_IMP(GMMProcess, false, true, false, matmulCFGUnitFlag);
++        } else {
++            GMM_CUBE_IMP(GMMProcess, false, false, false, matmulCFGUnitFlag);
++        }
++        return;
++    }
++
 +    if (transA) {
 +        GMM_CUBE_IMP(GMMProcess, true, false, false, matmulCFG);
 +    } else if (transB) {
@@ -79,6 +92,15 @@ diff --git a/gmm/grouped_matmul/op_kernel/grouped_matmul.h b/gmm/grouped_matmul/
 index 59e0f9d..5e9a7a6 100644
 --- a/gmm/grouped_matmul/op_kernel/grouped_matmul.h
 +++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+@@ -419,7 +419,7 @@
+     GlobalTensor<AT> xGm;
+     GlobalTensor<BT> weightGm;
+     GlobalTensor<BiasT> biasGm;
+-    GlobalTensor<DTYPE_Y> yGm;
++    GlobalTensor<CT> yGm;
+ #if defined(GMM_QUANT_INT8)
+     GM_ADDR scaleTensorPtr;
+     GlobalTensor<DTYPE_SCALE> scaleGm;
 @@ -474,11 +474,6 @@ __aicore__ inline void GMMCompute<mmType, sync>::Init(GM_ADDR x, GM_ADDR weight,
      LocalTensor<uint8_t> buf = ubBuf.template Get<uint8_t>();
      mm.SetLocalWorkspace(buf);

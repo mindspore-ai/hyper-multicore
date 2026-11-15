@@ -14,7 +14,7 @@
 # ============================================================================
 """AllToAll fill config: dispatch and combine (forward + backward)."""
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 
 from hyper_multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
@@ -25,6 +25,19 @@ from hyper_multicore.tasks.task_base import FillConfig
 from hyper_multicore.tasks.utils import (
     advance_tsv_vector, advance_tsv_vector_only,
 )
+
+
+class ShmemTaskPartition(IntEnum):
+    """Partition each peer/expert transfer into contiguous row ranges.
+
+    FIXED_ROWS uses task_split_value rows per task. RUNTIME_ROWS divides the
+    actual runtime row count evenly among that PUT's task descriptors.
+    GET continues to use fixed row tiles.
+    Both modes publish one completion credit per task, including empty ranges.
+    """
+
+    FIXED_ROWS = 0
+    RUNTIME_ROWS = 2
 
 
 class AllToAllType(Enum):
@@ -136,6 +149,7 @@ class AllToAllFillConfig(FillConfig):
             task.task_index           = i
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
+            task.extra_value_1 = ShmemTaskPartition.RUNTIME_ROWS if hasattr(op, "compact_lanes") else 0
             task.tiling_data_position = 0xFFFFFFFF
 
             cfg.all_tasks[tsv.pre_task_num + i] = task

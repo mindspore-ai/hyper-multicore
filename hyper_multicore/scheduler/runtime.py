@@ -166,6 +166,13 @@ def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
     return capacity
 
 
+def copy_runtime_config(cfg: RuntimeConfigC) -> RuntimeConfigC:
+    """Copy wire storage and retain the graph-owned host validation contract."""
+    result = type(cfg).from_buffer_copy(bytes(cfg))
+    result.task_validator = getattr(cfg, "task_validator", None)
+    return result
+
+
 def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     """Serialize dense tasks and queues up to their actual required capacity.
 
@@ -180,6 +187,10 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         Bytes for a matching native runtime reader.
     """
     capacity = runtime_config_task_capacity(cfg)
+    validator = getattr(cfg, "task_validator", None)
+    if validator is not None:
+        for task in cfg.all_tasks[:capacity]:
+            validator(task)
     event_capacity = len(cfg.all_event_num_triggers)
     if len(cfg.all_events) != event_capacity:
         raise ValueError("runtime event and trigger arrays must have equal capacity")
@@ -191,7 +202,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     layout = type(cfg)
     address = ctypes.addressof(cfg)
     prefix = struct.pack(
-        "<10I24x",
+        "<11I20x",
         cfg.task_num,
         cfg.num_workers,
         capacity,
@@ -202,6 +213,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         cfg.aiv_profile_record_capacity,
         cfg.completion_event,
         cfg.protocol_version,
+        cfg.vector_ready_queue,
     )
     sections = [
         (layout.all_event_num_triggers.offset, event_capacity * 4),

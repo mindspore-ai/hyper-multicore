@@ -81,6 +81,21 @@ class SplitSpec:
 
 
 @dataclass
+class TensorEffect:
+    """Named reads/writes sharing an operand and its existing completion event.
+
+    Regions describe logical aliases within a physical allocation. Remote writes
+    complete with the operator's token payload before its event is published.
+    """
+    operand: TensorSpec
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    remote_writes: tuple[str, ...] = ()
+    remote_reads: tuple[str, ...] = ()
+    completion: str = "task"
+
+
+@dataclass
 class OperatorNode:
     """A single operator node in the compute DAG."""
     name:            str
@@ -96,6 +111,7 @@ class OperatorNode:
     diagnostic_name: Optional[str] = None      # optional Host-side diagnostic display name
     diagnostic_view_resolver: Optional[Callable[..., Any]] = None
     diagnostic_host_ports: bool = False  # Native hard-coded ABI operands, not TaskDesc TensorDesc arrays.
+    tensor_effects: tuple[TensorEffect, ...] = ()
 
     predecessors:    List['OperatorNode'] = field(default_factory=list)
     successors:      List['OperatorNode'] = field(default_factory=list)
@@ -107,6 +123,7 @@ class ComputeGraph:
 
     def __init__(self) -> None:
         """Initialize an empty compute graph."""
+        self.task_validator: Optional[Callable[..., None]] = None
         self._nodes: dict[str, OperatorNode] = {}
         self._insertion_order: list[str] = []
 

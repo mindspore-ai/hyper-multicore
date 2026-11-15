@@ -32,7 +32,8 @@ from tests.common.multicore._test_env import (
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_mega_moe_profiling.py")
 _WORLD_SIZE = 2
-_EXPECTED_RECORD_COUNT = 1411
+_EXPECTED_AIV_RECORD_COUNT = 451
+_LOCAL_EXPERTS = 8
 
 
 def _prepare_torch_multicore_test_environment() -> None:
@@ -69,5 +70,7 @@ def test_mega_moe_standalone_profiler(monkeypatch, tmp_path: Path) -> None:
         trace = json.loads(trace_path.read_text(encoding="utf-8"))
         metadata = trace["megaKernelCycleTrace"]
         assert metadata["invocationCount"] == 1
-        assert metadata["recordCount"] == _EXPECTED_RECORD_COUNT
+        cube_slots = metadata["invocations"][0]["workerCapacities"]["cubeSlots"]
+        expected_records = cube_slots * _LOCAL_EXPERTS * 2 * 3 + _EXPECTED_AIV_RECORD_COUNT
+        assert metadata["recordCount"] == expected_records
         assert metadata["droppedRecordCount"] == 0

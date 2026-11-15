@@ -22,10 +22,12 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch_npu  # pylint: disable=unused-import
+import torch_npu  # noqa: F401  # pylint: disable=unused-import
 
 from hyper_multicore.diagnostics import profiler as multicore_profiler, schedule as diagnostic_schedule
 from hyper_multicore import MegaMoeExperts
+from hyper_multicore._core_spec import get_device_core_spec
+from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts
 from tests.torch import _test_mega_moe as common
 
 
@@ -38,18 +40,16 @@ _PROFILE_SHAPE = common.MoeShape(
     top_k=8,
     ep_size=2,
 )
-_EXPECTED_RECORD_COUNT = 1411
-_EXPECTED_CORE_RECORD_COUNTS = {"AIC": 960, "AIV": 451}
+_EXPECTED_AIV_RECORD_COUNT = 451
 
 
 def _build_profile_layer() -> MegaMoeExperts:
     """Construct the representative two-rank MegaMoe layer."""
-    return MegaMoeExperts(
+    return OwnedMegaMoeExperts(
         hidden_size=_PROFILE_SHAPE.hidden_size,
         intermediate_size=_PROFILE_SHAPE.intermediate_size,
         num_experts=_PROFILE_SHAPE.num_experts,
         top_k=_PROFILE_SHAPE.top_k,
-        ep_size=_PROFILE_SHAPE.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=common.DEVICE, dtype=torch.bfloat16)
 
@@ -57,16 +57,22 @@ def _build_profile_layer() -> MegaMoeExperts:
 def _assert_complete_forward_trace(trace: dict) -> None:
     """Reject incomplete or ambiguously named device records."""
     metadata = trace["megaKernelCycleTrace"]
+    # Two GMM stages per local expert, each recording wait, compute and trigger.
+    cube_slots = get_device_core_spec(common.DEVICE.index).num_cube_cores
+    cube_records = cube_slots * (_PROFILE_SHAPE.num_experts // _PROFILE_SHAPE.ep_size) * 2 * 3
+    expected_core_records = {"AIC": cube_records, "AIV": _EXPECTED_AIV_RECORD_COUNT}
+    expected_record_count = sum(expected_core_records.values())
+    assert metadata["invocations"][0]["workerCapacities"]["cubeSlots"] == cube_slots
     internal_events = [event for event in trace["traceEvents"] if event.get("cat") == "MegaKernelInternal"]
     core_record_counts = Counter(event["args"]["core_type"] for event in internal_events)
 
     assert metadata["invocationCount"] == 1, f"rank={common.RANK}: expected one forward invocation, got {metadata}."
     assert (
-        metadata["recordCount"] == _EXPECTED_RECORD_COUNT
+        metadata["recordCount"] == expected_record_count
     ), f"rank={common.RANK}: incomplete record count: {metadata}."
     assert metadata["droppedRecordCount"] == 0, f"rank={common.RANK}: profiling dropped records: {metadata}."
     assert (
-        core_record_counts == _EXPECTED_CORE_RECORD_COUNTS
+        core_record_counts == expected_core_records
     ), f"rank={common.RANK}: unexpected AIC/AIV records: {core_record_counts}."
     assert all(
         0 < event["args"]["start_cycle"] <= event["args"]["end_cycle"]

@@ -19,17 +19,46 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import torch_npu
-from torch import nn  # pylint: disable=forbidden-backend-import
+from torch import nn
 
 from examples._layers import SwiGLUMLP
 from examples._native import GroupedExperts
-from hyper_multicore import MegaMoeExperts
 from examples.moe.gate import Gate
+from hyper_multicore import MegaMoeExperts
 
 if TYPE_CHECKING:
     from examples.moe.model import MoeTransformerConfig
+
+
+class ModelExperts(nn.Module):
+    """Own packed expert parameters and delegate execution to MegaMoe."""
+
+    def __init__(self, config: MoeTransformerConfig, ep_group: Any | None) -> None:
+        """Initialize local expert parameters outside the executor."""
+        super().__init__()
+        self.executor = MegaMoeExperts(
+            hidden_size=config.hidden_size, intermediate_size=config.intermediate_size,
+            num_experts=config.num_experts, top_k=config.top_k, ep_group=ep_group,
+        )
+        local = self.executor.local_experts
+        self.gate_up_weight = nn.Parameter(torch.empty(local, config.hidden_size, config.intermediate_size * 2))
+        self.down_weight = nn.Parameter(torch.empty(local, config.intermediate_size, config.hidden_size))
+        for expert in range(local):
+            nn.init.xavier_uniform_(self.gate_up_weight[expert])
+            nn.init.xavier_uniform_(self.down_weight[expert])
+
+    def forward(self, hidden_states: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
+                *, tokens_per_expert: torch.Tensor | None = None) -> torch.Tensor:
+        """Pass the current model-owned parameters into the executor."""
+        return self.executor(hidden_states, topk_ids, topk_weights,
+                             expert_weights=(self.gate_up_weight, self.down_weight),
+                             tokens_per_expert=tokens_per_expert)
+
+    def close(self) -> None:
+        """Release the executor after its outstanding backwards complete."""
+        self.executor.close()
 
 
 class NativeExperts(torch.nn.Module):
@@ -38,7 +67,7 @@ class NativeExperts(torch.nn.Module):
     def __init__(
         self,
         config: MoeTransformerConfig,
-        source: MegaMoeExperts,
+        source: ModelExperts,
         ep_group: Any,
         device: torch.device,
     ) -> None:
@@ -112,16 +141,7 @@ class MoeTransformerBlock(nn.Module):
             hidden_size=config.hidden_size, num_experts=config.num_experts, top_k=config.top_k,
             routed_scaling_factor=config.routed_scaling_factor, use_mega_gate="gate" in mega_kernels,
         )
-        self.experts = MegaMoeExperts(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            num_experts=config.num_experts,
-            top_k=config.top_k,
-            initial_capacity_factor=config.initial_capacity_factor,
-            ep_group=ep_group,
-            dispatch_mode=config.dispatch_mode,
-            capacity_growth_factor=config.capacity_growth_factor,
-        )
+        self.experts = ModelExperts(config, ep_group)
         shared_source = nn.Module()
         shared_source.gate_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)
         shared_source.up_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)

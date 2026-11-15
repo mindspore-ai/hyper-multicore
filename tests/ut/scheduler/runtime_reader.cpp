@@ -35,10 +35,24 @@ using AscendC::GetTPipePtr;
 #include "hyper_multicore/ops/runtime/runtime_config.hpp"
 #include "hyper_multicore/ops/runtime/runtime_storage_bounds_host.h"
 
+#include "hyper_multicore/ops/common/swiglu_task_options.h"
+#include "hyper_multicore/ops/common/mega_moe/probability_abi.h"
+#include "hyper_multicore/ops/common/mega_moe/task_options.h"
+
 namespace Runtime = MulticoreRuntime;
 
 static_assert(sizeof(Runtime::TensorDesc) == 64);
 static_assert(sizeof(Runtime::TaskDesc) == 576);
+
+extern "C" void read_probability_layout(uint32_t *result) {
+  using Layout = Runtime::ProbabilityLayout;
+  const uint32_t values[] = {Layout::PLANES, Layout::ELEMENT_BYTES, Layout::FORWARD_POSITION,
+                            Layout::BACKWARD_POSITION, Layout::SOURCE, Layout::RECEIVED,
+                            Layout::RECEIVED_GRADIENT, Layout::RETURNED_GRADIENT};
+  for (uint32_t index = 0; index < 8; ++index) {
+    result[index] = values[index];
+  }
+}
 
 extern "C" void read_transport_and_kernel_task_types(uint32_t *result) {
   result[0] = static_cast<uint32_t>(Runtime::TaskType::TASK_SHMEM_GET_MEM);
@@ -99,6 +113,24 @@ extern "C" void read_layout(uint8_t *image, uint32_t *result) {
   result[11] = Runtime::getRuntimeEventCapacity(image);
 }
 
+extern "C" void read_task_option_values(uint32_t *result) {
+  result[0] = static_cast<uint32_t>(Runtime::GroupedMatmulTaskMode::PER_EXPERT);
+  result[1] = static_cast<uint32_t>(Runtime::GroupedMatmulTaskMode::SINGLE_GROUP);
+  result[2] = static_cast<uint32_t>(Runtime::GroupedMatmulTaskMode::BATCHED);
+  result[3] = static_cast<uint32_t>(Runtime::GroupedMatmulTaskMode::BATCHED_READY);
+  result[4] = static_cast<uint32_t>(Runtime::SwiGluClampPosition::BEFORE_SILU);
+  result[5] = static_cast<uint32_t>(Runtime::SwiGluClampPosition::AFTER_SILU);
+  result[6] = static_cast<uint32_t>(Runtime::SwiGluTaskIteration::TILED);
+  result[7] = static_cast<uint32_t>(Runtime::SwiGluTaskIteration::PERSISTENT_LANES);
+  result[8] = static_cast<uint32_t>(Runtime::ShmemTaskPartition::FIXED_ROWS);
+  result[9] = static_cast<uint32_t>(Runtime::ShmemTaskPartition::RUNTIME_ROWS);
+  result[10] = static_cast<uint32_t>(Runtime::MegaMoeActivationWeighting::UNWEIGHTED);
+  result[11] = static_cast<uint32_t>(Runtime::MegaMoeActivationWeighting::BEFORE_FC2);
+  result[12] = static_cast<uint32_t>(Runtime::MegaMoeTransportPayload::TOKENS);
+  result[13] = static_cast<uint32_t>(Runtime::MegaMoeTransportPayload::TOKENS_WITH_PROBABILITIES);
+  result[14] = static_cast<uint32_t>(Runtime::MegaMoeTransportPayload::TOKENS_WITH_PROBABILITY_GRADIENTS);
+}
+
 extern "C" void read_protocol_profile(uint8_t *image, uint32_t *result) {
   Runtime::ReadyHandshakeMeta meta;
   Runtime::getReadyHandshakeMeta(image, &meta);
@@ -107,4 +139,8 @@ extern "C" void read_protocol_profile(uint8_t *image, uint32_t *result) {
   result[2] = Runtime::isCycleProfileEnabled(image);
   result[3] = Runtime::getAicProfileRecordCapacity(image);
   result[4] = Runtime::getAivProfileRecordCapacity(image);
+}
+
+extern "C" bool valid_moe_task(const Runtime::TaskDesc *task, uint32_t position) {
+  return Runtime::IsMoeTaskOptionsValid(*task, position);
 }

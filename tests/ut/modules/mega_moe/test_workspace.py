@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_multicore import _collective
 from hyper_multicore.modules.mega_moe import workspace as workspace_module
 from hyper_multicore.modules.mega_moe.heap_manager import _HeapManager, _workspace_layout
 from hyper_multicore.modules.mega_moe.spec import (
@@ -60,7 +61,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         workspace.release_graph(context)
         self.assertTrue(workspace.can_close())
         with (
-            patch.object(workspace_module._collective, "exchange") as exchange,
+            patch.object(_collective, "exchange") as exchange,
             self.assertRaisesRegex(RuntimeError, "owning HeapManager"),
         ):
             workspace.close()
@@ -71,8 +72,8 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         self.assertEqual(workspace.route_cache_probe_after, 7)
         workspace.heap_manager = SimpleNamespace(root_group=None, access=nullcontext)
         with (
-            patch.object(workspace_module._collective.dist, "is_initialized", return_value=False),
-            patch.object(workspace_module._collective.dist, "all_gather_object") as gather,
+            patch.object(_collective.dist, "is_initialized", return_value=False),
+            patch.object(_collective.dist, "all_gather_object") as gather,
         ):
             workspace.close()
         gather.assert_not_called()
@@ -163,7 +164,7 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         Description: Allocate and reuse event storage through the SHMEM API.
         Expectation: Preserve dynamic counters and ready tails without reallocating.
         """
-        spec = SimpleNamespace(receive_capacity=128, routed_slots=256, hidden_size=16,
+        spec = SimpleNamespace(apply_probs_before_fc2=False, receive_capacity=128, routed_slots=256, hidden_size=16,
                                ep_size=64, num_experts=1024, dispatch_mode="push")
         workspace = MegaMoeWorkspace(shared=True)
         with (

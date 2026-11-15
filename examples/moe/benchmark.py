@@ -28,23 +28,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 import torch_npu
 
 from examples._optimizer import (
     Float16OptimizerWithFloat16Params,
 )
-from hyper_multicore import MegaMoeExperts, shmem
+from examples._training import _compare_tensor_maps, build_optimizer
+from examples.moe.experts import ModelExperts, NativeExperts
 from examples.moe.model import (
     MoeTransformerConfig,
     MoeTransformerModel,
 )
-from examples.moe.experts import NativeExperts
-from hyper_multicore.modules.mega_moe.spec import (
-    _resolve_capacity_factors,
-)
-from examples._training import _compare_tensor_maps, build_optimizer
+from hyper_multicore import shmem
 
 _EXPERTS_PER_RANK = 6
 _BATCH_SIZE = 1
@@ -104,11 +101,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--measured-steps", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--initial-capacity-factor", type=float, default=None,
-                        help="push only: initial receive factor (default: 1.25)")
-    parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
-    parser.add_argument("--capacity-growth-factor", type=float, default=None,
-                        help="push only: growth multiplier (default: 1.25; 1.0 fits actual demand)")
     parser.add_argument(
         "--mega-kernels", type=_parse_mega_kernels, default=("moe", "gate"),
         help="optimized backend kernels; common always uses the same architecture with Torch references",
@@ -120,8 +112,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="rank-zero JSON result path",
     )
     args = parser.parse_args(argv)
-    args.initial_capacity_factor, args.capacity_growth_factor = _resolve_capacity_factors(
-        args.dispatch_mode, args.initial_capacity_factor, args.capacity_growth_factor)
     if args.warmup_steps < 1:
         raise ValueError(f"warmup_steps must be positive, got {args.warmup_steps}.")
     if args.measured_steps <= 0:
@@ -145,9 +135,6 @@ def _build_config(args: argparse.Namespace, world_size: int) -> MoeTransformerCo
         ep_size=world_size,
         num_experts=num_experts,
         top_k=top_k,
-        initial_capacity_factor=args.initial_capacity_factor,
-        dispatch_mode=args.dispatch_mode,
-        capacity_growth_factor=args.capacity_growth_factor,
     )
 
 
@@ -413,7 +400,7 @@ def _canonical_tensors(
     }
     for layer_index, layer in enumerate(model.layers):
         experts = layer.mlp.experts
-        if isinstance(experts, MegaMoeExperts):
+        if isinstance(experts, ModelExperts):
             gate_up = _parameter_value(
                 experts.gate_up_weight,
                 gradients=gradients,
@@ -456,10 +443,10 @@ def _measure_backend(
         losses.append(float(loss.float().cpu().item()))
     managers = {}
     for layer in workload.model.layers:
-        if isinstance(layer.mlp.experts, MegaMoeExperts):
+        if isinstance(layer.mlp.experts, ModelExperts):
             # Capacity-growth records belong to the internal shared execution-resource group.
             # pylint: disable-next=protected-access
-            manager = layer.mlp.experts._resource_group.resources.heap_manager
+            manager = layer.mlp.experts.executor._resource_group.resources.heap_manager
             managers[id(manager)] = manager
     state = shmem.debug_state() if managers else {}
     return {
@@ -484,12 +471,17 @@ def _write_result(
     rank: int,
     accuracy: dict[str, Any],
     backends: dict[str, dict[str, Any]],
+    mega_model: MoeTransformerModel,
 ) -> None:
     """Write common-versus-MegaMoe accuracy and performance from rank zero."""
     common_median = backends["common"]["steady_state_optimizer_step_ms"]["median"]
     mega_median = backends["mega"]["steady_state_optimizer_step_ms"]["median"]
     ratio = mega_median / common_median
     if rank == 0:
+        experts = mega_model.layers[0].mlp.experts
+        # Record the actual execution configuration; the optimized backend may also use native experts.
+        specification = (experts.executor._resource_group.specification  # pylint: disable=protected-access
+                         if isinstance(experts, ModelExperts) else {})
         result = {
             "architecture": "moe_transformer_plain_residual",
             "mega_kernels": list(args.mega_kernels),
@@ -503,9 +495,9 @@ def _write_result(
                 "num_layers": config.num_layers,
                 "num_experts": config.num_experts,
                 "top_k": config.top_k,
-                "initial_capacity_factor": config.initial_capacity_factor,
-                "dispatch_mode": config.dispatch_mode,
-                "capacity_growth_factor": config.capacity_growth_factor,
+                "initial_capacity_factor": specification.get("initial_capacity_factor"),
+                "dispatch_mode": specification.get("dispatch_mode"),
+                "capacity_growth_factor": specification.get("capacity_growth_factor"),
                 "dtype": "bfloat16",
                 "scoring_func": "sqrtsoftplus",
             },
@@ -691,6 +683,7 @@ def main(argv: list[str] | None = None) -> int:
             context.rank,
             accuracy,
             backends,
+            context.models["mega"],
         )
         return 0
     finally:

@@ -41,47 +41,47 @@ forward 返回三张量 tuple：`logits`、`topk_weights`、`topk_ids`。
 
 ### MoE：只替换路由专家执行
 
-下面的完整模块保留 Router、共享专家及 `[B,S,H]` 输入/输出形状。原 Router 的辅助 loss 和负载均衡仍由模型处理。
+下面的示例假设原专家已经将 gate/up 合并成 `gate_up_weight`，并以 `down_weight` 保存下投影。
+权重由外层模块持有；原 Router 的辅助 loss 和负载均衡仍由模型处理。
 
 ```python
 import torch
-from hyper_multicore import MegaGate, MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
 
-class RoutedMoe(torch.nn.Module):
-    def __init__(self, source, ep_group):
+class RoutedExperts(torch.nn.Module):
+    def __init__(self, source, *, hidden_size, intermediate_size, num_experts, top_k, ep_group,
+                 numerics_options: MegaMoeNumericsOptions | None = None):
         super().__init__()
-        self.router = MegaGate.from_module(source.router)
-        self.experts = MegaMoeExperts.from_module(
-            source.experts, top_k=self.router.top_k, ep_group=ep_group,
+        self.gate_up_weight = source.gate_up_weight
+        self.down_weight = source.down_weight
+        self.executor = MegaMoeExperts(
+            hidden_size=hidden_size, intermediate_size=intermediate_size,
+            num_experts=num_experts, top_k=top_k, ep_group=ep_group,
+            numerics_options=numerics_options,
         )
-        self.shared_expert = source.shared_expert
 
-    def forward(self, hidden_states):
-        _, topk_weights, topk_ids = self.router(hidden_states)
-        routed = self.experts(hidden_states, topk_ids=topk_ids, topk_weights=topk_weights)
-        return routed + self.shared_expert(hidden_states)
-
-model.moe = RoutedMoe(model.moe, ep_group)
+    def forward(self, hidden_states, topk_ids, topk_weights):
+        return self.executor(hidden_states, topk_ids, topk_weights,
+                             expert_weights=(self.gate_up_weight, self.down_weight))
 ```
 
-`ep_group` 是实际 EP 组，组件从中推导大小；`ep_size` 通常省略，仅作一致性检查。
+`ep_group` 是实际 EP 组，组件从中推导 EP 大小。
 未指定组仅适用于独立单 rank，分布式进程不会自动猜成 WORLD。token 容量由实际输入维护，无需上限或模式开关；
 首次接入可省略 `tokens_per_expert`；复用 Router 的计数时，它须是当前本 rank、按全局专家编号的精确 `[E]` histogram。
 
-`from_module` 支持已 materialize 的本地 `GroupedExperts` SwiGLU 布局：
+示例中的模块应在 FSDP 包装和优化器创建前安装，调用时经过该模块的 `__call__`，使 FSDP hook
+先 unshard 参数；EP DTensor 由模型 adapter 在此时取出本地专家片段。执行器按两组权重形状自动识别
+EIO/EOI，契约见[输入与权重](../hyper_multicore/README.md#输入与权重)。如果原模型的 gate/up 是两个
+独立参数，需要模型侧合并或调整存储；每次 forward 拼接可能产生额外复制。
 
-| 原参数 | 原形状 | 转换到 Mega 参数 |
-| --- | --- | --- |
-| gate `w1` | `[local_E,I,H]` | 转置后写入 `gate_up_weight[..., :I]` |
-| up `w3` | `[local_E,I,H]` | 转置后写入 `gate_up_weight[..., I:]` |
-| down `w2` | `[local_E,H,I]` | 转置为 `down_weight` |
-
-表中转换采用默认的 `expert_weight_layout="EIO"`；传入 `"EOI"` 时，gate/up 沿输出维拼接为
-`[local_E,2I,H]`，down 保持 `[local_E,H,I]`，两种布局都生成连续、独立存储的参数。
-
-转换创建新 Parameter，保留 dtype/device 和梯度策略；gate/up 冻结策略须一致。
-EP DTensor 使用本地专家片段，FSDP 权重须先 materialize；meta 专家明确拒绝。
-其他数学定义、clamp 或布局由模型 adapter 明确转换，不按同名属性猜测。
+按来源模型逐层构造 `MegaMoeNumericsOptions(swiglu_limit=..., clamp_after_silu=...,
+apply_probs_before_fc2=...)`，再通过 `numerics_options=` 传入 adapter。
+省略时使用不截断、FC2 后乘概率的默认语义。`clamp_after_silu=True` 指 SiLU 后、乘 up 前截断，
+概率前移则保留激活 BF16 写出和乘概率后 BF16 写出两处舍入，详见
+[数值语义](../hyper_multicore/README.md#模型数学与数值语义)。这些选项由模型语义决定。
+需要调整 push/pull、容量或通信分片时，使用同一执行器的 `tuning_options=`，
+传入公开实验性的 `MegaMoeTuningOptions`；示例与兼容性边界见
+[调优配置](../hyper_multicore/README.md#公开实验性调优配置)。
 
 ### mHC：保留四流结构与显式状态
 
@@ -122,11 +122,11 @@ state = (block(block_input), residual, pre, post, mix)  # 下一边界调用 mod
 2. 在正确 EP 切片上替换模块并转换布局，再做设备/精度迁移和目标并行包装。
 3. 对最终 Parameter 集合创建优化器；以相同输入检查输出、梯度和更新后，再扩大层数、重算与动态输入。
 
-Gate/mHC 可绑定原 Parameter，MoE 合并/转置会创建新 Parameter。权重迁移不等于完整续训：
-当前 `from_module` 不转换旧 Adam 状态，严格续训还需同步转换 FP32 master、`exp_avg`、`exp_avg_sq` 及 checkpoint 元数据；
+Gate/mHC 可绑定原 Parameter，MegaMoe 的参数由调用方持有。权重迁移不等于完整续训：
+如模型侧合并/转置并创建新 Parameter，严格续训还需同步转换 FP32 master、`exp_avg`、`exp_avg_sq` 及 checkpoint 元数据；
 gate/up 动量按相同次序转置拼接，down 动量转置，gate/up step 必须一致。不能直接加载旧优化器 state_dict 并宣称等价。
 
-保留已有 FSDP/参数管理器时，使用 `create_parameters=False`，forward 内通过 `expert_weights=(gate_up, down)`
+保留已有 FSDP/参数管理器时，forward 内通过 `expert_weights=(gate_up, down)`
 传入当前已 unshard 的本地专家；形状和连续性契约见[输入与权重](../hyper_multicore/README.md#输入与权重)。
 不要保留两套可训练参数或跨更新缓存转换权重；非连续/拼接转换可能逐步复制，autograd 连接和生命周期由 adapter 维护。
 

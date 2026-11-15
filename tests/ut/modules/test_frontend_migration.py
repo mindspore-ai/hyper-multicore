@@ -21,8 +21,8 @@ from unittest.mock import patch
 
 import torch
 
-from tests.common.multicore.moe_reference import TorchExperts as GroupedExperts
 from hyper_multicore import MegaGate, MegaMhc, MegaMoeExperts
+from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.mega_gate import module as gate_module
 from hyper_multicore.modules.mega_moe import module as moe_module
 from tests.common.mark_utils import arg_mark
@@ -39,53 +39,86 @@ class TestFrontendMigration(unittest.TestCase):
         Description: Ep size follows explicit subgroup and rejects implicit world.
         Expectation: A subgroup determines local expert count; a global process group is never guessed.
         """
+        options = {"hidden_size": 16, "intermediate_size": 8, "num_experts": 4, "top_k": 2}
         group = object()
-        with (patch.object(moe_module.dist, "is_initialized", return_value=True),
-              patch.object(moe_module.dist, "get_world_size", return_value=2),
-              patch.object(moe_module.shmem, "root_members", return_value=(2, 3))):
-            layer = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, ep_group=group)
-            self.addCleanup(layer.close)
-            self.assertEqual(layer.ep_size, 2)
-            self.assertEqual(layer.local_experts, 2)
-            with self.assertRaisesRegex(ValueError, "does not match"):
-                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
-                               ep_group=group, ep_size=4)
-            with self.assertRaisesRegex(ValueError, "ep_group explicitly"):
-                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2)
+        for tuning_options in (None, MegaMoeTuningOptions(dispatch_mode="pull")):
+            for size in (1, 2):
+                with (self.subTest(tuning_options=tuning_options, group_size=size),
+                      patch.object(moe_module.dist, "is_initialized", return_value=True),
+                      patch.object(moe_module.dist, "get_world_size",
+                                   side_effect=lambda selected=None, n=size: 8 if selected is None else n) as get_size,
+                      patch.object(moe_module.shmem, "root_members", return_value=tuple(range(2, 2 + size)))):
+                    layer = MegaMoeExperts(**options, ep_group=group, tuning_options=tuning_options)
+                    self.addCleanup(layer.close)
+                    get_size.assert_called_once_with(group)
+                    self.assertEqual(layer.ep_size, size)
+                    self.assertEqual(layer.local_experts, 4 // size)
+                    self.assertIs(layer._root_group(), group)  # pylint: disable=protected-access
+                    with self.assertRaisesRegex(TypeError, "ep_size"):
+                        # pylint: disable-next=unexpected-keyword-arg
+                        MegaMoeExperts(**options, ep_group=group, ep_size=size, tuning_options=tuning_options)
+                    with self.assertRaisesRegex(ValueError, "ep_group explicitly"):
+                        MegaMoeExperts(**options, tuning_options=tuning_options)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_moe_migration_converts_each_expert_without_aliasing_source(self) -> None:
+    def test_ep_group_requires_initialization_and_defaults_to_single_rank(self) -> None:
+        """Explicit groups require distributed initialization; standalone owners infer EP1."""
+        options = {"hidden_size": 16, "intermediate_size": 8, "num_experts": 4, "top_k": 2}
+        for tuning_options in (None, MegaMoeTuningOptions(dispatch_mode="pull")):
+            with (self.subTest(tuning_options=tuning_options),
+                  patch.object(moe_module.dist, "is_initialized", return_value=False),
+                  patch.object(moe_module.dist, "get_world_size") as get_size):
+                layer = MegaMoeExperts(**options, tuning_options=tuning_options)
+                self.addCleanup(layer.close)
+                self.assertEqual((layer.ep_size, layer.local_experts), (1, 4))
+                with self.assertRaisesRegex(ValueError, "Initialize torch.distributed"):
+                    MegaMoeExperts(**options, ep_group=object(), tuning_options=tuning_options)
+                get_size.assert_not_called()
+            with (patch.object(moe_module.dist, "is_initialized", return_value=True),
+                  patch.object(moe_module.dist, "get_world_size", return_value=1),
+                  patch.object(moe_module.shmem, "root_members", return_value=(0,))):
+                layer = MegaMoeExperts(**options, tuning_options=tuning_options)
+                self.addCleanup(layer.close)
+                self.assertEqual((layer.ep_size, layer.local_experts), (1, 4))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_moe_executor_preserves_external_parameter_ownership(self) -> None:
         """Feature: MegaKernel frontend migration.
-        Description: Convert each expert to EIO and EOI without aliasing noncontiguous source weights.
-        Expectation: Both contiguous native layouts preserve the source SwiGLU function.
+        Description: Supply an existing model's packed local parameters to a parameterless executor.
+        Expectation: Expert and optimizer state stay with the original owner.
         """
-        source = GroupedExperts(16, 8, 4)
-        source.w2 = torch.nn.Parameter(source.w2.transpose(1, 2).contiguous().transpose(1, 2))
-        hidden = torch.randn(7, 16)
-        for layout in ("EIO", "EOI"):
-            with self.subTest(layout=layout):
-                converted = MegaMoeExperts.from_module(source, top_k=2, expert_weight_layout=layout)
-                self.addCleanup(converted.close)
-                for expert in range(4):
-                    weight1, weight2 = converted.gate_up_weight[expert], converted.down_weight[expert]
-                    if layout == "EOI":
-                        weight1, weight2 = weight1.T, weight2.T
-                    gate, up = (hidden @ weight1).chunk(2, -1)
-                    actual = (torch.nn.functional.silu(gate) * up) @ weight2
-                    expected = torch.nn.functional.linear(
-                        torch.nn.functional.silu(torch.nn.functional.linear(hidden, source.w1[expert]))
-                        * torch.nn.functional.linear(hidden, source.w3[expert]), source.w2[expert])
-                    torch.testing.assert_close(actual, expected)
-                self.assertNotEqual(converted.gate_up_weight.data_ptr(), source.w1.data_ptr())
-                self.assertNotEqual(converted.down_weight.data_ptr(), source.w2.data_ptr())
-                self.assertTrue(converted.gate_up_weight.is_contiguous())
-                self.assertTrue(converted.down_weight.is_contiguous())
-        source.w3.requires_grad_(False)
-        with self.assertRaisesRegex(ValueError, "gradient policies"):
-            MegaMoeExperts.from_module(source, top_k=2)
-        with self.assertRaisesRegex(ValueError, "materialize and initialize"):
-            MegaMoeExperts.from_module(source.to("meta"), top_k=2)
+        owner = torch.nn.Module()
+        owner.gate_up = torch.nn.Parameter(torch.randn(4, 16, 16, dtype=torch.bfloat16))
+        owner.down = torch.nn.Parameter(torch.randn(4, 16, 8, dtype=torch.bfloat16))
+        executor = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2)
+        self.addCleanup(executor.close)
+        hidden = SimpleNamespace(dtype=torch.bfloat16, is_npu=True, device=torch.device("cpu"))
+        executor._validate_tensors(hidden, (owner.gate_up, owner.down))  # pylint: disable=protected-access
+        self.assertEqual(executor._pending_layout, "EOI")  # pylint: disable=protected-access
+        self.assertEqual(list(executor.parameters()), [])
+        self.assertEqual(set(owner.state_dict()), {"gate_up", "down"})
+        self.assertFalse(hasattr(MegaMoeExperts, "from_module"))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_moe_migration_passes_tuning_options_and_rejects_old_keywords(self) -> None:
+        """Feature: MegaMoe migration tuning.
+        Description: Configure pull execution through the experimental options and reject an old flat keyword.
+        Expectation: The configuration reaches the resource specification and the old keyword is rejected.
+        """
+        converted = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                                    tuning_options=MegaMoeTuningOptions(dispatch_mode="pull", dispatch_split=256))
+        self.addCleanup(converted.close)
+        self.assertIs(type(converted), MegaMoeExperts)
+        specification = converted._resource_group.specification  # pylint: disable=protected-access
+        self.assertEqual((specification["dispatch_mode"], specification["dispatch_split"]), ("pull", 256))
+        self.assertIsNone(specification["initial_capacity_factor"])
+        with self.assertRaisesRegex(TypeError, "dispatch_mode"):
+            # This negative test deliberately passes a removed public keyword.
+            # pylint: disable-next=unexpected-keyword-arg
+            MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, dispatch_mode="pull")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -147,7 +180,7 @@ class TestFrontendMigration(unittest.TestCase):
             for parameter in protected:
                 parameter.copy_(torch.randn_like(parameter))
                 parameter.grad = torch.randn_like(parameter)
-                originals.append((parameter.detach().clone(), parameter.grad.clone()))
+                originals.append((torch.clone(parameter), parameter.grad.clone()))
         model.bfloat16()
         self.assertEqual(model.mhc.norm_weight.dtype, torch.bfloat16)
         self.assertEqual(model.gate.weight.dtype, torch.bfloat16)

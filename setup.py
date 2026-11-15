@@ -95,7 +95,8 @@ setup(
     install_requires=get_install_requires(),
     scripts=["scripts/hyper_multicore_set_env.bash", "scripts/hyper_multicore_build_info"],
     include_package_data=False,
-    package_data={"hyper_multicore": ["ops/runtime/*.h", "ops/runtime/*.hpp"]},
+    package_data={"hyper_multicore": ["ops/runtime/*.h", "ops/runtime/*.hpp",
+                                      "ops/common/*.h", "ops/common/mega_moe/*.h"]},
     cmdclass={"build_py": BuildPy},
     distclass=BinaryDistribution,
 )

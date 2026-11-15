@@ -44,9 +44,9 @@
           },
           {
             "path": "hyper_multicore/ops/patches/swi_glu_clamp.patch",
-            "sha256": "a28d5a60b140ee948542199d3750ccd6d9910fbf81658aa270cb778252b8a18f",
+            "sha256": "76b7b95498bee3560bb1068a6592e672aa326aa4b06c0d2459d4217864faeb06",
             "allow_zero_context": true,
-            "purpose": "add task-configured DeepSeek clipped SwiGLU forward and backward semantics"
+            "purpose": "add optional pre/post-SiLU clipping and dynamic tail bounds"
           },
           {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
@@ -74,7 +74,7 @@
             "patches": [
               {
                 "path": "hyper_multicore/ops/patches/grouped_matmul_fusion.patch",
-                "sha256": "f908a2dd909f75cc16b4532c24a2916858324f06034635e51fdab36056384c5c",
+                "sha256": "61506f77d380a36617c6e5e7ffbca689d18030c13c3f205a53113b2f07d7884c",
                 "purpose": "expose the selected grouped-matmul path as an inline building block"
               }
             ],

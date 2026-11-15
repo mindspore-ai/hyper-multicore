@@ -24,12 +24,11 @@ import torch
 from torch import nn
 
 from examples._layers import RMSNorm
-from hyper_multicore import MegaMoeExperts
 from examples._transformer import (
     TransformerAttention, TransformerConfig, language_model_output,
 )
 from examples.moe.experts import MoeTransformerBlock
-from hyper_multicore.modules.mega_moe.spec import _resolve_capacity_factors
+from hyper_multicore import MegaMoeExperts
 
 
 @dataclass(frozen=True)
@@ -41,18 +40,11 @@ class MoeTransformerConfig(TransformerConfig):
     intermediate_size: int = 1792
     shared_expert_intermediate_size: int = 1792
     routed_scaling_factor: float = 1.0
-    initial_capacity_factor: float | None = None
     ep_size: int = 8
-    dispatch_mode: str = "push"
-    capacity_growth_factor: float | None = None
 
     def __post_init__(self) -> None:
         """Validate shared dimensions and the expert-parallel configuration."""
         super().__post_init__()
-        initial, growth = _resolve_capacity_factors(
-            self.dispatch_mode, self.initial_capacity_factor, self.capacity_growth_factor)
-        object.__setattr__(self, "initial_capacity_factor", initial)
-        object.__setattr__(self, "capacity_growth_factor", growth)
         for name in ("num_experts", "top_k", "intermediate_size", "shared_expert_intermediate_size", "ep_size"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -100,7 +92,7 @@ class MoeTransformerModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(MoeTransformerDecoderLayer(config, ep_group, mega_kernels)
                                     for _ in range(config.num_layers))
-        MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in self.layers)
+        MegaMoeExperts.share_execution_resources(layer.mlp.experts.executor for layer in self.layers)
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

@@ -22,15 +22,16 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from tests.common.multicore.moe_reference import grouped_matmul
 from hyper_multicore import MegaMoeExperts
+from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.scheduler.runtime import RUNTIME_HEADER_BYTES
-from tests.torch import _test_mega_moe as baseline
 from tests.common.multicore._mega_moe_utils import (
     memory_sample,
     start_shmem_lifetime,
     write_evidence,
 )
+from tests.common.multicore.moe_reference import grouped_matmul
+from tests.torch import _test_mega_moe as baseline
 
 FORMER_TASK_LIMIT = 25600
 
@@ -123,11 +124,14 @@ def test_mega_moe_subgroups() -> None:
     group = groups[baseline.RANK % 2]
     rank = dist.get_rank(group)
     for mode in ("push", "pull", "grow"):
-        layer = MegaMoeExperts(hidden_size=512, intermediate_size=128,
-                               num_experts=4, top_k=2, ep_size=2, ep_group=group,
-                               create_parameters=False, dispatch_mode="push" if mode == "grow" else mode,
-                               capacity_growth_factor=1.25 if mode == "grow" else None,
-                               initial_capacity_factor=1.0 if mode == "grow" else None)
+        layer = MegaMoeExperts(
+            hidden_size=512, intermediate_size=128, num_experts=4, top_k=2, ep_group=group,
+            tuning_options=MegaMoeTuningOptions(
+                dispatch_mode="push" if mode == "grow" else mode,
+                capacity_growth_factor=1.25 if mode == "grow" else None,
+                initial_capacity_factor=1.0 if mode == "grow" else None,
+            ),
+        )
         try:
             for step in range(2):
                 torch.manual_seed(123 + step + baseline.RANK % 2)
@@ -161,3 +165,83 @@ def test_mega_moe_subgroups() -> None:
         finally:
             layer.close()
     write_evidence({"noncontiguous_subgroups": True, "external_weights": True, "both_transports": True})
+
+
+def _expect_layout_rejection(layer, hidden, ids, probabilities, pair, counts=None, *, first=False):
+    """Require all ranks to reject a mismatched layout without entering a kernel."""
+    try:
+        layer(hidden, ids, probabilities, expert_weights=pair, tokens_per_expert=counts)
+    except (RuntimeError, ValueError) as error:
+        messages = ("specifications differ", "configurations differ") if first else ("expert weights",)
+        assert any(message in str(error) for message in messages), str(error)
+    else:
+        raise AssertionError("a changed expert-weight layout was accepted")
+
+
+def _canonical_weight_gradients(layout, gradients):
+    """Compare EOI gradients in the corresponding EIO axes."""
+    if layout == "EOI":
+        return tuple(value.detach().transpose(1, 2) for value in gradients)
+    return tuple(value.detach() for value in gradients)
+
+
+def test_mega_moe_auto_weight_layout() -> None:
+    """Exercise automatic layouts, shared plans and rank-consistent invalid weights."""
+    start_shmem_lifetime()
+    shape = baseline.MoeShape()
+    hidden, upstream = baseline.make_data(shape)
+    ids, probabilities, counts = baseline.make_balanced_route(shape)
+    local = shape.local_experts
+    eio = (torch.randn(local, shape.hidden_size, 2 * shape.intermediate_size, device=baseline.DEVICE,
+                       dtype=torch.bfloat16).mul_(0.02),
+           torch.randn(local, shape.intermediate_size, shape.hidden_size, device=baseline.DEVICE,
+                       dtype=torch.bfloat16).mul_(0.02))
+    eoi = tuple(value.transpose(1, 2).contiguous() for value in eio)
+
+    def _make_executor() -> MegaMoeExperts:
+        """Construct one executor without holding any trainable weights."""
+        return MegaMoeExperts(
+            hidden_size=shape.hidden_size, intermediate_size=shape.intermediate_size,
+            num_experts=shape.num_experts, top_k=shape.top_k, ep_group=dist.group.WORLD,
+        )
+
+    divergent = _make_executor()
+    try:
+        _expect_layout_rejection(divergent, hidden, ids, probabilities,
+                                 eio if baseline.RANK == 0 else eoi, first=True)
+    finally:
+        divergent.close()
+    dist.barrier()
+
+    first, shared, linear = _make_executor(), _make_executor(), _make_executor()
+    MegaMoeExperts.share_execution_resources((first, shared))
+    try:
+        reference = resources = plan = None
+        for layer, layout, source in ((first, "EIO", eio), (shared, "EIO", eio), (linear, "EOI", eoi)):
+            current = tuple(value.detach().clone().requires_grad_(True) for value in source)
+            inputs = hidden.detach().clone().requires_grad_(True)
+            scores = probabilities.detach().clone().requires_grad_(True)
+            output = layer(inputs, ids, scores, tokens_per_expert=counts, expert_weights=current)
+            gradients = torch.autograd.grad(output, (inputs, scores, *current), upstream)
+            values = (output.detach(), *[value.detach() for value in gradients[:2]],
+                      *_canonical_weight_gradients(layout, gradients[2:]))
+            if reference is None:
+                reference = values
+                resources = first._resource_group.resources  # pylint: disable=protected-access
+                plan = next(iter(resources._plans.values()))  # pylint: disable=protected-access
+            else:
+                for actual, expected in zip(values, reference):
+                    baseline.assert_close("automatic weight layout", actual, expected)
+            if layer is shared:
+                assert shared._resource_group.resources is resources  # pylint: disable=protected-access
+                assert next(iter(resources._plans.values())) is plan  # pylint: disable=protected-access
+            assert not list(layer.parameters())
+
+        for pair in (eoi if baseline.RANK else eio, eoi):
+            _expect_layout_rejection(shared, hidden, ids, probabilities, pair, counts)
+        torch.npu.synchronize()
+    finally:
+        for layer in (first, shared, linear):
+            layer.close()
+    write_evidence({"automatic_eio_eoi": True, "fresh_weights": True, "shared_plan": True,
+                    "rank_mismatch_rejected": True})

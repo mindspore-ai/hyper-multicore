@@ -849,3 +849,77 @@ _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
 | GMM workspace 越界 | TILE_M/N 设置过大 | 检查 `tiling_tables.py` 中 workspace 预算 |
 | `runtime/worker_kernel.h` 找不到 | 新算子未纳入隔离源码组装 | 检查 `assemble_multicore_source.py` 的算子列表和 `MULTICORE_SOURCE_ASSEMBLY_FAILED` 日志 |
 | Python `ImportError: scheduler` | 从非包根目录运行 | 从 `hyper-multicore/` 根目录用 `python -m` 方式运行 |
+
+## MegaMoE 概率数据流与 task 执行
+
+### 图声明与 workspace
+
+概率数据流在 forward/backward 逻辑图构建时声明，随后才执行粒度 lowering、task 填充与队列编排。
+`ProbabilityTaskBinding` 同时定义辅助 operand、类型化 activation/transport option 与 scalar effects；
+`ProbabilityFillConfig` 复用既有 token filler，并从该声明生成最后一个辅助 descriptor。
+诊断图直接读取同一 operand，使用与执行图一致的概率数据流声明。
+
+四个逻辑区域共用一块 FP32 对称内存：`source_p`、`received_p`、`received_dp`、`returned_dp`。
+这块内存由 MegaMoE workspace 分配和管理，物理布局由 `ProbabilityLayout` 描述。
+`TensorEffect` 标明本地和远端读写及 `token_and_scalar` 完成条件；Push 在 token signal 之前
+完成 scalar PUT，Pull 在本地 dispatch event 之前完成 scalar 和 token GET。反向消费者继续沿既有
+DAG 等待，token 与 scalar 共享同一个 task 的完成信号。空 task、待反向图、源 buffer 和 workspace lease
+由 MegaMoE 执行资源管理；通用 runtime 和 SHMEM 负责调度与传输，不解释概率数学。
+
+### Task descriptor 与校验
+
+`TaskDesc.extra_value_1` 是按 `TaskType` 解码的 32 位字段。模式、遍历方式、激活数学和传输内容
+分别由所属算子定义，通用 runtime 只保存字段，不解释这些语义：
+
+| 类型 | Python 定义位置 | 语义 |
+| --- | --- | --- |
+| `GroupedMatmulTaskMode` | `tasks/gmm.py` | GMM 覆盖范围，四个取值互斥 |
+| `SwiGluClampPosition` | `tasks/swiglu.py` | 在 SiLU 之前或之后裁剪 gate 分支 |
+| `SwiGluTaskIteration` | `tasks/swiglu.py` | 单 tile，或按 lane 跨步遍历运行时有效 tiles |
+| `ShmemTaskPartition` | `tasks/alltoall.py` | 固定行数分块，或按 PUT 的实际行数均分连续区间；GET 使用固定分块 |
+| `MegaMoeActivationWeighting` | `modules/mega_moe/task_options.py` | 激活是否在 FC2 前乘概率 |
+| `MegaMoeTransportPayload` | `modules/mega_moe/task_options.py` | 传输 token、token+p 或 token+dp，三个取值互斥 |
+
+C++ 对应定义位于 `ops/common/*_task_options.h` 和 `ops/common/mega_moe/task_options.h`，
+使用独立的 `enum class`；组合只发生在对应 task 的编码、解码和校验处。
+
+| TaskType | extra_value_1 | 概率 operand 合同 |
+| --- | --- | --- |
+| SwiGLU / SwiGLUGrad | `1`：SiLU 后裁剪；`2`：按 lane 跨步遍历 tiles；`4`：FC2 前加权 | 1/2 个 token 输入、1 个 token 输出；FC2 前加权时附带 1 个概率 workspace 输出 descriptor，前向参数位置16、反向25 |
+| SHMEM PUT / GET | `2`：按实际行数划分 PUT 区间；`4`：token+p；`8`：token+dp | `4`/`8` 互斥；GET 不接受 `8`；4 个 token/metadata 输入、1 个 token 输出；传输概率或其梯度时附带 1 个概率 workspace 输出 descriptor |
+| GMM | 0/1/2/3 互斥 mode | 不按位组合 activation 或 transport options |
+
+表中 SwiGLU 和 SHMEM 的数值为十进制掩码。`extra_value_0` 由 SwiGLU 持有，用 FP32 bit pattern 表达裁剪限值；
+`extra_value_2` 由 runtime 持有，用于依赖轮询间隔。`ProbabilityLayout` 固定四个 plane、FP32
+元素宽度和 scalar-row 单位；host 拒绝未知位、冲突 payload、缺失辅助 operand、错误单位和激活方向。
+MoE device adapter 在解码前重复校验。host validator 由 graph 绑定，normal/profile/dump 的 runtime
+副本保留相同的 validator。
+
+### 调度与诊断
+
+normal、profile、L1 dump 使用同一个 `RunVectorReadyQueue` 扫描函数和相同静态 worker placement。
+`ProcessTasks` 和 `ExecuteTask` 使用运行时诊断模式参数，分别执行普通任务、采集时间戳或转储 L1，
+共用任务分发逻辑。动态就绪次序可能受记录开销影响，因此不同运行的实际 task 顺序可能不同。
+`MegaMoeSchedulePolicy` 分别表达 Vector/Cube 顺序、ready 选择、batching 和 polling；compact 仍是
+先执行的独立粒度 lowering。默认策略按 compact 选择 ready 和全 AIV；活动核集合与 ready 策略关联，
+没有独立的序列化 placement 字段。Cube stage 通过图节点身份定位。
+
+### 辅助 kernel 与概率数学
+
+| 功能 | 当前实现与执行边界 |
+| --- | --- |
+| 冷专家梯度清零 | `ZeroEmptyExpertGrad` 独立 kernel，以累计 counts 识别冷专家并选择性写零。 |
+| 路由 metadata | `Metadata` 独立 kernel，一次生成 row/element 描述符；同时提供基于标准 cumsum/reshape 的 fallback。 |
+| saved mapping 搬运 | `PermuteFromMapping` 独立 kernel，复用 forward mapping，在一次调用中展开 `[T,H]` token 并重排 p。 |
+| 概率数学 | `hyper_multicore/ops/common/mega_moe/routing_probabilities.h` 中的业务 helper 在 task 内执行 Cast/Mul/ReduceSum 循环，未复用标准算子源码片段。 |
+| A3 SwiGLU 裁剪 | 在锁定的 ops-nn `39e54ece7ee5ff64c8015d3ba418f891e640f242` 上应用 fusion 与 clamp patch；两个 patch 分别维护。 |
+
+FC2 前加权路径的概率数学为：`a0=BF16(a)`、`a1=BF16(FP32(a0)*p)`，反向
+`dp=sum(FP32(a0)*FP32(d_fc2_input))`、`d_a=BF16(FP32(d_fc2_input)*p)`。
+其中 `a` 是 SwiGLU 激活，`p` 是按专家行广播的路由概率，`dp` 沿激活的特征维规约。
+前向保留两处 BF16 舍入；反向使用未加权的 `a0` 计算 `dp`，不通过除以 `p` 恢复激活。
+这些计算在激活及其反向 task 内完成，使用 task 的 UB 和完成信号，不为每个 task 单独 launch 概率算子。
+
+上述三个独立辅助 kernel 通过 host launch bridge 由 Torch 调用，具有单独的构建入口，
+不属于 MegaKernel 内部的 task。辅助 kernel 的编译目标固定为 `dav-2201`；
+该构建路径不提供 A5 目标。构建依赖与制品要求见[构建说明](build.md)，设备验证方式见[测试指南](../tests/README.md)。

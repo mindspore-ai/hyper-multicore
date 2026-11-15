@@ -29,10 +29,11 @@ from pathlib import Path
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
 import torch
 import torch.distributed as dist
-import torch_npu
+import torch_npu  # noqa: F401  # pylint: disable=unused-import
 
 from hyper_multicore import MegaMoeExperts
 from tests.common.multicore.moe_reference import TorchExperts
+from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts as _MegaMoeExperts
 
 _RTOL = 2e-2
 _ATOL = 2e-3
@@ -237,16 +238,15 @@ def new_layers(
     """
     common_moe = new_common_moe(shape)
     mode = dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
-    mega = MegaMoeExperts(
+    mega = _MegaMoeExperts(
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
+        dispatch_mode=mode,
         initial_capacity_factor=initial_capacity_factor if mode == "push" else None,
         capacity_growth_factor=capacity_growth_factor if mode == "push" else None,
-        dispatch_mode=mode,
         expert_weight_layout=expert_weight_layout,
-        ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=DEVICE, dtype=torch.bfloat16)
     _copy_common_weights_to_mega(common_moe, mega)
@@ -568,14 +568,13 @@ def _new_performance_layer(
         raise ValueError(
             f"HP_MEGA_MOE_PERF_BACKEND must be common or mega_moe, got {backend!r}."
         )
-    return MegaMoeExperts(
+    return _MegaMoeExperts(
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
-        initial_capacity_factor=1.5 if os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push") == "push" else None,
         dispatch_mode=os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
-        ep_size=shape.ep_size,
+        initial_capacity_factor=1.5 if os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push") == "push" else None,
         ep_group=dist.group.WORLD,
     ).to(
         device=DEVICE,
