@@ -3,7 +3,6 @@
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from functools import cached_property
-import os
 
 import torch
 
@@ -50,8 +49,6 @@ class _MXFP8Plan:
 
 class Resources(_MegaMoeExecutionResources):
     def __init__(self, specification, tensor, *, shared, active_specifications):
-        if os.environ.get("HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY", "0") != "0":
-            raise ValueError("SwiGLU row-only was removed; unset HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY")
         if query_npu_arch() != 3510:
             raise ValueError("MX expert mathematics currently requires A5")
         super().__init__(specification, tensor, shared=shared, active_specifications=active_specifications)

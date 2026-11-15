@@ -46,7 +46,7 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker, VectorWorkerPolicy::A
 };
 }  // namespace MulticoreRuntime
 
-__aicore__ inline void RunMxTaskGraph(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events,
+__aicore__ inline void RunMegaMoeMxfp8(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events,
                                      GM_ADDR diagnostic, GM_ADDR launch_metadata) {
   auto launch = reinterpret_cast<__gm__ MulticoreMx::MxLaunchDescriptor*>(launch_metadata);
   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || launch->version != 1 || launch->reserved != 0 ||

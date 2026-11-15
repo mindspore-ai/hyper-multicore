@@ -478,7 +478,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         workspace_claimed: bool,
         grad_enabled: bool = True,
     ) -> Any:
-        """Launch the legacy forward op and save owned backward inputs.
+        """Launch the BF16 forward op and save owned backward inputs.
 
         Args:
             ctx: Autograd context for saved backward state.
@@ -568,7 +568,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
     @staticmethod
     # pylint: disable-next=arguments-differ
     def backward(ctx: Any, grad_output: Any) -> tuple[Any, ...]:
-        """Launch the legacy backward op into zero-safe gradient buffers.
+        """Launch the BF16 backward op into zero-safe gradient buffers.
 
         Args:
             ctx: Autograd context populated by ``forward``.
@@ -634,7 +634,7 @@ def execute_mega_moe(
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
 ) -> Any:
-    """Execute expert-major rows through the differentiable legacy kernels.
+    """Execute expert-major rows through the differentiable BF16 kernels.
 
     Args:
         routed_tokens: Expert-major token rows.
@@ -647,7 +647,7 @@ def execute_mega_moe(
     Returns:
         Expert-major output rows with independent storage.
     """
-    # Historical input-output views are materialized outside Function.forward so
+    # Input-output weight views are materialized outside Function.forward so
     # gradients reach the caller's original weights. Output-input storage is native.
     return _MegaMoeFunction.apply(
         routed_tokens,

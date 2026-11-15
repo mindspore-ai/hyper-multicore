@@ -802,6 +802,21 @@ pytest -v tests/torch/test_mega_moe_profiling.py
 
 ---
 
+## MegaMoE 精度后端的采集范围
+
+BF16 与 MXFP8 使用公共 `TorchMegaKernelProfiler` 采集 task 内部时间线。
+MXFP8 的外层算子为 `HyperMegaMoeMxfp8` / `HyperMegaMoeMxfp8Grad`；正反向分别作为 invocation 记录。
+重计算执行正向算子；forward/recompute 的业务标签由调用方提供。MXFP8 后端的
+`mx_profile_scope(layer=..., phase=...)` 可附加 layer 与 forward/recompute/backward 标签。
+step、micro 和采样 rank 的筛选由训练框架适配层负责。
+
+MXFP8 使用展开后的 UINT8 buffer-list 物理 ABI，内部 profiler 按其真实参数布局绑定。
+该后端只支持 task profiler，尚无 L0/L1 Tensor dump 的物理端口合同；开启 dump 会报错。
+BF16 的 Tensor dump 支持范围以对应算子的端口定义及测试为准。
+normal 不分配内部 profiling buffer，不生成任务记录。profile 与 normal 的队列和数学配置相同，
+但采集本身具有执行和显存开销，采集样本不作为无打点性能数据。
+
+
 ## 14. 相关文档
 
 - [MegaMoe Design and Usage](architecture.md)

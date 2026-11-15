@@ -66,8 +66,8 @@ set(OP_TILING_SOURCES
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
 )
 
-list(APPEND OP_SCHEMA_SOURCES ${FWD_HOST}/mxfp8_schema.cpp)
-list(APPEND OP_TILING_SOURCES ${FWD_HOST}/mxfp8_tiling.cpp)
+list(APPEND OP_SCHEMA_SOURCES ${FWD_HOST}/mxfp8/schema.cpp)
+list(APPEND OP_TILING_SOURCES ${FWD_HOST}/mxfp8/tiling.cpp)
 include_directories(${MX_HOST} ${MX_GRAD_HOST})
 
 function(hp_generate_op_definitions)
@@ -113,8 +113,8 @@ set(ACLNN_SOURCES
     ${GATE_GRAD_HOST}/op_api/linear_index/linear_index.cpp
 )
 list(APPEND ACLNN_SOURCES
-    ${MX_HOST}/op_api/hyper_mega_moe_mxfp8.cpp
-    ${MX_GRAD_HOST}/op_api/hyper_mega_moe_mxfp8_grad.cpp)
+    ${MX_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
+    ${MX_GRAD_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp)
 
 npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)

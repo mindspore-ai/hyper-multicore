@@ -32,10 +32,10 @@ example_dir=$(mktemp -d)
 cp examples/mega_moe_minimal.py "$example_dir/"
 cd "$example_dir"
 export ASCEND_RT_VISIBLE_DEVICES=0,1
-torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py
+torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py --dispatch-mode push
 ```
 
-示例执行前向与反向计算，
+使用 `--dispatch-mode pull` 可切换为 pull 分发。示例执行前向与反向计算，
 并输出形状、native 构建身份及耗时。通过 `--warmup` 和 `--iterations` 可增加采样次数。
 完整网络接入与训练对照见 [examples 指南](examples/README.md)，包括
 [MoE](examples/moe/README.md) 和 [MHC](examples/mhc/README.md)。
@@ -43,16 +43,11 @@ torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py
 应用程序可直接导入公共组件：
 
 ```python
-from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, MegaGate, MegaMhc
+from hyper_multicore import MegaMoeExperts, MegaGate, MegaMhc
 from hyper_multicore.diagnostics import MegaKernelDiagnostics
 ```
 
-`MegaMoeExperts` 的模型输入使用统一的稳定入口，数值语义通过公开稳定的
-`MegaMoeNumericsOptions` 及 `numerics_options=` 设置。用户调优通过公开实验 API
-`hyper_multicore.experimental.MegaMoeTuningOptions` 及 `tuning_options=` 配置，
-实验字段不保证跨版本兼容。数值语义、默认执行策略及调优参数见
-[MegaMoE 组件指南](hyper_multicore/README.md#megamoeexperts)。
-
+`MegaMoeExperts` 通过 `precision="bf16"`（默认）或 `precision="mxfp8"` 选择后端；MXFP8 要求 A5 和调用方提供量化权重存储。
 配置与使用方式见[组件指南](hyper_multicore/README.md)。使用算子的 Python 进程启动前，
 需先激活 native 路径。pip 安装及 Python 导入均不会编译 native 代码。
 

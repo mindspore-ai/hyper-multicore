@@ -1,6 +1,6 @@
 """The common expert API preserves parameter roots and backend contracts."""
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -61,9 +61,3 @@ def test_mx_passes_current_roots_counts_and_no_clone_to_autograd():
         run.assert_called_once_with(hidden, *roots, ids, probs, ((6, 64, 128), (6, 64, 64)),
                                     execution.return_value)
         assert result is run.return_value
-
-
-def test_removed_row_only_option_fails_before_binding_resources():
-    with patch.dict('os.environ', {'HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY': '1'}):
-        with pytest.raises(ValueError, match='row-only was removed'):
-            mx_backend.Resources({}, Mock(), shared=False, active_specifications=())

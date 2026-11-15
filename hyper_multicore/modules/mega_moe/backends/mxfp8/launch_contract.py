@@ -5,7 +5,7 @@ from collections.abc import Sequence
 MAX_GRAPH_BUFFERS = 64
 
 class MxLaunchDescriptor(ctypes.LittleEndianStructure):
-    """Launch bounds and the legacy rank/topology prefix consumed by SHMEM workers."""
+    """Launch bounds and the rank/topology prefix consumed by SHMEM workers."""
 
     _fields_ = [(name, ctypes.c_int64) for name in (
         'rank', 'ep', 'experts', 'hidden', 'local_tokens', 'cube_count',
@@ -22,7 +22,7 @@ def serialize_mx_launch_metadata(
 ) -> bytes:
     """Build the byte-list launch descriptor without reading any device data."""
     if not 0 < len(buffer_sizes) <= MAX_GRAPH_BUFFERS or any(size < 0 for size in buffer_sizes):
-        raise ValueError('MX task graph requires 1..64 nonnegative byte-buffer sizes')
+        raise ValueError('MXFP8 MoE launch requires 1..64 nonnegative byte-buffer sizes')
     if min(ep, experts, hidden, local_tokens, cube_count, runtime_bytes, event_bytes) <= 0:
         raise ValueError('MX launch topology and runtime bounds must be positive')
     if experts % ep or rank < 0:

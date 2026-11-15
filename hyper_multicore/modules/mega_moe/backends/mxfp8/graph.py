@@ -100,7 +100,7 @@ def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
         result[index].dtype_size = 4 if index in sizes else 8
     for index in ([6, 10] if forward else [19]):
         result[index].shape, result[index].dtype_size = [experts], 8
-    # Only the transport worker uses legacy dynamic tensor offsets. MX tasks
+    # Only the transport worker uses dynamic tensor offsets. MX tasks
     # resolve token and packed-scale ranges directly from the live group list.
     result[0].is_dynamic = True
     payload = 11 if forward else 12

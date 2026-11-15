@@ -113,7 +113,7 @@ def _resize_swiglu_tiling(data: bytes, num_cube_cores: int) -> bytes:
 
 
 def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
-    """Translate rank-local token shape into legacy scheduler coordinates.
+    """Translate rank-local token shape into scheduler task coordinates.
 
     Args:
         spec: Validated local-token and expert topology specification.

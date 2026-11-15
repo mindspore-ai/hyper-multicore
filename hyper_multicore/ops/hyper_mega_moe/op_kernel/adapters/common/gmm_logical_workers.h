@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-#ifndef HYPER_MULTICORE_GMM_LOGICAL_LANE_H_
-#define HYPER_MULTICORE_GMM_LOGICAL_LANE_H_
+#ifndef HYPER_MULTICORE_GMM_LOGICAL_WORKERS_H_
+#define HYPER_MULTICORE_GMM_LOGICAL_WORKERS_H_
 #include <cstdint>
 
 #if defined(__CCE_AICORE__) || defined(__NPU_ARCH__)

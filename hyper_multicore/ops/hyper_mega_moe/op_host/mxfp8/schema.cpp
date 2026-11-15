@@ -2,9 +2,9 @@
 #include "register/op_def_registry.h"
 #include "register/op_impl_registry.h"
 namespace ops {
-class Mxfp8ByteGraph : public OpDef {
+class MegaMoeMxfp8Schema : public OpDef {
  public:
-  explicit Mxfp8ByteGraph(const char* name) : OpDef(name) {
+  explicit MegaMoeMxfp8Schema(const char* name) : OpDef(name) {
     Input("buffers").ParamType(DYNAMIC).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
     for (const auto* resource : {"runtime_config", "events", "diagnostic", "launch_metadata"}) {
       Input(resource).ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
@@ -36,8 +36,8 @@ ge::graphStatus InferType(gert::InferDataTypeContext* context) {
 }
 }
 // Named registrations preserve both public OP identities and inference contracts.
-class HyperMegaMoeMxfp8 : public Mxfp8ByteGraph { public: using Mxfp8ByteGraph::Mxfp8ByteGraph; };
-class HyperMegaMoeMxfp8Grad : public Mxfp8ByteGraph { public: using Mxfp8ByteGraph::Mxfp8ByteGraph; };
+class HyperMegaMoeMxfp8 : public MegaMoeMxfp8Schema { public: using MegaMoeMxfp8Schema::MegaMoeMxfp8Schema; };
+class HyperMegaMoeMxfp8Grad : public MegaMoeMxfp8Schema { public: using MegaMoeMxfp8Schema::MegaMoeMxfp8Schema; };
 OP_ADD(HyperMegaMoeMxfp8);
 OP_ADD(HyperMegaMoeMxfp8Grad);
 IMPL_OP_INFERSHAPE(HyperMegaMoeMxfp8).InferShape(InferShape).InferDataType(InferType);

@@ -58,5 +58,16 @@
     ],
     "rejected_hunks": [],
     "action": "incoming conflict versions retained; all stages archived for review"
+  },
+  {
+    "patch": 11,
+    "unmerged_paths": [
+      "README.en.md",
+      "README.md",
+      "hyper_multicore/README.md",
+      "tests/ut/modules/test_frontend_contract.py"
+    ],
+    "rejected_hunks": [],
+    "action": "incoming conflict versions retained; all stages archived for review"
   }
 ]

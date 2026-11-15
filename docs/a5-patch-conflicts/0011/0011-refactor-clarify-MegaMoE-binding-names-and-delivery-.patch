@@ -1,0 +1,1728 @@
+From 135628bba77fe7babce1e7044efd712b62e87570 Mon Sep 17 00:00:00 2001
+From: hedongdong <hdd475375904@126.com>
+Date: Sun, 15 Nov 2026 09:39:09 +0800
+Subject: [PATCH 11/27] refactor: clarify MegaMoE binding names and delivery
+ documentation
+
+---
+ README.en.md                                  |   2 +
+ README.md                                     |   1 +
+ docs/a5-migration.json                        | 603 ------------------
+ docs/architecture.md                          | 146 +++--
+ docs/build.md                                 |  34 +-
+ docs/profiling.md                             |  15 +
+ docs/shmem.md                                 |   2 +-
+ hyper_multicore/README.md                     |  41 +-
+ hyper_multicore/_build/dependencies.lock.json |  16 +-
+ .../cmake/vendor/op_host/CMakeLists.txt       |   8 +-
+ .../mega_moe/backends/bf16/autograd.py        |   8 +-
+ .../modules/mega_moe/backends/bf16/plan.py    |   2 +-
+ .../mega_moe/backends/mxfp8/backend.py        |   3 -
+ .../mega_moe/backends/mxfp8/execution.py      |   4 +-
+ .../modules/mega_moe/backends/mxfp8/graph.py  |   2 +-
+ .../modules/mega_moe/backends/mxfp8/launch.py |  14 +-
+ .../backends/mxfp8/launch_contract.py         |   4 +-
+ hyper_multicore/modules/mega_moe/module.py    |   4 +-
+ hyper_multicore/modules/mega_moe/route.py     |   2 +-
+ hyper_multicore/modules/mega_moe/schedule.py  |   8 +-
+ hyper_multicore/modules/mega_moe/transport.py |   2 +-
+ hyper_multicore/modules/mega_moe/workspace.py |   2 +-
+ .../{mxfp8_op_api.inc => mxfp8/op_api.inc}    |   0
+ .../{mxfp8_schema.cpp => mxfp8/schema.cpp}    |   8 +-
+ .../{mxfp8_tiling.cpp => mxfp8/tiling.cpp}    |   6 +-
+ .../arch35/gmm/mxfp8_resource_policy.h        |   4 +-
+ .../adapters/arch35/moe_mxfp8_worker.h        |   2 +-
+ .../adapters/common/gmm_logical_workers.h     |   4 +-
+ ...fp8.cpp => aclnn_hyper_mega_moe_mxfp8.cpp} |   2 +-
+ .../op_kernel/hyper_mega_moe_mxfp8.cpp        |   2 +-
+ ...pp => aclnn_hyper_mega_moe_mxfp8_grad.cpp} |   2 +-
+ .../op_kernel/hyper_mega_moe_mxfp8_grad.cpp   |   2 +-
+ hyper_multicore/tasks/swiglu.py               |   2 +-
+ hyper_multicore/torch/CMakeLists.txt          |   2 +-
+ ...xfp8_task_graph.cpp => mega_moe_mxfp8.cpp} |  32 +-
+ .../{test_function.py => test_autograd.py}    |   0
+ .../mega_moe/test_precision_backends.py       |   8 +-
+ ...migration.py => test_frontend_contract.py} |  16 +-
+ 38 files changed, 218 insertions(+), 797 deletions(-)
+ delete mode 100644 docs/a5-migration.json
+ rename hyper_multicore/ops/hyper_mega_moe/op_host/{mxfp8_op_api.inc => mxfp8/op_api.inc} (100%)
+ rename hyper_multicore/ops/hyper_mega_moe/op_host/{mxfp8_schema.cpp => mxfp8/schema.cpp} (86%)
+ rename hyper_multicore/ops/hyper_mega_moe/op_host/{mxfp8_tiling.cpp => mxfp8/tiling.cpp} (81%)
+ rename hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/{hyper_mega_moe_mxfp8.cpp => aclnn_hyper_mega_moe_mxfp8.cpp} (80%)
+ rename hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/{hyper_mega_moe_mxfp8_grad.cpp => aclnn_hyper_mega_moe_mxfp8_grad.cpp} (81%)
+ rename hyper_multicore/torch/csrc/{mxfp8_task_graph.cpp => mega_moe_mxfp8.cpp} (50%)
+ rename tests/ut/modules/mega_moe/{test_function.py => test_autograd.py} (100%)
+ rename tests/ut/modules/{test_frontend_migration.py => test_frontend_contract.py} (96%)
+
+diff --git a/README.en.md b/README.en.md
+index 2ff6b2b..7f94f6a 100644
+--- a/README.en.md
++++ b/README.en.md
+@@ -54,6 +54,8 @@ from hyper_multicore import MegaMoeExperts, MegaGate, MegaMhc
+ from hyper_multicore.diagnostics import MegaKernelDiagnostics
+ ```
+ 
++`MegaMoeExperts` selects its backend with `precision="bf16"` (default) or `precision="mxfp8"`.
++MXFP8 requires A5 and caller-provided quantized weight storage.
+ See the [component guide](hyper_multicore/README.md) for configuration and usage.
+ Activate native paths before starting a Python process that uses the operators.
+ pip and Python imports do not compile native code.
+diff --git a/README.md b/README.md
+index 270a553..9f39dcc 100644
+--- a/README.md
++++ b/README.md
+@@ -47,6 +47,7 @@ from hyper_multicore import MegaMoeExperts, MegaGate, MegaMhc
+ from hyper_multicore.diagnostics import MegaKernelDiagnostics
+ ```
+ 
++`MegaMoeExperts` 通过 `precision="bf16"`（默认）或 `precision="mxfp8"` 选择后端；MXFP8 要求 A5 和调用方提供量化权重存储。
+ 配置与使用方式见[组件指南](hyper_multicore/README.md)。使用算子的 Python 进程启动前，
+ 需先激活 native 路径。pip 安装及 Python 导入均不会编译 native 代码。
+ 
+diff --git a/docs/a5-migration.json b/docs/a5-migration.json
+deleted file mode 100644
+index 76f24c5..0000000
+--- a/docs/a5-migration.json
++++ /dev/null
+@@ -1,603 +0,0 @@
+-{
+-  "baseline": "a11aaff3a97b7bd986c9bbcc434f462c93f6df22",
+-  "policy": {
+-    "a3_transport": "MTE",
+-    "a5_remote_transport": "UDMA",
+-    "qps_per_peer": 1,
+-    "self_copy": "local MTE",
+-    "upstream_math": "locked Git export, no vendored Blaze or SwiGLUGrad implementation",
+-    "runtime": "generic queues and events only; op-specific math remains in tasks and operators"
+-  },
+-  "source_evidence": {
+-    "mx_blaze": {
+-      "repository": "cann/ops-tensor",
+-      "commit": "c350b98e15dfd31c9b06464d1dfdfa1ad06a939b",
+-      "matching_original_files": 47,
+-      "total_original_files": 47,
+-      "introduced_by": "ops-transformer dff221330e cmake/third_party/ops-tensor.cmake"
+-    },
+-    "bf16_blaze": {
+-      "matching_original_files": 22,
+-      "total_original_files": 27,
+-      "remaining": "two template headers, dispatch policy, common utils and a legacy sync header require review; no equivalence asserted",
+-      "resolution": "No legacy closure copied. Standard upstream GemmUniversal::ProcessSingleGroup plus logical-worker and raw-pointer entry adapter; numerical equivalence and performance remain device gates."
+-    },
+-    "swiglu_grad": {
+-      "source": "ops-nn activation/swi_glu_grad/op_kernel/arch35",
+-      "already_in_master_lock": true,
+-      "legacy_closure_source": "CANN 9.2 installation",
+-      "same_original_files": 1,
+-      "compared_original_files": 5,
+-      "remaining": "classify API/format/implementation differences before task binding",
+-      "resolution": "Use existing pinned ops-nn arch35 with logicalIndex adapter; do not vendor the installed CANN9.2 copy. New upstream/device pairing requires fresh numerical tests."
+-    }
+-  },
+-  "stages": [
+-    {
+-      "id": 0,
+-      "name": "source identity and isolated A5 assembly",
+-      "state": "qualified on local A5"
+-    },
+-    {
+-      "id": 1,
+-      "name": "minimal math task adapters",
+-      "state": "qualified on local A5"
+-    },
+-    {
+-      "id": 2,
+-      "name": "shared QP1 transport",
+-      "state": "qualified on local A5"
+-    },
+-    {
+-      "id": 3,
+-      "name": "DAG and queue integration",
+-      "state": "qualified on local A5"
+-    },
+-    {
+-      "id": 4,
+-      "name": "correctness lifecycle performance and deployment",
+-      "state": "local A5 qualified; cluster and A3 device regression pending"
+-    }
+-  ],
+-  "validation": {
+-    "build": "passed: Python3.11.10 / torch2.12.0+cpu / torch_npu2.12.0.post3 / CANN9.2.0, ascend950",
+-    "device": "passed: two/four-card component gates",
+-    "native_binary_branch_identity": "unknown",
+-    "source_assembly": {
+-      "state": "passed",
+-      "upstream_sources_modified": false,
+-      "a5_manifest_file_count": 143
+-    },
+-    "build_source_checks": {
+-      "passed": 23,
+-      "failed": 0
+-    },
+-    "source_adapter_checks": {
+-      "a3_export": "passed",
+-      "a5_export_apply_and_reverse_check": "passed",
+-      "architecture_isolation_test": "passed",
+-      "device_entry_execution": "pending"
+-    },
+-    "shmem_1_8_a5_sdk_build": "passed; no NPU execution",
+-    "worker_queue_abi": {
+-      "runtime_and_cpp_reader_tests": 20,
+-      "subtests": 199,
+-      "profile_and_queue_tests": 26,
+-      "profile_subtests": 20,
+-      "device_execution": "pending"
+-    },
+-    "udma_adapter_compile": "passed: actual A5 compiler and SHMEM1.8 headers; no device launch",
+-    "host_integration": {
+-      "tests_passed": 113,
+-      "subtests_passed": 769,
+-      "log": "build/migration-final-host.log"
+-    },
+-    "math_template_compile": {
+-      "bf16_gmm_NN_NT_TN": "passed",
+-      "mx_gmm": "passed",
+-      "bf16_swiglu_grad_and_mx_vector_worker": "passed (device-only compiler pass)",
+-      "device_execution": "pending"
+-    },
+-    "profiler": {
+-      "tests_passed": 38,
+-      "subtests_passed": 20,
+-      "normal_instrumentation": false,
+-      "dropped_records": 0,
+-      "scoped_phases": [
+-        "forward",
+-        "recompute",
+-        "backward"
+-      ],
+-      "path": "build/migration-downstream-profile"
+-    },
+-    "device_cases": [
+-      "BF16 EIO/EOI: independent output/dX/dProbs/dW/SGD oracle, balanced/empty/skew/single destination, Push/Pull",
+-      "MX no-grad/recompute/full gradients/empty experts/current roots/old contexts/two streams",
+-      "H5120 I1792 six experts per rank TSV512 ready-depth8: BF16 two cards and MX Pull four cards",
+-      "automatic BF16 tokens: [0,0], [17,0], [127,257], [512,129], Push/Pull",
+-      "actual downstream quantized root type and FSDP root refresh via external imports"
+-    ],
+-    "bitwise_comparison": {
+-      "reference_commit": "1e8d0a498b89e59a855070c7a6c7a1b5aad88d81",
+-      "result": "all recorded outputs, dX, dProbs, dW1, dW2 SHA identical",
+-      "two_card_samples": 4,
+-      "four_card_samples": 8,
+-      "four_card_shape": {
+-        "tokens": 512,
+-        "hidden": 5120,
+-        "intermediate": 1792,
+-        "experts_per_rank": 6,
+-        "top_k": 8
+-      },
+-      "normal_comparison": "migration-mx-new-final-normal4 vs migration-mx-old-normal4-retry"
+-    },
+-    "performance": {
+-      "previous": {
+-        "rank_max_event_samples_ms": [
+-          8.778407096862793,
+-          10.598976135253906,
+-          10.16065788269043,
+-          10.68963623046875,
+-          10.559674263000488,
+-          11.20959186553955,
+-          9.887129783630371
+-        ],
+-        "event_median_ms": 10.559674263000488,
+-        "wall_median_ms": 10.787679813802242
+-      },
+-      "current": {
+-        "rank_max_event_samples_ms": [
+-          10.823664665222168,
+-          10.06666374206543,
+-          9.80793571472168,
+-          10.882139205932617,
+-          9.822155952453613,
+-          9.933552742004395,
+-          10.487435340881348
+-        ],
+-        "event_median_ms": 10.06666374206543,
+-        "wall_median_ms": 10.416069999337196
+-      },
+-      "interpretation": "No evident regression in this shallow replay; overlapping control spread, no performance gain asserted. F+B envelope includes orchestration, not pure math or training step."
+-    },
+-    "failures": [
+-      {
+-        "case": "fixed BF16 token plan",
+-        "cause": "new optional fixed-token API selected an automatic-only plan_tokens field",
+-        "resolution": "use the initial fixed plan; full shape replay/profile passed after fix"
+-      },
+-      {
+-        "case": "first four-card previous-version control",
+-        "cause": "HCCL AICPU RunAicpuIndOpThreadInit failed before Mega launch; root cause not established",
+-        "resolution": "one retry passed; failed launch excluded from timing"
+-      }
+-    ],
+-    "production_preprocess": {
+-      "sha256": "23d8eb57fc7173d9811c28e9d1e20f3f75625223f4196c113523b376a160c6ea",
+-      "contains_queue_state_publish_fix": true,
+-      "path": "build/migration-production-mx-aiv.ii"
+-    },
+-    "remaining": [
+-      "A3 device execution unavailable: source assembly and architecture guards checked, no A3 performance claim",
+-      "large cluster regression not run",
+-      "installed native binary tiler/template identity remains unknown",
+-      "BF16 host legacy tiling tables remain inherited; no new raw-offset table patch added"
+-    ],
+-    "automatic_token_details": [
+-      [
+-        {
+-          "mode": "push",
+-          "result": {
+-            "lengths": [
+-              0,
+-              0
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 768,
+-              "receive_rows": 1024,
+-              "heap_bytes": 134217728,
+-              "epoch": 0
+-            }
+-          }
+-        },
+-        {
+-          "mode": "push",
+-          "result": {
+-            "lengths": [
+-              17,
+-              0
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 768,
+-              "receive_rows": 1024,
+-              "heap_bytes": 134217728,
+-              "epoch": 0
+-            }
+-          }
+-        },
+-        {
+-          "mode": "push",
+-          "result": {
+-            "lengths": [
+-              127,
+-              257
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 2304,
+-              "receive_rows": 1280,
+-              "heap_bytes": 134217728,
+-              "epoch": 1
+-            }
+-          }
+-        },
+-        {
+-          "mode": "push",
+-          "result": {
+-            "lengths": [
+-              512,
+-              129
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 3072,
+-              "receive_rows": 2048,
+-              "heap_bytes": 134217728,
+-              "epoch": 2
+-            }
+-          }
+-        },
+-        {
+-          "mode": "pull",
+-          "result": {
+-            "lengths": [
+-              0,
+-              0
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 768,
+-              "receive_rows": 768,
+-              "heap_bytes": 134217728,
+-              "epoch": 0
+-            }
+-          }
+-        },
+-        {
+-          "mode": "pull",
+-          "result": {
+-            "lengths": [
+-              17,
+-              0
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 768,
+-              "receive_rows": 768,
+-              "heap_bytes": 134217728,
+-              "epoch": 0
+-            }
+-          }
+-        },
+-        {
+-          "mode": "pull",
+-          "result": {
+-            "lengths": [
+-              127,
+-              257
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 2304,
+-              "receive_rows": 768,
+-              "heap_bytes": 134217728,
+-              "epoch": 1
+-            }
+-          }
+-        },
+-        {
+-          "mode": "pull",
+-          "result": {
+-            "lengths": [
+-              512,
+-              129
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 3072,
+-              "receive_rows": 768,
+-              "heap_bytes": 134217728,
+-              "epoch": 2
+-            }
+-          }
+-        }
+-      ],
+-      [
+-        {
+-          "mode": "push",
+-          "result": {
+-            "lengths": [
+-              0,
+-              0
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 768,
+-              "receive_rows": 1024,
+-              "heap_bytes": 134217728,
+-              "epoch": 0
+-            }
+-          }
+-        },
+-        {
+-          "mode": "push",
+-          "result": {
+-            "lengths": [
+-              17,
+-              0
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 768,
+-              "receive_rows": 1024,
+-              "heap_bytes": 134217728,
+-              "epoch": 0
+-            }
+-          }
+-        },
+-        {
+-          "mode": "push",
+-          "result": {
+-            "lengths": [
+-              127,
+-              257
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 2304,
+-              "receive_rows": 1280,
+-              "heap_bytes": 134217728,
+-              "epoch": 1
+-            }
+-          }
+-        },
+-        {
+-          "mode": "push",
+-          "result": {
+-            "lengths": [
+-              512,
+-              129
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 3072,
+-              "receive_rows": 2048,
+-              "heap_bytes": 134217728,
+-              "epoch": 2
+-            }
+-          }
+-        },
+-        {
+-          "mode": "pull",
+-          "result": {
+-            "lengths": [
+-              0,
+-              0
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 768,
+-              "receive_rows": 768,
+-              "heap_bytes": 134217728,
+-              "epoch": 0
+-            }
+-          }
+-        },
+-        {
+-          "mode": "pull",
+-          "result": {
+-            "lengths": [
+-              17,
+-              0
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 768,
+-              "receive_rows": 768,
+-              "heap_bytes": 134217728,
+-              "epoch": 0
+-            }
+-          }
+-        },
+-        {
+-          "mode": "pull",
+-          "result": {
+-            "lengths": [
+-              127,
+-              257
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 2304,
+-              "receive_rows": 768,
+-              "heap_bytes": 134217728,
+-              "epoch": 1
+-            }
+-          }
+-        },
+-        {
+-          "mode": "pull",
+-          "result": {
+-            "lengths": [
+-              512,
+-              129
+-            ],
+-            "hot": false,
+-            "max_abs_error": {
+-              "output": 0.0,
+-              "input_grad": 0.0,
+-              "route_grad": 0.0,
+-              "w1_grad": 0.0,
+-              "w2_grad": 0.0
+-            },
+-            "capacity": {
+-              "routed_rows": 3072,
+-              "receive_rows": 768,
+-              "heap_bytes": 134217728,
+-              "epoch": 2
+-            }
+-          }
+-        }
+-      ]
+-    ],
+-    "kernel_sha256": {
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_gate_route/HyperMegaGateRoute_51b3ed5fb437e5de2c66aff4a6043505.o": "42e0c888321f436a4d2452c4ed8cdb4bfb5607f053d5ec398688dbc7d53e6f75",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_gate_route_grad/HyperMegaGateRouteGrad_303d12d6648a9fd322199a0a8d3ab5c0.o": "2ec42a6c006926f686c8bcc46192d8199aa097a79eb7080e3ec69885bc2cdcde",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_mhc/HyperMegaMhc_433fc592441f7ac1b484cebbff756b75.o": "6570e5431622c362ea1ead50b37e104ccef9bbf4d5c735e06c286cfce5c59b22",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_mhc_grad/HyperMegaMhcGrad_bf9c317a8a7bc83c9f4bed060af1a9cc.o": "afd68c8bf8cfef644b7d143b85f034bcba45ca3d66b226bce8e44b5257d376c6",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe/HyperMegaMoe_8fa11c3f49d35b114d045c751d29ca02.o": "64229405eb370f15ef5cd8d0513af347044d0d0337853e7df56b42b747d4a1ae",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe/HyperMegaMoe_e6c0ec2992b0e7c6cc20aea213fa5428.o": "118eae3948fbae7cd67cc06688b0847ff8fdec5e2bce04b5fb64d222c56d0d63",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_grad/HyperMegaMoeGrad_4a749b390f901cd7613a0b8a93a36252.o": "3b43a38a10421aa7febbdb04200d8d9a3dbf9fe80f6b90bd6f4f7c25b74c9f90",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_grad/HyperMegaMoeGrad_a3e209fcfebb8705529dbb31c9eba29b.o": "50f5429f8c9ca23deafb1074c881261bff54a44d91633b0438f7ce5505bbc21a",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_mxfp8/HyperMegaMoeMxfp8_69cf6e3b38a9f15d44136991671bf972.o": "ec7df9318def780b586e6fd77ff26c7efb7dadee3c31b206032e7b3a32c162a5",
+-      "op_impl/ai_core/tbe/kernel/arch35/hyper_mega_moe_mxfp8_grad/HyperMegaMoeMxfp8Grad_1f84f8722544bfdaf6b14787e3877291.o": "05baff62407251a2ea259438e033ee53dd28950051dacf6dc7fbb6a3281a1f21"
+-    },
+-    "source_manifest_sha256": "44b0f3e20012d347e1d56e4561caaf9265e24c1944521dc7f6cfe108f9a8b7f1"
+-  },
+-  "excluded": [
+-    "QP8/16/32 controls",
+-    "legacy SHMEM SDK and v1.7 patch bundle",
+-    "fixed solver tables",
+-    "unadopted math implementations",
+-    "downstream framework imports",
+-    "diagnostic observers"
+-  ],
+-  "communication_contract": {
+-    "completion": "each Put/Get returns after quiet; credit publication remains caller-owned",
+-    "self_copy": "double-buffered local MTE; no QP",
+-    "qp_owner": "caller-owned per peer/QP0, includes post and quiet",
+-    "engines": "explicit MTE or UDMA; A3 cannot instantiate UDMA"
+-  },
+-  "queue_contract": {
+-    "representation": "optional typed per-worker intervals appended after the existing dense runtime",
+-    "legacy_wire_prefix": "unchanged when queue_layout=0",
+-    "ready_depth": "per worker 0/1/8; no communication reorder by the executor",
+-    "profile": "normal has no added records; profile reports ReadyQueueWait and sizes by actual queues"
+-  },
+-  "migration_commits": [
+-    "9731358 profiling: preserve caller tags without device instrumentation",
+-    "47b928f megamoe: preserve fixed plans and no-grad storage ownership",
+-    "64b1f69 megamoe: compose A5 BF16 and MX tasks over shared QP1 queues",
+-    "9b15545 runtime: add explicit per-worker queues and bounded ready selection",
+-    "dd422f3 shmem: share completed QP1 UDMA transfers across consumers",
+-    "85c6964 build: expose task-local entries in upstream A5 primitives",
+-    "09dae93 build: assemble A5 math from pinned upstream sources"
+-  ]
+-}
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 43899d6..87692ff 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -231,7 +231,7 @@ FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
+ ```text
+ 用户 (Python)
+     ↓ build_forward_graph(tsv)
+-ComputeGraph [modules/mega_moe/forward/graph.py]
++ComputeGraph [modules/mega_moe/backends/bf16/forward/graph.py]
+     ↓ propagate_splits(tsv)
+ 各 OperatorNode 的 task_num / split_dim 被自动填充
+     ↓ build_runtime_config(graph, tsv, rank_id)
+@@ -748,7 +748,7 @@ def build_attention_fwd_graph(tsv: TaskSplitValue, ...) -> ComputeGraph:
+     return g
+ ```
+ 
+-**Step 3** — 实现 CLI（参考 `modules/mega_moe/forward/gen_runtime_data.py`）：
++**Step 3** — 实现 CLI（参考 `modules/mega_moe/backends/bf16/forward/gen_runtime_data.py`）：
+ 
+ ```python
+ def main():
+@@ -850,80 +850,78 @@ _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
+ | `runtime/worker_kernel.h` 找不到 | 新算子未纳入隔离源码组装 | 检查 `assemble_multicore_source.py` 的算子列表和 `MULTICORE_SOURCE_ASSEMBLY_FAILED` 日志 |
+ | Python `ImportError: scheduler` | 从非包根目录运行 | 从 `hyper-multicore/` 根目录用 `python -m` 方式运行 |
+ 
+-## A5 MegaMoE 迁移边界
++## MegaMoE 精度后端与任务边界
+ 
+-BF16 和 MXFP8 共用 `modules/mega_moe/transport.py` 的 QP0 owner 规划和
+-`ops/hyper_mega_moe/op_kernel/adapters/common/transport_task.h` 的完整传输/信用协议。SHMEM 只提供 MTE、UDMA
+-及其完成语义，不解释专家、路由或模型层。A3 使用 MTE；A5 可显式选择 MTE 或 UDMA。
+-UDMA 每个远端 peer 固定一个 QP，不读取历史的多 QP 配置变量。不同 peer 的 QP0 彼此独立。
++公共入口为 `MegaMoeExperts(precision="bf16" | "mxfp8")`；默认 BF16。
++模块、spec、route、transport、schedule、heap/workspace 与资源生命周期位于
++`modules/mega_moe/`。数学后端同级位于 `backends/bf16/` 与 `backends/mxfp8/`，
++负责各自的计算图、autograd、tiling/launch 和权重存储合同。
++后端通过普通 Python 模块分发，不创建嵌套 nn.Module；BF16 自有参数名为
++`gate_up_weight` / `down_weight`。外部权重以每次 forward 的 `expert_weights` 传入。
+ 
+-通信 AIV 按 peer 固定 owner，包含 post 和 quiet；本地自拷贝分散到可用 AIV，使用 MTE
+-双缓冲，不占 QP。完成之前不发布消费者信用。Pull 的源 ready、读完成和源存储复用握手
+-仍由公共运行时执行。跨 workspace/stream 的 QP0 使用由现有完成事件排序，不额外添加设备打点。
++| 后端 | 使用范围 | 输入与权重 |
++|---|---|---|
++| BF16 | A3/A5；自动 token 容量或显式 token 规格 | BF16 hidden states；BF16 EIO/EOI 专家权重 |
++| MXFP8 | A5；显式 `local_num_tokens`；H/I 为64的倍数 | BF16 hidden states；调用方持有原始 MX 权重 root；EIO；不支持激活 clamp |
+ 
+-业务 DAG 和两专家交错流水在 `modules/mega_moe/schedule.py`，通用运行时只执行显式的每核队列。
+-通信保持 FIFO，数学队列可配置 queue-ready-lookahead 0/1/8；这不是跨核偷取，也不是固定 solver 表。
+-每核队列是可选 ABI 扩展，旧队列的二进制前缀保持不变。核数由设备查询，业务层不固定写死为 32。
+-当前数学队列采用偶数 AIV、通信采用奇数 AIV 的分工；通用运行时不包含这种分工假设。
++MX 权重 root 提供当前 `col_data/col_scale`，反向还需 `row_data/row_scale`。
++量化数据为 E4M3FN，scale 为 uint8 存储的 E8M0 布局。反向从原始 root 重新解析当前物理存储，
++不缓存 FSDP gather 后的临时 view。激活保存、量化轴及 launch ABI 属于精度后端，
++资源共享不改变这些合同。no-grad 与重算采用 dual-axis SwiGLU 数学，no-clone 单独控制输出生命周期。
+ 
+-A5 数学实现从锁定的 CANN Git 源码装配，不在仓库内保存第二套 Blaze 或 SwiGLUGrad 源码树：
++### 标准数学、tiling、patch 与 adapter
+ 
+-| 内容 | 来源 | 本仓适配边界 |
+-|---|---|---|
+-| BF16 GMM NN/NT/TN | ops-tensor `c350b98e15` | 已解析的单专家、逻辑核编号、原标准 tile 循环 |
+-| MX GMM | 同一 ops-tensor revision | 单专家入口、逻辑核轮转、资源/scale 配置 |
+-| BF16 SwiGLUGrad | 原锁定 ops-nn `39e54ece7e` arch35 | 逻辑 AIV 编号；clamp/不适用形状保留原路径 |
+-| MX 量化/SwiGLU 正反向 | 同一 ops-nn revision 的 arch35 | task 内 tiling、逻辑编号和物理 scale 布局 |
+-| SHMEM | 原 master 锁定 v1.8.0 | 保留 master 的运行时符号和日志适配 |
+-
+-适配补丁不会重写 FMA、激活或量化数学函数。必要的代码包括指针/布局解释、单专家尾块、
+-空专家零梯度、task 完成前排空和 tiling 配置。它们仍须通过数值/生命周期门禁；
+-“来自标准源码”不等于已证明与当前系统 native 二进制选中了相同分支。
+-构建输入的实际文件 SHA 在装配目录 `source/a5/sources.json`。
+-
+-MX 权重由调用方持有原始 Tensor/Parameter，提供当前 `col_data/col_scale`，反向还需
+-`row_data/row_scale`。数据为 E4M3FN，scale 为 uint8 物理 E8M0 布局，逻辑权重为 EIO。
+-反向重新从原始 root 解析物理存储，禁止缓存 FSDP gather 后的临时 view。
+-正向 no-grad、首轮/重算使用同一个 SwiGLU dual-axis 数学实现；no-grad no-clone 单独控制输出生命周期。
+-Pull 的图计划按静态上界复用，真实负载只改变运行时 metadata，不生成逐路由队列表。
+-
+-未迁入未采纳的固定 solver 表、半核候选、老 SHMEM SDK、额外故障观察器和多 QP 开关。
+-历史阴性实验不能作为否定新架构组合的依据；后续候选应单独提交并与迁移基线比较。
+-
+-
+-### A5任务适配与标准数学边界
+-
+-`ops/`下的A5私有数学/通信适配收敛到`hyper_mega_moe/op_kernel/`：
+-`contracts/`保存布局与descriptor，`adapters/common/`翻译MoE传输任务，
+-`adapters/arch35/`绑定锁定的Blaze、SwiGLUGrad及MX量化数学。
+-正反向和两种精度共同引用，不在ops顶层维护bf16_gmm或mxfp8小算子目录。
+-上游数学源码仍由构建时Git导出，不复制第二份源码树。
+-
+-本次目录整改保持数学模板、数值规则、tiling参数和完成协议不变。
+-当前BF16 GMM固定tile、SwiGLUGrad UB参数以及MX tile/缓冲选择仍是本地选择逻辑，
+-不能因此宣称与native完整tiler一致。它们需按锁源可复用函数逐项审查；
+-本次没有为缩减行数删掉尾块、空专家dW清零、地址范围校验或源复用保护。
+-
+-`schedule.py`中逻辑stage绑定与纯队列策略分开；策略只返回数学任务排队结果，
+-公共层合并固定owner的通信队列，并验证完整唯一覆盖及QP0所有权。
+-数学DAG、传输分片和事件生成不由策略隐式改写。
+-用户只有一个队列扫描参数，FIFO/bounded-ready由其内部推导；仍保留现有0/1/8能力。
+-MX正反向共享schema、推导和launch封装，保持两个ACLNN名称及Hardware轨道身份。
+-
+-
+-### 精度后端与算子任务命名
+-
+-公共 `MegaMoeExperts` 接口、spec、transport、schedule、route、heap/workspace 和资源生命周期
+-位于 `modules/mega_moe/`。BF16、MXFP8 在同级 `backends/bf16/` 与 `backends/mxfp8/`
+-实现数学图、autograd、tiling/launch 和物理权重合同。后端以普通 Python 模块分发，
+-不嵌套 nn.Module，BF16 参数名保持 `gate_up_weight` / `down_weight`，外部权重 root 不由执行器持有参数副本。
+-两种精度的 descriptor、激活保存及反向权重来源不同，因此不强行合并 autograd/launch ABI。
+-
+-任务按算子职责命名：`tasks/gmm_mxfp8.py`、`quantization_mxfp8.py`、`swiglu_mxfp8.py`。
+-MoE launch 头放在 `backends/mxfp8/launch_contract.py`，不混入 GMM 数学 descriptor。
+-私有 device adapter 按 `gmm/`、`swiglu/`、`quantization/` 组织在 arch35 下；GMM 逻辑核轮转
+-由 `adapters/common/gmm_logical_workers.h` 供两种精度共用。
+-
+-`blaze_gmm_logical_workers.patch` 适配 ops-tensor 的 Blaze GMM，当前消费者为 arch35。
+-`grouped_matmul_fusion.patch` 适配 ops-transformer 的 GMMProcess，两者的上游目录、接口不同，
+-保持分别锁定和应用。补丁名标明算子，不把架构信息重复写进文件名；适用架构记录在锁源清单。
++数学源码由构建入口从 `dependencies.lock.json` 指定的 Git revision 导出。
++本仓不维护独立的 Blaze 或 SwiGLUGrad 数学源码副本。
++
++| 内容 | 来源与作用 |
++|---|---|
++| BF16/MX GMM | ops-tensor Blaze；task 调用单专家入口，执行标准数学块 |
++| BF16 SwiGLUGrad | ops-nn arch35；按逻辑 AIV 编号处理当前 task |
++| MX 量化/SwiGLU 正反向 | ops-nn arch35；保留标准数值规则和 scale 布局 |
++| `blaze_gmm_logical_workers.patch` | ops-tensor 的 GMM 单专家入口与逻辑核绑定；适用于 arch35 |
++| `grouped_matmul_fusion.patch` | ops-transformer GMMProcess task 接入；与 Blaze 分别锁定和应用 |
++| `swiglu_grad_logical_worker.patch` / `mx_quant_logical_workers.patch` | ops-nn 逻辑核及 task 范围入口 |
++
++patch 在隔离构建目录中应用于上游源码；adapter 是本仓的 task 接入代码。
++`ops/hyper_mega_moe/op_kernel/contracts/` 定义 descriptor，
++`adapters/common/` 负责公共 GMM 核映射及 MoE 传输任务解释，
++`adapters/arch35/{gmm,swiglu,quantization}/` 绑定标准数学实现。
++尾块、空专家零梯度、地址范围检查及任务完成前的资源排空属于执行合同。
++
++数学 tiling 并未完整复用 native Host tiler。BF16 GMM 使用 Host tiling 表、维度修补和
++A5 adapter 中的固定数学块/尾块配置；MX GMM 的 Host descriptor 选择 tile，device adapter
++选择 scale/L1 缓冲及流水级数；SwiGLUGrad 与 MX 量化也有本地参数构造。
++这些是算子接入层的显式策略，标准数学源码来源不能证明 native 对相同 shape 选择了同一分支。
++`op_host/mxfp8/tiling.cpp` 只负责 MegaMoE 外层 launch 的 buffer 数、核数和 tiling key，
++与 GMM/量化的数学 tiling 分开。
++
++### 通信与调度
++
++两种精度的 token、combine 结果及反向通信 payload 均为 BF16；MX 在接收后量化。
++BF16/MX 共用 `transport.py` 的 QP0 owner 规划与
++`adapters/common/transport_task.h` 的传输/信用协议。SHMEM 提供 MTE、UDMA 和完成语义；
++MoE task 解释路由与偏移并发布业务信用。每个远端 peer 固定一个 QP，不同 peer 的 QP0 独立。
++A3 使用 MTE；A5 可通过 `HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_udma` 使用 UDMA。
++本地自拷贝采用 MTE。Put/Get 完成确认后才满足消费者依赖，Pull 的 source-ready、读完成与源复用
++由 task 和公共执行协议共同约束。跨 workspace/stream 的提交通过完成事件排序。
++
++`schedule.py` 把数学 stage 绑定与排队策略分开；策略不改数学 DAG、通信分片和事件阈值。
++`two_expert_pipeline` 为默认两专家交错流水；`builder_order` 按 builder 数学顺序排队。
++两者共用固定数学 owner、通信 FIFO 及完整任务覆盖/远端 QP0 所有权检查。
++UDMA 显式队列中，数学使用偶数 AIV，通信使用奇数 AIV；通用 runtime 不包含此业务分工。
++数学队列扫描 `queue_ready_lookahead=0/1/8` 分别为 FIFO、队首就绪检查、有限就绪选择。
++通信与终止任务不参与数学重排；不跨核搬任务。BF16 MTE 使用隐式队列，非零扫描参数会报错。
++核数在绑定设备时查询。Pull 计划按静态路由上界缓存，真实负载更新运行时 metadata。
++
++### Host 与框架绑定
++
++任务封装按算子职责组织在 `tasks/gmm_mxfp8.py`、`quantization_mxfp8.py`、`swiglu_mxfp8.py`。
++MoE launch descriptor 位于 `backends/mxfp8/launch_contract.py`，与 GMM 数学 descriptor 分开。
++`torch/csrc/mega_moe_mxfp8.cpp` 绑定专用的 `mega_moe_mxfp8` / `mega_moe_mxfp8_grad` Torch op；
++它们不是可承载任意业务 DAG 的通用 task-graph 算子。
++对应 ACLNN 名称为 `aclnnHyperMegaMoeMxfp8` 和 `aclnnHyperMegaMoeMxfp8Grad`。
++
++正反向的公共 op-api 声明与编译入口分别为各自目录中的 `aclnn_*.h` / `aclnn_*.cpp`。
++共享 Host schema、外层 tiling、L0/L2 实现位于 `hyper_mega_moe/op_host/mxfp8/`，
++由两个入口分别实例化，保留独立的算子与 Hardware 轨道身份。
+diff --git a/docs/build.md b/docs/build.md
+index f5a378a..f46845e 100644
+--- a/docs/build.md
++++ b/docs/build.md
+@@ -326,10 +326,9 @@ NPU 用例需先构建并激活 native payload。
+ 
+ ## 从源码构建并使用 A5 BF16/MXFP8 MegaMoE
+ 
+-A5 构建会额外解析锁文件中的 `ops_tensor`，其余 ops-nn、ops-transformer、SHMEM revision
+-保持原 master 的锁定值。Blaze 的传递来源是 ops-tensor，单独拉 ops-transformer 不等于已具备
+-完整头文件闭包。构建入口会下载/校验并在隔离目录装配全部依赖，既不修改系统 CANN，也不修改
+-下载仓库的工作区。无需另带历史 SDK、数学源码副本或本机实验目录。
++A5 构建从锁文件解析 ops-nn、ops-transformer、ops-tensor 和 SHMEM revision。
++Blaze 的头文件来自 ops-tensor。构建入口下载、校验并在隔离目录装配全部依赖，
++不修改系统 CANN 或下载仓库的工作区；交付内容由源码和构建 payload 组成。
+ 
+ ```bash
+ # 使用需要交付的同一 Python/Torch/torch_npu/CANN 环境。
+@@ -345,16 +344,16 @@ export SHMEM_LOG_LEVEL=ERROR
+ 
+ 然后导入 `from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions`。
+ 统一入口以 `precision="bf16"`（默认）或 `precision="mxfp8"` 选择数学后端，forward 的参数保持一致。
+-BF16 原有自动 token API 保留，可选 `local_num_tokens` 建立固定计划；MX 当前要求 `create_parameters=False`，并显式传入
++BF16 支持自动 token 管理，也可指定 `local_num_tokens`；MX 要求 `create_parameters=False`，并显式传入
+ `local_num_tokens`，并且 H/I 均为 64 的倍数。两者都可传 `dispatch_mode="push"` 或 `"pull"`；
+ Pull 不传容量因子。外部权重每次用 `expert_weights=(root1, root2)` 传入。
+ MX 的物理权重合同见 [architecture.md](architecture.md)。
+ 
+ | 配置 | 作用 |
+ |---|---|
+-| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（原默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
++| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
+ | `HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE` | 可选 `push/pull`；若同时传构造参数必须一致 |
+-| `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，原 API 默认仍为 128 |
++| `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，API 默认 128 |
+ | `HYPER_MULTICORE_MEGAMOE_SCHEDULE_POLICY` | `two_expert_pipeline`（默认，两专家交错）或 `builder_order`（保留 builder 数学顺序） |
+ | `HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD` | 数学任务队列就绪扫描：0为FIFO，1仅检查队首，8有限重排；默认0，通信保持FIFO |
+ | `HYPER_MULTICORE_MX_NOGRAD_NO_CLONE` | 默认 1，在 lease 内完成 unpermute 后返回独立输出 |
+@@ -363,8 +362,8 @@ MX 的物理权重合同见 [architecture.md](architecture.md)。
+ 
+ 
+ 两种策略共用安全 QP0 owner、通信 FIFO 和数学任务核归属。`builder_order` 只改变数学
+-队列顺序，不恢复旧通信队列或更改 DAG。它是诊断对照，不代表性能更优；A3 BF16 MTE
+-保留原隐式队列。可在构造前设置上述环境变量，或显式传入：
++队列顺序，通信队列和 DAG 不变。BF16 MTE 使用隐式队列。
++可在构造前设置上述环境变量，或显式传入：
+ 
+ ```python
+ experts = MegaMoeExperts(
+@@ -376,12 +375,11 @@ experts = MegaMoeExperts(
+ y = experts(x, topk_ids, topk_weights, expert_weights=(root1, root2))
+ ```
+ 
+-MXFP8 不再提供独立的 public Experts 类，也不自动转换权重精度。调用方仍须提供每次
+-FSDP gather 后的原始量化权重 root。BF16 的 `from_module` 仅转换 BF16 权重，不生成 MX 物理存储。
+-SwiGLU row-only 分支已移除：no-grad 也使用完整 dual-axis 数学；no-clone 保持独立开关。
+-旧 `HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY=1` 会报明确错误，应从启动环境删除。
++两种精度均通过 `MegaMoeExperts` 使用。MXFP8 权重由调用方量化，并在每次 FSDP gather 后
++提供当前物理存储所在的原始 root。`from_module` 支持 BF16 权重转换。
++MX no-grad 与重算均执行 dual-axis SwiGLU，no-clone 由独立开关控制。
+ 
+-通信分片保留 `HYPER_MULTICORE_MX_COMM_SPLIT` 别名；队列扫描保留
++通信分片也接受 `HYPER_MULTICORE_MX_COMM_SPLIT`；队列扫描也接受
+ `HYPER_MULTICORE_MEGAMOE_READY_DEPTH`、`HYPER_MULTICORE_MX_READY_DEPTH` 和
+ `HYPER_MULTICORE_BF16_READY_DEPTH` 别名。队列扫描的显式参数和各别名必须一致，
+ 冲突直接报错。QP固定1，不需要配置QP数量。
+@@ -413,8 +411,8 @@ Torch/torch_npu 和 CANN 兼容性；不复制构建机器的 Conda 路径或个
+ from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions
+ 
+ schedule = MegaMoeScheduleOptions(policy="two_expert_pipeline", queue_ready_lookahead=8)
+-# BF16/MX的既有构造参数不变，新增可选 schedule=schedule。
+-# 不传时仍使用现有默认行为；配置在构造时解析，不能通过改环境变量热切换。
++# 将 schedule=schedule 传入 MegaMoeExperts。
++# 默认策略为 two_expert_pipeline，扫描深度为0；配置在构造时解析，不能热切换。
+ ```
+ 
+ ```bash
+@@ -426,5 +424,5 @@ python -m hyper_multicore.modules.mega_moe.schedule compare plan-a.json plan-b.j
+ 对已构建的host配置调用 `explain_schedule(cfg)`，再用 `json.dump` 保存上述plan JSON。
+ 该函数不读取设备tensor，不启动collective；输出逻辑stage、每核队列、真实依赖、事件阈值、
+ 计划指纹和runtime字节指纹。normal/profile的计划指纹相同；runtime字节指纹允许随记录模式变化。
+-当前registry只包含已实现的两专家流水；不提供异步在途窗口、半核分区或solver导入接口。
+-A3/BF16 MTE保留原队列；显式数学队列扫描仅在现有UDMA队列上支持，非零请求会报错。
++策略注册表提供 `two_expert_pipeline` 和 `builder_order`。
++BF16 MTE 使用隐式队列；显式数学队列扫描适用于 UDMA 队列，BF16 MTE 的非零扫描请求会报错。
+diff --git a/docs/profiling.md b/docs/profiling.md
+index c1bfb5f..8ee1aa2 100644
+--- a/docs/profiling.md
++++ b/docs/profiling.md
+@@ -802,6 +802,21 @@ pytest -v tests/torch/test_mega_moe_profiling.py
+ 
+ ---
+ 
++## MegaMoE 精度后端的采集范围
++
++BF16 与 MXFP8 使用公共 `TorchMegaKernelProfiler` 采集 task 内部时间线。
++MXFP8 的外层算子为 `HyperMegaMoeMxfp8` / `HyperMegaMoeMxfp8Grad`；正反向分别作为 invocation 记录。
++重计算执行正向算子；forward/recompute 的业务标签由调用方提供。MXFP8 后端的
++`mx_profile_scope(layer=..., phase=...)` 可附加 layer 与 forward/recompute/backward 标签。
++step、micro 和采样 rank 的筛选由训练框架适配层负责。
++
++MXFP8 使用展开后的 UINT8 buffer-list 物理 ABI，内部 profiler 按其真实参数布局绑定。
++该后端只支持 task profiler，尚无 L0/L1 Tensor dump 的物理端口合同；开启 dump 会报错。
++BF16 的 Tensor dump 支持范围以对应算子的端口定义及测试为准。
++normal 不分配内部 profiling buffer，不生成任务记录。profile 与 normal 的队列和数学配置相同，
++但采集本身具有执行和显存开销，采集样本不作为无打点性能数据。
++
++
+ ## 14. 相关文档
+ 
+ - [MegaMoe Design and Usage](architecture.md)
+diff --git a/docs/shmem.md b/docs/shmem.md
+index b1ddfc1..066c361 100644
+--- a/docs/shmem.md
++++ b/docs/shmem.md
+@@ -98,7 +98,7 @@ MegaKernel是融合任务的执行方式；MegaMoe是使用该方式的业务模
+ | 所有者 | 负责的状态与行为 |
+ | --- | --- |
+ | [Multicore资源管理](../hyper_multicore/modules/module.py) | 模块成员、兼容资源共享、延迟绑定、协调关闭 |
+-| [MegaMoe spec与plan](../hyper_multicore/modules/mega_moe/backends/bf16/plan.py) | 业务规格、正反向计算图、任务/事件配置和tiling |
++| [MegaMoe spec](../hyper_multicore/modules/mega_moe/spec.py)、[BF16 plan](../hyper_multicore/modules/mega_moe/backends/bf16/plan.py)、[MX graph](../hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py) | 业务规格、精度后端的正反向图、任务/事件及 tiling |
+ | [MegaMoe HeapManager](../hyper_multicore/modules/mega_moe/heap_manager.py) | reservation、layout、容量预算、替换描述、业务epoch和growth record |
+ | [MegaMoe workspace](../hyper_multicore/modules/mega_moe/workspace.py) | Tensor字段映射、lease、完成事件、反向图使用关系和业务计数器布局 |
+ | [SHMEM lifecycle](../hyper_multicore/shmem/_lifecycle.py) | 引用、Root一致性、阶段收敛、物理restart编排和进程级不可用标记 |
+diff --git a/hyper_multicore/README.md b/hyper_multicore/README.md
+index 8b4bd18..5d1f5cf 100644
+--- a/hyper_multicore/README.md
++++ b/hyper_multicore/README.md
+@@ -142,7 +142,8 @@ loss.backward()
+ 
+ ### MegaMoeExperts
+ 
+-Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家，当前支持 Ascend NPU 上的 Torch BF16 训练。
++Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家。`precision="bf16"` 为默认后端，
++支持 A3/A5；`precision="mxfp8"` 支持 A5。两种后端使用相同的 forward 参数。
+ 先按[构建与交付](../docs/build.md)运行 `bash build.sh`，激活 CANN 和 native payload，
+ 并为所有 EP rank 配置相同的 `HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT`（如 `tcp://<rank-zero-ip>:<port>`）。
+ 
+@@ -172,6 +173,37 @@ Subgroups exchange independent CANN bootstrap IDs internally and do not use a
+ shared WORLD rendezvous port. See the [SHMEM lifecycle](../docs/shmem.md) for
+ cross-node interface selection and group-local shutdown requirements.
+ 
++### 精度与调度合同
++
++| 配置 | BF16 | MXFP8 |
++|---|---|---|
++| `precision` | `"bf16"`，默认 | `"mxfp8"`，A5 |
++| `hidden_states` | BF16 | BF16；dispatch 后量化 |
++| token 规格 | 自动管理或显式 `local_num_tokens` | 显式 `local_num_tokens`，与回放输入规格一致 |
++| 权重 | 自有 Parameter 或 `expert_weights`；EIO/EOI | `create_parameters=False`；外部 MX root；EIO |
++| H / I | 按 BF16 算子约束 | 均须为64的倍数 |
++| `swiglu_limit` | 可配置正数 clamp | 必须为 `None` |
++| `dispatch_mode` | `push` / `pull` | `push` / `pull` |
++
++MX 权重 root 的 `col_data/col_scale` 必须由调用方提供；反向前还须提供当前
++`row_data/row_scale`。量化数据为 E4M3FN，scale 为 uint8 物理 E8M0 布局。
++执行器保留原始 root 供反向重新解析，不缓存 FSDP 临时权重 view，也不代替调用方量化权重。
++普通 BF16 Tensor 不能直接作为 MX 物理存储使用。
++
++```python
++from hyper_multicore import MegaMoeScheduleOptions
++
++schedule = MegaMoeScheduleOptions(
++    policy="two_expert_pipeline",  # 也可选 builder_order
++    queue_ready_lookahead=8,
++)
++# 将 precision、schedule 传入 MegaMoeExperts；外部权重逐次传入 forward。
++```
++
++QP 固定为每个远端 peer 一个。A5 UDMA 下，两种精度共用通信队列、owner 及完成协议；
++调度只调整数学任务顺序。队列扫描支持0/1/8，通信始终 FIFO。BF16 MTE 不支持非零队列扫描。
++完整构建、环境变量、独立组件回放及免编译部署见[构建指南](../docs/build.md#从源码构建并使用-a5-bf16mxfp8-megamoe)。
++
+ ### 下游模型集成
+ 
+ DSV4.1、Qwen 和 TP/SP/CP/EP/FSDP 模型适配器及其集成测试由 HyperParallel 下游维护。
+@@ -180,7 +212,8 @@ DSV4.1、Qwen 和 TP/SP/CP/EP/FSDP 模型适配器及其集成测试由 HyperPar
+ ### 输入与权重
+ 
+ - 分布式执行必须显式指定 `ep_group`，`E` 必须能被 EP 整除。
+-  token 数由每次实际输入决定，无需构造时指定长度或上限，各 rank 可不等长或为空。
++  BF16 自动 token 模式按实际输入管理长度，各 rank 可不等长或为空；
++  MXFP8 要求显式 source token 规格，详见下方精度合同。
+   所有 EP rank 必须按相同顺序进入正反向，并使用一致的梯度参与策略。
+   source/接收容量保留历史高水位，计划按几何桶缓存；待反向图保留原计划。
+ - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
+@@ -205,10 +238,10 @@ output = experts(
+ )
+ ```
+ 
+-### 自动 token 与通信容量
++### BF16 自动 token 与通信容量
+ 
+ 
+-MegaMoe 从实际 forward 输入自动维护容量，无需 token 上限或动态/静态模式开关。
++BF16 自动 token 模式从实际 forward 输入维护容量，无需 token 上限或动态/静态模式开关。
+ 构造时不分配通信 workspace，首次绑定从128行的最小 source token 容量开始，按实际需求增长并保留高水位。
+ 调度计划按几何桶缓存，待反向图保留原计划；桶大小不改变真实 token 激活形状。
+ 初次绑定、进入新桶及扩容有额外成本；稳定容量和已缓存计划可复用。
+diff --git a/hyper_multicore/_build/dependencies.lock.json b/hyper_multicore/_build/dependencies.lock.json
+index 5dc3d04..41c132a 100644
+--- a/hyper_multicore/_build/dependencies.lock.json
++++ b/hyper_multicore/_build/dependencies.lock.json
+@@ -18,11 +18,6 @@
+       "torch_cxx11_abi": "reported by the active torch package"
+     }
+   },
+-  "local_compatibility": {
+-    "cann": [
+-      "9.2.0"
+-    ]
+-  },
+   "components": {
+     "multicore": {
+       "ops_nn": {
+@@ -177,7 +172,7 @@
+         "commit": "c350b98e15dfd31c9b06464d1dfdfa1ad06a939b",
+         "tree": "f60225e2beb7d59a55c095a7c0c650f46540aa78",
+         "git_archive_tar_sha256": "6ac45efc6377f5843a2ba0db908075a0008f1d6679e01646b466990b75e907b4",
+-        "resolution": "A5 Blaze dependency pinned by ops-transformer dff221330e; all 47 original MX closure files match this Git tree",
++        "resolution": "Blaze GMM source pinned by ops-transformer dff221330e; exported from this exact Git revision",
+         "patches": [
+           {
+             "path": "hyper_multicore/ops/patches/blaze_gmm_logical_workers.patch",
+@@ -191,14 +186,5 @@
+         "upgrade_policy": "preserve task-local numerical and resource contracts; verify BF16 and MX independently"
+       }
+     }
+-  },
+-  "current_repository_baseline": {
+-    "shmem": "v1.8.0",
+-    "ops_nn": "v9.1.0.pre",
+-    "ops_transformer": {
+-      "gmm": "v9.1.0.pre",
+-      "mhc": "58b4a6bde"
+-    },
+-    "multicore_input": "locked ops-nn and ops-transformer kernel source plus the selected installed CANN >=9.1.0 toolchain"
+   }
+ }
+diff --git a/hyper_multicore/cmake/vendor/op_host/CMakeLists.txt b/hyper_multicore/cmake/vendor/op_host/CMakeLists.txt
+index 8bd86c2..5598893 100644
+--- a/hyper_multicore/cmake/vendor/op_host/CMakeLists.txt
++++ b/hyper_multicore/cmake/vendor/op_host/CMakeLists.txt
+@@ -66,8 +66,8 @@ set(OP_TILING_SOURCES
+     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
+ )
+ 
+-list(APPEND OP_SCHEMA_SOURCES ${FWD_HOST}/mxfp8_schema.cpp)
+-list(APPEND OP_TILING_SOURCES ${FWD_HOST}/mxfp8_tiling.cpp)
++list(APPEND OP_SCHEMA_SOURCES ${FWD_HOST}/mxfp8/schema.cpp)
++list(APPEND OP_TILING_SOURCES ${FWD_HOST}/mxfp8/tiling.cpp)
+ include_directories(${MX_HOST} ${MX_GRAD_HOST})
+ 
+ function(hp_generate_op_definitions)
+@@ -113,8 +113,8 @@ set(ACLNN_SOURCES
+     ${GATE_GRAD_HOST}/op_api/linear_index/linear_index.cpp
+ )
+ list(APPEND ACLNN_SOURCES
+-    ${MX_HOST}/op_api/hyper_mega_moe_mxfp8.cpp
+-    ${MX_GRAD_HOST}/op_api/hyper_mega_moe_mxfp8_grad.cpp)
++    ${MX_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
++    ${MX_GRAD_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp)
+ 
+ npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
+ target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
+diff --git a/hyper_multicore/modules/mega_moe/backends/bf16/autograd.py b/hyper_multicore/modules/mega_moe/backends/bf16/autograd.py
+index 2a9a8d5..4cccd39 100644
+--- a/hyper_multicore/modules/mega_moe/backends/bf16/autograd.py
++++ b/hyper_multicore/modules/mega_moe/backends/bf16/autograd.py
+@@ -478,7 +478,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
+         workspace_claimed: bool,
+         grad_enabled: bool = True,
+     ) -> Any:
+-        """Launch the legacy forward op and save owned backward inputs.
++        """Launch the BF16 forward op and save owned backward inputs.
+ 
+         Args:
+             ctx: Autograd context for saved backward state.
+@@ -568,7 +568,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
+     @staticmethod
+     # pylint: disable-next=arguments-differ
+     def backward(ctx: Any, grad_output: Any) -> tuple[Any, ...]:
+-        """Launch the legacy backward op into zero-safe gradient buffers.
++        """Launch the BF16 backward op into zero-safe gradient buffers.
+ 
+         Args:
+             ctx: Autograd context populated by ``forward``.
+@@ -634,7 +634,7 @@ def execute_mega_moe(
+     plan: MegaMoePlan,
+     workspace: MegaMoeWorkspace,
+ ) -> Any:
+-    """Execute expert-major rows through the differentiable legacy kernels.
++    """Execute expert-major rows through the differentiable BF16 kernels.
+ 
+     Args:
+         routed_tokens: Expert-major token rows.
+@@ -647,7 +647,7 @@ def execute_mega_moe(
+     Returns:
+         Expert-major output rows with independent storage.
+     """
+-    # Historical input-output views are materialized outside Function.forward so
++    # Input-output weight views are materialized outside Function.forward so
+     # gradients reach the caller's original weights. Output-input storage is native.
+     return _MegaMoeFunction.apply(
+         routed_tokens,
+diff --git a/hyper_multicore/modules/mega_moe/backends/bf16/plan.py b/hyper_multicore/modules/mega_moe/backends/bf16/plan.py
+index 8f8bd64..be50100 100644
+--- a/hyper_multicore/modules/mega_moe/backends/bf16/plan.py
++++ b/hyper_multicore/modules/mega_moe/backends/bf16/plan.py
+@@ -113,7 +113,7 @@ def _resize_swiglu_tiling(data: bytes, num_cube_cores: int) -> bytes:
+ 
+ 
+ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
+-    """Translate rank-local token shape into legacy scheduler coordinates.
++    """Translate rank-local token shape into scheduler task coordinates.
+ 
+     Args:
+         spec: Validated local-token and expert topology specification.
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py
+index f31e6cc..72a7f6f 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py
+@@ -3,7 +3,6 @@
+ from collections import OrderedDict
+ from dataclasses import dataclass, replace
+ from functools import cached_property
+-import os
+ 
+ import torch
+ 
+@@ -50,8 +49,6 @@ class _MXFP8Plan:
+ 
+ class Resources(_MegaMoeExecutionResources):
+     def __init__(self, specification, tensor, *, shared, active_specifications):
+-        if os.environ.get("HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY", "0") != "0":
+-            raise ValueError("SwiGLU row-only was removed; unset HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY")
+         if query_npu_arch() != 3510:
+             raise ValueError("MX expert mathematics currently requires A5")
+         super().__init__(specification, tensor, shared=shared, active_specifications=active_specifications)
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py
+index 046d5fa..23ea136 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py
+@@ -12,7 +12,7 @@ from hyper_multicore.torch import ops as multicore_ops
+ 
+ from .autograd import MXFP8ForwardState
+ from .diagnostics import current_mx_profile_scope, mx_profile_capture_enabled, profile_mx_launch
+-from .launch import launch_mxfp8_task_graph, prepare_mxfp8_launch, serialize_mxfp8_launch
++from .launch import launch_mxfp8_experts, prepare_mxfp8_launch, serialize_mxfp8_launch
+ from .weights import MXFP8PhysicalWeight
+ from ...route import prepare_topk_route
+ 
+@@ -47,7 +47,7 @@ class MXFP8Execution:
+     def _launch(self, buffers, runtime, events, plan, device, direction="forward"):
+         if events.numel() < runtime.event_capacity * 4:
+             raise ValueError("MX event storage is smaller than the graph")
+-        launch_graph = partial(launch_mxfp8_task_graph, direction=direction)
++        launch_graph = partial(launch_mxfp8_experts, direction=direction)
+         if mx_profile_capture_enabled():
+             scope = current_mx_profile_scope() or self._profile_scope
+             if direction == 'forward':
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py
+index 7f7a835..17c7ee5 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py
+@@ -100,7 +100,7 @@ def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
+         result[index].dtype_size = 4 if index in sizes else 8
+     for index in ([6, 10] if forward else [19]):
+         result[index].shape, result[index].dtype_size = [experts], 8
+-    # Only the transport worker uses legacy dynamic tensor offsets. MX tasks
++    # Only the transport worker uses dynamic tensor offsets. MX tasks
+     # resolve token and packed-scale ranges directly from the live group list.
+     result[0].is_dynamic = True
+     payload = 11 if forward else 12
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/launch.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/launch.py
+index 18f922a..6997832 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/launch.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/launch.py
+@@ -1,5 +1,5 @@
+ # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+-"""Byte-alias launch adapter for the separately versioned native MX task graph."""
++"""Byte-alias launch adapter for the native MXFP8 MegaMoE ABI."""
+ 
+ from functools import lru_cache
+ from collections.abc import Sequence
+@@ -15,8 +15,8 @@ from ...spec import MegaMoeSpec
+ @lru_cache(maxsize=1)
+ def _load_mxfp8_native() -> None:
+     _load_native()
+-    if torch.ops.hyper_multicore.mxfp8_task_graph_version() != 3:
+-        raise RuntimeError('MXFP8 task-graph adapter ABI mismatch; rebuild the local multicore component.')
++    if torch.ops.hyper_multicore.mega_moe_mxfp8_abi_version() != 3:
++        raise RuntimeError('MXFP8 MegaMoE adapter ABI mismatch; rebuild the local multicore component.')
+ 
+ 
+ def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+@@ -45,14 +45,14 @@ def prepare_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
+     return torch.frombuffer(bytearray(metadata), dtype=torch.uint8).to(device=runtime.device)
+ 
+ 
+-def launch_mxfp8_task_graph(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
++def launch_mxfp8_experts(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
+                            events: torch.Tensor, diagnostic: torch.Tensor, launch: torch.Tensor,
+                            *, direction: str = 'forward') -> None:
+-    """Run the native fused task graph with alias-preserving physical arguments."""
++    """Run the native fused MoE with alias-preserving physical arguments."""
+     aliases = _byte_aliases(buffers)
+     _load_mxfp8_native()
+     if direction not in ('forward', 'backward'):
+         raise ValueError('MX native direction must be forward or backward')
+-    primary = (torch.ops.hyper_multicore.mxfp8_task_graph_grad if direction == 'backward'
+-               else torch.ops.hyper_multicore.mxfp8_task_graph)
++    primary = (torch.ops.hyper_multicore.mega_moe_mxfp8_grad if direction == 'backward'
++               else torch.ops.hyper_multicore.mega_moe_mxfp8)
+     primary(aliases, runtime, events, diagnostic, launch)
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/launch_contract.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/launch_contract.py
+index 2081072..b082579 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/launch_contract.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/launch_contract.py
+@@ -5,7 +5,7 @@ from collections.abc import Sequence
+ MAX_GRAPH_BUFFERS = 64
+ 
+ class MxLaunchDescriptor(ctypes.LittleEndianStructure):
+-    """Launch bounds and the legacy rank/topology prefix consumed by SHMEM workers."""
++    """Launch bounds and the rank/topology prefix consumed by SHMEM workers."""
+ 
+     _fields_ = [(name, ctypes.c_int64) for name in (
+         'rank', 'ep', 'experts', 'hidden', 'local_tokens', 'cube_count',
+@@ -22,7 +22,7 @@ def serialize_mx_launch_metadata(
+ ) -> bytes:
+     """Build the byte-list launch descriptor without reading any device data."""
+     if not 0 < len(buffer_sizes) <= MAX_GRAPH_BUFFERS or any(size < 0 for size in buffer_sizes):
+-        raise ValueError('MX task graph requires 1..64 nonnegative byte-buffer sizes')
++        raise ValueError('MXFP8 MoE launch requires 1..64 nonnegative byte-buffer sizes')
+     if min(ep, experts, hidden, local_tokens, cube_count, runtime_bytes, event_bytes) <= 0:
+         raise ValueError('MX launch topology and runtime bounds must be positive')
+     if experts % ep or rank < 0:
+diff --git a/hyper_multicore/modules/mega_moe/module.py b/hyper_multicore/modules/mega_moe/module.py
+index 494b13e..8cae2c4 100644
+--- a/hyper_multicore/modules/mega_moe/module.py
++++ b/hyper_multicore/modules/mega_moe/module.py
+@@ -232,11 +232,11 @@ class MegaMoeExperts(MulticoreModule):
+             swiglu_limit: Optional positive, finite float32-representable clamp
+                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
+                 the up branch is clamped to ``[-limit, limit]``. ``None``
+-                preserves the legacy unclamped path.
++                selects the unclamped activation.
+             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
+             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
+             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
+-                ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
++                ``[experts, in_features, out_features]``. ``"EOI"`` means
+                 ``[experts, out_features, in_features]`` and accepts Torch linear storage directly. ``EOI`` weights
+                 must use dense contiguous storage for zero-copy execution.
+             ep_group: Explicit EP group; expert ownership follows group-local rank order.
+diff --git a/hyper_multicore/modules/mega_moe/route.py b/hyper_multicore/modules/mega_moe/route.py
+index d33fb84..29778a4 100644
+--- a/hyper_multicore/modules/mega_moe/route.py
++++ b/hyper_multicore/modules/mega_moe/route.py
+@@ -460,7 +460,7 @@ def _valid_route_counts(row: list[int], top_k: int) -> bool:
+ 
+ 
+ def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
+-    """Keep native size and legacy bound rejection ahead of route publication."""
++    """Validate native sizes and explicit token bounds before route publication."""
+     flexible = spec.auto_tokens
+     if flexible and any(row[0] or row[1] < 0 for row in rows):
+         raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
+diff --git a/hyper_multicore/modules/mega_moe/schedule.py b/hyper_multicore/modules/mega_moe/schedule.py
+index 2e6621e..c650f51 100644
+--- a/hyper_multicore/modules/mega_moe/schedule.py
++++ b/hyper_multicore/modules/mega_moe/schedule.py
+@@ -130,7 +130,7 @@ def _two_expert_pipeline(stages):
+ 
+ 
+ def _builder_order(stages):
+-    """Keep builder math order on the shared fixed owners; no legacy QP rollback."""
++    """Keep builder math order on the shared fixed owners; communication owner queues remain fixed."""
+     vectors = [[] for _ in range(2 * stages.cores)]
+     for lane, queue in enumerate(stages.original_vectors):
+         vectors[2 * lane] = list(queue)
+@@ -150,14 +150,14 @@ def describe_schedule_policy(name):
+         raise ValueError(f'Unknown MegaMoE schedule policy {name!r}; available: {list_schedule_policies()}')
+     return {'name': name, 'precision': ['bf16', 'mxfp8'], 'phases': ['forward', 'backward'],
+             'queue_ready_lookahead': [0, 1, 8], 'transport_fifo': True,
+-            'legacy_bf16_mte': 'preserved; explicit math-queue selection requires UDMA'}
++            'bf16_mte': 'implicit queues; nonzero math-queue lookahead requires UDMA'}
+ 
+ 
+ def configure_expert_queues(cfg, graph, spec, *, forward):
+     """Compile a policy over fixed QP0 owners and serialize the existing queue ABI."""
+     if spec.transport_engine != 'udma' and spec.precision == 'bf16':
+         if spec.ready_depth:
+-            raise ValueError('BF16 MTE legacy queues do not support explicit math queue ready selection')
++            raise ValueError('BF16 MTE implicit queues do not support explicit math queue ready selection')
+         return cfg
+     stages = _expert_stages(graph, spec, forward, cfg)
+     describe_schedule_policy(spec.schedule_policy)
+@@ -182,7 +182,7 @@ def explain_schedule(cfg):
+     """Export static queues and actual dependencies without device reads or logging."""
+     from hyper_multicore.scheduler.runtime import serialize_runtime_config
+     if cfg.queue_layout != 1:
+-        return {'layout': 'legacy'}
++        return {'layout': 'implicit'}
+     cubes = cfg.num_workers // 2
+     queues = []
+     for worker, queue in enumerate(cfg.worker_queues):
+diff --git a/hyper_multicore/modules/mega_moe/transport.py b/hyper_multicore/modules/mega_moe/transport.py
+index 6bb24be..4acf940 100644
+--- a/hyper_multicore/modules/mega_moe/transport.py
++++ b/hyper_multicore/modules/mega_moe/transport.py
+@@ -9,7 +9,7 @@ TRANSPORT_TASKS = (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_M
+ 
+ @lru_cache(maxsize=1)
+ def require_queue_backend():
+-    """Reject an old native payload before it can interpret an explicit queue image."""
++    """Require the native runtime ABI needed to interpret explicit worker queues."""
+     import torch
+     from hyper_multicore.torch.ops import _load_native
+     _load_native()
+diff --git a/hyper_multicore/modules/mega_moe/workspace.py b/hyper_multicore/modules/mega_moe/workspace.py
+index 955e5f7..e191352 100644
+--- a/hyper_multicore/modules/mega_moe/workspace.py
++++ b/hyper_multicore/modules/mega_moe/workspace.py
+@@ -36,7 +36,7 @@ from hyper_multicore.shmem import _lifecycle
+ 
+ from .spec import MegaMoeSpec, _resolve_receive_capacity
+ 
+-# The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
++# The composed Cube-only GMM and SwiGLU-grad kernels do not use these
+ # tensor arguments. Keep non-empty ABI placeholders; native tiling reserves
+ # the separate CANN library workspace needed by the enclosing operator.
+ _GMM_WORKSPACE_BYTES = 512
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8_op_api.inc b/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/op_api.inc
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8_op_api.inc
+rename to hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/op_api.inc
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8_schema.cpp b/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/schema.cpp
+similarity index 86%
+rename from hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8_schema.cpp
+rename to hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/schema.cpp
+index 1117cc5..1208d8e 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8_schema.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/schema.cpp
+@@ -2,9 +2,9 @@
+ #include "register/op_def_registry.h"
+ #include "register/op_impl_registry.h"
+ namespace ops {
+-class Mxfp8ByteGraph : public OpDef {
++class MegaMoeMxfp8Schema : public OpDef {
+  public:
+-  explicit Mxfp8ByteGraph(const char* name) : OpDef(name) {
++  explicit MegaMoeMxfp8Schema(const char* name) : OpDef(name) {
+     Input("buffers").ParamType(DYNAMIC).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
+     for (const auto* resource : {"runtime_config", "events", "diagnostic", "launch_metadata"}) {
+       Input(resource).ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
+@@ -36,8 +36,8 @@ ge::graphStatus InferType(gert::InferDataTypeContext* context) {
+ }
+ }
+ // Named registrations preserve both public OP identities and inference contracts.
+-class HyperMegaMoeMxfp8 : public Mxfp8ByteGraph { public: using Mxfp8ByteGraph::Mxfp8ByteGraph; };
+-class HyperMegaMoeMxfp8Grad : public Mxfp8ByteGraph { public: using Mxfp8ByteGraph::Mxfp8ByteGraph; };
++class HyperMegaMoeMxfp8 : public MegaMoeMxfp8Schema { public: using MegaMoeMxfp8Schema::MegaMoeMxfp8Schema; };
++class HyperMegaMoeMxfp8Grad : public MegaMoeMxfp8Schema { public: using MegaMoeMxfp8Schema::MegaMoeMxfp8Schema; };
+ OP_ADD(HyperMegaMoeMxfp8);
+ OP_ADD(HyperMegaMoeMxfp8Grad);
+ IMPL_OP_INFERSHAPE(HyperMegaMoeMxfp8).InferShape(InferShape).InferDataType(InferType);
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8_tiling.cpp b/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/tiling.cpp
+similarity index 81%
+rename from hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8_tiling.cpp
+rename to hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/tiling.cpp
+index 44e523a..e50421f 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8_tiling.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/tiling.cpp
+@@ -1,8 +1,8 @@
+ // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+-#include "../../hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.h"
+-#include "../../hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.h"
++#include "../../../hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.h"
++#include "../../../hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.h"
+ #include "register/op_impl_registry.h"
+-#include "../../hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8_tiling_key.h"
++#include "../../../hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8_tiling_key.h"
+ #include "tiling/platform/platform_ascendc.h"
+ namespace optiling {
+ template <class TilingData>
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_resource_policy.h b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_resource_policy.h
+index 1d8e0ee..34edccb 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_resource_policy.h
++++ b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_resource_policy.h
+@@ -1,6 +1,6 @@
+ // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+-#ifndef HYPER_MULTICORE_MX_A5_POLICY_H_
+-#define HYPER_MULTICORE_MX_A5_POLICY_H_
++#ifndef HYPER_MULTICORE_MXFP8_GMM_RESOURCE_POLICY_H_
++#define HYPER_MULTICORE_MXFP8_GMM_RESOURCE_POLICY_H_
+ #include "hyper_mega_moe/op_kernel/contracts/mx_gmm_descriptor.h"
+ 
+ #ifdef __NPU_ARCH__
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h
+index 81fc9b0..0b1fcf7 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h
++++ b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h
+@@ -46,7 +46,7 @@ class MxTaskWorker : public KernelWorkerBase<MxTaskWorker, VectorWorkerPolicy::A
+ };
+ }  // namespace MulticoreRuntime
+ 
+-__aicore__ inline void RunMxTaskGraph(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events,
++__aicore__ inline void RunMegaMoeMxfp8(GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events,
+                                      GM_ADDR diagnostic, GM_ADDR launch_metadata) {
+   auto launch = reinterpret_cast<__gm__ MulticoreMx::MxLaunchDescriptor*>(launch_metadata);
+   if (launch->magic != MulticoreMx::MX_LAUNCH_MAGIC || launch->version != 1 || launch->reserved != 0 ||
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h
+index 8bcdfef..626635a 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h
++++ b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h
+@@ -1,6 +1,6 @@
+ // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+-#ifndef HYPER_MULTICORE_GMM_LOGICAL_LANE_H_
+-#define HYPER_MULTICORE_GMM_LOGICAL_LANE_H_
++#ifndef HYPER_MULTICORE_GMM_LOGICAL_WORKERS_H_
++#define HYPER_MULTICORE_GMM_LOGICAL_WORKERS_H_
+ #include <cstdint>
+ 
+ #if defined(__CCE_AICORE__) || defined(__NPU_ARCH__)
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/hyper_mega_moe_mxfp8.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
+similarity index 80%
+rename from hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/hyper_mega_moe_mxfp8.cpp
+rename to hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
+index 2ad2950..7407cf0 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/hyper_mega_moe_mxfp8.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
+@@ -3,4 +3,4 @@
+ #define HYPER_MX_OP HyperMegaMoeMxfp8
+ #define HYPER_MX_API aclnnHyperMegaMoeMxfp8
+ #define HYPER_MX_WORKSPACE_API aclnnHyperMegaMoeMxfp8GetWorkspaceSize
+-#include "../../../hyper_mega_moe/op_host/mxfp8_op_api.inc"
++#include "../../../hyper_mega_moe/op_host/mxfp8/op_api.inc"
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8.cpp
+index 6f42c30..22b70fa 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8.cpp
+@@ -6,5 +6,5 @@ __global__ __aicore__ void hyper_mega_moe_mxfp8(
+     GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events, GM_ADDR diagnostic,
+     GM_ADDR launch_metadata, GM_ADDR buffers_ref, GM_ADDR workspace, GM_ADDR tiling) {
+   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+-  RunMxTaskGraph(buffers, runtime, events, diagnostic, launch_metadata);
++  RunMegaMoeMxfp8(buffers, runtime, events, diagnostic, launch_metadata);
+ }
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/hyper_mega_moe_mxfp8_grad.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp
+similarity index 81%
+rename from hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/hyper_mega_moe_mxfp8_grad.cpp
+rename to hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp
+index 50f5a69..fc9b000 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/hyper_mega_moe_mxfp8_grad.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp
+@@ -3,4 +3,4 @@
+ #define HYPER_MX_OP HyperMegaMoeMxfp8Grad
+ #define HYPER_MX_API aclnnHyperMegaMoeMxfp8Grad
+ #define HYPER_MX_WORKSPACE_API aclnnHyperMegaMoeMxfp8GradGetWorkspaceSize
+-#include "../../../hyper_mega_moe/op_host/mxfp8_op_api.inc"
++#include "../../../hyper_mega_moe/op_host/mxfp8/op_api.inc"
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_kernel/hyper_mega_moe_mxfp8_grad.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_kernel/hyper_mega_moe_mxfp8_grad.cpp
+index 0d41013..fdd9722 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_kernel/hyper_mega_moe_mxfp8_grad.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_kernel/hyper_mega_moe_mxfp8_grad.cpp
+@@ -6,5 +6,5 @@ __global__ __aicore__ void hyper_mega_moe_mxfp8_grad(
+     GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events, GM_ADDR diagnostic,
+     GM_ADDR launch_metadata, GM_ADDR buffers_ref, GM_ADDR workspace, GM_ADDR tiling) {
+   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+-  RunMxTaskGraph(buffers, runtime, events, diagnostic, launch_metadata);
++  RunMegaMoeMxfp8(buffers, runtime, events, diagnostic, launch_metadata);
+ }
+diff --git a/hyper_multicore/tasks/swiglu.py b/hyper_multicore/tasks/swiglu.py
+index f96631a..0c333dd 100644
+--- a/hyper_multicore/tasks/swiglu.py
++++ b/hyper_multicore/tasks/swiglu.py
+@@ -57,7 +57,7 @@ class SwiGLUFillConfig(FillConfig):
+     SwiGLU fill config — forward (TASK_SWI_GLU) and backward (TASK_SWI_GLU_GRAD).
+ 
+     ``clamp_limit`` is serialized in ``TaskDesc.extra_value_0``.  Zero keeps
+-    the legacy unclamped path; a positive value enables clipped SwiGLU.
++    the unclamped path; a positive value enables clipped SwiGLU.
+     """
+ 
+     clamp_limit: float | None = None
+diff --git a/hyper_multicore/torch/CMakeLists.txt b/hyper_multicore/torch/CMakeLists.txt
+index 7cbe255..0526299 100644
+--- a/hyper_multicore/torch/CMakeLists.txt
++++ b/hyper_multicore/torch/CMakeLists.txt
+@@ -51,7 +51,7 @@ add_library(hyper_multicore_torch SHARED
+     csrc/mega_moe_unpermute.cpp
+     csrc/mega_gate_registration.cpp
+     csrc/mega_gate.cpp
+-    csrc/mxfp8_task_graph.cpp)
++    csrc/mega_moe_mxfp8.cpp)
+ hp_apply_torch_cxx_standard(
+     hyper_multicore_torch "${TORCH_CXX_STANDARD}")
+ # Match the active op-plugin compatibility headers.
+diff --git a/hyper_multicore/torch/csrc/mxfp8_task_graph.cpp b/hyper_multicore/torch/csrc/mega_moe_mxfp8.cpp
+similarity index 50%
+rename from hyper_multicore/torch/csrc/mxfp8_task_graph.cpp
+rename to hyper_multicore/torch/csrc/mega_moe_mxfp8.cpp
+index c3ce3c0..6bffb68 100644
+--- a/hyper_multicore/torch/csrc/mxfp8_task_graph.cpp
++++ b/hyper_multicore/torch/csrc/mega_moe_mxfp8.cpp
+@@ -4,43 +4,43 @@
+ #include "csrc/cached_op_api.h"
+ 
+ namespace {
+-void ValidateTaskGraph(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
++void ValidateMoeBuffers(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
+                        const at::Tensor& diagnostic, const at::Tensor& launch) {
+-  TORCH_CHECK(!buffers.empty() && buffers.size() <= 64, "MX graph requires 1..64 buffers");
++  TORCH_CHECK(!buffers.empty() && buffers.size() <= 64, "MXFP8 MegaMoE requires 1..64 buffers");
+   for (const auto& buffer : buffers) {
+     TORCH_CHECK(buffer.scalar_type() == at::kByte && buffer.is_contiguous() && buffer.dim() == 1,
+-                "MX buffers must be contiguous UINT8 vectors");
+-    TORCH_CHECK(buffer.device() == runtime.device(), "MX buffers must use the runtime NPU device");
++                "MXFP8 MoE buffers must be contiguous UINT8 vectors");
++    TORCH_CHECK(buffer.device() == runtime.device(), "MXFP8 MoE buffers must use the runtime NPU device");
+   }
+   for (const auto& resource : {runtime, events, diagnostic, launch}) {
+     TORCH_CHECK(resource.scalar_type() == at::kByte && resource.is_contiguous() && resource.dim() == 1,
+-                "MX runtime resources must be contiguous UINT8 vectors");
+-    TORCH_CHECK(resource.device() == runtime.device(), "MX resources must use one NPU device");
++                "MXFP8 MoE runtime resources must be contiguous UINT8 vectors");
++    TORCH_CHECK(resource.device() == runtime.device(), "MXFP8 MoE resources must use one NPU device");
+   }
+-  TORCH_CHECK(launch.numel() == 592, "MX launch descriptor must contain 592 bytes");
++  TORCH_CHECK(launch.numel() == 592, "MXFP8 MoE launch descriptor must contain 592 bytes");
+ }
+-void Mxfp8TaskGraph(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
++void MegaMoeMxfp8(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
+                    const at::Tensor& diagnostic, const at::Tensor& launch) {
+-  ValidateTaskGraph(buffers, runtime, events, diagnostic, launch);
++  ValidateMoeBuffers(buffers, runtime, events, diagnostic, launch);
+   int64_t count = buffers.size();
+   HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8, buffers, runtime, events, diagnostic, launch, buffers, count);
+ }
+-void Mxfp8TaskGraphGrad(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
++void MegaMoeMxfp8Grad(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
+                        const at::Tensor& diagnostic, const at::Tensor& launch) {
+-  ValidateTaskGraph(buffers, runtime, events, diagnostic, launch);
++  ValidateMoeBuffers(buffers, runtime, events, diagnostic, launch);
+   int64_t count = buffers.size();
+   HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8Grad, buffers, runtime, events, diagnostic, launch, buffers, count);
+ }
+ }  // namespace
+ 
+ TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
+-  m.def("mxfp8_task_graph(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
++  m.def("mega_moe_mxfp8(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
+         "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
+-  m.def("mxfp8_task_graph_grad(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
++  m.def("mega_moe_mxfp8_grad(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
+         "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
+-  m.def("mxfp8_task_graph_version() -> int", []() -> int64_t { return 3; });
++  m.def("mega_moe_mxfp8_abi_version() -> int", []() -> int64_t { return 3; });
+ }
+ TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
+-  m.impl("mxfp8_task_graph", &Mxfp8TaskGraph);
+-  m.impl("mxfp8_task_graph_grad", &Mxfp8TaskGraphGrad);
++  m.impl("mega_moe_mxfp8", &MegaMoeMxfp8);
++  m.impl("mega_moe_mxfp8_grad", &MegaMoeMxfp8Grad);
+ }
+diff --git a/tests/ut/modules/mega_moe/test_function.py b/tests/ut/modules/mega_moe/test_autograd.py
+similarity index 100%
+rename from tests/ut/modules/mega_moe/test_function.py
+rename to tests/ut/modules/mega_moe/test_autograd.py
+diff --git a/tests/ut/modules/mega_moe/test_precision_backends.py b/tests/ut/modules/mega_moe/test_precision_backends.py
+index 760d696..87147bf 100644
+--- a/tests/ut/modules/mega_moe/test_precision_backends.py
++++ b/tests/ut/modules/mega_moe/test_precision_backends.py
+@@ -1,6 +1,6 @@
+ """The common expert API preserves parameter roots and backend contracts."""
+ from types import SimpleNamespace
+-from unittest.mock import Mock, patch
++from unittest.mock import patch
+ 
+ import pytest
+ import torch
+@@ -61,9 +61,3 @@ def test_mx_passes_current_roots_counts_and_no_clone_to_autograd():
+         run.assert_called_once_with(hidden, *roots, ids, probs, ((6, 64, 128), (6, 64, 64)),
+                                     execution.return_value)
+         assert result is run.return_value
+-
+-
+-def test_removed_row_only_option_fails_before_binding_resources():
+-    with patch.dict('os.environ', {'HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY': '1'}):
+-        with pytest.raises(ValueError, match='row-only was removed'):
+-            mx_backend.Resources({}, Mock(), shared=False, active_specifications=())
+diff --git a/tests/ut/modules/test_frontend_migration.py b/tests/ut/modules/test_frontend_contract.py
+similarity index 96%
+rename from tests/ut/modules/test_frontend_migration.py
+rename to tests/ut/modules/test_frontend_contract.py
+index 8735fc1..6ec46e8 100644
+--- a/tests/ut/modules/test_frontend_migration.py
++++ b/tests/ut/modules/test_frontend_contract.py
+@@ -12,7 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ # ============================================================================
+-"""CPU checks for model-facing MegaKernel migration, named state and precision policies."""
++"""CPU checks for model-facing MegaKernel conversion, named state and precision policies."""
+ 
+ import unittest
+ from types import SimpleNamespace
+@@ -29,13 +29,13 @@ from tests.common.mark_utils import arg_mark
+ from tests.common.multicore.mega_mhc_golden import torch_mega_mhc
+ 
+ 
+-class TestFrontendMigration(unittest.TestCase):
++class TestFrontendContracts(unittest.TestCase):
+     """Check original Parameter ownership and mathematical configuration at replacement boundaries."""
+ 
+     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+               card_mark="allcards", essential_mark="essential")
+     def test_ep_size_follows_explicit_subgroup_and_rejects_implicit_world(self) -> None:
+-        """Feature: MegaKernel frontend migration.
++        """Feature: MegaKernel frontend contract.
+         Description: Ep size follows explicit subgroup and rejects implicit world.
+         Expectation: A subgroup determines local expert count; a global process group is never guessed.
+         """
+@@ -55,8 +55,8 @@ class TestFrontendMigration(unittest.TestCase):
+ 
+     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+               card_mark="allcards", essential_mark="essential")
+-    def test_moe_migration_converts_each_expert_without_aliasing_source(self) -> None:
+-        """Feature: MegaKernel frontend migration.
++    def test_moe_conversion_preserves_each_expert_without_aliasing_source(self) -> None:
++        """Feature: MegaKernel frontend contract.
+         Description: Convert each expert to EIO and EOI without aliasing noncontiguous source weights.
+         Expectation: Both contiguous native layouts preserve the source SwiGLU function.
+         """
+@@ -90,7 +90,7 @@ class TestFrontendMigration(unittest.TestCase):
+     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+               card_mark="allcards", essential_mark="essential")
+     def test_gate_migration_and_gradient_parity(self) -> None:
+-        """Feature: MegaKernel frontend migration.
++        """Feature: MegaKernel frontend contract.
+         Description: Gate migration and gradient parity.
+         Expectation: A migrated router keeps Parameters and scoring instead of initializing a new gate.
+         """
+@@ -133,7 +133,7 @@ class TestFrontendMigration(unittest.TestCase):
+     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+               card_mark="allcards", essential_mark="essential")
+     def test_dtype_conversion_preserves_control_values_and_existing_gradients(self) -> None:
+-        """Feature: MegaKernel frontend migration.
++        """Feature: MegaKernel frontend contract.
+         Description: Dtype conversion preserves control values and existing gradients.
+         Expectation: Global BF16 conversion must never round an FP32 predictor and then cast it back.
+         """
+@@ -160,7 +160,7 @@ class TestFrontendMigration(unittest.TestCase):
+     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+               card_mark="allcards", essential_mark="essential")
+     def test_mhc_migration_keeps_parameters_and_gradients(self) -> None:
+-        """Feature: MegaKernel frontend migration.
++        """Feature: MegaKernel frontend contract.
+         Description: Compare migrated and source modules with the same five input tensors.
+         Expectation: Preserve Parameter identities, outputs and every input/parameter gradient.
+         """
+-- 
+2.54.0
+

@@ -326,10 +326,9 @@ NPU 用例需先构建并激活 native payload。
 
 ## 从源码构建并使用 A5 BF16/MXFP8 MegaMoE
 
-A5 构建会额外解析锁文件中的 `ops_tensor`，其余 ops-nn、ops-transformer、SHMEM revision
-保持原 master 的锁定值。Blaze 的传递来源是 ops-tensor，单独拉 ops-transformer 不等于已具备
-完整头文件闭包。构建入口会下载/校验并在隔离目录装配全部依赖，既不修改系统 CANN，也不修改
-下载仓库的工作区。无需另带历史 SDK、数学源码副本或本机实验目录。
+A5 构建从锁文件解析 ops-nn、ops-transformer、ops-tensor 和 SHMEM revision。
+Blaze 的头文件来自 ops-tensor。构建入口下载、校验并在隔离目录装配全部依赖，
+不修改系统 CANN 或下载仓库的工作区；交付内容由源码和构建 payload 组成。
 
 ```bash
 # 使用需要交付的同一 Python/Torch/torch_npu/CANN 环境。
@@ -345,16 +344,16 @@ export SHMEM_LOG_LEVEL=ERROR
 
 然后导入 `from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions`。
 统一入口以 `precision="bf16"`（默认）或 `precision="mxfp8"` 选择数学后端，forward 的参数保持一致。
-BF16 原有自动 token API 保留，可选 `local_num_tokens` 建立固定计划；MX 当前要求 `create_parameters=False`，并显式传入
+BF16 支持自动 token 管理，也可指定 `local_num_tokens`；MX 要求 `create_parameters=False`，并显式传入
 `local_num_tokens`，并且 H/I 均为 64 的倍数。两者都可传 `dispatch_mode="push"` 或 `"pull"`；
 Pull 不传容量因子。外部权重每次用 `expert_weights=(root1, root2)` 传入。
 MX 的物理权重合同见 [architecture.md](architecture.md)。
 
 | 配置 | 作用 |
 |---|---|
-| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（原默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
+| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
 | `HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE` | 可选 `push/pull`；若同时传构造参数必须一致 |
-| `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，原 API 默认仍为 128 |
+| `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，API 默认 128 |
 | `HYPER_MULTICORE_MEGAMOE_SCHEDULE_POLICY` | `two_expert_pipeline`（默认，两专家交错）或 `builder_order`（保留 builder 数学顺序） |
 | `HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD` | 数学任务队列就绪扫描：0为FIFO，1仅检查队首，8有限重排；默认0，通信保持FIFO |
 | `HYPER_MULTICORE_MX_NOGRAD_NO_CLONE` | 默认 1，在 lease 内完成 unpermute 后返回独立输出 |
@@ -363,8 +362,8 @@ MX 的物理权重合同见 [architecture.md](architecture.md)。
 
 
 两种策略共用安全 QP0 owner、通信 FIFO 和数学任务核归属。`builder_order` 只改变数学
-队列顺序，不恢复旧通信队列或更改 DAG。它是诊断对照，不代表性能更优；A3 BF16 MTE
-保留原隐式队列。可在构造前设置上述环境变量，或显式传入：
+队列顺序，通信队列和 DAG 不变。BF16 MTE 使用隐式队列。
+可在构造前设置上述环境变量，或显式传入：
 
 ```python
 experts = MegaMoeExperts(
@@ -376,12 +375,11 @@ experts = MegaMoeExperts(
 y = experts(x, topk_ids, topk_weights, expert_weights=(root1, root2))
 ```
 
-MXFP8 不再提供独立的 public Experts 类，也不自动转换权重精度。调用方仍须提供每次
-FSDP gather 后的原始量化权重 root。BF16 的 `from_module` 仅转换 BF16 权重，不生成 MX 物理存储。
-SwiGLU row-only 分支已移除：no-grad 也使用完整 dual-axis 数学；no-clone 保持独立开关。
-旧 `HYPER_MULTICORE_MX_SWIGLU_ROW_ONLY=1` 会报明确错误，应从启动环境删除。
+两种精度均通过 `MegaMoeExperts` 使用。MXFP8 权重由调用方量化，并在每次 FSDP gather 后
+提供当前物理存储所在的原始 root。`from_module` 支持 BF16 权重转换。
+MX no-grad 与重算均执行 dual-axis SwiGLU，no-clone 由独立开关控制。
 
-通信分片保留 `HYPER_MULTICORE_MX_COMM_SPLIT` 别名；队列扫描保留
+通信分片也接受 `HYPER_MULTICORE_MX_COMM_SPLIT`；队列扫描也接受
 `HYPER_MULTICORE_MEGAMOE_READY_DEPTH`、`HYPER_MULTICORE_MX_READY_DEPTH` 和
 `HYPER_MULTICORE_BF16_READY_DEPTH` 别名。队列扫描的显式参数和各别名必须一致，
 冲突直接报错。QP固定1，不需要配置QP数量。
@@ -413,8 +411,8 @@ Torch/torch_npu 和 CANN 兼容性；不复制构建机器的 Conda 路径或个
 from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions
 
 schedule = MegaMoeScheduleOptions(policy="two_expert_pipeline", queue_ready_lookahead=8)
-# BF16/MX的既有构造参数不变，新增可选 schedule=schedule。
-# 不传时仍使用现有默认行为；配置在构造时解析，不能通过改环境变量热切换。
+# 将 schedule=schedule 传入 MegaMoeExperts。
+# 默认策略为 two_expert_pipeline，扫描深度为0；配置在构造时解析，不能热切换。
 ```
 
 ```bash
@@ -426,5 +424,5 @@ python -m hyper_multicore.modules.mega_moe.schedule compare plan-a.json plan-b.j
 对已构建的host配置调用 `explain_schedule(cfg)`，再用 `json.dump` 保存上述plan JSON。
 该函数不读取设备tensor，不启动collective；输出逻辑stage、每核队列、真实依赖、事件阈值、
 计划指纹和runtime字节指纹。normal/profile的计划指纹相同；runtime字节指纹允许随记录模式变化。
-当前registry只包含已实现的两专家流水；不提供异步在途窗口、半核分区或solver导入接口。
-A3/BF16 MTE保留原队列；显式数学队列扫描仅在现有UDMA队列上支持，非零请求会报错。
+策略注册表提供 `two_expert_pipeline` 和 `builder_order`。
+BF16 MTE 使用隐式队列；显式数学队列扫描适用于 UDMA 队列，BF16 MTE 的非零扫描请求会报错。

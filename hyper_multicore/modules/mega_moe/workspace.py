@@ -36,7 +36,7 @@ from hyper_multicore.shmem import _lifecycle
 
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
-# The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
+# The composed Cube-only GMM and SwiGLU-grad kernels do not use these
 # tensor arguments. Keep non-empty ABI placeholders; native tiling reserves
 # the separate CANN library workspace needed by the enclosing operator.
 _GMM_WORKSPACE_BYTES = 512

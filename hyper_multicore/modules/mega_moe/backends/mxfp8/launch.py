@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-"""Byte-alias launch adapter for the separately versioned native MX task graph."""
+"""Byte-alias launch adapter for the native MXFP8 MegaMoE ABI."""
 
 from functools import lru_cache
 from collections.abc import Sequence
@@ -15,8 +15,8 @@ from ...spec import MegaMoeSpec
 @lru_cache(maxsize=1)
 def _load_mxfp8_native() -> None:
     _load_native()
-    if torch.ops.hyper_multicore.mxfp8_task_graph_version() != 3:
-        raise RuntimeError('MXFP8 task-graph adapter ABI mismatch; rebuild the local multicore component.')
+    if torch.ops.hyper_multicore.mega_moe_mxfp8_abi_version() != 3:
+        raise RuntimeError('MXFP8 MegaMoE adapter ABI mismatch; rebuild the local multicore component.')
 
 
 def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
@@ -45,14 +45,14 @@ def prepare_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
     return torch.frombuffer(bytearray(metadata), dtype=torch.uint8).to(device=runtime.device)
 
 
-def launch_mxfp8_task_graph(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
+def launch_mxfp8_experts(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
                            events: torch.Tensor, diagnostic: torch.Tensor, launch: torch.Tensor,
                            *, direction: str = 'forward') -> None:
-    """Run the native fused task graph with alias-preserving physical arguments."""
+    """Run the native fused MoE with alias-preserving physical arguments."""
     aliases = _byte_aliases(buffers)
     _load_mxfp8_native()
     if direction not in ('forward', 'backward'):
         raise ValueError('MX native direction must be forward or backward')
-    primary = (torch.ops.hyper_multicore.mxfp8_task_graph_grad if direction == 'backward'
-               else torch.ops.hyper_multicore.mxfp8_task_graph)
+    primary = (torch.ops.hyper_multicore.mega_moe_mxfp8_grad if direction == 'backward'
+               else torch.ops.hyper_multicore.mega_moe_mxfp8)
     primary(aliases, runtime, events, diagnostic, launch)

@@ -18,11 +18,6 @@
       "torch_cxx11_abi": "reported by the active torch package"
     }
   },
-  "local_compatibility": {
-    "cann": [
-      "9.2.0"
-    ]
-  },
   "components": {
     "multicore": {
       "ops_nn": {
@@ -177,7 +172,7 @@
         "commit": "c350b98e15dfd31c9b06464d1dfdfa1ad06a939b",
         "tree": "f60225e2beb7d59a55c095a7c0c650f46540aa78",
         "git_archive_tar_sha256": "6ac45efc6377f5843a2ba0db908075a0008f1d6679e01646b466990b75e907b4",
-        "resolution": "A5 Blaze dependency pinned by ops-transformer dff221330e; all 47 original MX closure files match this Git tree",
+        "resolution": "Blaze GMM source pinned by ops-transformer dff221330e; exported from this exact Git revision",
         "patches": [
           {
             "path": "hyper_multicore/ops/patches/blaze_gmm_logical_workers.patch",
@@ -191,14 +186,5 @@
         "upgrade_policy": "preserve task-local numerical and resource contracts; verify BF16 and MX independently"
       }
     }
-  },
-  "current_repository_baseline": {
-    "shmem": "v1.8.0",
-    "ops_nn": "v9.1.0.pre",
-    "ops_transformer": {
-      "gmm": "v9.1.0.pre",
-      "mhc": "58b4a6bde"
-    },
-    "multicore_input": "locked ops-nn and ops-transformer kernel source plus the selected installed CANN >=9.1.0 toolchain"
   }
 }

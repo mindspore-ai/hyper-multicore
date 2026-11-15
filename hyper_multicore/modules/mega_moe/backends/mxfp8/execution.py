@@ -12,7 +12,7 @@ from hyper_multicore.torch import ops as multicore_ops
 
 from .autograd import MXFP8ForwardState
 from .diagnostics import current_mx_profile_scope, mx_profile_capture_enabled, profile_mx_launch
-from .launch import launch_mxfp8_task_graph, prepare_mxfp8_launch, serialize_mxfp8_launch
+from .launch import launch_mxfp8_experts, prepare_mxfp8_launch, serialize_mxfp8_launch
 from .weights import MXFP8PhysicalWeight
 from ...route import prepare_topk_route
 
@@ -47,7 +47,7 @@ class MXFP8Execution:
     def _launch(self, buffers, runtime, events, plan, device, direction="forward"):
         if events.numel() < runtime.event_capacity * 4:
             raise ValueError("MX event storage is smaller than the graph")
-        launch_graph = partial(launch_mxfp8_task_graph, direction=direction)
+        launch_graph = partial(launch_mxfp8_experts, direction=direction)
         if mx_profile_capture_enabled():
             scope = current_mx_profile_scope() or self._profile_scope
             if direction == 'forward':

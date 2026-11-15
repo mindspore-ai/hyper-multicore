@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-#include "../../hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.h"
-#include "../../hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.h"
+#include "../../../hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.h"
+#include "../../../hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.h"
 #include "register/op_impl_registry.h"
-#include "../../hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8_tiling_key.h"
+#include "../../../hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8_tiling_key.h"
 #include "tiling/platform/platform_ascendc.h"
 namespace optiling {
 template <class TilingData>

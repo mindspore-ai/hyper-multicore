@@ -231,7 +231,7 @@ FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
 ```text
 用户 (Python)
     ↓ build_forward_graph(tsv)
-ComputeGraph [modules/mega_moe/forward/graph.py]
+ComputeGraph [modules/mega_moe/backends/bf16/forward/graph.py]
     ↓ propagate_splits(tsv)
 各 OperatorNode 的 task_num / split_dim 被自动填充
     ↓ build_runtime_config(graph, tsv, rank_id)
@@ -748,7 +748,7 @@ def build_attention_fwd_graph(tsv: TaskSplitValue, ...) -> ComputeGraph:
     return g
 ```
 
-**Step 3** — 实现 CLI（参考 `modules/mega_moe/forward/gen_runtime_data.py`）：
+**Step 3** — 实现 CLI（参考 `modules/mega_moe/backends/bf16/forward/gen_runtime_data.py`）：
 
 ```python
 def main():
@@ -850,80 +850,78 @@ _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
 | `runtime/worker_kernel.h` 找不到 | 新算子未纳入隔离源码组装 | 检查 `assemble_multicore_source.py` 的算子列表和 `MULTICORE_SOURCE_ASSEMBLY_FAILED` 日志 |
 | Python `ImportError: scheduler` | 从非包根目录运行 | 从 `hyper-multicore/` 根目录用 `python -m` 方式运行 |
 
-## A5 MegaMoE 迁移边界
+## MegaMoE 精度后端与任务边界
 
-BF16 和 MXFP8 共用 `modules/mega_moe/transport.py` 的 QP0 owner 规划和
-`ops/hyper_mega_moe/op_kernel/adapters/common/transport_task.h` 的完整传输/信用协议。SHMEM 只提供 MTE、UDMA
-及其完成语义，不解释专家、路由或模型层。A3 使用 MTE；A5 可显式选择 MTE 或 UDMA。
-UDMA 每个远端 peer 固定一个 QP，不读取历史的多 QP 配置变量。不同 peer 的 QP0 彼此独立。
+公共入口为 `MegaMoeExperts(precision="bf16" | "mxfp8")`；默认 BF16。
+模块、spec、route、transport、schedule、heap/workspace 与资源生命周期位于
+`modules/mega_moe/`。数学后端同级位于 `backends/bf16/` 与 `backends/mxfp8/`，
+负责各自的计算图、autograd、tiling/launch 和权重存储合同。
+后端通过普通 Python 模块分发，不创建嵌套 nn.Module；BF16 自有参数名为
+`gate_up_weight` / `down_weight`。外部权重以每次 forward 的 `expert_weights` 传入。
 
-通信 AIV 按 peer 固定 owner，包含 post 和 quiet；本地自拷贝分散到可用 AIV，使用 MTE
-双缓冲，不占 QP。完成之前不发布消费者信用。Pull 的源 ready、读完成和源存储复用握手
-仍由公共运行时执行。跨 workspace/stream 的 QP0 使用由现有完成事件排序，不额外添加设备打点。
-
-业务 DAG 和两专家交错流水在 `modules/mega_moe/schedule.py`，通用运行时只执行显式的每核队列。
-通信保持 FIFO，数学队列可配置 queue-ready-lookahead 0/1/8；这不是跨核偷取，也不是固定 solver 表。
-每核队列是可选 ABI 扩展，旧队列的二进制前缀保持不变。核数由设备查询，业务层不固定写死为 32。
-当前数学队列采用偶数 AIV、通信采用奇数 AIV 的分工；通用运行时不包含这种分工假设。
-
-A5 数学实现从锁定的 CANN Git 源码装配，不在仓库内保存第二套 Blaze 或 SwiGLUGrad 源码树：
-
-| 内容 | 来源 | 本仓适配边界 |
+| 后端 | 使用范围 | 输入与权重 |
 |---|---|---|
-| BF16 GMM NN/NT/TN | ops-tensor `c350b98e15` | 已解析的单专家、逻辑核编号、原标准 tile 循环 |
-| MX GMM | 同一 ops-tensor revision | 单专家入口、逻辑核轮转、资源/scale 配置 |
-| BF16 SwiGLUGrad | 原锁定 ops-nn `39e54ece7e` arch35 | 逻辑 AIV 编号；clamp/不适用形状保留原路径 |
-| MX 量化/SwiGLU 正反向 | 同一 ops-nn revision 的 arch35 | task 内 tiling、逻辑编号和物理 scale 布局 |
-| SHMEM | 原 master 锁定 v1.8.0 | 保留 master 的运行时符号和日志适配 |
+| BF16 | A3/A5；自动 token 容量或显式 token 规格 | BF16 hidden states；BF16 EIO/EOI 专家权重 |
+| MXFP8 | A5；显式 `local_num_tokens`；H/I 为64的倍数 | BF16 hidden states；调用方持有原始 MX 权重 root；EIO；不支持激活 clamp |
 
-适配补丁不会重写 FMA、激活或量化数学函数。必要的代码包括指针/布局解释、单专家尾块、
-空专家零梯度、task 完成前排空和 tiling 配置。它们仍须通过数值/生命周期门禁；
-“来自标准源码”不等于已证明与当前系统 native 二进制选中了相同分支。
-构建输入的实际文件 SHA 在装配目录 `source/a5/sources.json`。
+MX 权重 root 提供当前 `col_data/col_scale`，反向还需 `row_data/row_scale`。
+量化数据为 E4M3FN，scale 为 uint8 存储的 E8M0 布局。反向从原始 root 重新解析当前物理存储，
+不缓存 FSDP gather 后的临时 view。激活保存、量化轴及 launch ABI 属于精度后端，
+资源共享不改变这些合同。no-grad 与重算采用 dual-axis SwiGLU 数学，no-clone 单独控制输出生命周期。
 
-MX 权重由调用方持有原始 Tensor/Parameter，提供当前 `col_data/col_scale`，反向还需
-`row_data/row_scale`。数据为 E4M3FN，scale 为 uint8 物理 E8M0 布局，逻辑权重为 EIO。
-反向重新从原始 root 解析物理存储，禁止缓存 FSDP gather 后的临时 view。
-正向 no-grad、首轮/重算使用同一个 SwiGLU dual-axis 数学实现；no-grad no-clone 单独控制输出生命周期。
-Pull 的图计划按静态上界复用，真实负载只改变运行时 metadata，不生成逐路由队列表。
+### 标准数学、tiling、patch 与 adapter
 
-未迁入未采纳的固定 solver 表、半核候选、老 SHMEM SDK、额外故障观察器和多 QP 开关。
-历史阴性实验不能作为否定新架构组合的依据；后续候选应单独提交并与迁移基线比较。
+数学源码由构建入口从 `dependencies.lock.json` 指定的 Git revision 导出。
+本仓不维护独立的 Blaze 或 SwiGLUGrad 数学源码副本。
 
+| 内容 | 来源与作用 |
+|---|---|
+| BF16/MX GMM | ops-tensor Blaze；task 调用单专家入口，执行标准数学块 |
+| BF16 SwiGLUGrad | ops-nn arch35；按逻辑 AIV 编号处理当前 task |
+| MX 量化/SwiGLU 正反向 | ops-nn arch35；保留标准数值规则和 scale 布局 |
+| `blaze_gmm_logical_workers.patch` | ops-tensor 的 GMM 单专家入口与逻辑核绑定；适用于 arch35 |
+| `grouped_matmul_fusion.patch` | ops-transformer GMMProcess task 接入；与 Blaze 分别锁定和应用 |
+| `swiglu_grad_logical_worker.patch` / `mx_quant_logical_workers.patch` | ops-nn 逻辑核及 task 范围入口 |
 
-### A5任务适配与标准数学边界
+patch 在隔离构建目录中应用于上游源码；adapter 是本仓的 task 接入代码。
+`ops/hyper_mega_moe/op_kernel/contracts/` 定义 descriptor，
+`adapters/common/` 负责公共 GMM 核映射及 MoE 传输任务解释，
+`adapters/arch35/{gmm,swiglu,quantization}/` 绑定标准数学实现。
+尾块、空专家零梯度、地址范围检查及任务完成前的资源排空属于执行合同。
 
-`ops/`下的A5私有数学/通信适配收敛到`hyper_mega_moe/op_kernel/`：
-`contracts/`保存布局与descriptor，`adapters/common/`翻译MoE传输任务，
-`adapters/arch35/`绑定锁定的Blaze、SwiGLUGrad及MX量化数学。
-正反向和两种精度共同引用，不在ops顶层维护bf16_gmm或mxfp8小算子目录。
-上游数学源码仍由构建时Git导出，不复制第二份源码树。
+数学 tiling 并未完整复用 native Host tiler。BF16 GMM 使用 Host tiling 表、维度修补和
+A5 adapter 中的固定数学块/尾块配置；MX GMM 的 Host descriptor 选择 tile，device adapter
+选择 scale/L1 缓冲及流水级数；SwiGLUGrad 与 MX 量化也有本地参数构造。
+这些是算子接入层的显式策略，标准数学源码来源不能证明 native 对相同 shape 选择了同一分支。
+`op_host/mxfp8/tiling.cpp` 只负责 MegaMoE 外层 launch 的 buffer 数、核数和 tiling key，
+与 GMM/量化的数学 tiling 分开。
 
-本次目录整改保持数学模板、数值规则、tiling参数和完成协议不变。
-当前BF16 GMM固定tile、SwiGLUGrad UB参数以及MX tile/缓冲选择仍是本地选择逻辑，
-不能因此宣称与native完整tiler一致。它们需按锁源可复用函数逐项审查；
-本次没有为缩减行数删掉尾块、空专家dW清零、地址范围校验或源复用保护。
+### 通信与调度
 
-`schedule.py`中逻辑stage绑定与纯队列策略分开；策略只返回数学任务排队结果，
-公共层合并固定owner的通信队列，并验证完整唯一覆盖及QP0所有权。
-数学DAG、传输分片和事件生成不由策略隐式改写。
-用户只有一个队列扫描参数，FIFO/bounded-ready由其内部推导；仍保留现有0/1/8能力。
-MX正反向共享schema、推导和launch封装，保持两个ACLNN名称及Hardware轨道身份。
+两种精度的 token、combine 结果及反向通信 payload 均为 BF16；MX 在接收后量化。
+BF16/MX 共用 `transport.py` 的 QP0 owner 规划与
+`adapters/common/transport_task.h` 的传输/信用协议。SHMEM 提供 MTE、UDMA 和完成语义；
+MoE task 解释路由与偏移并发布业务信用。每个远端 peer 固定一个 QP，不同 peer 的 QP0 独立。
+A3 使用 MTE；A5 可通过 `HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_udma` 使用 UDMA。
+本地自拷贝采用 MTE。Put/Get 完成确认后才满足消费者依赖，Pull 的 source-ready、读完成与源复用
+由 task 和公共执行协议共同约束。跨 workspace/stream 的提交通过完成事件排序。
 
+`schedule.py` 把数学 stage 绑定与排队策略分开；策略不改数学 DAG、通信分片和事件阈值。
+`two_expert_pipeline` 为默认两专家交错流水；`builder_order` 按 builder 数学顺序排队。
+两者共用固定数学 owner、通信 FIFO 及完整任务覆盖/远端 QP0 所有权检查。
+UDMA 显式队列中，数学使用偶数 AIV，通信使用奇数 AIV；通用 runtime 不包含此业务分工。
+数学队列扫描 `queue_ready_lookahead=0/1/8` 分别为 FIFO、队首就绪检查、有限就绪选择。
+通信与终止任务不参与数学重排；不跨核搬任务。BF16 MTE 使用隐式队列，非零扫描参数会报错。
+核数在绑定设备时查询。Pull 计划按静态路由上界缓存，真实负载更新运行时 metadata。
 
-### 精度后端与算子任务命名
+### Host 与框架绑定
 
-公共 `MegaMoeExperts` 接口、spec、transport、schedule、route、heap/workspace 和资源生命周期
-位于 `modules/mega_moe/`。BF16、MXFP8 在同级 `backends/bf16/` 与 `backends/mxfp8/`
-实现数学图、autograd、tiling/launch 和物理权重合同。后端以普通 Python 模块分发，
-不嵌套 nn.Module，BF16 参数名保持 `gate_up_weight` / `down_weight`，外部权重 root 不由执行器持有参数副本。
-两种精度的 descriptor、激活保存及反向权重来源不同，因此不强行合并 autograd/launch ABI。
+任务封装按算子职责组织在 `tasks/gmm_mxfp8.py`、`quantization_mxfp8.py`、`swiglu_mxfp8.py`。
+MoE launch descriptor 位于 `backends/mxfp8/launch_contract.py`，与 GMM 数学 descriptor 分开。
+`torch/csrc/mega_moe_mxfp8.cpp` 绑定专用的 `mega_moe_mxfp8` / `mega_moe_mxfp8_grad` Torch op；
+它们不是可承载任意业务 DAG 的通用 task-graph 算子。
+对应 ACLNN 名称为 `aclnnHyperMegaMoeMxfp8` 和 `aclnnHyperMegaMoeMxfp8Grad`。
 
-任务按算子职责命名：`tasks/gmm_mxfp8.py`、`quantization_mxfp8.py`、`swiglu_mxfp8.py`。
-MoE launch 头放在 `backends/mxfp8/launch_contract.py`，不混入 GMM 数学 descriptor。
-私有 device adapter 按 `gmm/`、`swiglu/`、`quantization/` 组织在 arch35 下；GMM 逻辑核轮转
-由 `adapters/common/gmm_logical_workers.h` 供两种精度共用。
-
-`blaze_gmm_logical_workers.patch` 适配 ops-tensor 的 Blaze GMM，当前消费者为 arch35。
-`grouped_matmul_fusion.patch` 适配 ops-transformer 的 GMMProcess，两者的上游目录、接口不同，
-保持分别锁定和应用。补丁名标明算子，不把架构信息重复写进文件名；适用架构记录在锁源清单。
+正反向的公共 op-api 声明与编译入口分别为各自目录中的 `aclnn_*.h` / `aclnn_*.cpp`。
+共享 Host schema、外层 tiling、L0/L2 实现位于 `hyper_mega_moe/op_host/mxfp8/`，
+由两个入口分别实例化，保留独立的算子与 Hardware 轨道身份。

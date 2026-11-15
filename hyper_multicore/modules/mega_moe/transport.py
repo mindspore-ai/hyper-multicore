@@ -9,7 +9,7 @@ TRANSPORT_TASKS = (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_M
 
 @lru_cache(maxsize=1)
 def require_queue_backend():
-    """Reject an old native payload before it can interpret an explicit queue image."""
+    """Require the native runtime ABI needed to interpret explicit worker queues."""
     import torch
     from hyper_multicore.torch.ops import _load_native
     _load_native()

@@ -98,7 +98,7 @@ MegaKernel是融合任务的执行方式；MegaMoe是使用该方式的业务模
 | 所有者 | 负责的状态与行为 |
 | --- | --- |
 | [Multicore资源管理](../hyper_multicore/modules/module.py) | 模块成员、兼容资源共享、延迟绑定、协调关闭 |
-| [MegaMoe spec与plan](../hyper_multicore/modules/mega_moe/backends/bf16/plan.py) | 业务规格、正反向计算图、任务/事件配置和tiling |
+| [MegaMoe spec](../hyper_multicore/modules/mega_moe/spec.py)、[BF16 plan](../hyper_multicore/modules/mega_moe/backends/bf16/plan.py)、[MX graph](../hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py) | 业务规格、精度后端的正反向图、任务/事件及 tiling |
 | [MegaMoe HeapManager](../hyper_multicore/modules/mega_moe/heap_manager.py) | reservation、layout、容量预算、替换描述、业务epoch和growth record |
 | [MegaMoe workspace](../hyper_multicore/modules/mega_moe/workspace.py) | Tensor字段映射、lease、完成事件、反向图使用关系和业务计数器布局 |
 | [SHMEM lifecycle](../hyper_multicore/shmem/_lifecycle.py) | 引用、Root一致性、阶段收敛、物理restart编排和进程级不可用标记 |

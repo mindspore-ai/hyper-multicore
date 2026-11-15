@@ -232,11 +232,11 @@ class MegaMoeExperts(MulticoreModule):
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
-                preserves the legacy unclamped path.
+                selects the unclamped activation.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
-                ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
+                ``[experts, in_features, out_features]``. ``"EOI"`` means
                 ``[experts, out_features, in_features]`` and accepts Torch linear storage directly. ``EOI`` weights
                 must use dense contiguous storage for zero-copy execution.
             ep_group: Explicit EP group; expert ownership follows group-local rank order.

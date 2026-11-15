@@ -130,7 +130,7 @@ def _two_expert_pipeline(stages):
 
 
 def _builder_order(stages):
-    """Keep builder math order on the shared fixed owners; no legacy QP rollback."""
+    """Keep builder math order on the shared fixed owners; communication owner queues remain fixed."""
     vectors = [[] for _ in range(2 * stages.cores)]
     for lane, queue in enumerate(stages.original_vectors):
         vectors[2 * lane] = list(queue)
@@ -150,14 +150,14 @@ def describe_schedule_policy(name):
         raise ValueError(f'Unknown MegaMoE schedule policy {name!r}; available: {list_schedule_policies()}')
     return {'name': name, 'precision': ['bf16', 'mxfp8'], 'phases': ['forward', 'backward'],
             'queue_ready_lookahead': [0, 1, 8], 'transport_fifo': True,
-            'legacy_bf16_mte': 'preserved; explicit math-queue selection requires UDMA'}
+            'bf16_mte': 'implicit queues; nonzero math-queue lookahead requires UDMA'}
 
 
 def configure_expert_queues(cfg, graph, spec, *, forward):
     """Compile a policy over fixed QP0 owners and serialize the existing queue ABI."""
     if spec.transport_engine != 'udma' and spec.precision == 'bf16':
         if spec.ready_depth:
-            raise ValueError('BF16 MTE legacy queues do not support explicit math queue ready selection')
+            raise ValueError('BF16 MTE implicit queues do not support explicit math queue ready selection')
         return cfg
     stages = _expert_stages(graph, spec, forward, cfg)
     describe_schedule_policy(spec.schedule_policy)
@@ -182,7 +182,7 @@ def explain_schedule(cfg):
     """Export static queues and actual dependencies without device reads or logging."""
     from hyper_multicore.scheduler.runtime import serialize_runtime_config
     if cfg.queue_layout != 1:
-        return {'layout': 'legacy'}
+        return {'layout': 'implicit'}
     cubes = cfg.num_workers // 2
     queues = []
     for worker, queue in enumerate(cfg.worker_queues):
