@@ -53,6 +53,8 @@ from hyper_multicore.diagnostics import MegaKernelDiagnostics
 
 ## 开发与测试
 
+所有组件的新代码与存量重构遵循[架构与代码归属规范](docs/architecture-contract.md)，包括职责分层、依赖方向、目录归属和 review 门禁。
+
 Python 实现、设备 kernel 和 native binding 位于 `hyper_multicore/`。
 HyperParallel 是下游消费方，构建、测试及使用本包均不依赖它。
 

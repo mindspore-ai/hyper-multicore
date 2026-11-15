@@ -11,6 +11,8 @@ private SHMEM communication resources.
 - **MegaMHC**: residual-stream mixing with forward and backward operators.
 - **Diagnostics**: kernel profiling and tensor dumps.
 
+Development and refactoring follow the [architecture and code ownership contract](docs/architecture-contract.md).
+
 ## Quick start
 
 Use Linux with an Ascend NPU, Python/CPU architecture matching the wheel tags, and mutually compatible
