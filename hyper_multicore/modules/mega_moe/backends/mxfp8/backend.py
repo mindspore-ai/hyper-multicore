@@ -6,7 +6,6 @@ from functools import cached_property
 
 import torch
 
-from hyper_multicore._loader import query_npu_arch
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
 from ...resources import _MegaMoeExecutionResources
 from .diagnostics import prepare_mx_diagnostics

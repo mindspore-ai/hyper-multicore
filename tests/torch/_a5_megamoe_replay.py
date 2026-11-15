@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import timedelta
 import torch, torch.distributed as dist, torch_npu
 from hyper_multicore import MegaMoeExperts
+from hyper_multicore.experimental import MegaMoeTuningOptions
 
 def main():
     p = argparse.ArgumentParser()
@@ -42,7 +43,11 @@ def main():
         root = torch.nn.Parameter(w)
         roots.append(root)
         physical.append(quant)
-    module = MegaMoeExperts(precision=a.precision, local_num_tokens=a.tokens, hidden_size=h, intermediate_size=i, num_experts=e * world, top_k=k, ep_size=world, ep_group=dist.group.WORLD, create_parameters=False, dispatch_mode=a.mode, initial_capacity_factor=2 if a.mode == 'push' else None)
+    module = MegaMoeExperts(precision=a.precision, hidden_size=h, intermediate_size=i,
+                            num_experts=e * world, top_k=k, ep_group=dist.group.WORLD,
+                            tuning_options=MegaMoeTuningOptions(
+                                dispatch_mode=a.mode, dispatch_split=512, combine_split=512,
+                                initial_capacity_factor=2 if a.mode == 'push' else None))
 
     def axes(backward=False, fresh=False):
         if a.precision == 'bf16':

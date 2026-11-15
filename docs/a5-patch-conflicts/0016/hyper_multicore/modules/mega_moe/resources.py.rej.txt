@@ -1,0 +1,10 @@
+diff a/hyper_multicore/modules/mega_moe/resources.py b/hyper_multicore/modules/mega_moe/resources.py	(rejected hunks)
+@@ -118,7 +118,7 @@ class _MegaMoeExecutionResources:
+                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
+                   "batch_experts", "nominal_schedule")
+         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
+-        manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout,
++        manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
+                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
+         # Resource groups must have the same order as their symmetric allocations.
+         manifests = [None] * self.spec.ep_size

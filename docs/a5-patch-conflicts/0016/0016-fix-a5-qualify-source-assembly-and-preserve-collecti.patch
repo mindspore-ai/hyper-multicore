@@ -1,0 +1,181 @@
+From 41067ed5ef2794b8143ee2563f133dfbbda2f431 Mon Sep 17 00:00:00 2001
+From: hedongdong <hdd475375904@126.com>
+Date: Sun, 15 Nov 2026 18:10:15 +0800
+Subject: [PATCH 16/27] fix(a5): qualify source assembly and preserve
+ collective backend validation
+
+---
+ .../_build/assemble_multicore_source.py          |  1 +
+ .../modules/mega_moe/backends/mxfp8/backend.py   |  7 +++----
+ .../modules/mega_moe/backends/mxfp8/weights.py   |  4 ++++
+ hyper_multicore/modules/mega_moe/module.py       |  7 +++++++
+ hyper_multicore/modules/mega_moe/resources.py    |  2 +-
+ hyper_multicore/ops/runtime/worker_kernel.h      | 16 ----------------
+ tests/torch/_a5_megamoe_replay.py                |  7 ++++++-
+ tests/ut/modules/mega_moe/test_module.py         |  4 ++--
+ 8 files changed, 24 insertions(+), 24 deletions(-)
+
+diff --git a/hyper_multicore/_build/assemble_multicore_source.py b/hyper_multicore/_build/assemble_multicore_source.py
+index 01e5d47..4b53321 100644
+--- a/hyper_multicore/_build/assemble_multicore_source.py
++++ b/hyper_multicore/_build/assemble_multicore_source.py
+@@ -278,6 +278,7 @@ def _compose_hyper_multicore_ops(
+ ) -> None:
+     """Compose HP operator code with selected adapted upstream kernel sources."""
+     shutil.copytree(_MULTICORE_OPS / "runtime", source_root / "runtime")
++    shutil.copytree(_MULTICORE_OPS / "common", source_root / "common")
+     shmem_root = source_root / "shmem"
+     shmem_root.mkdir(parents=True)
+     (shmem_root / "cann").mkdir()
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py
+index 9514676..86854fd 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py
+@@ -6,7 +6,6 @@ from functools import cached_property
+ 
+ import torch
+ 
+-from hyper_multicore._loader import query_npu_arch
+ from hyper_multicore.scheduler.runtime import serialize_runtime_config
+ from ...resources import _MegaMoeExecutionResources
+ from .diagnostics import prepare_mx_diagnostics
+@@ -50,13 +49,13 @@ class _MXFP8Plan:
+ 
+ class Resources(_MegaMoeExecutionResources):
+     def __init__(self, specification, tensor, *, expert_weight_layout, shared, active_specifications):
+-        if query_npu_arch() != 3510:
+-            raise ValueError("MX expert mathematics currently requires A5")
+         super().__init__(specification, tensor, expert_weight_layout=expert_weight_layout, shared=shared, active_specifications=active_specifications)
+         self._plans = OrderedDict()
+ 
+     def _initial_plan(self, tensor):
+-        # MX plans are selected by physical capacity; never construct a BF16 math plan.
++        # Capability rejection participates in the common construction collective.
++        if self.spec.architecture != 3510:
++            raise ValueError("MX expert mathematics currently requires A5")
+         return None
+ 
+     def plan_for_capacity(self, capacity, device, *, tokens=None):
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/weights.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/weights.py
+index b82cc78..340876f 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/weights.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/weights.py
+@@ -65,6 +65,10 @@ class MXFP8ExpertWeightBinding:
+             raise ValueError(f'MegaMoE MXFP8 current root is missing required {direction} data/scale.')
+         if data.dtype != torch.float8_e4m3fn or scale.dtype != torch.uint8:
+             raise TypeError('MegaMoE MXFP8 physical storage requires E4M3FN data and packed uint8 E8M0 scales.')
++        if not data.is_contiguous() or not scale.is_contiguous():
++            raise ValueError("MX physical data and scale must be contiguous; implicit copies are forbidden")
++        if data.device != self.root.device or scale.device != self.root.device:
++            raise ValueError("MX physical data, scales and current root must share a device")
+         experts, rows, columns = self.logical_shape
+         scale_shape = ((experts, rows, columns // 64, 2) if direction == 'row'
+                        else (experts, rows // 64, columns, 2))
+diff --git a/hyper_multicore/modules/mega_moe/module.py b/hyper_multicore/modules/mega_moe/module.py
+index 870ff1f..92645bb 100644
+--- a/hyper_multicore/modules/mega_moe/module.py
++++ b/hyper_multicore/modules/mega_moe/module.py
+@@ -164,6 +164,13 @@ class MegaMoeExperts(MulticoreModule):
+         if precision == "mxfp8" and (numerics.swiglu_limit is not None or numerics.apply_probs_before_fc2):
+             raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
+         scheduler = tuning.scheduler
++        if scheduler is not None:
++            if scheduler.lowering not in ("auto", "dense", "compact"):
++                raise ValueError("MegaMoE lowering must be auto, dense or compact")
++            for name in ("batch_experts", "nominal_schedule"):
++                value = getattr(scheduler, name)
++                if value is not None and not isinstance(value, bool):
++                    raise TypeError(f"{name} must be bool or None")
+         resolved = resolve_schedule_options(scheduler, precision=precision)
+         specification = {
+             "local_num_tokens": _COMMUNICATION_SPLIT,
+diff --git a/hyper_multicore/modules/mega_moe/resources.py b/hyper_multicore/modules/mega_moe/resources.py
+index fb8c646..2e03c4a 100644
+--- a/hyper_multicore/modules/mega_moe/resources.py
++++ b/hyper_multicore/modules/mega_moe/resources.py
+@@ -118,7 +118,7 @@ class _MegaMoeExecutionResources:
+                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
+                   "batch_experts", "nominal_schedule")
+         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
+-        manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout,
++        manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
+                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
+         # Resource groups must have the same order as their symmetric allocations.
+         manifests = [None] * self.spec.ep_size
+diff --git a/hyper_multicore/ops/runtime/worker_kernel.h b/hyper_multicore/ops/runtime/worker_kernel.h
+index a9818f6..ddd047f 100644
+--- a/hyper_multicore/ops/runtime/worker_kernel.h
++++ b/hyper_multicore/ops/runtime/worker_kernel.h
+@@ -303,22 +303,6 @@ class KernelWorkerBase {
+     WaitForDependency(meta.ready_event);
+ #endif
+   }
+-#else
+-  __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
+-#ifdef HMC_RUNTIME_CUBE
+-    WaitForDependency(meta.ready_event);
+-#else
+-    if (this->active_vector_num != this->vector_num && this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
+-      return;
+-    }
+-    const uint32_t leader = this->active_vector_num == this->vector_num ? 0 : 1;
+-    if (this->worker_id_ == leader) {
+-      PublishDeviceReady(meta);
+-    }
+-    WaitForDependency(meta.ready_event);
+-#endif
+-  }
+-#endif
+ 
+   __aicore__ inline TaskId GetTaskIndex(uint32_t task_id) {
+ #ifdef HMC_RUNTIME_CUBE
+diff --git a/tests/torch/_a5_megamoe_replay.py b/tests/torch/_a5_megamoe_replay.py
+index 9a41740..9a62bbe 100644
+--- a/tests/torch/_a5_megamoe_replay.py
++++ b/tests/torch/_a5_megamoe_replay.py
+@@ -10,6 +10,7 @@ from pathlib import Path
+ from datetime import timedelta
+ import torch, torch.distributed as dist, torch_npu
+ from hyper_multicore import MegaMoeExperts
++from hyper_multicore.experimental import MegaMoeTuningOptions
+ 
+ def main():
+     p = argparse.ArgumentParser()
+@@ -42,7 +43,11 @@ def main():
+         root = torch.nn.Parameter(w)
+         roots.append(root)
+         physical.append(quant)
+-    module = MegaMoeExperts(precision=a.precision, local_num_tokens=a.tokens, hidden_size=h, intermediate_size=i, num_experts=e * world, top_k=k, ep_size=world, ep_group=dist.group.WORLD, create_parameters=False, dispatch_mode=a.mode, initial_capacity_factor=2 if a.mode == 'push' else None)
++    module = MegaMoeExperts(precision=a.precision, hidden_size=h, intermediate_size=i,
++                            num_experts=e * world, top_k=k, ep_group=dist.group.WORLD,
++                            tuning_options=MegaMoeTuningOptions(
++                                dispatch_mode=a.mode, dispatch_split=512, combine_split=512,
++                                initial_capacity_factor=2 if a.mode == 'push' else None))
+ 
+     def axes(backward=False, fresh=False):
+         if a.precision == 'bf16':
+diff --git a/tests/ut/modules/mega_moe/test_module.py b/tests/ut/modules/mega_moe/test_module.py
+index 0239ca8..f95fcb8 100644
+--- a/tests/ut/modules/mega_moe/test_module.py
++++ b/tests/ut/modules/mega_moe/test_module.py
+@@ -273,7 +273,7 @@ class TestMegaMoeExperts(unittest.TestCase):
+         Expectation: Every mismatch fails before symmetric allocation or count exchange.
+         """
+         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+-        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI")
++        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI", architecture=2201)
+         for mismatch in ("configuration", "wire", "layout"):
+             def gather(output: list, value: Any, kind: str = mismatch, **kwargs: Any) -> None:
+                 """Change one peer agreement field while preserving all unrelated metadata."""
+@@ -296,7 +296,7 @@ class TestMegaMoeExperts(unittest.TestCase):
+     def test_precision_options_participate_in_rank_consensus(self) -> None:
+         """Reject a rank using a different clamp or routing-probability definition."""
+         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+-        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI")
++        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI", architecture=2201)
+         specification = {"local_num_tokens": 128, "auto_tokens": True, "expert_weight_layout": "EOI",
+                          "swiglu_limit": 0.5, "clamp_after_activation": False, "apply_probs_before_fc2": False}
+ 
+-- 
+2.54.0
+

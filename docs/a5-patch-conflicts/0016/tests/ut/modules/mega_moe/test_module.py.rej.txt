@@ -1,0 +1,19 @@
+diff a/tests/ut/modules/mega_moe/test_module.py b/tests/ut/modules/mega_moe/test_module.py	(rejected hunks)
+@@ -273,7 +273,7 @@ class TestMegaMoeExperts(unittest.TestCase):
+         Expectation: Every mismatch fails before symmetric allocation or count exchange.
+         """
+         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+-        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI")
++        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI", architecture=2201)
+         for mismatch in ("configuration", "wire", "layout"):
+             def gather(output: list, value: Any, kind: str = mismatch, **kwargs: Any) -> None:
+                 """Change one peer agreement field while preserving all unrelated metadata."""
+@@ -296,7 +296,7 @@ class TestMegaMoeExperts(unittest.TestCase):
+     def test_precision_options_participate_in_rank_consensus(self) -> None:
+         """Reject a rank using a different clamp or routing-probability definition."""
+         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
+-        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI")
++        resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI", architecture=2201)
+         specification = {"local_num_tokens": 128, "auto_tokens": True, "expert_weight_layout": "EOI",
+                          "swiglu_limit": 0.5, "clamp_after_activation": False, "apply_probs_before_fc2": False}
+ 

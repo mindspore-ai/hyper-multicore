@@ -278,6 +278,7 @@ def _compose_hyper_multicore_ops(
 ) -> None:
     """Compose HP operator code with selected adapted upstream kernel sources."""
     shutil.copytree(_MULTICORE_OPS / "runtime", source_root / "runtime")
+    shutil.copytree(_MULTICORE_OPS / "common", source_root / "common")
     shmem_root = source_root / "shmem"
     shmem_root.mkdir(parents=True)
     (shmem_root / "cann").mkdir()

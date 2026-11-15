@@ -93,5 +93,17 @@
     ],
     "action": "partial application; rejected hunks and original patch retained",
     "apply_exit_code": 1
+  },
+  {
+    "patch": 16,
+    "unmerged_paths": [],
+    "rejected_hunks": [
+      "tests/ut/modules/mega_moe/test_module.py.rej",
+      "hyper_multicore/modules/mega_moe/resources.py.rej",
+      "hyper_multicore/modules/mega_moe/module.py.rej",
+      "hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py.rej"
+    ],
+    "action": "partial application; rejected hunks and original patch retained",
+    "apply_exit_code": 1
   }
 ]

@@ -1,0 +1,15 @@
+diff a/hyper_multicore/modules/mega_moe/module.py b/hyper_multicore/modules/mega_moe/module.py	(rejected hunks)
+@@ -164,6 +164,13 @@ class MegaMoeExperts(MulticoreModule):
+         if precision == "mxfp8" and (numerics.swiglu_limit is not None or numerics.apply_probs_before_fc2):
+             raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
+         scheduler = tuning.scheduler
++        if scheduler is not None:
++            if scheduler.lowering not in ("auto", "dense", "compact"):
++                raise ValueError("MegaMoE lowering must be auto, dense or compact")
++            for name in ("batch_experts", "nominal_schedule"):
++                value = getattr(scheduler, name)
++                if value is not None and not isinstance(value, bool):
++                    raise TypeError(f"{name} must be bool or None")
+         resolved = resolve_schedule_options(scheduler, precision=precision)
+         specification = {
+             "local_num_tokens": _COMMUNICATION_SPLIT,

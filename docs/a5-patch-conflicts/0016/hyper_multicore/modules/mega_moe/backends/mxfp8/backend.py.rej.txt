@@ -1,0 +1,18 @@
+diff a/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/backend.py	(rejected hunks)
+@@ -50,13 +49,13 @@ class _MXFP8Plan:
+ 
+ class Resources(_MegaMoeExecutionResources):
+     def __init__(self, specification, tensor, *, expert_weight_layout, shared, active_specifications):
+-        if query_npu_arch() != 3510:
+-            raise ValueError("MX expert mathematics currently requires A5")
+         super().__init__(specification, tensor, expert_weight_layout=expert_weight_layout, shared=shared, active_specifications=active_specifications)
+         self._plans = OrderedDict()
+ 
+     def _initial_plan(self, tensor):
+-        # MX plans are selected by physical capacity; never construct a BF16 math plan.
++        # Capability rejection participates in the common construction collective.
++        if self.spec.architecture != 3510:
++            raise ValueError("MX expert mathematics currently requires A5")
+         return None
+ 
+     def plan_for_capacity(self, capacity, device, *, tokens=None):

@@ -303,22 +303,6 @@ class KernelWorkerBase {
     WaitForDependency(meta.ready_event);
 #endif
   }
-#else
-  __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
-#ifdef HMC_RUNTIME_CUBE
-    WaitForDependency(meta.ready_event);
-#else
-    if (this->active_vector_num != this->vector_num && this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
-      return;
-    }
-    const uint32_t leader = this->active_vector_num == this->vector_num ? 0 : 1;
-    if (this->worker_id_ == leader) {
-      PublishDeviceReady(meta);
-    }
-    WaitForDependency(meta.ready_event);
-#endif
-  }
-#endif
 
   __aicore__ inline TaskId GetTaskIndex(uint32_t task_id) {
 #ifdef HMC_RUNTIME_CUBE

@@ -65,6 +65,10 @@ class MXFP8ExpertWeightBinding:
             raise ValueError(f'MegaMoE MXFP8 current root is missing required {direction} data/scale.')
         if data.dtype != torch.float8_e4m3fn or scale.dtype != torch.uint8:
             raise TypeError('MegaMoE MXFP8 physical storage requires E4M3FN data and packed uint8 E8M0 scales.')
+        if not data.is_contiguous() or not scale.is_contiguous():
+            raise ValueError("MX physical data and scale must be contiguous; implicit copies are forbidden")
+        if data.device != self.root.device or scale.device != self.root.device:
+            raise ValueError("MX physical data, scales and current root must share a device")
         experts, rows, columns = self.logical_shape
         scale_shape = ((experts, rows, columns // 64, 2) if direction == 'row'
                        else (experts, rows // 64, columns, 2))
