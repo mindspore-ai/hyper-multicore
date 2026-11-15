@@ -1,0 +1,19 @@
+diff a/tests/ut/torch/test_native_utilities.py b/tests/ut/torch/test_native_utilities.py	(rejected hunks)
+@@ -28,17 +28,6 @@ import torch
+ from tests.common.mark_utils import arg_mark
+ 
+ _STUB_HEADERS = {
+-    "torch_npu/csrc/core/npu/NpuVariables.h": """#pragma once
+-namespace launch_test { extern int soc_version; }
+-namespace c10_npu {
+-enum class SocVersion { Ascend910B1=220, Ascend950=260 };
+-inline const SocVersion& GetSocVersion() {
+-    static SocVersion value;
+-    value = launch_test::soc_version == 3510 ? SocVersion::Ascend950 : SocVersion::Ascend910B1;
+-    return value;
+-}
+-}
+-""",
+     "launch_test_state.h": """#pragma once
+ namespace launch_test {
+ extern int callback_status;

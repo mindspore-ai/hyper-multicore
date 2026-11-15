@@ -1,0 +1,79 @@
+From b8d5b07ac1321d20ccd599cdf5cbc9e41c905031 Mon Sep 17 00:00:00 2001
+From: hedongdong <hdd475375904@126.com>
+Date: Sun, 15 Nov 2026 17:54:24 +0800
+Subject: [PATCH 15/27] fix(build): select MoE utility providers through the
+ public CANN SoC API
+
+---
+ hyper_multicore/torch/csrc/mega_moe_utilities.cpp | 12 ++++++------
+ tests/ut/torch/test_native_utilities.py           | 14 +++-----------
+ 2 files changed, 9 insertions(+), 17 deletions(-)
+
+diff --git a/hyper_multicore/torch/csrc/mega_moe_utilities.cpp b/hyper_multicore/torch/csrc/mega_moe_utilities.cpp
+index 7074697..9c20ffd 100644
+--- a/hyper_multicore/torch/csrc/mega_moe_utilities.cpp
++++ b/hyper_multicore/torch/csrc/mega_moe_utilities.cpp
+@@ -3,7 +3,7 @@
+ // Framework bindings for component-owned MoE utility providers.
+ #include <c10/core/DeviceGuard.h>
+ #include <torch/library.h>
+-#include <torch_npu/csrc/core/npu/NpuVariables.h>
++#include <cstring>
+ #include <torch_npu/csrc/core/npu/NPUStream.h>
+ #include <torch_npu/csrc/framework/OpCommand.h>
+ #include <acl/acl.h>
+@@ -28,14 +28,14 @@ extern "C" void HmcLaunchZeroCold_arch3510(unsigned blocks, void* stream, uint8_
+ #endif
+ namespace {
+ template <typename Fn> Fn SelectUtility(Fn a3, Fn a5) {
+-  (void)a5;
+-#if HMC_UTILITY_ARCH3510
+-  if (c10_npu::GetSocVersion() == c10_npu::SocVersion::Ascend950) {
++  const char *soc = aclrtGetSocName();
++  TORCH_CHECK(soc != nullptr, "cannot query the current NPU SoC");
++  if (std::strncmp(soc, "Ascend950", 9) == 0) {
+     TORCH_CHECK(a5 != nullptr, "MoE utility provider was not built for Ascend950");
+     return a5;
+   }
+-#endif
+-  TORCH_CHECK(a3 != nullptr, "MoE utility provider was not built for this device architecture");
++  TORCH_CHECK(std::strncmp(soc, "Ascend910", 9) == 0 && a3 != nullptr,
++              "MoE utility provider was not built for this device architecture: ", soc);
+   return a3;
+ }
+ using Outputs = std::tuple<at::Tensor&, at::Tensor&>;
+diff --git a/tests/ut/torch/test_native_utilities.py b/tests/ut/torch/test_native_utilities.py
+index 72a2348..1155489 100644
+--- a/tests/ut/torch/test_native_utilities.py
++++ b/tests/ut/torch/test_native_utilities.py
+@@ -28,17 +28,6 @@ import torch
+ from tests.common.mark_utils import arg_mark
+ 
+ _STUB_HEADERS = {
+-    "torch_npu/csrc/core/npu/NpuVariables.h": """#pragma once
+-namespace launch_test { extern int soc_version; }
+-namespace c10_npu {
+-enum class SocVersion { Ascend910B1=220, Ascend950=260 };
+-inline const SocVersion& GetSocVersion() {
+-    static SocVersion value;
+-    value = launch_test::soc_version == 3510 ? SocVersion::Ascend950 : SocVersion::Ascend910B1;
+-    return value;
+-}
+-}
+-""",
+     "launch_test_state.h": """#pragma once
+ namespace launch_test {
+ extern int callback_status;
+@@ -70,6 +59,9 @@ struct OpCommand {
+ }
+ """,
+     "acl/acl.h": """
++namespace launch_test { extern int soc_version; }
++inline const char* aclrtGetSocName() { return launch_test::soc_version == 3510 ? "Ascend950" : "Ascend910B1"; }
++
+ #pragma once
+ #include <cstdint>
+ #include "launch_test_state.h"
+-- 
+2.54.0
+

@@ -59,6 +59,9 @@ struct OpCommand {
 }
 """,
     "acl/acl.h": """
+namespace launch_test { extern int soc_version; }
+inline const char* aclrtGetSocName() { return launch_test::soc_version == 3510 ? "Ascend950" : "Ascend910B1"; }
+
 #pragma once
 #include <cstdint>
 #include "launch_test_state.h"

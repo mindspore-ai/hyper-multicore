@@ -83,5 +83,15 @@
     ],
     "rejected_hunks": [],
     "action": "incoming conflict versions retained; all stages archived for review"
+  },
+  {
+    "patch": 15,
+    "unmerged_paths": [],
+    "rejected_hunks": [
+      "tests/ut/torch/test_native_utilities.py.rej",
+      "hyper_multicore/torch/csrc/mega_moe_utilities.cpp.rej"
+    ],
+    "action": "partial application; rejected hunks and original patch retained",
+    "apply_exit_code": 1
   }
 ]

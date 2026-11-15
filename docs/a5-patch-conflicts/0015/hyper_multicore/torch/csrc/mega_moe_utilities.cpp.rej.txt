@@ -1,0 +1,30 @@
+diff a/hyper_multicore/torch/csrc/mega_moe_utilities.cpp b/hyper_multicore/torch/csrc/mega_moe_utilities.cpp	(rejected hunks)
+@@ -3,7 +3,7 @@
+ // Framework bindings for component-owned MoE utility providers.
+ #include <c10/core/DeviceGuard.h>
+ #include <torch/library.h>
+-#include <torch_npu/csrc/core/npu/NpuVariables.h>
++#include <cstring>
+ #include <torch_npu/csrc/core/npu/NPUStream.h>
+ #include <torch_npu/csrc/framework/OpCommand.h>
+ #include <acl/acl.h>
+@@ -28,14 +28,14 @@ extern "C" void HmcLaunchZeroCold_arch3510(unsigned blocks, void* stream, uint8_
+ #endif
+ namespace {
+ template <typename Fn> Fn SelectUtility(Fn a3, Fn a5) {
+-  (void)a5;
+-#if HMC_UTILITY_ARCH3510
+-  if (c10_npu::GetSocVersion() == c10_npu::SocVersion::Ascend950) {
++  const char *soc = aclrtGetSocName();
++  TORCH_CHECK(soc != nullptr, "cannot query the current NPU SoC");
++  if (std::strncmp(soc, "Ascend950", 9) == 0) {
+     TORCH_CHECK(a5 != nullptr, "MoE utility provider was not built for Ascend950");
+     return a5;
+   }
+-#endif
+-  TORCH_CHECK(a3 != nullptr, "MoE utility provider was not built for this device architecture");
++  TORCH_CHECK(std::strncmp(soc, "Ascend910", 9) == 0 && a3 != nullptr,
++              "MoE utility provider was not built for this device architecture: ", soc);
+   return a3;
+ }
+ using Outputs = std::tuple<at::Tensor&, at::Tensor&>;
