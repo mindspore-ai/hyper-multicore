@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #ifndef HYPER_MULTICORE_MXFP8_GMM_RESOURCE_POLICY_H_
 #define HYPER_MULTICORE_MXFP8_GMM_RESOURCE_POLICY_H_
-#include "hyper_mega_moe/op_kernel/contracts/mx_gmm_descriptor.h"
+#include "common/mega_moe/contracts/mx_gmm_descriptor.h"
 
 #ifdef __NPU_ARCH__
 #define MX_POLICY_INLINE __aicore__ inline

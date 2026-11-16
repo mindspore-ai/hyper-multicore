@@ -7,7 +7,7 @@ def test_pooled_metadata_view_uses_logical_bounds_within_physical_storage(tmp_pa
     root = Path(__file__).resolve().parents[4]
     source = tmp_path / 'contract.cpp'
     source.write_text('''
-#include "hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h"
+#include "common/mega_moe/contracts/mx_byte_tensor_list.h"
 int main() {
   using MulticoreMx::IsMxByteVectorShapeValid;
   if (!IsMxByteVectorShapeValid(0x100000001ULL, 2144, 48)) return 1;

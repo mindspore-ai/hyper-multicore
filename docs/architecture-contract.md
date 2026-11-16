@@ -63,7 +63,7 @@ flowchart TD
 | `tasks/` | 每种算子的 typed task 参数与 lowering，数学 tiling 的调用适配 |
 | `torch/` 等框架目录 | 框架 binding、注册、资源/stream 对接；不存放组件 device 算法 |
 | `ops/runtime/` | 通用 device 执行、事件与可观测性；只消费显式的通用合同 |
-| `ops/common/<component>/` | 同一组件正反向等多个入口共享的业务 device 代码 |
+| `ops/common/<component>/` | 同一组件多个 native 入口共享的业务合同；host 代码明确放在 op_host，device adapter 按架构归属 |
 | `ops/common/` 中的算子合同 | 真正可跨组件复用的算子参数编码与通用 primitive |
 | `ops/hyper_*/op_host/` | native ABI、形状/类型校验、外层资源与 launch tiling |
 | `ops/hyper_*/op_kernel/` | megakernel 入口、task 分发与标准算子 adapter |
@@ -144,3 +144,23 @@ flowchart TD
 - 每个例外有具体原因、所有者、验证和退出条件；不能仅写“后续优化”。
 
 架构图用于理解，正文合同用于判定。README 只作为入口，本规范是新开发和存量重构的共同依据。
+
+## 7. MegaMoE native operator ownership
+
+The public `MegaMoeExperts` interface selects precision. Native BF16 and MXFP8
+operator identities remain distinct; neither operator family owns the other.
+Each native operator directory owns its registration, launch tiling binding,
+op-api entry and kernel entry. Shared MoE mechanisms belong to
+`ops/common/mega_moe`, with host-only helpers under `op_host` and architecture
+adapters under `adapters/arch35`. Shared headers must not register operators.
+
+The shared MX task worker dispatches both forward and backward task graphs;
+it is component execution code rather than a standard-math adapter. It consumes
+component-owned descriptors. BF16 and MX math adapters call locked standard
+sources. Shared transport translates expert descriptors into SHMEM requests;
+QP and hardware completion remain in `shmem`. The generic runtime does not own
+these mathematical or routing implementations.
+
+Source assembly may copy shared headers into generated closures. Such copies
+are build products, not independent source owners. Changes must update the
+single checked-in owner, its consumers and source-assembly checks together.

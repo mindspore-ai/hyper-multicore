@@ -5,7 +5,7 @@
 
 #include "kernel_operator.h"
 #include "runtime/runtime_config.hpp"
-#include "hyper_mega_moe/op_kernel/contracts/mx_quant_descriptor.h"
+#include "common/mega_moe/contracts/mx_quant_descriptor.h"
 #define HYPER_MULTICORE_MX_LOGICAL_VECTOR
 #ifndef TPL_SCALE_ALG_0
 #define TPL_SCALE_ALG_0 0

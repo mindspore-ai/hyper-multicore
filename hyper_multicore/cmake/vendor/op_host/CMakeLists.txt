@@ -67,10 +67,14 @@ set(OP_TILING_SOURCES
 )
 
 if(EXISTS "${HP_MULTICORE_SOURCE_ROOT}/a5/sources.json")
-    list(APPEND OP_SCHEMA_SOURCES ${FWD_HOST}/mxfp8/schema.cpp)
-    list(APPEND OP_TILING_SOURCES ${FWD_HOST}/mxfp8/tiling.cpp)
+    list(APPEND OP_SCHEMA_SOURCES
+        ${MX_HOST}/hyper_mega_moe_mxfp8_def.cpp
+        ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_def.cpp)
+    list(APPEND OP_TILING_SOURCES
+        ${MX_HOST}/hyper_mega_moe_mxfp8_tiling.cpp
+        ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_tiling.cpp)
 endif()
-include_directories(${MX_HOST} ${MX_GRAD_HOST})
+include_directories(${MX_HOST} ${MX_GRAD_HOST} ${HP_MULTICORE_SOURCE_ROOT})
 
 function(hp_generate_op_definitions)
     set(ASCEND_COMPUTE_UNIT ${HP_MULTICORE_REGISTERED_SOCS})
@@ -82,6 +86,7 @@ function(hp_generate_op_definitions)
         COMPILE_OPTIONS
             -I${CANN_OP_COMMON_INCLUDE}
             -I${CANN_OP_HOST_INCLUDE}
+            -I${HP_MULTICORE_SOURCE_ROOT}
     )
 endfunction()
 hp_generate_op_definitions()

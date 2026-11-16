@@ -3,4 +3,4 @@
 #define HYPER_MX_OP HyperMegaMoeMxfp8Grad
 #define HYPER_MX_API aclnnHyperMegaMoeMxfp8Grad
 #define HYPER_MX_WORKSPACE_API aclnnHyperMegaMoeMxfp8GradGetWorkspaceSize
-#include "../../../hyper_mega_moe/op_host/mxfp8/op_api.inc"
+#include "common/mega_moe/op_host/mxfp8_op_api.inc"

@@ -2,7 +2,7 @@
 // Task binding only; numerical blocks and their tile loop are upstream Blaze.
 #pragma once
 #include "blaze/gemm/kernel/kernel_grouped_matmul.h"
-#include "hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h"
+#include "common/mega_moe/gmm_logical_workers.h"
 #include "bf16_problem.h"
 
 namespace MulticoreBf16 {

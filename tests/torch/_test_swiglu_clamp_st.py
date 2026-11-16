@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import torch_npu
 
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
-from hyper_multicore.modules.mega_moe import function as mega_function
+from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as mega_function
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import execute_mega_moe
 from hyper_multicore.modules.mega_moe.route import (
     PreparedTopKRoute,

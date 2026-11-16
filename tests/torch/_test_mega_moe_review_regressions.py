@@ -62,7 +62,7 @@ def _checkpoint_forward(
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
 def test_compact_header_uses_normal_ready_queue() -> None:
-    """Compact graphs publish ready_queue=1 in NORMAL mode for both layouts and clamp modes."""
+    """Compact graphs publish explicit worker queues in NORMAL mode for both layouts and clamp modes."""
     prepare_multicore_test_environment()
     torch.npu.set_device(0)
     device = torch.device("npu", 0)
@@ -80,7 +80,7 @@ def test_compact_header_uses_normal_ready_queue() -> None:
                 out = layer(x, ids, probs)
                 resources = layer._get_execution_resources(x.reshape(-1, 128))  # pylint: disable=protected-access
                 header = _header(resources.plan_for_tokens(tokens, device))
-                assert int(header.vector_ready_queue) == 1
+                assert int(header.queue_layout) == 2
                 assert int(header.diagnostic_mode) == 0
                 out.float().square().mean().backward()
                 assert x.grad is not None and torch.isfinite(x.grad).all()
@@ -113,7 +113,7 @@ def test_fp32_native_weight_gradients_before_autograd_cast() -> None:
             os.environ["HP_MEGA_MOE_CAPTURE_DW"] = "1"
             function_module._CAPTURED_WEIGHT_GRADS = None  # pylint: disable=protected-access
             try:
-                with patch.object(module_module, "build_mega_moe_plan", side_effect=fp32_plan):
+                with patch.object(resources_module, "build_mega_moe_plan", side_effect=fp32_plan):
                     out = layer(x, ids, probs)
                     out.float().square().mean().backward()
             finally:
@@ -194,7 +194,7 @@ def test_fp32_native_dw_matches_cpu_fp32_reference() -> None:
 
             with patch.dict(os.environ, HP_MEGA_MOE_CAPTURE_DW="1"):
                 function_module._CAPTURED_WEIGHT_GRADS = None  # pylint: disable=protected-access
-                with patch.object(module_module, "build_mega_moe_plan", side_effect=fp32_plan):
+                with patch.object(resources_module, "build_mega_moe_plan", side_effect=fp32_plan):
                     out = layer(x, ids, probs)
                     out.float().square().mean().backward()
             captured = function_module._CAPTURED_WEIGHT_GRADS  # pylint: disable=protected-access

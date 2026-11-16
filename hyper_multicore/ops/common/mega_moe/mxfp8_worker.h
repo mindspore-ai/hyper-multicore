@@ -1,16 +1,17 @@
 // Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 // Licensed under the Apache License, Version 2.0.
 #pragma once
+// A5 MX task dispatch shared by forward and backward native entries.
 #include "kernel_operator.h"
-#include "hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h"
-#include "hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h"
+#include "common/mega_moe/contracts/mx_launch_descriptor.h"
+#include "common/mega_moe/contracts/mx_byte_tensor_list.h"
 #include "runtime/worker_kernel.h"
 #include "common/mega_moe/invocation_protocol.h"
-#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
+#include "common/mega_moe/transport_task.h"
 #ifdef __DAV_CUBE__
-#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_worker.h"
+#include "common/mega_moe/adapters/arch35/gmm/mxfp8_worker.h"
 #else
-#include "hyper_mega_moe/op_kernel/adapters/arch35/quantization/dual_axis_mxfp8_worker.h"
+#include "common/mega_moe/adapters/arch35/quantization/dual_axis_mxfp8_worker.h"
 #endif
 
 namespace MulticoreRuntime {

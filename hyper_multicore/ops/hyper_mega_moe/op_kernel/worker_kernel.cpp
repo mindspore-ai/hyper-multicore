@@ -22,9 +22,9 @@
 #include "runtime/worker_kernel.h"
 #include "common/mega_moe/invocation_protocol.h"
 #include "common/mega_moe/transport.h"
-#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
+#include "common/mega_moe/transport_task.h"
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
-#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h"
+#include "common/mega_moe/adapters/arch35/gmm/bf16_worker.h"
 #endif
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"

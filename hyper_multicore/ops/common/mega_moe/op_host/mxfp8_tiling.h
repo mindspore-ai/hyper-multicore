@@ -1,12 +1,10 @@
 // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-#include "../../../hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.h"
-#include "../../../hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.h"
+#pragma once
 #include "register/op_impl_registry.h"
-#include "../../../hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8_tiling_key.h"
 #include "tiling/platform/platform_ascendc.h"
-namespace optiling {
+namespace optiling::mega_moe_mxfp8_detail {
 template <class TilingData>
-static ge::graphStatus Tiling(gert::TilingContext* context) {
+inline ge::graphStatus Tiling(gert::TilingContext* context) {
   auto count = context->GetAttrs()->GetAttrPointer<int64_t>(0);
   if (count == nullptr || *count <= 0 || *count > 64) return ge::GRAPH_FAILED;
   platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
@@ -23,6 +21,4 @@ static ge::graphStatus Tiling(gert::TilingContext* context) {
   context->GetWorkspaceSizes(1)[0] = 0;
   return ge::GRAPH_SUCCESS;
 }
-IMPL_OP_OPTILING(HyperMegaMoeMxfp8).Tiling(Tiling<HyperMegaMoeMxfp8TilingData>);
-IMPL_OP_OPTILING(HyperMegaMoeMxfp8Grad).Tiling(Tiling<HyperMegaMoeMxfp8GradTilingData>);
-}
+}  // namespace optiling::mega_moe_mxfp8_detail

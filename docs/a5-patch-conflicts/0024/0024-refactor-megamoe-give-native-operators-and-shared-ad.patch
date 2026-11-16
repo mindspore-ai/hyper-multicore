@@ -1,0 +1,613 @@
+From 95ffac6420a687d6c2de0b66a2ae49b976a6df2a Mon Sep 17 00:00:00 2001
+From: hedongdong <hdd475375904@126.com>
+Date: Mon, 16 Nov 2026 11:48:31 +0800
+Subject: [PATCH 24/27] refactor(megamoe): give native operators and shared
+ adapters explicit source ownership
+
+---
+ docs/architecture-contract.md                 | 22 ++++++++++++++++++-
+ .../_build/assemble_multicore_source.py       |  5 +++++
+ .../cmake/vendor/op_host/CMakeLists.txt       | 11 +++++++---
+ .../adapters/arch35/gmm/bf16_problem.h        |  0
+ .../adapters/arch35/gmm/bf16_worker.h         |  2 +-
+ .../arch35/gmm/mxfp8_resource_policy.h        |  2 +-
+ .../adapters/arch35/gmm/mxfp8_worker.h        |  6 ++---
+ .../quantization/dual_axis_mxfp8_worker.h     |  2 +-
+ .../adapters/arch35/swiglu/bf16_grad_tiling.h |  0
+ .../adapters/arch35/swiglu/bf16_grad_worker.h |  0
+ .../mega_moe}/contracts/mx_byte_tensor_list.h |  0
+ .../mega_moe}/contracts/mx_gmm_descriptor.h   |  0
+ .../contracts/mx_launch_descriptor.h          |  0
+ .../mega_moe}/contracts/mx_quant_descriptor.h |  0
+ .../mega_moe}/gmm_logical_workers.h           |  0
+ .../mega_moe/mxfp8_worker.h}                  | 11 +++++-----
+ .../mega_moe/op_host/mxfp8_op_api.inc}        |  0
+ .../mega_moe/op_host/mxfp8_schema.h}          | 14 ++++--------
+ .../mega_moe/op_host/mxfp8_tiling.h}          | 12 ++++------
+ .../mega_moe}/transport_task.h                |  0
+ .../op_kernel/contracts/swiglu.h              |  7 ------
+ .../op_kernel/worker_kernel.cpp               |  4 ++--
+ .../op_kernel/worker_kernel.cpp               |  6 ++---
+ .../op_host/hyper_mega_moe_mxfp8_def.cpp      |  8 +++++++
+ .../op_host/hyper_mega_moe_mxfp8_tiling.cpp   |  7 ++++++
+ .../op_api/aclnn_hyper_mega_moe_mxfp8.cpp     |  2 +-
+ .../op_kernel/hyper_mega_moe_mxfp8.cpp        |  2 +-
+ .../op_host/hyper_mega_moe_mxfp8_grad_def.cpp |  8 +++++++
+ .../hyper_mega_moe_mxfp8_grad_tiling.cpp      |  7 ++++++
+ .../aclnn_hyper_mega_moe_mxfp8_grad.cpp       |  2 +-
+ .../op_kernel/hyper_mega_moe_mxfp8_grad.cpp   |  2 +-
+ .../_test_mega_moe_review_regressions.py      | 12 +++++-----
+ tests/torch/_test_swiglu_clamp_st.py          |  2 +-
+ .../ut/modules/mega_moe/test_mx_byte_views.py |  2 +-
+ tests/ut/torch/test_ops.py                    |  4 ++--
+ 35 files changed, 103 insertions(+), 59 deletions(-)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/adapters/arch35/gmm/bf16_problem.h (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/adapters/arch35/gmm/bf16_worker.h (98%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/adapters/arch35/gmm/mxfp8_resource_policy.h (94%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/adapters/arch35/gmm/mxfp8_worker.h (97%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/adapters/arch35/quantization/dual_axis_mxfp8_worker.h (98%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/adapters/arch35/swiglu/bf16_grad_tiling.h (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/adapters/arch35/swiglu/bf16_grad_worker.h (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/contracts/mx_byte_tensor_list.h (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/contracts/mx_gmm_descriptor.h (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/contracts/mx_launch_descriptor.h (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel => common/mega_moe}/contracts/mx_quant_descriptor.h (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel/adapters/common => common/mega_moe}/gmm_logical_workers.h (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h => common/mega_moe/mxfp8_worker.h} (89%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_host/mxfp8/op_api.inc => common/mega_moe/op_host/mxfp8_op_api.inc} (100%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_host/mxfp8/schema.cpp => common/mega_moe/op_host/mxfp8_schema.h} (71%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_host/mxfp8/tiling.cpp => common/mega_moe/op_host/mxfp8_tiling.h} (63%)
+ rename hyper_multicore/ops/{hyper_mega_moe/op_kernel/adapters/common => common/mega_moe}/transport_task.h (100%)
+ delete mode 100644 hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/swiglu.h
+ create mode 100644 hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_def.cpp
+ create mode 100644 hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.cpp
+ create mode 100644 hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_def.cpp
+ create mode 100644 hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.cpp
+
+diff --git a/docs/architecture-contract.md b/docs/architecture-contract.md
+index 8d3529a..6d2368d 100644
+--- a/docs/architecture-contract.md
++++ b/docs/architecture-contract.md
+@@ -63,7 +63,7 @@ flowchart TD
+ | `tasks/` | 每种算子的 typed task 参数与 lowering，数学 tiling 的调用适配 |
+ | `torch/` 等框架目录 | 框架 binding、注册、资源/stream 对接；不存放组件 device 算法 |
+ | `ops/runtime/` | 通用 device 执行、事件与可观测性；只消费显式的通用合同 |
+-| `ops/common/<component>/` | 同一组件正反向等多个入口共享的业务 device 代码 |
++| `ops/common/<component>/` | 同一组件多个 native 入口共享的业务合同；host 代码明确放在 op_host，device adapter 按架构归属 |
+ | `ops/common/` 中的算子合同 | 真正可跨组件复用的算子参数编码与通用 primitive |
+ | `ops/hyper_*/op_host/` | native ABI、形状/类型校验、外层资源与 launch tiling |
+ | `ops/hyper_*/op_kernel/` | megakernel 入口、task 分发与标准算子 adapter |
+@@ -144,3 +144,23 @@ flowchart TD
+ - 每个例外有具体原因、所有者、验证和退出条件；不能仅写“后续优化”。
+ 
+ 架构图用于理解，正文合同用于判定。README 只作为入口，本规范是新开发和存量重构的共同依据。
++
++## 7. MegaMoE native operator ownership
++
++The public `MegaMoeExperts` interface selects precision. Native BF16 and MXFP8
++operator identities remain distinct; neither operator family owns the other.
++Each native operator directory owns its registration, launch tiling binding,
++op-api entry and kernel entry. Shared MoE mechanisms belong to
++`ops/common/mega_moe`, with host-only helpers under `op_host` and architecture
++adapters under `adapters/arch35`. Shared headers must not register operators.
++
++The shared MX task worker dispatches both forward and backward task graphs;
++it is component execution code rather than a standard-math adapter. It consumes
++component-owned descriptors. BF16 and MX math adapters call locked standard
++sources. Shared transport translates expert descriptors into SHMEM requests;
++QP and hardware completion remain in `shmem`. The generic runtime does not own
++these mathematical or routing implementations.
++
++Source assembly may copy shared headers into generated closures. Such copies
++are build products, not independent source owners. Changes must update the
++single checked-in owner, its consumers and source-assembly checks together.
+diff --git a/hyper_multicore/_build/assemble_multicore_source.py b/hyper_multicore/_build/assemble_multicore_source.py
+index 4b53321..23d27e9 100644
+--- a/hyper_multicore/_build/assemble_multicore_source.py
++++ b/hyper_multicore/_build/assemble_multicore_source.py
+@@ -381,6 +381,11 @@ def _require_assembled_files(source_root: Path) -> None:
+         source_root / "hyper_mega_gate_grad" / "op_host" / "hyper_mega_gate_route_grad_def.cpp",
+         source_root / "hyper_mega_gate_grad" / "op_host" / "op_api" / "linear_index" / "linear_index.cpp",
+         source_root / "hyper_mega_gate_grad" / "op_kernel" / "hyper_mega_gate_route_grad.cpp",
++        source_root / "common" / "mega_moe" / "transport_task.h",
++        source_root / "common" / "mega_moe" / "mxfp8_worker.h",
++        source_root / "common" / "mega_moe" / "op_host" / "mxfp8_schema.h",
++        source_root / "hyper_mega_moe_mxfp8" / "op_host" / "hyper_mega_moe_mxfp8_def.cpp",
++        source_root / "hyper_mega_moe_mxfp8_grad" / "op_host" / "hyper_mega_moe_mxfp8_grad_def.cpp",
+         source_root / "shmem" / "data_plane" / "rma.h",
+         source_root / "shmem" / "data_plane" / "sync.h",
+         source_root / "hyper_mega_mhc" / "op_host" / "hyper_mega_mhc_def.cpp",
+diff --git a/hyper_multicore/cmake/vendor/op_host/CMakeLists.txt b/hyper_multicore/cmake/vendor/op_host/CMakeLists.txt
+index 61bb375..25d1e73 100644
+--- a/hyper_multicore/cmake/vendor/op_host/CMakeLists.txt
++++ b/hyper_multicore/cmake/vendor/op_host/CMakeLists.txt
+@@ -67,10 +67,14 @@ set(OP_TILING_SOURCES
+ )
+ 
+ if(EXISTS "${HP_MULTICORE_SOURCE_ROOT}/a5/sources.json")
+-    list(APPEND OP_SCHEMA_SOURCES ${FWD_HOST}/mxfp8/schema.cpp)
+-    list(APPEND OP_TILING_SOURCES ${FWD_HOST}/mxfp8/tiling.cpp)
++    list(APPEND OP_SCHEMA_SOURCES
++        ${MX_HOST}/hyper_mega_moe_mxfp8_def.cpp
++        ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_def.cpp)
++    list(APPEND OP_TILING_SOURCES
++        ${MX_HOST}/hyper_mega_moe_mxfp8_tiling.cpp
++        ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_tiling.cpp)
+ endif()
+-include_directories(${MX_HOST} ${MX_GRAD_HOST})
++include_directories(${MX_HOST} ${MX_GRAD_HOST} ${HP_MULTICORE_SOURCE_ROOT})
+ 
+ function(hp_generate_op_definitions)
+     set(ASCEND_COMPUTE_UNIT ${HP_MULTICORE_REGISTERED_SOCS})
+@@ -82,6 +86,7 @@ function(hp_generate_op_definitions)
+         COMPILE_OPTIONS
+             -I${CANN_OP_COMMON_INCLUDE}
+             -I${CANN_OP_HOST_INCLUDE}
++            -I${HP_MULTICORE_SOURCE_ROOT}
+     )
+ endfunction()
+ hp_generate_op_definitions()
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_problem.h b/hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/bf16_problem.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_problem.h
+rename to hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/bf16_problem.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h b/hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/bf16_worker.h
+similarity index 98%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h
+rename to hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/bf16_worker.h
+index 7678458..260e852 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h
++++ b/hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/bf16_worker.h
+@@ -2,7 +2,7 @@
+ // Task binding only; numerical blocks and their tile loop are upstream Blaze.
+ #pragma once
+ #include "blaze/gemm/kernel/kernel_grouped_matmul.h"
+-#include "hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h"
++#include "common/mega_moe/gmm_logical_workers.h"
+ #include "bf16_problem.h"
+ 
+ namespace MulticoreBf16 {
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_resource_policy.h b/hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/mxfp8_resource_policy.h
+similarity index 94%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_resource_policy.h
+rename to hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/mxfp8_resource_policy.h
+index 34edccb..e88da49 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_resource_policy.h
++++ b/hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/mxfp8_resource_policy.h
+@@ -1,7 +1,7 @@
+ // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+ #ifndef HYPER_MULTICORE_MXFP8_GMM_RESOURCE_POLICY_H_
+ #define HYPER_MULTICORE_MXFP8_GMM_RESOURCE_POLICY_H_
+-#include "hyper_mega_moe/op_kernel/contracts/mx_gmm_descriptor.h"
++#include "common/mega_moe/contracts/mx_gmm_descriptor.h"
+ 
+ #ifdef __NPU_ARCH__
+ #define MX_POLICY_INLINE __aicore__ inline
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_worker.h b/hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/mxfp8_worker.h
+similarity index 97%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_worker.h
+rename to hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/mxfp8_worker.h
+index 00d87cf..f5956c2 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_worker.h
++++ b/hyper_multicore/ops/common/mega_moe/adapters/arch35/gmm/mxfp8_worker.h
+@@ -3,10 +3,10 @@
+ #define HYPER_MULTICORE_MX_GMM_WORKER_H_
+ 
+ #include "kernel_operator.h"
+-#include "hyper_mega_moe/op_kernel/contracts/mx_gmm_descriptor.h"
+-#include "hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h"
++#include "common/mega_moe/contracts/mx_gmm_descriptor.h"
++#include "common/mega_moe/contracts/mx_launch_descriptor.h"
+ #include "mxfp8_resource_policy.h"
+-#include "hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h"
++#include "common/mega_moe/gmm_logical_workers.h"
+ #include "blaze/gemm/block/block_mmad_qgmm_mx.h"
+ #include "blaze/gemm/kernel/kernel_qgmm_mx.h"
+ 
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/quantization/dual_axis_mxfp8_worker.h b/hyper_multicore/ops/common/mega_moe/adapters/arch35/quantization/dual_axis_mxfp8_worker.h
+similarity index 98%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/quantization/dual_axis_mxfp8_worker.h
+rename to hyper_multicore/ops/common/mega_moe/adapters/arch35/quantization/dual_axis_mxfp8_worker.h
+index 3bd4a60..2b324ca 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/quantization/dual_axis_mxfp8_worker.h
++++ b/hyper_multicore/ops/common/mega_moe/adapters/arch35/quantization/dual_axis_mxfp8_worker.h
+@@ -5,7 +5,7 @@
+ 
+ #include "kernel_operator.h"
+ #include "runtime/runtime_config.hpp"
+-#include "hyper_mega_moe/op_kernel/contracts/mx_quant_descriptor.h"
++#include "common/mega_moe/contracts/mx_quant_descriptor.h"
+ #define HYPER_MULTICORE_MX_LOGICAL_VECTOR
+ #ifndef TPL_SCALE_ALG_0
+ #define TPL_SCALE_ALG_0 0
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/swiglu/bf16_grad_tiling.h b/hyper_multicore/ops/common/mega_moe/adapters/arch35/swiglu/bf16_grad_tiling.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/swiglu/bf16_grad_tiling.h
+rename to hyper_multicore/ops/common/mega_moe/adapters/arch35/swiglu/bf16_grad_tiling.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/swiglu/bf16_grad_worker.h b/hyper_multicore/ops/common/mega_moe/adapters/arch35/swiglu/bf16_grad_worker.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/swiglu/bf16_grad_worker.h
+rename to hyper_multicore/ops/common/mega_moe/adapters/arch35/swiglu/bf16_grad_worker.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h b/hyper_multicore/ops/common/mega_moe/contracts/mx_byte_tensor_list.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h
+rename to hyper_multicore/ops/common/mega_moe/contracts/mx_byte_tensor_list.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/mx_gmm_descriptor.h b/hyper_multicore/ops/common/mega_moe/contracts/mx_gmm_descriptor.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/mx_gmm_descriptor.h
+rename to hyper_multicore/ops/common/mega_moe/contracts/mx_gmm_descriptor.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h b/hyper_multicore/ops/common/mega_moe/contracts/mx_launch_descriptor.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h
+rename to hyper_multicore/ops/common/mega_moe/contracts/mx_launch_descriptor.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/mx_quant_descriptor.h b/hyper_multicore/ops/common/mega_moe/contracts/mx_quant_descriptor.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/mx_quant_descriptor.h
+rename to hyper_multicore/ops/common/mega_moe/contracts/mx_quant_descriptor.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h b/hyper_multicore/ops/common/mega_moe/gmm_logical_workers.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/common/gmm_logical_workers.h
+rename to hyper_multicore/ops/common/mega_moe/gmm_logical_workers.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h b/hyper_multicore/ops/common/mega_moe/mxfp8_worker.h
+similarity index 89%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h
+rename to hyper_multicore/ops/common/mega_moe/mxfp8_worker.h
+index 00b819d..c5217b2 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h
++++ b/hyper_multicore/ops/common/mega_moe/mxfp8_worker.h
+@@ -1,16 +1,17 @@
+ // Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
+ // Licensed under the Apache License, Version 2.0.
+ #pragma once
++// A5 MX task dispatch shared by forward and backward native entries.
+ #include "kernel_operator.h"
+-#include "hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h"
+-#include "hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h"
++#include "common/mega_moe/contracts/mx_launch_descriptor.h"
++#include "common/mega_moe/contracts/mx_byte_tensor_list.h"
+ #include "runtime/worker_kernel.h"
+ #include "common/mega_moe/invocation_protocol.h"
+-#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
++#include "common/mega_moe/transport_task.h"
+ #ifdef __DAV_CUBE__
+-#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_worker.h"
++#include "common/mega_moe/adapters/arch35/gmm/mxfp8_worker.h"
+ #else
+-#include "hyper_mega_moe/op_kernel/adapters/arch35/quantization/dual_axis_mxfp8_worker.h"
++#include "common/mega_moe/adapters/arch35/quantization/dual_axis_mxfp8_worker.h"
+ #endif
+ 
+ namespace MulticoreRuntime {
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/op_api.inc b/hyper_multicore/ops/common/mega_moe/op_host/mxfp8_op_api.inc
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/op_api.inc
+rename to hyper_multicore/ops/common/mega_moe/op_host/mxfp8_op_api.inc
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/schema.cpp b/hyper_multicore/ops/common/mega_moe/op_host/mxfp8_schema.h
+similarity index 71%
+rename from hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/schema.cpp
+rename to hyper_multicore/ops/common/mega_moe/op_host/mxfp8_schema.h
+index 1208d8e..20c49e1 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/schema.cpp
++++ b/hyper_multicore/ops/common/mega_moe/op_host/mxfp8_schema.h
+@@ -1,4 +1,5 @@
+ // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
++#pragma once
+ #include "register/op_def_registry.h"
+ #include "register/op_impl_registry.h"
+ namespace ops {
+@@ -19,8 +20,8 @@ class MegaMoeMxfp8Schema : public OpDef {
+     AICore().AddConfig("ascend950", config);
+   }
+ };
+-namespace {
+-ge::graphStatus InferShape(gert::InferShapeContext* context) {
++namespace mega_moe_mxfp8_detail {
++inline ge::graphStatus InferShape(gert::InferShapeContext* context) {
+   auto count = context->GetAttrs()->GetAttrPointer<int64_t>(0);
+   if (count == nullptr || *count <= 0 || *count > 64) return ge::GRAPH_FAILED;
+   for (int64_t i = 0; i < *count; ++i) {
+@@ -28,18 +29,11 @@ ge::graphStatus InferShape(gert::InferShapeContext* context) {
+   }
+   return ge::GRAPH_SUCCESS;
+ }
+-ge::graphStatus InferType(gert::InferDataTypeContext* context) {
++inline ge::graphStatus InferType(gert::InferDataTypeContext* context) {
+   auto count = context->GetAttrs()->GetAttrPointer<int64_t>(0);
+   if (count == nullptr || *count <= 0 || *count > 64) return ge::GRAPH_FAILED;
+   for (int64_t i = 0; i < *count; ++i) context->SetOutputDataType(i, ge::DT_UINT8);
+   return ge::GRAPH_SUCCESS;
+ }
+ }
+-// Named registrations preserve both public OP identities and inference contracts.
+-class HyperMegaMoeMxfp8 : public MegaMoeMxfp8Schema { public: using MegaMoeMxfp8Schema::MegaMoeMxfp8Schema; };
+-class HyperMegaMoeMxfp8Grad : public MegaMoeMxfp8Schema { public: using MegaMoeMxfp8Schema::MegaMoeMxfp8Schema; };
+-OP_ADD(HyperMegaMoeMxfp8);
+-OP_ADD(HyperMegaMoeMxfp8Grad);
+-IMPL_OP_INFERSHAPE(HyperMegaMoeMxfp8).InferShape(InferShape).InferDataType(InferType);
+-IMPL_OP_INFERSHAPE(HyperMegaMoeMxfp8Grad).InferShape(InferShape).InferDataType(InferType);
+ }  // namespace ops
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/tiling.cpp b/hyper_multicore/ops/common/mega_moe/op_host/mxfp8_tiling.h
+similarity index 63%
+rename from hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/tiling.cpp
+rename to hyper_multicore/ops/common/mega_moe/op_host/mxfp8_tiling.h
+index e50421f..eb1e40c 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_host/mxfp8/tiling.cpp
++++ b/hyper_multicore/ops/common/mega_moe/op_host/mxfp8_tiling.h
+@@ -1,12 +1,10 @@
+ // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+-#include "../../../hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.h"
+-#include "../../../hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.h"
++#pragma once
+ #include "register/op_impl_registry.h"
+-#include "../../../hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8_tiling_key.h"
+ #include "tiling/platform/platform_ascendc.h"
+-namespace optiling {
++namespace optiling::mega_moe_mxfp8_detail {
+ template <class TilingData>
+-static ge::graphStatus Tiling(gert::TilingContext* context) {
++inline ge::graphStatus Tiling(gert::TilingContext* context) {
+   auto count = context->GetAttrs()->GetAttrPointer<int64_t>(0);
+   if (count == nullptr || *count <= 0 || *count > 64) return ge::GRAPH_FAILED;
+   platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+@@ -23,6 +21,4 @@ static ge::graphStatus Tiling(gert::TilingContext* context) {
+   context->GetWorkspaceSizes(1)[0] = 0;
+   return ge::GRAPH_SUCCESS;
+ }
+-IMPL_OP_OPTILING(HyperMegaMoeMxfp8).Tiling(Tiling<HyperMegaMoeMxfp8TilingData>);
+-IMPL_OP_OPTILING(HyperMegaMoeMxfp8Grad).Tiling(Tiling<HyperMegaMoeMxfp8GradTilingData>);
+-}
++}  // namespace optiling::mega_moe_mxfp8_detail
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/common/transport_task.h b/hyper_multicore/ops/common/mega_moe/transport_task.h
+similarity index 100%
+rename from hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/common/transport_task.h
+rename to hyper_multicore/ops/common/mega_moe/transport_task.h
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/swiglu.h b/hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/swiglu.h
+deleted file mode 100644
+index 5e400ae..0000000
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/contracts/swiglu.h
++++ /dev/null
+@@ -1,7 +0,0 @@
+-// Copyright (c) 2026 Huawei Technologies Co., Ltd.
+-#pragma once
+-#include <cstdint>
+-namespace MulticoreMoE {
+-// The selected standard SwiGLU tiling limits dynamic baseRowLen to 19.
+-constexpr int64_t kSwiGluDynamicTailBaseRows = 19;
+-}
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp b/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
+index fc24185..a84e702 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
+@@ -22,9 +22,9 @@
+ #include "runtime/worker_kernel.h"
+ #include "common/mega_moe/invocation_protocol.h"
+ #include "common/mega_moe/transport.h"
+-#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
++#include "common/mega_moe/transport_task.h"
+ #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
+-#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h"
++#include "common/mega_moe/adapters/arch35/gmm/bf16_worker.h"
+ #endif
+ #include "common/mega_moe/task_options.h"
+ #include "common/mega_moe/routing_probabilities.h"
+diff --git a/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp b/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
+index 40d869a..db69471 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
+@@ -23,15 +23,15 @@
+ #include "runtime/worker_kernel.h"
+ #include "common/mega_moe/invocation_protocol.h"
+ #include "common/mega_moe/transport.h"
+-#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
++#include "common/mega_moe/transport_task.h"
+ #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
+-#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h"
++#include "common/mega_moe/adapters/arch35/gmm/bf16_worker.h"
+ #endif
+ #include "common/mega_moe/task_options.h"
+ #include "common/mega_moe/routing_probabilities.h"
+ 
+ #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+-#include "hyper_mega_moe/op_kernel/adapters/arch35/swiglu/bf16_grad_worker.h"
++#include "common/mega_moe/adapters/arch35/swiglu/bf16_grad_worker.h"
+ #endif
+ 
+ using namespace AscendC;
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_def.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_def.cpp
+new file mode 100644
+index 0000000..102ecc0
+--- /dev/null
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_def.cpp
+@@ -0,0 +1,8 @@
++// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
++#include "common/mega_moe/op_host/mxfp8_schema.h"
++namespace ops {
++class HyperMegaMoeMxfp8 : public MegaMoeMxfp8Schema { public: using MegaMoeMxfp8Schema::MegaMoeMxfp8Schema; };
++OP_ADD(HyperMegaMoeMxfp8);
++IMPL_OP_INFERSHAPE(HyperMegaMoeMxfp8).InferShape(mega_moe_mxfp8_detail::InferShape)
++    .InferDataType(mega_moe_mxfp8_detail::InferType);
++}  // namespace ops
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.cpp
+new file mode 100644
+index 0000000..b2a3584
+--- /dev/null
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/hyper_mega_moe_mxfp8_tiling.cpp
+@@ -0,0 +1,7 @@
++// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
++#include "hyper_mega_moe_mxfp8_tiling.h"
++#include "../op_kernel/hyper_mega_moe_mxfp8_tiling_key.h"
++#include "common/mega_moe/op_host/mxfp8_tiling.h"
++namespace optiling {
++IMPL_OP_OPTILING(HyperMegaMoeMxfp8).Tiling(mega_moe_mxfp8_detail::Tiling<HyperMegaMoeMxfp8TilingData>);
++}  // namespace optiling
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/aclnn_hyper_mega_moe_mxfp8.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
+index 7407cf0..bd130d0 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_host/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
+@@ -3,4 +3,4 @@
+ #define HYPER_MX_OP HyperMegaMoeMxfp8
+ #define HYPER_MX_API aclnnHyperMegaMoeMxfp8
+ #define HYPER_MX_WORKSPACE_API aclnnHyperMegaMoeMxfp8GetWorkspaceSize
+-#include "../../../hyper_mega_moe/op_host/mxfp8/op_api.inc"
++#include "common/mega_moe/op_host/mxfp8_op_api.inc"
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8.cpp
+index 22b70fa..20ee31b 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8/op_kernel/hyper_mega_moe_mxfp8.cpp
+@@ -1,5 +1,5 @@
+ // Copyright (c) 2026 Huawei Technologies Co., Ltd.
+-#include "hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h"
++#include "common/mega_moe/mxfp8_worker.h"
+ #include "hyper_mega_moe_mxfp8_tiling_key.h"
+ template <int8_t MX_MIX>
+ __global__ __aicore__ void hyper_mega_moe_mxfp8(
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_def.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_def.cpp
+new file mode 100644
+index 0000000..49f3973
+--- /dev/null
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_def.cpp
+@@ -0,0 +1,8 @@
++// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
++#include "common/mega_moe/op_host/mxfp8_schema.h"
++namespace ops {
++class HyperMegaMoeMxfp8Grad : public MegaMoeMxfp8Schema { public: using MegaMoeMxfp8Schema::MegaMoeMxfp8Schema; };
++OP_ADD(HyperMegaMoeMxfp8Grad);
++IMPL_OP_INFERSHAPE(HyperMegaMoeMxfp8Grad).InferShape(mega_moe_mxfp8_detail::InferShape)
++    .InferDataType(mega_moe_mxfp8_detail::InferType);
++}  // namespace ops
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.cpp
+new file mode 100644
+index 0000000..463705e
+--- /dev/null
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/hyper_mega_moe_mxfp8_grad_tiling.cpp
+@@ -0,0 +1,7 @@
++// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
++#include "hyper_mega_moe_mxfp8_grad_tiling.h"
++#include "../op_kernel/hyper_mega_moe_mxfp8_grad_tiling_key.h"
++#include "common/mega_moe/op_host/mxfp8_tiling.h"
++namespace optiling {
++IMPL_OP_OPTILING(HyperMegaMoeMxfp8Grad).Tiling(mega_moe_mxfp8_detail::Tiling<HyperMegaMoeMxfp8GradTilingData>);
++}  // namespace optiling
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp
+index fc9b000..644f6bc 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_host/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp
+@@ -3,4 +3,4 @@
+ #define HYPER_MX_OP HyperMegaMoeMxfp8Grad
+ #define HYPER_MX_API aclnnHyperMegaMoeMxfp8Grad
+ #define HYPER_MX_WORKSPACE_API aclnnHyperMegaMoeMxfp8GradGetWorkspaceSize
+-#include "../../../hyper_mega_moe/op_host/mxfp8/op_api.inc"
++#include "common/mega_moe/op_host/mxfp8_op_api.inc"
+diff --git a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_kernel/hyper_mega_moe_mxfp8_grad.cpp b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_kernel/hyper_mega_moe_mxfp8_grad.cpp
+index fdd9722..6df2dd2 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_kernel/hyper_mega_moe_mxfp8_grad.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_mxfp8_grad/op_kernel/hyper_mega_moe_mxfp8_grad.cpp
+@@ -1,5 +1,5 @@
+ // Copyright (c) 2026 Huawei Technologies Co., Ltd.
+-#include "hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h"
++#include "common/mega_moe/mxfp8_worker.h"
+ #include "hyper_mega_moe_mxfp8_grad_tiling_key.h"
+ template <int8_t MX_MIX>
+ __global__ __aicore__ void hyper_mega_moe_mxfp8_grad(
+diff --git a/tests/torch/_test_mega_moe_review_regressions.py b/tests/torch/_test_mega_moe_review_regressions.py
+index 860a1ac..d846d76 100644
+--- a/tests/torch/_test_mega_moe_review_regressions.py
++++ b/tests/torch/_test_mega_moe_review_regressions.py
+@@ -23,8 +23,8 @@ from unittest.mock import patch
+ import torch
+ from torch.utils.checkpoint import checkpoint
+ 
+-from hyper_multicore.modules.mega_moe import function as function_module
+-from hyper_multicore.modules.mega_moe import module as module_module
++from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
++from hyper_multicore.modules.mega_moe.backends.bf16 import resources as resources_module
+ from hyper_multicore.modules.mega_moe.backends.bf16.plan import MegaMoePlan, build_mega_moe_plan
+ from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+ from hyper_multicore.scheduler.config import RuntimeConfigC
+@@ -62,7 +62,7 @@ def _checkpoint_forward(
+ @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+           card_mark="onecard", essential_mark="essential")
+ def test_compact_header_uses_normal_ready_queue() -> None:
+-    """Compact graphs publish ready_queue=1 in NORMAL mode for both layouts and clamp modes."""
++    """Compact graphs publish explicit worker queues in NORMAL mode for both layouts and clamp modes."""
+     prepare_multicore_test_environment()
+     torch.npu.set_device(0)
+     device = torch.device("npu", 0)
+@@ -80,7 +80,7 @@ def test_compact_header_uses_normal_ready_queue() -> None:
+                 out = layer(x, ids, probs)
+                 resources = layer._get_execution_resources(x.reshape(-1, 128))  # pylint: disable=protected-access
+                 header = _header(resources.plan_for_tokens(tokens, device))
+-                assert int(header.vector_ready_queue) == 1
++                assert int(header.queue_layout) == 2
+                 assert int(header.diagnostic_mode) == 0
+                 out.float().square().mean().backward()
+                 assert x.grad is not None and torch.isfinite(x.grad).all()
+@@ -113,7 +113,7 @@ def test_fp32_native_weight_gradients_before_autograd_cast() -> None:
+             os.environ["HP_MEGA_MOE_CAPTURE_DW"] = "1"
+             function_module._CAPTURED_WEIGHT_GRADS = None  # pylint: disable=protected-access
+             try:
+-                with patch.object(module_module, "build_mega_moe_plan", side_effect=fp32_plan):
++                with patch.object(resources_module, "build_mega_moe_plan", side_effect=fp32_plan):
+                     out = layer(x, ids, probs)
+                     out.float().square().mean().backward()
+             finally:
+@@ -194,7 +194,7 @@ def test_fp32_native_dw_matches_cpu_fp32_reference() -> None:
+ 
+             with patch.dict(os.environ, HP_MEGA_MOE_CAPTURE_DW="1"):
+                 function_module._CAPTURED_WEIGHT_GRADS = None  # pylint: disable=protected-access
+-                with patch.object(module_module, "build_mega_moe_plan", side_effect=fp32_plan):
++                with patch.object(resources_module, "build_mega_moe_plan", side_effect=fp32_plan):
+                     out = layer(x, ids, probs)
+                     out.float().square().mean().backward()
+             captured = function_module._CAPTURED_WEIGHT_GRADS  # pylint: disable=protected-access
+diff --git a/tests/torch/_test_swiglu_clamp_st.py b/tests/torch/_test_swiglu_clamp_st.py
+index 56eb86b..f68c0fc 100644
+--- a/tests/torch/_test_swiglu_clamp_st.py
++++ b/tests/torch/_test_swiglu_clamp_st.py
+@@ -26,7 +26,7 @@ import torch.nn.functional as F
+ import torch_npu
+ 
+ from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+-from hyper_multicore.modules.mega_moe import function as mega_function
++from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as mega_function
+ from hyper_multicore.modules.mega_moe.backends.bf16.autograd import execute_mega_moe
+ from hyper_multicore.modules.mega_moe.route import (
+     PreparedTopKRoute,
+diff --git a/tests/ut/modules/mega_moe/test_mx_byte_views.py b/tests/ut/modules/mega_moe/test_mx_byte_views.py
+index f756f18..c92d77e 100644
+--- a/tests/ut/modules/mega_moe/test_mx_byte_views.py
++++ b/tests/ut/modules/mega_moe/test_mx_byte_views.py
+@@ -7,7 +7,7 @@ def test_pooled_metadata_view_uses_logical_bounds_within_physical_storage(tmp_pa
+     root = Path(__file__).resolve().parents[4]
+     source = tmp_path / 'contract.cpp'
+     source.write_text('''
+-#include "hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h"
++#include "common/mega_moe/contracts/mx_byte_tensor_list.h"
+ int main() {
+   using MulticoreMx::IsMxByteVectorShapeValid;
+   if (!IsMxByteVectorShapeValid(0x100000001ULL, 2144, 48)) return 1;
+diff --git a/tests/ut/torch/test_ops.py b/tests/ut/torch/test_ops.py
+index e28afde..d26ac10 100644
+--- a/tests/ut/torch/test_ops.py
++++ b/tests/ut/torch/test_ops.py
+@@ -84,7 +84,7 @@ class TestTorchOps(unittest.TestCase):
+             patch.object(ops, "preload_vendor_library") as preload,
+             patch.object(ops.torch.ops, "load_library") as load,
+             patch.object(ops.torch.ops.hyper_multicore, "mega_moe_transport_version",
+-                         return_value=1, create=True) as version,
++                         return_value=2, create=True) as version,
+             patch.object(ops.torch.ops.hyper_multicore, "mega_moe_grad", self._backward_op(), create=True) as backward,
+         ):
+             ops._load_native()
+@@ -106,7 +106,7 @@ class TestTorchOps(unittest.TestCase):
+             self.backend.assert_called_once_with()
+             preload.assert_called_once_with(Path("vendor"))
+             load.assert_called_once_with("good.so")
+-            for protocol, alias, message in ((0, "a", "transport ABI"), (1, "e", "storage reuse")):
++            for protocol, alias, message in ((0, "a", "transport ABI"), (2, "e", "storage reuse")):
+                 _loader._loaded_kinds.clear()
+                 _loader._native_failure = None
+                 version.return_value = protocol
+-- 
+2.54.0
+

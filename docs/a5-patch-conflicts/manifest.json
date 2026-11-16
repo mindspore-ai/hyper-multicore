@@ -121,5 +121,15 @@
     ],
     "action": "partial application; rejected hunks and original patch retained",
     "apply_exit_code": 1
+  },
+  {
+    "patch": 24,
+    "unmerged_paths": [],
+    "rejected_hunks": [
+      "tests/torch/_test_mega_moe_review_regressions.py.rej",
+      "hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp.rej"
+    ],
+    "action": "partial application; rejected hunks and original patch retained",
+    "apply_exit_code": 1
   }
 ]
