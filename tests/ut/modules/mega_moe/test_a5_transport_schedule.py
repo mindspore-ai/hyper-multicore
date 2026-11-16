@@ -71,3 +71,22 @@ def test_mx_graph_coverage_and_shared_protocol(ep, mode):
         validate_transport_owners(cfg, spec, vectors)
         # Persistent ready/completion lanes have the same positions in F/R/B.
         assert cfg.event_capacity == phases[0].config.event_capacity
+
+
+@pytest.mark.parametrize('tokens', [128, 256, 768, 4096])
+@pytest.mark.parametrize('mode', ['push', 'pull'])
+def test_bf16_communication_tiles_cover_short_and_tail_plans(tokens, mode):
+    """Every peer/expert owns completion credits, including a short final tile."""
+    spec = MegaMoeSpec(local_num_tokens=tokens, hidden_size=512, intermediate_size=128,
+                       num_experts=24, top_k=8, initial_capacity_factor=2 if mode == 'push' else None,
+                       receive_capacity=32768, ep_size=4, ep_group=None, rank_id=0,
+                       num_cube_cores=32, dispatch_mode=mode, dispatch_split=512, combine_split=512,
+                       transport_engine='udma', architecture=3510)
+    forward_graph, forward, backward_graph, backward = _build_runtime_artifacts(spec)
+    fragments = (tokens + 511) // 512
+    for graph, config in ((forward_graph, forward), (backward_graph, backward)):
+        for name in ('dispatch', 'combine'):
+            assert graph.get_op(name).task_num == 24 * fragments
+        vectors = [list(config.vector_task_indices[q.begin:q.end]) for q in config.worker_queues[32:]]
+        validate_transport_owners(config, spec, vectors)
+        assert serialize_runtime_config(config)

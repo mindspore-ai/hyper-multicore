@@ -133,7 +133,7 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
         param_positions=[1, 2, 3, 4, 0], split_value=dispatch_sv,
         split_spec=SplitSpec(
             split_inputs=None, split_output_dims=[0],
-            task_num_fn=lambda tsv: tsv.all_expert_num * (tsv.per_expert_seq_to_other // dispatch_sv),
+            task_num_fn=lambda tsv: tsv.all_expert_num * ((tsv.per_expert_seq_to_other + dispatch_sv - 1) // dispatch_sv),
         ),
         tiling_position=-1,
         fill_config=AllToAllFillConfig(moe_type=AllToAllType.DISPATCH, advance="vector",
@@ -210,7 +210,7 @@ def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cu
         param_positions=[14, 12, 15, 16, 13], split_value=combine_sv,
         split_spec=SplitSpec(
             split_inputs=[(1, 0)], split_output_dims=[0],
-            task_num_fn=lambda tsv: tsv.all_expert_num * (tsv.per_expert_seq_to_other // combine_sv),
+            task_num_fn=lambda tsv: tsv.all_expert_num * ((tsv.per_expert_seq_to_other + combine_sv - 1) // combine_sv),
         ),
         tiling_position=-1,
         fill_config=AllToAllFillConfig(moe_type=AllToAllType.COMBINE, advance="vector_only", event_group=1),
