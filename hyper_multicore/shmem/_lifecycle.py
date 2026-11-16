@@ -167,7 +167,7 @@ def _subgroup_unique_id(
     *,
     failure_prefix: str = "SHMEM bootstrap failed",
 ) -> bytes:
-    """Broadcast an independent CANN bootstrap ID without involving other PP stages."""
+    """Exchange one root-owned CANN bootstrap ID within the explicit subgroup."""
     payload = [None, None]
     root_error = None
     if rank == 0:
@@ -178,10 +178,14 @@ def _subgroup_unique_id(
             root_error = error
             payload[1] = _collective.failure_report(error, message=_exception_summary(error))
     try:
-        dist.broadcast_object_list(payload, src=ranks[0], group=group)
+        # Tensor adapters can advertise CUDA compatibility without CUDA capability.
+        # Metadata all-gather avoids broadcast's CUDA-only FP8 capability query.
+        peers = [None] * len(ranks)
+        dist.all_gather_object(peers, payload, group=group)
+        payload = peers[0]
     except Exception as error:
         raise RuntimeError(
-            f"{failure_prefix} on root_rank={rank}: broadcast failed: {_exception_summary(error)}"
+            f"{failure_prefix} on root_rank={rank}: ID exchange failed: {_exception_summary(error)}"
         ) from error
     if payload[1] is not None:
         details = _collective.format_collective_failures(

@@ -209,6 +209,22 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.assertNotIn("cann_detail", str(raised.exception))
         self.assertIs(raised.exception.__cause__, native_error)
 
+    def test_bootstrap_uses_backend_neutral_metadata_exchange(self) -> None:
+        """Bootstrap must not query CUDA capability through an adapted broadcast."""
+        self.dist.broadcast_object_list.side_effect = TypeError("CUDA capability is unavailable")
+        result = _lifecycle._subgroup_unique_id(self.native, self.dist, self.world, 0, (0, 1))
+        self.assertEqual(result, b"group-bootstrap")
+        self.dist.broadcast_object_list.assert_not_called()
+
+    def test_bootstrap_peer_uses_root_id(self) -> None:
+        """Only subgroup rank zero generates the ID and every peer consumes it."""
+        self.dist.all_gather_object.side_effect = (
+            lambda output, _value, **_kw: output.__setitem__(slice(None), [[b"root-id", None], [None, None]])
+        )
+        result = _lifecycle._subgroup_unique_id(self.native, self.dist, self.world, 1, (8, 9))
+        self.assertEqual(result, b"root-id")
+        self.native._get_unique_id.assert_not_called()
+
     def test_clean_release_allows_new_runtime(self) -> None:
         """Run Native initialization and shutdown again after a clean lifecycle."""
         for _ in range(2):
@@ -477,14 +493,16 @@ class TestRuntimeLifecycle(unittest.TestCase):
             ],
         )
         self.assertTrue(all(call.kwargs["root_group"] is self.world for call in stage_call.call_args_list))
-        self.assertEqual(self.dist.all_gather_object.call_count, 7)
+        self.assertEqual(self.dist.all_gather_object.call_count, 8)
         payloads = [call.args[1] for call in self.dist.all_gather_object.call_args_list]
         self.assertEqual(payloads[0], (
             (256, ("layout", 1), (((4,), "torch.float32", 16),), (((8,), "torch.float32", 16, 32),)),
             None,
             False,
         ))
-        self.assertEqual(payloads[1:], [(None, None, False)] * 6)
+        self.assertEqual(payloads[1:5], [(None, None, False)] * 4)
+        self.assertEqual(payloads[5], [b"replacement-bootstrap", None])
+        self.assertEqual(payloads[6:], [(None, None, False)] * 2)
         self.assertFalse(_lifecycle._runtime_invalidated)  # pylint: disable=protected-access
 
     def test_runtime_restart_preflight_failure_preserves_runtime(self) -> None:
