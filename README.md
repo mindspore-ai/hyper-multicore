@@ -51,6 +51,16 @@ from hyper_multicore.diagnostics import MegaKernelDiagnostics
 配置与使用方式见[组件指南](hyper_multicore/README.md)。使用算子的 Python 进程启动前，
 需先激活 native 路径。pip 安装及 Python 导入均不会编译 native 代码。
 
+
+从源码构建后也可直接激活，不需要安装 wheel。源码目录和 `build/native/payload` 一起复制后可在目标环境重复激活；目标 Python/Torch/PTA ABI、SoC 和系统库仍须满足制品合同。
+
+```bash
+source /path/to/hyper-multicore/activate.bash
+python -c "from hyper_multicore import MegaMoeExperts; print(MegaMoeExperts.__name__)"
+```
+
+激活脚本只设置包和 native 库路径，不编译、不设置模型或调度策略。
+
 ## 开发与测试
 
 所有组件的新代码与存量重构遵循[架构与代码归属规范](docs/architecture-contract.md)，包括职责分层、依赖方向、目录归属和 review 门禁。

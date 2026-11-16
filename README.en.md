@@ -62,6 +62,19 @@ See the [component guide](hyper_multicore/README.md) for configuration and usage
 Activate native paths before starting a Python process that uses the operators.
 pip and Python imports do not compile native code.
 
+
+After building, activate a source checkout without installing a wheel:
+
+```bash
+source /path/to/hyper-multicore/activate.bash
+python -c "from hyper_multicore import MegaMoeExperts; print(MegaMoeExperts.__name__)"
+```
+
+Copy the checkout together with `build/native/payload` for deployment. The target
+Python/Torch/PTA ABI, SoC and system libraries must satisfy the built artifact
+contract. Activation sets package/native paths only; it neither compiles nor
+selects model or scheduling policies.
+
 ## Development and tests
 
 Python, device kernels and native bindings live under `hyper_multicore/`.
