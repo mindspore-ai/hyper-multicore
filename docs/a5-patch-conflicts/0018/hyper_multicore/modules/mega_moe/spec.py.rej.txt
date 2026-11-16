@@ -1,0 +1,19 @@
+diff a/hyper_multicore/modules/mega_moe/spec.py b/hyper_multicore/modules/mega_moe/spec.py	(rejected hunks)
+@@ -63,7 +64,7 @@ class MegaMoeSpec:
+     architecture: int = 2201
+     precision: str = "bf16"
+     transport_engine: str = "mte"
+-    ready_depth: int = 0
++    ready_depth: int | None = None
+     schedule_policy: str = "auto"
+     lowering: str = "auto"
+ 
+@@ -241,7 +243,7 @@ def bind_mega_moe_spec(
+         architecture=architecture,
+         precision=specification.get("precision", "bf16"),
+         transport_engine=specification.get("transport_engine", "mte"),
+-        ready_depth=specification.get("ready_depth", 0),
++        ready_depth=specification.get("ready_depth"),
+         schedule_policy=specification.get("schedule_policy", "auto"),
+         lowering=specification.get("lowering", "auto"),
+     )

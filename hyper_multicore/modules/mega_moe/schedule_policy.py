@@ -181,6 +181,7 @@ class MegaMoeSchedulePolicy:
     """Independent task ordering and ready selection after granularity lowering."""
 
     vector_ready_queue: bool = False
+    vector_ready_depth: int = 256
     pipeline_vector: bool = False
     pipeline_cube: bool = False
     batch_experts: bool = False
@@ -212,4 +213,4 @@ class MegaMoeSchedulePolicy:
                 config.all_tasks[task_id].extra_value_1 = GroupedMatmulTaskMode.SINGLE_GROUP
         if self.vector_ready_queue:
             from hyper_multicore.scheduler.worker_queues import install_strided_worker_queues
-            install_strided_worker_queues(config)
+            install_strided_worker_queues(config, vector_ready_depth=self.vector_ready_depth)

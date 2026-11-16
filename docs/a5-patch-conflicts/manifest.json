@@ -105,5 +105,21 @@
     ],
     "action": "partial application; rejected hunks and original patch retained",
     "apply_exit_code": 1
+  },
+  {
+    "patch": 18,
+    "unmerged_paths": [],
+    "rejected_hunks": [
+      "docs/architecture.md.rej",
+      "hyper_multicore/README.md.rej",
+      "hyper_multicore/modules/mega_moe/resources.py.rej",
+      "hyper_multicore/modules/mega_moe/module.py.rej",
+      "hyper_multicore/modules/mega_moe/spec.py.rej",
+      "hyper_multicore/modules/mega_moe/schedule.py.rej",
+      "hyper_multicore/modules/mega_moe/backends/bf16/resources.py.rej",
+      "hyper_multicore/modules/mega_moe/backends/bf16/plan.py.rej"
+    ],
+    "action": "partial application; rejected hunks and original patch retained",
+    "apply_exit_code": 1
   }
 ]

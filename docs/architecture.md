@@ -455,7 +455,8 @@ trigger_event = all_event_num  （全局唯一 event）
 header 的前五个 uint32 字段依次为 task_num、num_workers、task_capacity、event_capacity、ready_event；
 ready_event 为 0 表示无需跨 rank ready。接着三个 uint32 为 diagnostic_mode、
 aic_profile_record_capacity、aiv_profile_record_capacity；再两个为 completion_event、protocol_version，
-最后 24 字节用于对齐。diagnostic_mode=0 表示普通执行，=1 表示 profiling，=2 表示 L1 dump。
+byte40 为 queue_layout，byte44 为 worker_queue_offset；最后16字节用于对齐。
+queue_layout=2 表示追加的24字节 WorkerQueue 描述表，0表示隐式队列。diagnostic_mode=0 表示普通执行，=1 表示 profiling，=2 表示 L1 dump。
 protocol_version=0 表示 push，=1 表示 pull；pull 的 completion_event
 用于等待所有参与 worker 完成，随后跨 rank 确认 source 可安全复用。
 task capacity 覆盖计算 task、terminate、队列长度和所有引用的最大 task ID，并按 16 对齐，没有固定 task 数上限。

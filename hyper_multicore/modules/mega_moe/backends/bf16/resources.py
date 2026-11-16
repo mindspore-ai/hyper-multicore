@@ -21,6 +21,8 @@ class BF16Resources(_MegaMoeExecutionResources):
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
         """
+        if weight_grad_dtype is None and self.spec.partial_weight_grad_dtype == "float32":
+            weight_grad_dtype = torch.float32
         if tokens > self._token_capacity:
             raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
                                f"requested={tokens}, capacity={self._token_capacity}")

@@ -179,8 +179,9 @@ class MXFP8Execution:
         grad_probs = torch.empty_like(probs)
         da = torch.empty((capacity, spec.intermediate_size), dtype=torch.bfloat16, device=device)
         dx = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
-        dw1 = torch.zeros(weight1.logical_shape, dtype=torch.bfloat16, device=device)
-        dw2 = torch.zeros(weight2.logical_shape, dtype=torch.bfloat16, device=device)
+        partial_dtype = torch.float32 if spec.partial_weight_grad_dtype == "float32" else torch.bfloat16
+        dw1 = torch.zeros(weight1.logical_shape, dtype=partial_dtype, device=device)
+        dw2 = torch.zeros(weight2.logical_shape, dtype=partial_dtype, device=device)
         workspace.claim()
         try:
             multicore_ops.mega_moe_unpermute_grad_out(

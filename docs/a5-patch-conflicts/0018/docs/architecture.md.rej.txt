@@ -1,0 +1,30 @@
+diff a/docs/architecture.md b/docs/architecture.md	(rejected hunks)
+@@ -893,19 +894,24 @@ C++ 对应定义位于 `ops/common/*_task_options.h` 和 `ops/common/mega_moe/ta
+ | GMM | 0/1/2/3 互斥 mode | 不按位组合 activation 或 transport options |
+ 
+ 表中 SwiGLU 和 SHMEM 的数值为十进制掩码。`extra_value_0` 由 SwiGLU 持有，用 FP32 bit pattern 表达裁剪限值；
+-`extra_value_2` 由 runtime 持有，用于依赖轮询间隔。`ProbabilityLayout` 固定四个 plane、FP32
++`dependency_poll_interval_us` 由 runtime 持有，用于依赖轮询间隔，保留原物理偏移。
++SHMEM engine 使用独立 typed option 的 bit16，不与轮询字段混用。`ProbabilityLayout` 固定四个 plane、FP32
+ 元素宽度和 scalar-row 单位；host 拒绝未知位、冲突 payload、缺失辅助 operand、错误单位和激活方向。
+ MoE device adapter 在解码前重复校验。host validator 由 graph 绑定，normal/profile/dump 的 runtime
+ 副本保留相同的 validator。
+ 
+ ### 调度与诊断
+ 
+-normal、profile、L1 dump 使用同一个 `RunVectorReadyQueue` 扫描函数和相同静态 worker placement。
++normal、profile、L1 dump 使用同一个 `RunWorkerQueue` 扫描函数和相同静态 worker placement。
+ `ProcessTasks` 和 `ExecuteTask` 使用运行时诊断模式参数，分别执行普通任务、采集时间戳或转储 L1，
+ 共用任务分发逻辑。动态就绪次序可能受记录开销影响，因此不同运行的实际 task 顺序可能不同。
+ `MegaMoeSchedulePolicy` 分别表达 Vector/Cube 顺序、ready 选择、batching 和 polling；compact 仍是
+-先执行的独立粒度 lowering。默认策略按 compact 选择 ready 和全 AIV；活动核集合与 ready 策略关联，
+-没有独立的序列化 placement 字段。Cube stage 通过图节点身份定位。
++先执行的独立粒度 lowering。A3 默认按 compact 选择全 AIV placement 和256槽 Vector ready；A5 使用固定通信 owner 与数学队列。
++WorkerQueue 的 begin/end/stride 表达 placement，ready_depth 只控制当前 worker 的有限就绪选择。
++无任务窃取；等待策略由同一描述表下发。stage 当前按组件内 operator.name 绑定。
++
++MoE 跨 rank source-ready/read-complete 协议由 `ops/common/mega_moe/invocation_protocol.h` 持有；
++通用 runtime 只调用协议 hook，负责本地事件计数与队列完成。
+ 
+ ### 辅助 kernel 与概率数学
+ 

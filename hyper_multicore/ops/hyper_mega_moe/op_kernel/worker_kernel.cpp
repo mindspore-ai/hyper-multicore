@@ -20,7 +20,12 @@
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
+#include "common/mega_moe/invocation_protocol.h"
 #include "common/mega_moe/transport.h"
+#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
+#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h"
+#endif
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
 
@@ -28,10 +33,13 @@ using namespace AscendC;
 
 namespace MulticoreRuntime {
 
-class KernelWorker : public KernelWorkerBase<KernelWorker> {
+class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::LEGACY_ODD,
+                                              RuntimeStorageBoundsPolicy::NATIVE_TILING,
+                                              MulticoreMoE::InvocationProtocol> {
  public:
   // input_list layout for hyper_mega_moe (forward):
   //   [23] = tiling params  [24] = all_event_counters  [25] = diagnostic_buffer  [16] = gmm_workspace
+  static constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
   static constexpr uint32_t TILING_IDX   = 23;
   static constexpr uint32_t EVENT_IDX    = 24;
   static constexpr uint32_t DIAGNOSTIC_IDX = 25;
@@ -62,10 +70,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteSwiglu(task_desc);
         break;
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
+                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
+#else
         ExecuteShmemPutMem(task_desc);
+#endif
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
+                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
+#else
         ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
+#endif
         break;
       default:
         break;
@@ -205,6 +223,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(TaskDesc task_desc) {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
+      MulticoreBf16::ExecuteGmmTask<>(task_desc, input_list, this->core_num, task_tiling);
+      return;
+    }
+#endif
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));

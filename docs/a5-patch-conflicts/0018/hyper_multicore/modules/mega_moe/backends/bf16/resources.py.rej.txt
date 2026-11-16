@@ -1,0 +1,12 @@
+diff a/hyper_multicore/modules/mega_moe/backends/bf16/resources.py b/hyper_multicore/modules/mega_moe/backends/bf16/resources.py	(rejected hunks)
+@@ -9,7 +9,9 @@ from .plan import build_mega_moe_plan
+ class BF16Resources(_MegaMoeExecutionResources):
+     def _initial_plan(self, tensor: torch.Tensor) -> Any:
+         """Precision implementations supply plans while sharing the resource lifecycle."""
+-        return build_mega_moe_plan(self.spec, tensor.device) if not self.spec.dynamic_tokens else None
++        dtype = torch.float32 if self.spec.partial_weight_grad_dtype == "float32" else None
++        options = {} if dtype is None else {"weight_grad_dtype": dtype}
++        return build_mega_moe_plan(self.spec, tensor.device, **options) if not self.spec.dynamic_tokens else None
+ 
+     def plan_for_tokens(self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
+                         batch_experts: bool = False, nominal_schedule: bool = False) -> Any:

@@ -1,0 +1,13 @@
+diff a/hyper_multicore/modules/mega_moe/backends/bf16/plan.py b/hyper_multicore/modules/mega_moe/backends/bf16/plan.py	(rejected hunks)
+@@ -217,8 +217,11 @@ def _build_runtime_artifacts(
+         forward_data = configure_expert_queues(forward_data, forward_graph, spec, forward=True)
+         backward_data = configure_expert_queues(backward_data, backward_graph, spec, forward=False)
+         return forward_graph, forward_data, backward_graph, backward_data
++    if not compact and spec.ready_depth not in (None, 0):
++        raise ValueError("A3 ready lookahead requires compact lowering")
+     policy = MegaMoeSchedulePolicy(
+         vector_ready_queue=bool(compact),
++        vector_ready_depth=256 if spec.ready_depth is None else spec.ready_depth,
+         pipeline_vector=bool(compact) and not spec.batch_experts,
+         pipeline_cube=bool(compact) and not spec.batch_experts,
+         batch_experts=spec.batch_experts,

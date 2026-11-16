@@ -179,8 +179,8 @@ cross-node interface selection and group-local shutdown requirements.
 |---|---|---|
 | `precision` | `"bf16"`，默认 | `"mxfp8"`，A5 |
 | `hidden_states` | BF16 | BF16；dispatch 后量化 |
-| token 规格 | 自动管理或显式 `local_num_tokens` | 显式 `local_num_tokens`，与回放输入规格一致 |
-| 权重 | 自有 Parameter 或 `expert_weights`；EIO/EOI | `create_parameters=False`；外部 MX root；EIO |
+| token 规格 | 按调用自动管理 | 按调用自动管理 |
+| 权重 | 模型持有，每次 forward 传入 `expert_weights`；EIO/EOI | 模型持有的外部 MX root；EIO |
 | H / I | 按 BF16 算子约束 | 均须为64的倍数 |
 | `swiglu_limit` | 可配置正数 clamp | 必须为 `None` |
 | `dispatch_mode` | `push` / `pull` | `push` / `pull` |
@@ -191,17 +191,19 @@ MX 权重 root 的 `col_data/col_scale` 必须由调用方提供；反向前还�
 普通 BF16 Tensor 不能直接作为 MX 物理存储使用。
 
 ```python
-from hyper_multicore import MegaMoeScheduleOptions
+from hyper_multicore.experimental import MegaMoeSchedulerOptions, MegaMoeTuningOptions
 
-schedule = MegaMoeScheduleOptions(
+schedule = MegaMoeSchedulerOptions(
     policy="two_expert_pipeline",  # 也可选 builder_order
     queue_ready_lookahead=8,
 )
-# 将 precision、schedule 传入 MegaMoeExperts；外部权重逐次传入 forward。
+# 将 tuning_options=MegaMoeTuningOptions(scheduler=schedule) 传入 MegaMoeExperts。
+# precision 选择数学后端；外部权重逐次传入 forward。
 ```
 
 QP 固定为每个远端 peer 一个。A5 UDMA 下，两种精度共用通信队列、owner 及完成协议；
-调度只调整数学任务顺序。队列扫描支持0/1/8，通信始终 FIFO。BF16 MTE 不支持非零队列扫描。
+调度只调整数学任务顺序。A5 数学队列扫描支持0/1/8，通信始终 FIFO。A3 compact 默认保留256槽 Vector 扫描；
+显式窗口仅在支持的 profile 上生效。队列窗口不改变 worker 归属。
 完整构建、环境变量、独立组件回放及免编译部署见[构建指南](../docs/build.md#从源码构建并使用-a5-bf16mxfp8-megamoe)。
 
 ### 下游模型集成

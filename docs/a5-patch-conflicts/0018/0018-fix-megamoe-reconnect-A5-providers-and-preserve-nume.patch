@@ -1,0 +1,990 @@
+From 33d568f7943aa8d7c049c0e3fda01b3ff1ae0e3e Mon Sep 17 00:00:00 2001
+From: hedongdong <hdd475375904@126.com>
+Date: Mon, 16 Nov 2026 08:37:10 +0800
+Subject: [PATCH 18/27] fix(megamoe): reconnect A5 providers and preserve
+ numerical and invocation contracts
+
+---
+ docs/architecture.md                          | 16 ++--
+ docs/build.md                                 | 35 +++++----
+ hyper_multicore/README.md                     | 17 +++--
+ .../modules/mega_moe/backends/bf16/plan.py    |  3 +
+ .../mega_moe/backends/bf16/resources.py       |  6 +-
+ .../mega_moe/backends/mxfp8/execution.py      |  5 +-
+ .../modules/mega_moe/backends/mxfp8/graph.py  |  3 +
+ hyper_multicore/modules/mega_moe/module.py    |  3 +
+ hyper_multicore/modules/mega_moe/numerics.py  |  5 ++
+ hyper_multicore/modules/mega_moe/resources.py |  4 +-
+ hyper_multicore/modules/mega_moe/schedule.py  | 10 +--
+ .../modules/mega_moe/schedule_policy.py       |  3 +-
+ hyper_multicore/modules/mega_moe/spec.py      |  6 +-
+ hyper_multicore/modules/mega_moe/transport.py | 17 -----
+ .../ops/common/mega_moe/invocation_protocol.h | 51 +++++++++++++
+ .../adapters/arch35/gmm/bf16_worker.h         | 15 ++--
+ .../adapters/arch35/moe_mxfp8_worker.h        |  5 +-
+ .../op_kernel/worker_kernel.cpp               | 27 ++++++-
+ .../op_kernel/worker_kernel.cpp               | 27 ++++++-
+ hyper_multicore/ops/runtime/worker_kernel.h   | 76 +++++++------------
+ hyper_multicore/tasks/gmm_mxfp8.py            |  3 +-
+ tests/ut/modules/mega_moe/test_module.py      |  9 ++-
+ .../mega_moe/test_partial_weight_grad.py      | 49 ++++++++++++
+ 23 files changed, 274 insertions(+), 121 deletions(-)
+ create mode 100644 hyper_multicore/ops/common/mega_moe/invocation_protocol.h
+ create mode 100644 tests/ut/modules/mega_moe/test_partial_weight_grad.py
+
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 1534c29..22e7ac9 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -455,7 +455,8 @@ trigger_event = all_event_num  （全局唯一 event）
+ header 的前五个 uint32 字段依次为 task_num、num_workers、task_capacity、event_capacity、ready_event；
+ ready_event 为 0 表示无需跨 rank ready。接着三个 uint32 为 diagnostic_mode、
+ aic_profile_record_capacity、aiv_profile_record_capacity；再两个为 completion_event、protocol_version，
+-最后 24 字节用于对齐。diagnostic_mode=0 表示普通执行，=1 表示 profiling，=2 表示 L1 dump。
++byte40 为 queue_layout，byte44 为 worker_queue_offset；最后16字节用于对齐。
++queue_layout=2 表示追加的24字节 WorkerQueue 描述表，0表示隐式队列。diagnostic_mode=0 表示普通执行，=1 表示 profiling，=2 表示 L1 dump。
+ protocol_version=0 表示 push，=1 表示 pull；pull 的 completion_event
+ 用于等待所有参与 worker 完成，随后跨 rank 确认 source 可安全复用。
+ task capacity 覆盖计算 task、terminate、队列长度和所有引用的最大 task ID，并按 16 对齐，没有固定 task 数上限。
+@@ -893,19 +894,24 @@ C++ 对应定义位于 `ops/common/*_task_options.h` 和 `ops/common/mega_moe/ta
+ | GMM | 0/1/2/3 互斥 mode | 不按位组合 activation 或 transport options |
+ 
+ 表中 SwiGLU 和 SHMEM 的数值为十进制掩码。`extra_value_0` 由 SwiGLU 持有，用 FP32 bit pattern 表达裁剪限值；
+-`extra_value_2` 由 runtime 持有，用于依赖轮询间隔。`ProbabilityLayout` 固定四个 plane、FP32
++`dependency_poll_interval_us` 由 runtime 持有，用于依赖轮询间隔，保留原物理偏移。
++SHMEM engine 使用独立 typed option 的 bit16，不与轮询字段混用。`ProbabilityLayout` 固定四个 plane、FP32
+ 元素宽度和 scalar-row 单位；host 拒绝未知位、冲突 payload、缺失辅助 operand、错误单位和激活方向。
+ MoE device adapter 在解码前重复校验。host validator 由 graph 绑定，normal/profile/dump 的 runtime
+ 副本保留相同的 validator。
+ 
+ ### 调度与诊断
+ 
+-normal、profile、L1 dump 使用同一个 `RunVectorReadyQueue` 扫描函数和相同静态 worker placement。
++normal、profile、L1 dump 使用同一个 `RunWorkerQueue` 扫描函数和相同静态 worker placement。
+ `ProcessTasks` 和 `ExecuteTask` 使用运行时诊断模式参数，分别执行普通任务、采集时间戳或转储 L1，
+ 共用任务分发逻辑。动态就绪次序可能受记录开销影响，因此不同运行的实际 task 顺序可能不同。
+ `MegaMoeSchedulePolicy` 分别表达 Vector/Cube 顺序、ready 选择、batching 和 polling；compact 仍是
+-先执行的独立粒度 lowering。默认策略按 compact 选择 ready 和全 AIV；活动核集合与 ready 策略关联，
+-没有独立的序列化 placement 字段。Cube stage 通过图节点身份定位。
++先执行的独立粒度 lowering。A3 默认按 compact 选择全 AIV placement 和256槽 Vector ready；A5 使用固定通信 owner 与数学队列。
++WorkerQueue 的 begin/end/stride 表达 placement，ready_depth 只控制当前 worker 的有限就绪选择。
++无任务窃取；等待策略由同一描述表下发。stage 当前按组件内 operator.name 绑定。
++
++MoE 跨 rank source-ready/read-complete 协议由 `ops/common/mega_moe/invocation_protocol.h` 持有；
++通用 runtime 只调用协议 hook，负责本地事件计数与队列完成。
+ 
+ ### 辅助 kernel 与概率数学
+ 
+diff --git a/docs/build.md b/docs/build.md
+index f46845e..b00eeec 100644
+--- a/docs/build.md
++++ b/docs/build.md
+@@ -336,50 +336,48 @@ bash build.sh --soc-list ascend950 --jobs 16
+ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+ source build/native/payload/hyper_multicore/lib/set_env.bash
+ export HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte_udma
+-export HYPER_MULTICORE_MEGAMOE_COMM_SPLIT=512
+ export HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD=8
+ export HYPER_MULTICORE_SHMEM_LOG_LEVEL=2
+ export SHMEM_LOG_LEVEL=ERROR
+ ```
+ 
+-然后导入 `from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions`。
++然后从 `hyper_multicore` 导入 `MegaMoeExperts`，从 `hyper_multicore.experimental` 导入调优配置。
+ 统一入口以 `precision="bf16"`（默认）或 `precision="mxfp8"` 选择数学后端，forward 的参数保持一致。
+-BF16 支持自动 token 管理，也可指定 `local_num_tokens`；MX 要求 `create_parameters=False`，并显式传入
+-`local_num_tokens`，并且 H/I 均为 64 的倍数。两者都可传 `dispatch_mode="push"` 或 `"pull"`；
++两种后端均自动管理 token 规格并使用模型持有的外部权重。MX 的 H/I 均为64的倍数。
++在 `MegaMoeTuningOptions` 中设置 `dispatch_mode="push"` 或 `"pull"`；
+ Pull 不传容量因子。外部权重每次用 `expert_weights=(root1, root2)` 传入。
+ MX 的物理权重合同见 [architecture.md](architecture.md)。
+ 
+ | 配置 | 作用 |
+ |---|---|
+ | `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte`（默认）或 `mte_udma`；需在 SHMEM 初始化前设置 |
+-| `HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE` | 可选 `push/pull`；若同时传构造参数必须一致 |
+-| `HYPER_MULTICORE_MEGAMOE_COMM_SPLIT` | 两种精度共用通信分片；显式构造参数优先，API 默认 128 |
+ | `HYPER_MULTICORE_MEGAMOE_SCHEDULE_POLICY` | `two_expert_pipeline`（默认，两专家交错）或 `builder_order`（保留 builder 数学顺序） |
+ | `HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD` | 数学任务队列就绪扫描：0为FIFO，1仅检查队首，8有限重排；默认0，通信保持FIFO |
+-| `HYPER_MULTICORE_MX_NOGRAD_NO_CLONE` | 默认 1，在 lease 内完成 unpermute 后返回独立输出 |
+-| `HYPER_MULTICORE_BF16_NOGRAD_NO_COPY` | 默认 1，A5 UDMA no-grad 免保存 dispatch，并在 lease 内 unpermute |
+ | `HYPER_MULTICORE_SHMEM_HEAP_SIZE` | 显式字节预算；按实际模型/路由容量评估，不能用扩大预算代替正确性 |
+ 
+ 
+ 两种策略共用安全 QP0 owner、通信 FIFO 和数学任务核归属。`builder_order` 只改变数学
+-队列顺序，通信队列和 DAG 不变。BF16 MTE 使用隐式队列。
++队列顺序，通信队列和 DAG 不变。A3 BF16 保留 compact/隐式 placement 的原生策略；
++A5 的 MTE 与 UDMA 共用显式逐专家数学队列。
+ 可在构造前设置上述环境变量，或显式传入：
+ 
+ ```python
+ experts = MegaMoeExperts(
+-    precision="mxfp8", local_num_tokens=4096, hidden_size=5120,
++    precision="mxfp8", hidden_size=5120,
+     intermediate_size=1792, num_experts=384, top_k=8,
+-    ep_group=ep_group, create_parameters=False,
+-    schedule=MegaMoeScheduleOptions(policy="two_expert_pipeline", queue_ready_lookahead=8),
++    ep_group=ep_group,
++    tuning_options=MegaMoeTuningOptions(
++        dispatch_mode="pull", dispatch_split=512, combine_split=512,
++        scheduler=MegaMoeSchedulerOptions(policy="two_expert_pipeline", queue_ready_lookahead=8)),
+ )
+ y = experts(x, topk_ids, topk_weights, expert_weights=(root1, root2))
+ ```
+ 
+ 两种精度均通过 `MegaMoeExperts` 使用。MXFP8 权重由调用方量化，并在每次 FSDP gather 后
+-提供当前物理存储所在的原始 root。`from_module` 支持 BF16 权重转换。
+-MX no-grad 与重算均执行 dual-axis SwiGLU，no-clone 由独立开关控制。
++提供当前物理存储所在的原始 root。BF16 直接使用模型持有的专家参数。
++MX no-grad 与重算均执行 dual-axis SwiGLU。no-grad 输出免 clone 由组件生命周期管理，不需要环境开关。
+ 
+-通信分片也接受 `HYPER_MULTICORE_MX_COMM_SPLIT`；队列扫描也接受
++通信模式及分片通过 `MegaMoeTuningOptions` 显式设置。队列扫描也接受
+ `HYPER_MULTICORE_MEGAMOE_READY_DEPTH`、`HYPER_MULTICORE_MX_READY_DEPTH` 和
+ `HYPER_MULTICORE_BF16_READY_DEPTH` 别名。队列扫描的显式参数和各别名必须一致，
+ 冲突直接报错。QP固定1，不需要配置QP数量。
+@@ -408,10 +406,11 @@ Torch/torch_npu 和 CANN 兼容性；不复制构建机器的 Conda 路径或个
+ ### 调度选择与解释
+ 
+ ```python
+-from hyper_multicore import MegaMoeExperts, MegaMoeScheduleOptions
++from hyper_multicore import MegaMoeExperts
++from hyper_multicore.experimental import MegaMoeSchedulerOptions, MegaMoeTuningOptions
+ 
+-schedule = MegaMoeScheduleOptions(policy="two_expert_pipeline", queue_ready_lookahead=8)
+-# 将 schedule=schedule 传入 MegaMoeExperts。
++schedule = MegaMoeSchedulerOptions(policy="two_expert_pipeline", queue_ready_lookahead=8)
++# 将 tuning_options=MegaMoeTuningOptions(scheduler=schedule) 传入 MegaMoeExperts。
+ # 默认策略为 two_expert_pipeline，扫描深度为0；配置在构造时解析，不能热切换。
+ ```
+ 
+diff --git a/hyper_multicore/README.md b/hyper_multicore/README.md
+index edc853b..92e19c0 100644
+--- a/hyper_multicore/README.md
++++ b/hyper_multicore/README.md
+@@ -193,8 +193,8 @@ MegaMoe 不接受 TP 大小参数。子组内部交换各自的 CANN bootstrap I
+ |---|---|---|
+ | `precision` | `"bf16"`，默认 | `"mxfp8"`，A5 |
+ | `hidden_states` | BF16 | BF16；dispatch 后量化 |
+-| token 规格 | 自动管理或显式 `local_num_tokens` | 显式 `local_num_tokens`，与回放输入规格一致 |
+-| 权重 | 自有 Parameter 或 `expert_weights`；EIO/EOI | `create_parameters=False`；外部 MX root；EIO |
++| token 规格 | 按调用自动管理 | 按调用自动管理 |
++| 权重 | 模型持有，每次 forward 传入 `expert_weights`；EIO/EOI | 模型持有的外部 MX root；EIO |
+ | H / I | 按 BF16 算子约束 | 均须为64的倍数 |
+ | `swiglu_limit` | 可配置正数 clamp | 必须为 `None` |
+ | `dispatch_mode` | `push` / `pull` | `push` / `pull` |
+@@ -205,17 +205,19 @@ MX 权重 root 的 `col_data/col_scale` 必须由调用方提供；反向前还
+ 普通 BF16 Tensor 不能直接作为 MX 物理存储使用。
+ 
+ ```python
+-from hyper_multicore import MegaMoeScheduleOptions
++from hyper_multicore.experimental import MegaMoeSchedulerOptions, MegaMoeTuningOptions
+ 
+-schedule = MegaMoeScheduleOptions(
++schedule = MegaMoeSchedulerOptions(
+     policy="two_expert_pipeline",  # 也可选 builder_order
+     queue_ready_lookahead=8,
+ )
+-# 将 precision、schedule 传入 MegaMoeExperts；外部权重逐次传入 forward。
++# 将 tuning_options=MegaMoeTuningOptions(scheduler=schedule) 传入 MegaMoeExperts。
++# precision 选择数学后端；外部权重逐次传入 forward。
+ ```
+ 
+ QP 固定为每个远端 peer 一个。A5 UDMA 下，两种精度共用通信队列、owner 及完成协议；
+-调度只调整数学任务顺序。队列扫描支持0/1/8，通信始终 FIFO。BF16 MTE 不支持非零队列扫描。
++调度只调整数学任务顺序。A5 数学队列扫描支持0/1/8，通信始终 FIFO。A3 compact 默认保留256槽 Vector 扫描；
++显式窗口仅在支持的 profile 上生效。队列窗口不改变 worker 归属。
+ 完整构建、环境变量、独立组件回放及免编译部署见[构建指南](../docs/build.md#从源码构建并使用-a5-bf16mxfp8-megamoe)。
+ 
+ ### 下游模型集成
+@@ -259,10 +261,11 @@ output = experts(
+ 
+ `MegaMoeNumericsOptions` 是公开稳定的数值配置接口，可直接从 `hyper_multicore` 导入。
+ 类型定义位于 `modules/mega_moe/numerics.py`，由 MegaMoE 模块管理。
+-通过 `MegaMoeExperts(..., numerics_options=...)` 按模型逐层配置以下三个字段：
++通过 `MegaMoeExperts(..., numerics_options=...)` 按模型逐层配置以下字段：
+ 
+ | 字段 | 默认值 | 语义 |
+ | --- | --- | --- |
++| `partial_weight_grad_dtype` | `None` | 保留后端既有默认；`"native"` 按参数 dtype 写 partial dW；`"float32"` 以 FP32 保存 partial dW。最终参数梯度和 main_grad 的 dtype 由调用方决定。 |
+ | `swiglu_limit` | `None` | 不进行 clamp；提供时须为正、有限且可由 FP32 表示的值。gate 分支只截上界，up 分支截到 `[-limit, limit]`。 |
+ | `clamp_after_silu` | `False` | `False` 在 SiLU 前截 gate；`True` 在 SiLU(gate) 后、乘 up 前截 gate 激活。仅在提供 `swiglu_limit` 时生效。 |
+ | `apply_probs_before_fc2` | `False` | `False` 在 FC2 后对专家输出加权；`True` 对 BF16 SwiGLU 激活加权，再送入 FC2。 |
+diff --git a/hyper_multicore/modules/mega_moe/backends/bf16/plan.py b/hyper_multicore/modules/mega_moe/backends/bf16/plan.py
+index 6780849..784394b 100644
+--- a/hyper_multicore/modules/mega_moe/backends/bf16/plan.py
++++ b/hyper_multicore/modules/mega_moe/backends/bf16/plan.py
+@@ -217,8 +217,11 @@ def _build_runtime_artifacts(
+         forward_data = configure_expert_queues(forward_data, forward_graph, spec, forward=True)
+         backward_data = configure_expert_queues(backward_data, backward_graph, spec, forward=False)
+         return forward_graph, forward_data, backward_graph, backward_data
++    if not compact and spec.ready_depth not in (None, 0):
++        raise ValueError("A3 ready lookahead requires compact lowering")
+     policy = MegaMoeSchedulePolicy(
+         vector_ready_queue=bool(compact),
++        vector_ready_depth=256 if spec.ready_depth is None else spec.ready_depth,
+         pipeline_vector=bool(compact) and not spec.batch_experts,
+         pipeline_cube=bool(compact) and not spec.batch_experts,
+         batch_experts=spec.batch_experts,
+diff --git a/hyper_multicore/modules/mega_moe/backends/bf16/resources.py b/hyper_multicore/modules/mega_moe/backends/bf16/resources.py
+index 21522de..aabd77f 100644
+--- a/hyper_multicore/modules/mega_moe/backends/bf16/resources.py
++++ b/hyper_multicore/modules/mega_moe/backends/bf16/resources.py
+@@ -9,7 +9,9 @@ from .plan import build_mega_moe_plan
+ class BF16Resources(_MegaMoeExecutionResources):
+     def _initial_plan(self, tensor: torch.Tensor) -> Any:
+         """Precision implementations supply plans while sharing the resource lifecycle."""
+-        return build_mega_moe_plan(self.spec, tensor.device) if not self.spec.dynamic_tokens else None
++        dtype = torch.float32 if self.spec.partial_weight_grad_dtype == "float32" else None
++        options = {} if dtype is None else {"weight_grad_dtype": dtype}
++        return build_mega_moe_plan(self.spec, tensor.device, **options) if not self.spec.dynamic_tokens else None
+ 
+     def plan_for_tokens(self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
+                         batch_experts: bool = False, nominal_schedule: bool = False) -> Any:
+@@ -26,6 +28,8 @@ class BF16Resources(_MegaMoeExecutionResources):
+         Returns:
+             Immutable plan covering the requested rows without enlarging storage.
+         """
++        if weight_grad_dtype is None and self.spec.partial_weight_grad_dtype == "float32":
++            weight_grad_dtype = torch.float32
+         if tokens > self._token_capacity:
+             raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
+                                f"requested={tokens}, capacity={self._token_capacity}")
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py
+index 8b97405..e5feedb 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py
+@@ -185,8 +185,9 @@ class MXFP8Execution:
+         grad_probs = torch.empty_like(probs)
+         da = torch.empty((capacity, spec.intermediate_size), dtype=torch.bfloat16, device=device)
+         dx = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
+-        dw1 = torch.zeros(weight1.logical_shape, dtype=torch.bfloat16, device=device)
+-        dw2 = torch.zeros(weight2.logical_shape, dtype=torch.bfloat16, device=device)
++        partial_dtype = torch.float32 if spec.partial_weight_grad_dtype == "float32" else torch.bfloat16
++        dw1 = torch.zeros(weight1.logical_shape, dtype=partial_dtype, device=device)
++        dw2 = torch.zeros(weight2.logical_shape, dtype=partial_dtype, device=device)
+         workspace.claim()
+         try:
+             multicore_ops.mega_moe_unpermute_grad_out(
+diff --git a/hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py b/hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py
+index 956a352..11e118b 100644
+--- a/hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py
++++ b/hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py
+@@ -93,6 +93,9 @@ def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
+                 else {0: h, 2: h, 6: h, 8: width, 9: 2 * width, 12: h, 13: h, 18: 2 * width})
+     for index, columns in ordinary.items():
+         result[index].shape, result[index].dtype_size = [rows, columns], 2
++    if not forward and spec.partial_weight_grad_dtype == "float32":
++        for index in (6, 18):
++            result[index].dtype_size = 4
+     metadata = ([1, 3, 13, 14] if forward else [1, 3, 14, 15])
+     sizes = [4, 15] if forward else [4, 16]
+     for index in metadata + sizes:
+diff --git a/hyper_multicore/modules/mega_moe/module.py b/hyper_multicore/modules/mega_moe/module.py
+index 92645bb..7c4a4db 100644
+--- a/hyper_multicore/modules/mega_moe/module.py
++++ b/hyper_multicore/modules/mega_moe/module.py
+@@ -163,6 +163,8 @@ class MegaMoeExperts(MulticoreModule):
+             raise ValueError("MegaMoE precision must be bf16 or mxfp8")
+         if precision == "mxfp8" and (numerics.swiglu_limit is not None or numerics.apply_probs_before_fc2):
+             raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
++        if numerics.partial_weight_grad_dtype not in (None, "native", "float32"):
++            raise ValueError("partial_weight_grad_dtype must be native, float32 or None")
+         scheduler = tuning.scheduler
+         if scheduler is not None:
+             if scheduler.lowering not in ("auto", "dense", "compact"):
+@@ -178,6 +180,7 @@ class MegaMoeExperts(MulticoreModule):
+             "intermediate_size": intermediate_size,
+             "num_experts": num_experts,
+             "top_k": top_k,
++            "partial_weight_grad_dtype": numerics.partial_weight_grad_dtype,
+             "swiglu_limit": numerics.swiglu_limit,
+             "clamp_after_activation": numerics.clamp_after_silu,
+             "apply_probs_before_fc2": numerics.apply_probs_before_fc2,
+diff --git a/hyper_multicore/modules/mega_moe/numerics.py b/hyper_multicore/modules/mega_moe/numerics.py
+index 3f7ad46..566d13e 100644
+--- a/hyper_multicore/modules/mega_moe/numerics.py
++++ b/hyper_multicore/modules/mega_moe/numerics.py
+@@ -15,6 +15,7 @@
+ """Stable model numerical options owned by the MegaMoE component."""
+ 
+ from dataclasses import dataclass
++from typing import Literal
+ 
+ 
+ @dataclass(frozen=True)
+@@ -28,6 +29,9 @@ class MegaMoeNumericsOptions:
+     tuning policies cannot override them.
+ 
+     Args:
++        partial_weight_grad_dtype: None preserves the backend default; "native"
++            writes partial weight gradients in the parameter dtype, while
++            "float32" postpones their final rounding until autograd accumulation.
+         swiglu_limit: Optional positive, finite float32-representable clamp
+             limit. The gate branch is clipped only above the limit; the up
+             branch is clipped to ``[-limit, limit]``. None disables clipping.
+@@ -40,6 +44,7 @@ class MegaMoeNumericsOptions:
+             probabilities, and rounds to BF16 again before FC2.
+     """
+ 
++    partial_weight_grad_dtype: Literal["native", "float32"] | None = None
+     swiglu_limit: float | None = None
+     clamp_after_silu: bool = False
+     apply_probs_before_fc2: bool = False
+diff --git a/hyper_multicore/modules/mega_moe/resources.py b/hyper_multicore/modules/mega_moe/resources.py
+index 2e03c4a..379496f 100644
+--- a/hyper_multicore/modules/mega_moe/resources.py
++++ b/hyper_multicore/modules/mega_moe/resources.py
+@@ -82,7 +82,7 @@ class _MegaMoeExecutionResources:
+             "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
+             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
+             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
+-            self.spec.expert_weight_layout, self.spec.apply_probs_before_fc2,
++            self.spec.expert_weight_layout, self.spec.apply_probs_before_fc2, self.spec.partial_weight_grad_dtype,
+             self.spec.precision, self.spec.transport_engine, self.spec.ready_depth,
+             self.spec.schedule_policy, self.spec.lowering,
+             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
+@@ -114,7 +114,7 @@ class _MegaMoeExecutionResources:
+         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
+                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
+                   "dispatch_split", "combine_split", "swiglu_limit", "clamp_after_activation",
+-                  "apply_probs_before_fc2", "expert_weight_layout", "ep_size", "auto_tokens",
++                  "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout", "ep_size", "auto_tokens",
+                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
+                   "batch_experts", "nominal_schedule")
+         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
+diff --git a/hyper_multicore/modules/mega_moe/schedule.py b/hyper_multicore/modules/mega_moe/schedule.py
+index 156e074..a80bf44 100644
+--- a/hyper_multicore/modules/mega_moe/schedule.py
++++ b/hyper_multicore/modules/mega_moe/schedule.py
+@@ -36,10 +36,10 @@ def resolve_schedule_options(options=None, *, precision='bf16'):
+     value = _option(options.queue_ready_lookahead,
+                     ('HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD',
+                      'HYPER_MULTICORE_MEGAMOE_READY_DEPTH',
+-                     f'HYPER_MULTICORE_{"MX" if precision == "mxfp8" else "BF16"}_READY_DEPTH'), 0)
+-    if value not in ('0', '1', '8') or isinstance(options.queue_ready_lookahead, bool):
++                     f'HYPER_MULTICORE_{"MX" if precision == "mxfp8" else "BF16"}_READY_DEPTH'), None)
++    if value not in ('None', '0', '1', '8') or isinstance(options.queue_ready_lookahead, bool):
+         raise ValueError('MegaMoE queue ready lookahead must be 0, 1 or 8')
+-    return MegaMoeSchedulerOptions(policy, int(value))
++    return MegaMoeSchedulerOptions(policy, None if value == "None" else int(value))
+ 
+ 
+ @dataclass(frozen=True)
+@@ -162,8 +162,8 @@ def configure_expert_queues(cfg, graph, spec, *, forward):
+     for queue, compute in zip(vectors, math):
+         queue.extend(compute)
+     validate_transport_owners(cfg, spec, vectors)
+-    result = install_worker_queues(cfg, cubes, vectors, cube_ready_depth=spec.ready_depth,
+-                                   vector_ready_depths=[spec.ready_depth if i % 2 == 0 else 0
++    result = install_worker_queues(cfg, cubes, vectors, cube_ready_depth=spec.ready_depth or 0,
++                                   vector_ready_depths=[(spec.ready_depth or 0) if i % 2 == 0 else 0
+                                                         for i in range(2 * stages.cores)])
+     result.schedule_info = {'policy': spec.schedule_policy, 'precision': spec.precision,
+                             'phase': 'forward' if forward else 'backward',
+diff --git a/hyper_multicore/modules/mega_moe/schedule_policy.py b/hyper_multicore/modules/mega_moe/schedule_policy.py
+index a27cb8c..7886983 100644
+--- a/hyper_multicore/modules/mega_moe/schedule_policy.py
++++ b/hyper_multicore/modules/mega_moe/schedule_policy.py
+@@ -181,6 +181,7 @@ class MegaMoeSchedulePolicy:
+     """Independent task ordering and ready selection after granularity lowering."""
+ 
+     vector_ready_queue: bool = False
++    vector_ready_depth: int = 256
+     pipeline_vector: bool = False
+     pipeline_cube: bool = False
+     batch_experts: bool = False
+@@ -212,4 +213,4 @@ class MegaMoeSchedulePolicy:
+                 config.all_tasks[task_id].extra_value_1 = GroupedMatmulTaskMode.SINGLE_GROUP
+         if self.vector_ready_queue:
+             from hyper_multicore.scheduler.worker_queues import install_strided_worker_queues
+-            install_strided_worker_queues(config)
++            install_strided_worker_queues(config, vector_ready_depth=self.vector_ready_depth)
+diff --git a/hyper_multicore/modules/mega_moe/spec.py b/hyper_multicore/modules/mega_moe/spec.py
+index d398a3c..46c809e 100644
+--- a/hyper_multicore/modules/mega_moe/spec.py
++++ b/hyper_multicore/modules/mega_moe/spec.py
+@@ -51,6 +51,7 @@ class MegaMoeSpec:
+     dispatch_split: int = _COMMUNICATION_SPLIT
+     combine_split: int = _COMMUNICATION_SPLIT
+     swiglu_split: int = _COMMUNICATION_SPLIT
++    partial_weight_grad_dtype: str | None = None
+     swiglu_limit: float | None = None
+     max_local_num_tokens: int | None = None
+     schedule_tokens: int | None = None
+@@ -63,7 +64,7 @@ class MegaMoeSpec:
+     architecture: int = 2201
+     precision: str = "bf16"
+     transport_engine: str = "mte"
+-    ready_depth: int = 0
++    ready_depth: int | None = None
+     schedule_policy: str = "auto"
+     lowering: str = "auto"
+ 
+@@ -227,6 +228,7 @@ def bind_mega_moe_spec(
+         rank_id=rank_id,
+         num_cube_cores=core_spec.num_cube_cores,
+         swiglu_limit=swiglu_limit,
++        partial_weight_grad_dtype=specification.get("partial_weight_grad_dtype"),
+         dispatch_mode=specification.get("dispatch_mode", "push"),
+         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
+         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
+@@ -241,7 +243,7 @@ def bind_mega_moe_spec(
+         architecture=architecture,
+         precision=specification.get("precision", "bf16"),
+         transport_engine=specification.get("transport_engine", "mte"),
+-        ready_depth=specification.get("ready_depth", 0),
++        ready_depth=specification.get("ready_depth"),
+         schedule_policy=specification.get("schedule_policy", "auto"),
+         lowering=specification.get("lowering", "auto"),
+     )
+diff --git a/hyper_multicore/modules/mega_moe/transport.py b/hyper_multicore/modules/mega_moe/transport.py
+index b425aae..2ac6934 100644
+--- a/hyper_multicore/modules/mega_moe/transport.py
++++ b/hyper_multicore/modules/mega_moe/transport.py
+@@ -18,23 +18,6 @@ def require_queue_backend():
+         raise RuntimeError("Explicit worker queues require a matching rebuilt native payload")
+ 
+ 
+-def execution_options(dispatch_mode, dispatch_split, combine_split, default_split):
+-    """Resolve public options once; explicit split arguments override environment aliases."""
+-    environment_mode = os.environ.get('HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE')
+-    if environment_mode not in (None, 'push', 'pull'):
+-        raise ValueError("MegaMoE dispatch mode must be push or pull")
+-    if environment_mode is not None and dispatch_mode is not None and dispatch_mode != environment_mode:
+-        raise ValueError("Explicit MegaMoE dispatch mode conflicts with its environment option")
+-    mode = dispatch_mode or environment_mode or 'push'
+-    split = os.environ.get('HYPER_MULTICORE_MEGAMOE_COMM_SPLIT',
+-                           os.environ.get('HYPER_MULTICORE_MX_COMM_SPLIT', str(default_split)))
+-    try:
+-        split = int(split)
+-    except ValueError as error:
+-        raise ValueError("MegaMoE communication split must be an integer") from error
+-    return mode, split if dispatch_split is None else dispatch_split, split if combine_split is None else combine_split
+-
+-
+ def requested_transport() -> str:
+     """Match the explicitly initialized SHMEM engine; never mutate process configuration."""
+     engine = os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE", "mte")
+diff --git a/hyper_multicore/ops/common/mega_moe/invocation_protocol.h b/hyper_multicore/ops/common/mega_moe/invocation_protocol.h
+new file mode 100644
+index 0000000..894973c
+--- /dev/null
++++ b/hyper_multicore/ops/common/mega_moe/invocation_protocol.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 Huawei Technologies Co., Ltd.
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "shmem.h"
++
++namespace MulticoreMoE {
++// Generation-separated source readiness and read completion are an MoE
++// distributed-buffer protocol, independent of task queue selection.
++struct InvocationProtocol {
++  template <class Worker>
++  __aicore__ static inline void Publish(Worker &worker, const MulticoreRuntime::ReadyHandshakeMeta &meta,
++                                        bool completion) {
++#if !defined(__DAV_CUBE__) && !defined(__DAV_C220_CUBE__)
++    using namespace MulticoreRuntime;
++    int64_t ep = getExtraValueFromTiling(worker.input_list[Worker::TILING_IDX], 1);
++    int64_t rank = getExtraValueFromTiling(worker.input_list[Worker::TILING_IDX], 0) % ep;
++    constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
++    __gm__ int32_t *ready = (__gm__ int32_t *)(worker.input_list[Worker::EVENT_IDX]) + worker.runtime_event_capacity;
++    if (completion) {
++      ready += (ep + 1) * ready_stride;
++    }
++
++    GlobalTensor<int32_t> ready_state;
++    ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
++    uint32_t generation_index = static_cast<uint32_t>(ep) * ready_stride;
++    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
++      ready_state[generation_index]);
++    int32_t previous_generation = ready_state.GetValue(generation_index);
++    if (previous_generation == INT32_MAX) {
++      AscendC::Trap();
++    }
++    int32_t generation = previous_generation + 1;
++    ready_state.SetValue(generation_index, generation);
++    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
++      ready_state[generation_index]);
++    PipeBarrier<PIPE_ALL>();
++
++    uint32_t round = 0;
++    for (int64_t distance = 1; distance < ep; distance *= 2, ++round) {
++      int64_t target = (rank + distance) % ep;
++      __gm__ int32_t *round_ready = ready + round * ready_stride;
++      aclshmemx_signal_op(round_ready, generation, ACLSHMEM_SIGNAL_SET, static_cast<int>(target));
++      aclshmem_signal_wait_until(round_ready, ACLSHMEM_CMP_GE, generation);
++    }
++    if (!completion) {
++      worker.TriggerEvent(meta.ready_event);
++    }
++#endif
++  }
++};
++}  // namespace MulticoreMoE
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h
+index ad35798..7678458 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h
++++ b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h
+@@ -6,14 +6,14 @@
+ #include "bf16_problem.h"
+ 
+ namespace MulticoreBf16 {
+-template <class LayoutA, class LayoutB>
++template <class LayoutA, class LayoutB, class Output = bfloat16_t>
+ __aicore__ inline void RunStandardGmm(const Problem& p, GM_ADDR a, GM_ADDR b, GM_ADDR c,
+                                      uint32_t lane, uint32_t cores, uint32_t expert) {
+   using namespace Blaze::Gemm;
+   using Row = asc::te::nd_ext_layout_ptn;
+   using Policy = MatmulMultiBlockBasic<0, 0, KernelGroupedMmadNoQuant, 0, MatmulOutputMode::OVERWRITE>;
+   using Mmad = Block::BlockMmad<Policy, bfloat16_t, LayoutA, bfloat16_t, LayoutB,
+-                               bfloat16_t, Row, float, Row>;
++                               Output, Row, float, Row>;
+   using Shape = asc::te::shape<int64_t, int64_t, int64_t, int64_t>;
+   using Kernel = Kernel::GemmUniversal<Shape, Mmad, Blaze::Epilogue::Block::BlockEpilogueEmpty,
+                                        Block::BlockSchedulerGmmNoQuant>;
+@@ -38,7 +38,7 @@ __aicore__ inline void RunStandardGmm(const Problem& p, GM_ADDR a, GM_ADDR b, GM
+   AscendC::PipeBarrier<PIPE_ALL>();
+ }
+ 
+-template <class Task>
++template <class WeightOutput = bfloat16_t, class Task>
+ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_t cores,
+                                       const TCubeTiling& tiling) {
+   if ASCEND_IS_AIV { return; }
+@@ -52,12 +52,15 @@ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_
+   const auto p = MakeProblem(tiling.M, tiling.N, tiling.Ka, expert, start, end - start, ta);
+   auto a = inputs[task.inputs[0].input_position] + p.a * sizeof(bfloat16_t);
+   auto b = inputs[task.inputs[1].input_position] + p.b * sizeof(bfloat16_t);
+-  auto c = inputs[task.outputs[0].input_position] + p.c * sizeof(bfloat16_t);
++  // TN writes partial dW; NN/NT retain the activation output dtype.
++  const uint32_t output_bytes = ta ? sizeof(WeightOutput) : sizeof(bfloat16_t);
++  if (task.outputs[0].data_type != output_bytes) AscendC::Trap();
++  auto c = inputs[task.outputs[0].input_position] + p.c * output_bytes;
+   if (start == end) {
+     if (ta) {
+       // Empty expert still owns a complete zero weight gradient. Cache lines are disjoint.
+       AscendC::GlobalTensor<uint32_t> output;
+-      const uint64_t words = p.m * p.n * sizeof(bfloat16_t) / sizeof(uint32_t);
++      const uint64_t words = p.m * p.n * output_bytes / sizeof(uint32_t);
+       output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(c), words);
+       for (uint64_t line = lane; line < (words + 31) / 32; line += cores) {
+         for (uint64_t i = line * 32; i < (line + 1) * 32 && i < words; ++i) output.SetValue(i, 0);
+@@ -68,7 +71,7 @@ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_
+     return;
+   }
+   AscendC::AscendCUtils::SetOverflow(1);
+-  if (ta) RunStandardGmm<asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn>(p, a, b, c, lane, cores, expert);
++  if (ta) RunStandardGmm<asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn, WeightOutput>(p, a, b, c, lane, cores, expert);
+   else if (tb) RunStandardGmm<asc::te::nd_ext_layout_ptn, asc::te::dn_ext_layout_ptn>(p, a, b, c, lane, cores, expert);
+   else RunStandardGmm<asc::te::nd_ext_layout_ptn, asc::te::nd_ext_layout_ptn>(p, a, b, c, lane, cores, expert);
+ }
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h
+index 9c38d0f..00b819d 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h
++++ b/hyper_multicore/ops/hyper_mega_moe/op_kernel/adapters/arch35/moe_mxfp8_worker.h
+@@ -5,6 +5,7 @@
+ #include "hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h"
+ #include "hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h"
+ #include "runtime/worker_kernel.h"
++#include "common/mega_moe/invocation_protocol.h"
+ #include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
+ #ifdef __DAV_CUBE__
+ #include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_worker.h"
+@@ -13,7 +14,9 @@
+ #endif
+ 
+ namespace MulticoreRuntime {
+-class MxTaskWorker : public KernelWorkerBase<MxTaskWorker, VectorWorkerPolicy::ALL> {
++class MxTaskWorker : public KernelWorkerBase<MxTaskWorker, VectorWorkerPolicy::ALL,
++                                           RuntimeStorageBoundsPolicy::NATIVE_TILING,
++                                           MulticoreMoE::InvocationProtocol> {
+  public:
+   static constexpr uint32_t EVENT_IDX = 65;
+   static constexpr uint32_t DIAGNOSTIC_IDX = 66;
+diff --git a/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp b/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
+index 87f5113..fc24185 100644
+--- a/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe/op_kernel/worker_kernel.cpp
+@@ -20,7 +20,12 @@
+ #include "grouped_matmul/grouped_matmul.cpp"
+ #include "put_mem_signal/put_mem_signal_kernel.cpp"
+ #include "runtime/worker_kernel.h"
++#include "common/mega_moe/invocation_protocol.h"
+ #include "common/mega_moe/transport.h"
++#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
++#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h"
++#endif
+ #include "common/mega_moe/task_options.h"
+ #include "common/mega_moe/routing_probabilities.h"
+ 
+@@ -28,10 +33,13 @@ using namespace AscendC;
+ 
+ namespace MulticoreRuntime {
+ 
+-class KernelWorker : public KernelWorkerBase<KernelWorker> {
++class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::LEGACY_ODD,
++                                              RuntimeStorageBoundsPolicy::NATIVE_TILING,
++                                              MulticoreMoE::InvocationProtocol> {
+  public:
+   // input_list layout for hyper_mega_moe (forward):
+   //   [23] = tiling params  [24] = all_event_counters  [25] = diagnostic_buffer  [16] = gmm_workspace
++  static constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
+   static constexpr uint32_t TILING_IDX   = 23;
+   static constexpr uint32_t EVENT_IDX    = 24;
+   static constexpr uint32_t DIAGNOSTIC_IDX = 25;
+@@ -62,10 +70,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
+         ExecuteSwiglu(task_desc);
+         break;
+       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
++        MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
++                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
++#else
+         ExecuteShmemPutMem(task_desc);
++#endif
+         break;
+       case TaskType::TASK_SHMEM_GET_MEM:
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
++        MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
++                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
++#else
+         ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
++#endif
+         break;
+       default:
+         break;
+@@ -205,6 +223,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
+   }
+ 
+   __aicore__ inline void ExecuteGroupedMatmul(TaskDesc task_desc) {
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
++    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
++      GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
++      MulticoreBf16::ExecuteGmmTask<>(task_desc, input_list, this->core_num, task_tiling);
++      return;
++    }
++#endif
+     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
+       DynamicData dynamic_data;
+       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
+diff --git a/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp b/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
+index 78d3086..40d869a 100644
+--- a/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
++++ b/hyper_multicore/ops/hyper_mega_moe_grad/op_kernel/worker_kernel.cpp
+@@ -21,7 +21,12 @@
+ #include "grouped_matmul/grouped_matmul.cpp"
+ #include "put_mem_signal/put_mem_signal_kernel.cpp"
+ #include "runtime/worker_kernel.h"
++#include "common/mega_moe/invocation_protocol.h"
+ #include "common/mega_moe/transport.h"
++#include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
++#include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/bf16_worker.h"
++#endif
+ #include "common/mega_moe/task_options.h"
+ #include "common/mega_moe/routing_probabilities.h"
+ 
+@@ -33,11 +38,14 @@ using namespace AscendC;
+ 
+ namespace MulticoreRuntime {
+ 
+-class KernelWorker : public KernelWorkerBase<KernelWorker> {
++class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::LEGACY_ODD,
++                                              RuntimeStorageBoundsPolicy::NATIVE_TILING,
++                                              MulticoreMoE::InvocationProtocol> {
+  public:
+   // input_list layout for hyper_mega_moe_grad (backward):
+   //   [30] = tiling params  [31] = all_event_counters  [32] = diagnostic_buffer
+   //   [25] = gmm_workspace  [26] = swi_glu_grad_workspace
++  static constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
+   static constexpr uint32_t TILING_IDX              = 30;
+   static constexpr uint32_t EVENT_IDX               = 31;
+   static constexpr uint32_t DIAGNOSTIC_IDX          = 32;
+@@ -70,10 +78,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
+         ExecuteGroupedMatmul(task_desc);
+         break;
+       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
++        MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
++                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
++#else
+         ExecuteShmemPutMem(task_desc);
++#endif
+         break;
+       case TaskType::TASK_SHMEM_GET_MEM:
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
++        MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
++                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
++#else
+         ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
++#endif
+         break;
+       case TaskType::TASK_SWI_GLU_GRAD:
+         ExecuteSwiGluGrad(task_desc);
+@@ -257,6 +275,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
+   }
+ 
+   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
++    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
++      GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
++      MulticoreBf16::ExecuteGmmTask<DTYPE_HIDDEN_DW>(task_desc, input_list, this->core_num, task_tiling);
++      return;
++    }
++#endif
+     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
+       DynamicData dynamic_data;
+       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
+diff --git a/hyper_multicore/ops/runtime/worker_kernel.h b/hyper_multicore/ops/runtime/worker_kernel.h
+index ddd047f..797376a 100644
+--- a/hyper_multicore/ops/runtime/worker_kernel.h
++++ b/hyper_multicore/ops/runtime/worker_kernel.h
+@@ -26,7 +26,6 @@
+ #define HYPER_MULTICORE_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_
+ 
+ #include "kernel_operator.h"
+-#include "shmem.h"
+ #include "runtime_config.hpp"
+ #include "runtime_storage_bounds.h"
+ #include "cycle_trace_recorder.h"
+@@ -54,9 +53,6 @@ constexpr int64_t EVENT_REFRESH_TIME_UNIT_CYCLES = 50;
+ constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_UNITS = 50;     // 2,500 system cycles.
+ constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_UNITS = 150;  // 7,500 system cycles.
+ #endif
+-// The selected SwiGLU tiling uses baseRowLen=19; smaller dynamic tails must lower it.
+-constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
+-constexpr int64_t READY_SIGNAL_RADIX = 2;
+ 
+ enum class VectorWorkerPolicy : uint32_t {
+   LEGACY_ODD = 0,
+@@ -68,9 +64,19 @@ enum class RuntimeStorageBoundsPolicy : uint32_t {
+   GRAPH_OWNED = 1,
+ };
+ 
++// Default workers have only local events; distributed operators supply a protocol.
++struct LocalInvocationProtocol {
++  template <class Worker>
++  __aicore__ static inline void Publish(Worker &worker, const ReadyHandshakeMeta &meta, bool completion) {
++    if (!completion) worker.TriggerEvent(meta.ready_event);
++  }
++};
++
+ template <typename Derived, VectorWorkerPolicy WorkerPolicy = VectorWorkerPolicy::LEGACY_ODD,
+-          RuntimeStorageBoundsPolicy StorageBoundsPolicy = RuntimeStorageBoundsPolicy::NATIVE_TILING>
++          RuntimeStorageBoundsPolicy StorageBoundsPolicy = RuntimeStorageBoundsPolicy::NATIVE_TILING,
++          typename InvocationProtocol = LocalInvocationProtocol>
+ class KernelWorkerBase {
++  friend InvocationProtocol;
+  public:
+   __aicore__ inline KernelWorkerBase() {}
+ 
+@@ -214,7 +220,13 @@ class KernelWorkerBase {
+         worker.WaitForDependency(dependent, view.poll_interval_us);
+       } else {
+         if (mode == DiagnosticMode::PROFILE && idle_start == 0) idle_start = recorder.Now();
+-        const int64_t until = AscendC::GetSystemCycle() + view.poll_interval_us * SYSTEM_CYCLES_PER_US;
++        const int64_t until = AscendC::GetSystemCycle() + view.poll_interval_us *
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
++                              SYSTEM_CYCLES_PER_US
++#else
++                              EVENT_REFRESH_TIME_UNIT_CYCLES
++#endif
++                              ;
+         while (AscendC::GetSystemCycle() < until) {}
+       }
+     }
+@@ -236,44 +248,6 @@ class KernelWorkerBase {
+     return meta->ready_event != 0;
+   }
+ 
+-  __aicore__ inline void PublishDeviceReady(const ReadyHandshakeMeta &meta, bool completion = false) {
+-#ifndef HMC_RUNTIME_CUBE
+-    int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
+-    int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
+-    constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
+-    __gm__ int32_t *ready = (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + runtime_event_capacity;
+-    if (completion) {
+-      ready += (ep + 1) * ready_stride;
+-    }
+-
+-    GlobalTensor<int32_t> ready_state;
+-    ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
+-    uint32_t generation_index = static_cast<uint32_t>(ep) * ready_stride;
+-    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+-      ready_state[generation_index]);
+-    int32_t previous_generation = ready_state.GetValue(generation_index);
+-    if (previous_generation == INT32_MAX) {
+-      AscendC::Trap();
+-    }
+-    int32_t generation = previous_generation + 1;
+-    ready_state.SetValue(generation_index, generation);
+-    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+-      ready_state[generation_index]);
+-    PipeBarrier<PIPE_ALL>();
+-
+-    uint32_t round = 0;
+-    for (int64_t distance = 1; distance < ep; distance *= READY_SIGNAL_RADIX, ++round) {
+-      int64_t target = (rank + distance) % ep;
+-      __gm__ int32_t *round_ready = ready + round * ready_stride;
+-      aclshmemx_signal_op(round_ready, generation, ACLSHMEM_SIGNAL_SET, static_cast<int>(target));
+-      aclshmem_signal_wait_until(round_ready, ACLSHMEM_CMP_GE, generation);
+-    }
+-    if (!completion) {
+-      TriggerEvent(meta.ready_event);
+-    }
+-#endif
+-  }
+-
+   __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
+ #ifndef HMC_RUNTIME_CUBE
+     if (!IsActiveVectorWorker()) {
+@@ -285,7 +259,7 @@ class KernelWorkerBase {
+     if (this->worker_id_ == 1) {
+       WaitForDependency(meta.completion_event);
+       if (meta.ready_event != 0) {
+-        PublishDeviceReady(meta, true);
++        InvocationProtocol::Publish(*static_cast<Derived *>(this), meta, true);
+       }
+     }
+ #endif
+@@ -297,8 +271,8 @@ class KernelWorkerBase {
+     if (!IsActiveVectorWorker()) {
+       return;
+     }
+-    if (this->worker_id_ == 1) {
+-      PublishDeviceReady(meta);
++    if (this->worker_id_ == ReadyLeader()) {
++      InvocationProtocol::Publish(*static_cast<Derived *>(this), meta, false);
+     }
+     WaitForDependency(meta.ready_event);
+ #endif
+@@ -319,14 +293,20 @@ class KernelWorkerBase {
+     return this->worker_id_ % 2 == 0 ? INVALID_VECTOR_SCHEDULE_INDEX : this->worker_id_ / 2;
+   }
+ 
+-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+   __aicore__ inline bool IsActiveVectorWorker() const {
+     if (WorkerPolicy == VectorWorkerPolicy::ALL || explicit_queues_) {
+       return this->worker_id_ < this->active_vector_num;
+     }
+     return this->worker_id_ % VECTOR_WORKER_STRIDE != 0;
+   }
++
++  __aicore__ inline uint32_t ReadyLeader() const {
++#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
++    return 1;
++#else
++    return this->active_vector_num == this->vector_num ? 0 : 1;
+ #endif
++  }
+ 
+   __aicore__ inline void AtomicAddForAllEventCounters(uint32_t event_index) {
+ #if defined(HMC_RUNTIME_CUBE) && defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+diff --git a/hyper_multicore/tasks/gmm_mxfp8.py b/hyper_multicore/tasks/gmm_mxfp8.py
+index f8b24a9..0ebbeee 100644
+--- a/hyper_multicore/tasks/gmm_mxfp8.py
++++ b/hyper_multicore/tasks/gmm_mxfp8.py
+@@ -130,6 +130,7 @@ class Mxfp8GmmFillConfig:
+                     cube_count=self.workers, cube_index=worker, group_list_offset=expert * 8,
+                     w_offset=0 if self.layout == 'TN' else expert * self.n * self.k,
+                     w_scale_offset=0 if self.layout == 'TN' else expert * self.n * self.k // 32,
+-                    y_offset=expert * self.m * self.n * 2 if self.layout == 'TN' else 0,
++                    y_offset=expert * self.m * self.n * op.outputs[0].dtype_size if self.layout == 'TN' else 0,
++                    output_dtype=MX_GMM_OUTPUT_FP32 if op.outputs[0].dtype_size == 4 else MX_GMM_OUTPUT_BF16,
+                 ))
+         fill_expert_compute_tasks(cfg, op, tsv, MX_GMM_TASK_TYPE, self.workers, False, indices, cube=True)
+diff --git a/tests/ut/modules/mega_moe/test_module.py b/tests/ut/modules/mega_moe/test_module.py
+index f95fcb8..df4dd56 100644
+--- a/tests/ut/modules/mega_moe/test_module.py
++++ b/tests/ut/modules/mega_moe/test_module.py
+@@ -974,7 +974,8 @@ class TestMegaMoeExperts(unittest.TestCase):
+         root_group = object()
+         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+                                      dispatch_mode="push", max_local_num_tokens=None,
+-                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0)
++                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
++                                     partial_weight_grad_dtype=None)
+         workspace = Mock()
+         manager = Mock(root_group=root_group, heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
+         manager.reserve.return_value = ({},)
+@@ -1025,7 +1026,8 @@ class TestMegaMoeExperts(unittest.TestCase):
+         root_group = object()
+         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+                                      dispatch_mode="push", max_local_num_tokens=None,
+-                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0)
++                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
++                                     partial_weight_grad_dtype=None)
+ 
+         manager = Mock(heap_bytes=1024, epoch=0, workspaces=[])
+         manager.reserve.return_value = ({},)
+@@ -1065,7 +1067,8 @@ class TestMegaMoeExperts(unittest.TestCase):
+         specification = {"name": "new resource"}
+         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+                                      dispatch_mode="push", max_local_num_tokens=None,
+-                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0)
++                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
++                                     partial_weight_grad_dtype=None)
+         growth_record = {"epoch": 1, "heap_bytes": 4096}
+         manager = Mock(heap_bytes=2048, epoch=0, workspaces=[object()], growth_records=[])
+         manager.attach_runtime.return_value = False
+diff --git a/tests/ut/modules/mega_moe/test_partial_weight_grad.py b/tests/ut/modules/mega_moe/test_partial_weight_grad.py
+new file mode 100644
+index 0000000..a4894fa
+--- /dev/null
++++ b/tests/ut/modules/mega_moe/test_partial_weight_grad.py
+@@ -0,0 +1,49 @@
++"""Partial-gradient precision changes storage, not scheduling or activation math."""
++import ctypes
++from dataclasses import replace
++
++import pytest
++
++from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
++from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
++from hyper_multicore.modules.mega_moe.schedule import explain_schedule
++from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
++from hyper_multicore.tasks.gmm_mxfp8 import MxGmmDescriptor, MX_GMM_OUTPUT_FP32
++
++
++def test_partial_gradient_policy_reaches_common_resource_contract():
++    layer = MegaMoeExperts(hidden_size=512, intermediate_size=128, num_experts=8, top_k=2,
++                           numerics_options=MegaMoeNumericsOptions(partial_weight_grad_dtype="float32"))
++    try:
++        assert layer._resource_group.specification['partial_weight_grad_dtype'] == 'float32'
++    finally:
++        layer.close()
++    with pytest.raises(ValueError, match='partial_weight_grad_dtype'):
++        MegaMoeExperts(hidden_size=512, intermediate_size=128, num_experts=8, top_k=2,
++                       numerics_options=MegaMoeNumericsOptions(partial_weight_grad_dtype='float16'))
++
++
++def test_mx_fp32_partials_have_disjoint_full_width_outputs_and_same_dag():
++    spec = MegaMoeSpec(512, 512, 128, 24, 8, 1.25, 8192, 4, None, 0, 32,
++                       precision='mxfp8', transport_engine='udma', dispatch_split=512, combine_split=512)
++    ordinary = build_mxfp8_runtime(spec, forward=False)
++    fp32 = build_mxfp8_runtime(replace(spec, partial_weight_grad_dtype='float32'), forward=False)
++    before, after = explain_schedule(ordinary.config), explain_schedule(fp32.config)
++    assert before['queues'] == after['queues']
++    assert before['tasks'] == after['tasks']
++    assert before['event_triggers'] == after['event_triggers']
++    size = ctypes.sizeof(MxGmmDescriptor)
++    records = [MxGmmDescriptor.from_buffer_copy(fp32.gmm_descriptors, i)
++               for i in range(0, len(fp32.gmm_descriptors), size)]
++    seen = 0
++    for record in records:
++        if record.layout == 2:  # TN partial weight gradients.
++            assert record.output_dtype == MX_GMM_OUTPUT_FP32
++            expert = record.group_list_offset // 8
++            assert record.y_offset == expert * record.m * record.n * 4
++            seen += 1
++        else:
++            assert record.output_dtype == 0
++    assert seen == 2 * spec.local_experts * spec.num_cube_cores
++    assert build_mxfp8_runtime(spec, forward=True).gmm_descriptors == build_mxfp8_runtime(
++        replace(spec, partial_weight_grad_dtype='float32'), forward=True).gmm_descriptors
+-- 
+2.54.0
+

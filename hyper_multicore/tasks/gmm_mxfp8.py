@@ -130,6 +130,7 @@ class Mxfp8GmmFillConfig:
                     cube_count=self.workers, cube_index=worker, group_list_offset=expert * 8,
                     w_offset=0 if self.layout == 'TN' else expert * self.n * self.k,
                     w_scale_offset=0 if self.layout == 'TN' else expert * self.n * self.k // 32,
-                    y_offset=expert * self.m * self.n * 2 if self.layout == 'TN' else 0,
+                    y_offset=expert * self.m * self.n * op.outputs[0].dtype_size if self.layout == 'TN' else 0,
+                    output_dtype=MX_GMM_OUTPUT_FP32 if op.outputs[0].dtype_size == 4 else MX_GMM_OUTPUT_BF16,
                 ))
         fill_expert_compute_tasks(cfg, op, tsv, MX_GMM_TASK_TYPE, self.workers, False, indices, cube=True)

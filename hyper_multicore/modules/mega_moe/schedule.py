@@ -168,8 +168,8 @@ def configure_expert_queues(cfg, graph, spec, *, forward):
     for queue, compute in zip(vectors, math):
         queue.extend(compute)
     validate_transport_owners(cfg, spec, vectors)
-    result = install_worker_queues(cfg, cubes, vectors, cube_ready_depth=spec.ready_depth,
-                                   vector_ready_depths=[spec.ready_depth if i % 2 == 0 else 0
+    result = install_worker_queues(cfg, cubes, vectors, cube_ready_depth=spec.ready_depth or 0,
+                                   vector_ready_depths=[(spec.ready_depth or 0) if i % 2 == 0 else 0
                                                         for i in range(2 * stages.cores)])
     result.schedule_info = {'policy': spec.schedule_policy, 'precision': spec.precision,
                             'phase': 'forward' if forward else 'backward',

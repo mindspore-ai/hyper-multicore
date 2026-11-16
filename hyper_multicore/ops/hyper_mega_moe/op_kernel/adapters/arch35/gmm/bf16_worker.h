@@ -6,14 +6,14 @@
 #include "bf16_problem.h"
 
 namespace MulticoreBf16 {
-template <class LayoutA, class LayoutB>
+template <class LayoutA, class LayoutB, class Output = bfloat16_t>
 __aicore__ inline void RunStandardGmm(const Problem& p, GM_ADDR a, GM_ADDR b, GM_ADDR c,
                                      uint32_t lane, uint32_t cores, uint32_t expert) {
   using namespace Blaze::Gemm;
   using Row = asc::te::nd_ext_layout_ptn;
   using Policy = MatmulMultiBlockBasic<0, 0, KernelGroupedMmadNoQuant, 0, MatmulOutputMode::OVERWRITE>;
   using Mmad = Block::BlockMmad<Policy, bfloat16_t, LayoutA, bfloat16_t, LayoutB,
-                               bfloat16_t, Row, float, Row>;
+                               Output, Row, float, Row>;
   using Shape = asc::te::shape<int64_t, int64_t, int64_t, int64_t>;
   using Kernel = Kernel::GemmUniversal<Shape, Mmad, Blaze::Epilogue::Block::BlockEpilogueEmpty,
                                        Block::BlockSchedulerGmmNoQuant>;
@@ -38,7 +38,7 @@ __aicore__ inline void RunStandardGmm(const Problem& p, GM_ADDR a, GM_ADDR b, GM
   AscendC::PipeBarrier<PIPE_ALL>();
 }
 
-template <class Task>
+template <class WeightOutput = bfloat16_t, class Task>
 __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_t cores,
                                       const TCubeTiling& tiling) {
   if ASCEND_IS_AIV { return; }
@@ -52,12 +52,15 @@ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_
   const auto p = MakeProblem(tiling.M, tiling.N, tiling.Ka, expert, start, end - start, ta);
   auto a = inputs[task.inputs[0].input_position] + p.a * sizeof(bfloat16_t);
   auto b = inputs[task.inputs[1].input_position] + p.b * sizeof(bfloat16_t);
-  auto c = inputs[task.outputs[0].input_position] + p.c * sizeof(bfloat16_t);
+  // TN writes partial dW; NN/NT retain the activation output dtype.
+  const uint32_t output_bytes = ta ? sizeof(WeightOutput) : sizeof(bfloat16_t);
+  if (task.outputs[0].data_type != output_bytes) AscendC::Trap();
+  auto c = inputs[task.outputs[0].input_position] + p.c * output_bytes;
   if (start == end) {
     if (ta) {
       // Empty expert still owns a complete zero weight gradient. Cache lines are disjoint.
       AscendC::GlobalTensor<uint32_t> output;
-      const uint64_t words = p.m * p.n * sizeof(bfloat16_t) / sizeof(uint32_t);
+      const uint64_t words = p.m * p.n * output_bytes / sizeof(uint32_t);
       output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(c), words);
       for (uint64_t line = lane; line < (words + 31) / 32; line += cores) {
         for (uint64_t i = line * 32; i < (line + 1) * 32 && i < words; ++i) output.SetValue(i, 0);
@@ -68,7 +71,7 @@ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_
     return;
   }
   AscendC::AscendCUtils::SetOverflow(1);
-  if (ta) RunStandardGmm<asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn>(p, a, b, c, lane, cores, expert);
+  if (ta) RunStandardGmm<asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn, WeightOutput>(p, a, b, c, lane, cores, expert);
   else if (tb) RunStandardGmm<asc::te::nd_ext_layout_ptn, asc::te::dn_ext_layout_ptn>(p, a, b, c, lane, cores, expert);
   else RunStandardGmm<asc::te::nd_ext_layout_ptn, asc::te::nd_ext_layout_ptn>(p, a, b, c, lane, cores, expert);
 }

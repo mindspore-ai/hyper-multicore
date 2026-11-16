@@ -5,6 +5,7 @@
 #include "hyper_mega_moe/op_kernel/contracts/mx_launch_descriptor.h"
 #include "hyper_mega_moe/op_kernel/contracts/mx_byte_tensor_list.h"
 #include "runtime/worker_kernel.h"
+#include "common/mega_moe/invocation_protocol.h"
 #include "hyper_mega_moe/op_kernel/adapters/common/transport_task.h"
 #ifdef __DAV_CUBE__
 #include "hyper_mega_moe/op_kernel/adapters/arch35/gmm/mxfp8_worker.h"
@@ -13,7 +14,9 @@
 #endif
 
 namespace MulticoreRuntime {
-class MxTaskWorker : public KernelWorkerBase<MxTaskWorker, VectorWorkerPolicy::ALL> {
+class MxTaskWorker : public KernelWorkerBase<MxTaskWorker, VectorWorkerPolicy::ALL,
+                                           RuntimeStorageBoundsPolicy::NATIVE_TILING,
+                                           MulticoreMoE::InvocationProtocol> {
  public:
   static constexpr uint32_t EVENT_IDX = 65;
   static constexpr uint32_t DIAGNOSTIC_IDX = 66;

@@ -17,23 +17,6 @@ def require_queue_backend():
         raise RuntimeError("Explicit worker queues require a matching rebuilt native payload")
 
 
-def execution_options(dispatch_mode, dispatch_split, combine_split, default_split):
-    """Resolve public options once; explicit split arguments override environment aliases."""
-    environment_mode = os.environ.get('HYPER_MULTICORE_MEGAMOE_DISPATCH_MODE')
-    if environment_mode not in (None, 'push', 'pull'):
-        raise ValueError("MegaMoE dispatch mode must be push or pull")
-    if environment_mode is not None and dispatch_mode is not None and dispatch_mode != environment_mode:
-        raise ValueError("Explicit MegaMoE dispatch mode conflicts with its environment option")
-    mode = dispatch_mode or environment_mode or 'push'
-    split = os.environ.get('HYPER_MULTICORE_MEGAMOE_COMM_SPLIT',
-                           os.environ.get('HYPER_MULTICORE_MX_COMM_SPLIT', str(default_split)))
-    try:
-        split = int(split)
-    except ValueError as error:
-        raise ValueError("MegaMoE communication split must be an integer") from error
-    return mode, split if dispatch_split is None else dispatch_split, split if combine_split is None else combine_split
-
-
 def requested_transport() -> str:
     """Match the explicitly initialized SHMEM engine; never mutate process configuration."""
     engine = os.environ.get("HYPER_MULTICORE_SHMEM_DATA_ENGINE", "mte")

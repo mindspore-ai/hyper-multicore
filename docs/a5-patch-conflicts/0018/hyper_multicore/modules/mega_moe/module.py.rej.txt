@@ -1,0 +1,18 @@
+diff a/hyper_multicore/modules/mega_moe/module.py b/hyper_multicore/modules/mega_moe/module.py	(rejected hunks)
+@@ -163,6 +163,8 @@ class MegaMoeExperts(MulticoreModule):
+             raise ValueError("MegaMoE precision must be bf16 or mxfp8")
+         if precision == "mxfp8" and (numerics.swiglu_limit is not None or numerics.apply_probs_before_fc2):
+             raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
++        if numerics.partial_weight_grad_dtype not in (None, "native", "float32"):
++            raise ValueError("partial_weight_grad_dtype must be native, float32 or None")
+         scheduler = tuning.scheduler
+         if scheduler is not None:
+             if scheduler.lowering not in ("auto", "dense", "compact"):
+@@ -178,6 +180,7 @@ class MegaMoeExperts(MulticoreModule):
+             "intermediate_size": intermediate_size,
+             "num_experts": num_experts,
+             "top_k": top_k,
++            "partial_weight_grad_dtype": numerics.partial_weight_grad_dtype,
+             "swiglu_limit": numerics.swiglu_limit,
+             "clamp_after_activation": numerics.clamp_after_silu,
+             "apply_probs_before_fc2": numerics.apply_probs_before_fc2,

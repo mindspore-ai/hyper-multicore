@@ -93,6 +93,9 @@ def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
                 else {0: h, 2: h, 6: h, 8: width, 9: 2 * width, 12: h, 13: h, 18: 2 * width})
     for index, columns in ordinary.items():
         result[index].shape, result[index].dtype_size = [rows, columns], 2
+    if not forward and spec.partial_weight_grad_dtype == "float32":
+        for index in (6, 18):
+            result[index].dtype_size = 4
     metadata = ([1, 3, 13, 14] if forward else [1, 3, 14, 15])
     sizes = [4, 15] if forward else [4, 16]
     for index in metadata + sizes:

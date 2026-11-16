@@ -697,7 +697,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0)
+                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
+                                     partial_weight_grad_dtype=None)
         workspace = Mock()
         manager = Mock(root_group=root_group, heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
         manager.reserve.return_value = ({},)
@@ -747,7 +748,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0)
+                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
+                                     partial_weight_grad_dtype=None)
 
         manager = Mock(heap_bytes=1024, epoch=0, workspaces=[])
         manager.reserve.return_value = ({},)
@@ -786,7 +788,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         specification = {"name": "new resource"}
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None,
-                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0)
+                                     dynamic_tokens=False, auto_tokens=False, transport_engine="mte", ready_depth=0,
+                                     partial_weight_grad_dtype=None)
         growth_record = {"epoch": 1, "heap_bytes": 4096}
         manager = Mock(heap_bytes=2048, epoch=0, workspaces=[object()], growth_records=[])
         manager.attach_runtime.return_value = False

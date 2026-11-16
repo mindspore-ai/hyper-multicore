@@ -1,0 +1,15 @@
+diff a/hyper_multicore/modules/mega_moe/schedule.py b/hyper_multicore/modules/mega_moe/schedule.py	(rejected hunks)
+@@ -36,10 +36,10 @@ def resolve_schedule_options(options=None, *, precision='bf16'):
+     value = _option(options.queue_ready_lookahead,
+                     ('HYPER_MULTICORE_MEGAMOE_QUEUE_READY_LOOKAHEAD',
+                      'HYPER_MULTICORE_MEGAMOE_READY_DEPTH',
+-                     f'HYPER_MULTICORE_{"MX" if precision == "mxfp8" else "BF16"}_READY_DEPTH'), 0)
+-    if value not in ('0', '1', '8') or isinstance(options.queue_ready_lookahead, bool):
++                     f'HYPER_MULTICORE_{"MX" if precision == "mxfp8" else "BF16"}_READY_DEPTH'), None)
++    if value not in ('None', '0', '1', '8') or isinstance(options.queue_ready_lookahead, bool):
+         raise ValueError('MegaMoE queue ready lookahead must be 0, 1 or 8')
+-    return MegaMoeSchedulerOptions(policy, int(value))
++    return MegaMoeSchedulerOptions(policy, None if value == "None" else int(value))
+ 
+ 
+ @dataclass(frozen=True)
