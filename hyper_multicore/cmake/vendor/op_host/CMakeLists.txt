@@ -66,8 +66,10 @@ set(OP_TILING_SOURCES
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
 )
 
-list(APPEND OP_SCHEMA_SOURCES ${FWD_HOST}/mxfp8/schema.cpp)
-list(APPEND OP_TILING_SOURCES ${FWD_HOST}/mxfp8/tiling.cpp)
+if(EXISTS "${HP_MULTICORE_SOURCE_ROOT}/a5/sources.json")
+    list(APPEND OP_SCHEMA_SOURCES ${FWD_HOST}/mxfp8/schema.cpp)
+    list(APPEND OP_TILING_SOURCES ${FWD_HOST}/mxfp8/tiling.cpp)
+endif()
 include_directories(${MX_HOST} ${MX_GRAD_HOST})
 
 function(hp_generate_op_definitions)
