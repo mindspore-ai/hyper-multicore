@@ -49,11 +49,6 @@ diff --git a/activation/swi_glu/op_kernel/swi_glu_bf16.hpp b/activation/swi_glu/
 +        Maxs(bLocal, bLocal, -clampLimit, curTileLen);
 +        PipeBarrier<PIPE_V>();
 +    }
-@@ -87,3 +103 @@
--// Ascend 950 requires explicit rounding for FP32-to-BF16 conversion.
--#if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 220) || \
--    (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
-+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
 diff --git a/activation/swi_glu/op_kernel/swi_glu_single.hpp b/activation/swi_glu/op_kernel/swi_glu_single.hpp
 --- a/activation/swi_glu/op_kernel/swi_glu_single.hpp
 +++ b/activation/swi_glu/op_kernel/swi_glu_single.hpp
@@ -96,11 +91,6 @@ diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad_bf16.hpp b/activatio
 @@ -48,0 +51,2 @@
 +    LocalTensor<inType> aInput;
 +    LocalTensor<inType> bInput;
-@@ -56,3 +60 @@
--// Ascend 950 requires explicit rounding for FP32-to-BF16 conversion.
--#if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 220) || \
--    (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
-+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
 @@ -91,3 +92,0 @@
 -    // tbuf::templocaltensor
 -    // deque input tensors from VECIN queue
