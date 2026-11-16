@@ -20,6 +20,6 @@ Importing tuning options does not load the MegaMoe executor or initialize an
 NPU runtime.
 """
 
-from ._mega_moe import MegaMoeTuningOptions
+from ._mega_moe import MegaMoeTuningOptions, MegaMoeSchedulerOptions
 
-__all__ = ["MegaMoeTuningOptions"]
+__all__ = ["MegaMoeTuningOptions", "MegaMoeSchedulerOptions"]

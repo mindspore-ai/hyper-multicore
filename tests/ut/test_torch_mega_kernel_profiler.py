@@ -14,6 +14,9 @@
 # ============================================================================
 """Unit tests for the standalone Torch MegaKernel profiler frontend."""
 
+# The assertions verify internal ownership and the native ABI.
+# pylint: disable=protected-access
+
 from __future__ import annotations
 
 import inspect
@@ -158,6 +161,22 @@ class _FakeRuntime:
                 "droppedRecordCount": 0,
             },
         }
+
+
+def test_invocation_tags_survive_trace_export():
+    """Caller labels are copied per invocation and cannot replace reserved identity."""
+    runtime = _FakeRuntime()
+    invocation = torch_profiler._RawInvocation(
+        runtime, b"1000", "backward", 3, 9,
+        tags={"layer": "25", "phase": "backward", "direction": "invalid"},
+    )
+    trace = torch_profiler._TraceAccumulator(1000)
+    trace.append(invocation, runtime.parse(b"1000", detailed_task_names=True))
+    assert trace.invocation_metadata[0]["layer"] == "25"
+    assert trace.invocation_metadata[0]["direction"] == "backward"
+    event = next(event for event in trace.trace_events if event["ph"] == "X")
+    assert event["args"]["phase"] == "backward"
+    assert event["args"]["direction"] == "backward"
 
 
 class _FakeNpu:

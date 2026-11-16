@@ -55,6 +55,7 @@ class MegaKernelDiagnostics:
     def launch(
         self, parameters: Sequence[torch.Tensor | None], *, direction: str,
         fallback_event_counters: torch.Tensor | None = None,
+        tags: dict[str, str] | None = None,
     ) -> DiagnosticCall:
         """Select exactly one tool, or return an ordinary no-op context.
 
@@ -66,7 +67,7 @@ class MegaKernelDiagnostics:
             direction: Forward or backward invocation direction.
             fallback_event_counters: Existing execution-owned event counters, if any.
         """
-        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters)
+        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters, tags)
         session = _get_active_session()
         if session is None or not session.is_capture_enabled():
             return DiagnosticCall(context.ordinary_arguments())

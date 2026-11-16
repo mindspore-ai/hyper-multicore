@@ -13,37 +13,71 @@
 namespace launch_test {
 int injected_status = 0;
 int last_status = 0;
+int npu_arch = 2201;
+int selected_arch = 0;
 int callback_status = -1;
 int launch_calls = 0;
 int status_reads = 0;
 }  // namespace launch_test
 
-extern "C" void HmcLaunchRouteMetadata(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, int32_t, int32_t, int32_t,
+extern "C" void HmcLaunchRouteMetadata_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+                                       int32_t, int32_t, int32_t,
                                        int32_t, int32_t, int32_t, int32_t, int32_t, int32_t) {
+  launch_test::selected_arch = 2201;
   ++launch_test::launch_calls;
   launch_test::last_status = launch_test::injected_status;
 }
 
-extern "C" void HmcLaunchZeroCold(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, int64_t, int64_t, int64_t) {
+extern "C" void HmcLaunchRouteMetadata_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+                                       int32_t, int32_t, int32_t,
+                                       int32_t, int32_t, int32_t, int32_t, int32_t, int32_t) {
+  launch_test::selected_arch = 3510;
+  ++launch_test::launch_calls;
+  launch_test::last_status = launch_test::injected_status;
+}
+
+extern "C" void HmcLaunchZeroCold_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, int64_t, int64_t, int64_t) {
+  launch_test::selected_arch = 2201;
   throw std::logic_error("unexpected cold-gradient launch");
 }
 
-extern "C" void HmcLaunchPermuteFromMapping(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, int64_t,
-                                            int64_t, int64_t) {
+extern "C" void HmcLaunchZeroCold_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, int64_t, int64_t, int64_t) {
+  launch_test::selected_arch = 3510;
+  throw std::logic_error("unexpected cold-gradient launch");
+}
+
+extern "C" void HmcLaunchPermuteFromMapping_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
+                                            int64_t, int64_t, int64_t) {
+  launch_test::selected_arch = 2201;
+  throw std::logic_error("unexpected permutation launch");
+}
+
+extern "C" void HmcLaunchPermuteFromMapping_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
+                                            int64_t, int64_t, int64_t) {
+  launch_test::selected_arch = 3510;
   throw std::logic_error("unexpected permutation launch");
 }
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
+  if (argc != 3) {
     return 2;
   }
   launch_test::injected_status = std::stoi(argv[1]);
+  launch_test::npu_arch = std::stoi(argv[2]);
+  const bool supported = launch_test::npu_arch == 2201 || launch_test::npu_arch == 3510;
   bool raised = false;
   try {
     auto counts = at::zeros({2, 4}, at::TensorOptions().dtype(at::kInt));
     using Route = std::tuple<at::Tensor, at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t);
     auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::route_offsets", "").typed<Route>();
     route.redispatch(c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), counts, 0, 262144, 128);
+  } catch (const c10::Error& error) {
+    if (!supported && std::string(error.what()).find("unsupported NPU architecture for MoE utility") !=
+                          std::string::npos && launch_test::launch_calls == 0 && launch_test::status_reads == 0) {
+      return 0;
+    }
+    std::cerr << error.what() << '\n';
+    return 1;
   } catch (const std::runtime_error& error) {
     raised = true;
     if (std::string(error.what()) != "launch status " + std::to_string(launch_test::injected_status)) {
@@ -56,5 +90,6 @@ int main(int argc, char** argv) {
     std::cerr << "launch status was not propagated to RunOpApi\n";
     return 1;
   }
+  if (!supported || launch_test::selected_arch != launch_test::npu_arch) return 9;
   return 0;
 }

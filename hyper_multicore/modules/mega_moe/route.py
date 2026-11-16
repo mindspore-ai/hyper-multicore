@@ -564,7 +564,7 @@ def _valid_route_counts(row: list[int], top_k: int) -> bool:
 
 
 def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
-    """Keep native size and legacy bound rejection ahead of route publication."""
+    """Validate native sizes and explicit token bounds before route publication."""
     flexible = spec.auto_tokens
     if flexible and any(row[0] or row[1] < 0 for row in rows):
         raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")

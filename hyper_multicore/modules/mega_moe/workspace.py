@@ -37,7 +37,7 @@ from hyper_multicore.shmem import _lifecycle
 from .probability import PROBABILITY_PLANES, ProbabilityPlane
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
-# The composed Cube-only GMM and SwiGLU-grad kernels do not use these legacy
+# The composed Cube-only GMM and SwiGLU-grad kernels do not use these
 # tensor arguments. Keep non-empty ABI placeholders; native tiling reserves
 # the separate CANN library workspace needed by the enclosing operator.
 _GMM_WORKSPACE_BYTES = 512
@@ -55,11 +55,12 @@ def _workspace_allocation_specs(
     num_experts: int,
     dtype: torch.dtype,
     apply_probs_before_fc2: bool = False,
+    compute_stages: int = 3,
 ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
     """Return the single ordered physical Allocation description for a workspace."""
     data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
     data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
-    event_bytes = event_workspace_bytes(ep_size, num_experts)
+    event_bytes = event_workspace_bytes(ep_size, num_experts, compute_stages)
     allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
     allocations = (
         (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
@@ -96,6 +97,7 @@ def _spec_workspace_bytes(
         hidden_size=specification["hidden_size"],
         ep_size=specification["ep_size"],
         num_experts=specification["num_experts"],
+        compute_stages=6 if specification.get("precision") == 'mxfp8' else 3,
         dtype=dtype,
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
     )
@@ -142,6 +144,7 @@ class MegaMoeWorkspace:
     expert_capacity: int = 0
     routed_slots: int = 0
     dispatch_mode: str = "push"
+    transport_engine: str = "mte"
     source_buffer: Any | None = None
     expert_buffer: Any | None = None
     routed_buffer: Any | None = None
@@ -196,6 +199,7 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
@@ -226,6 +230,7 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
@@ -255,6 +260,7 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
@@ -269,7 +275,8 @@ class MegaMoeWorkspace:
         self.device = device
         self.expert_capacity = receive_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        stages = 6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3
+        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size, stages) * 4
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
 
@@ -288,6 +295,7 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
@@ -356,6 +364,7 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
+            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
@@ -364,7 +373,8 @@ class MegaMoeWorkspace:
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        stages = 6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3
+        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size, stages) * 4
         try:
             for field_name, allocation in allocations:
                 setattr(self, field_name, shmem.empty(

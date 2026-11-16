@@ -142,14 +142,14 @@ class TestMegaMhcGradGraph(unittest.TestCase):
             self.assertEqual(task.dependent_event, layout.init_done)
             self.assertEqual(task.trigger_event, layout.rms_ready_base + index)
             self.assertEqual(
-                task.extra_value_2,
+                task.dependency_poll_interval_us,
                 FAST_DEPENDENCY_POLL_INTERVAL_US,
             )
         for index, task in enumerate(prepare_tasks):
             self.assertEqual(task.task_type, TaskType.TASK_MHC_GRAD_PREV_A_AND_MAPPING)
             self.assertEqual(task.task_split_value, DEFAULT_GRAD_TOKEN_TILE)
             self.assertEqual(
-                task.extra_value_2,
+                task.dependency_poll_interval_us,
                 FAST_DEPENDENCY_POLL_INTERVAL_US,
             )
             self.assertEqual(task.dependent_event, layout.rms_ready_base + index)

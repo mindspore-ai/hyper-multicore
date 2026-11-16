@@ -25,24 +25,41 @@ ACLSHMEM_DEVICE int32_t my_pe() { return aclshmem_my_pe(); }
 /** @brief Return the initialized number of UDMA QPs per peer. */
 ACLSHMEM_DEVICE uint32_t udma_qp_count() { return aclshmemi_udma_qp_info_fetch()->qp_num; }
 
-/** @brief Complete a GET on a caller-owned QP, waiting after each SDK-sized chunk. */
-template <typename T>
-ACLSHMEM_DEVICE void get_udma(GM_ADDR destination, GM_ADDR source, int64_t elements, int32_t source_pe, uint32_t qp) {
+/** @brief Complete a transfer on a caller-owned QP before returning to its consumer. */
+template <bool IsGet, typename T>
+ACLSHMEM_DEVICE void transfer_udma(GM_ADDR destination, GM_ADDR source, int64_t elements, int32_t peer, uint32_t qp) {
+  if (elements < 0 || static_cast<uint64_t>(elements) > ~uint64_t{0} / sizeof(T)) AscendC::Trap();
   AscendC::TPipe pipe;
   AscendC::TBuf<AscendC::TPosition::VECOUT> staging;
   pipe.InitBuffer(staging, ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE);
   auto scratch = reinterpret_cast<__ubuf__ uint8_t *>(staging.Get<uint8_t>().GetPhyAddr());
-  auto local = reinterpret_cast<__gm__ uint8_t *>(destination);
-  auto remote = reinterpret_cast<__gm__ uint8_t *>(source);
+  auto dst = reinterpret_cast<__gm__ uint8_t *>(destination);
+  auto src = reinterpret_cast<__gm__ uint8_t *>(source);
   uint64_t remaining = elements * sizeof(T);
   while (remaining > 0) {
     const uint32_t bytes = remaining < (1ULL << 28) ? remaining : (1ULL << 28);
-    aclshmemx_udma_qp_get_nbi<uint8_t>(local, remote, scratch, bytes, source_pe, qp, 0);
-    aclshmemx_udma_qp_quiet(source_pe, qp);
-    local += bytes;
-    remote += bytes;
+    if constexpr (IsGet) {
+      aclshmemx_udma_qp_get_nbi<uint8_t>(dst, src, scratch, bytes, peer, qp, 0);
+    } else {
+      aclshmemx_udma_qp_put_nbi<uint8_t>(dst, src, scratch, bytes, peer, qp, 0);
+    }
+    aclshmemx_udma_qp_quiet(peer, qp);
+    dst += bytes;
+    src += bytes;
     remaining -= bytes;
   }
+}
+
+/** @brief Complete a GET on the caller's exclusively owned peer/QP. */
+template <typename T>
+ACLSHMEM_DEVICE void get_udma(GM_ADDR destination, GM_ADDR source, int64_t elements, int32_t peer, uint32_t qp) {
+  transfer_udma<true, T>(destination, source, elements, peer, qp);
+}
+
+/** @brief Complete a PUT before a caller publishes a remote-ready Signal. */
+template <typename T>
+ACLSHMEM_DEVICE void put_udma(GM_ADDR destination, GM_ADDR source, int64_t elements, int32_t peer, uint32_t qp) {
+  transfer_udma<false, T>(destination, source, elements, peer, qp);
 }
 #endif
 

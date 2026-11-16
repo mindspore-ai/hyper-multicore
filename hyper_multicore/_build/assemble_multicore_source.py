@@ -43,6 +43,12 @@ _OPS_NN_PATHS = (
     "index/linear_index/op_host/op_api",
 )
 _OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
+_ARCH35_OPS_NN_PATHS = (
+    "common/inc/op_kernel",
+    "quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35",
+    "quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35",
+    "quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35",
+)
 _OPS_TRANSFORMER_MHC_PATHS = (
     "common/include",
     "mhc/mhc_post/op_kernel/arch22",
@@ -57,6 +63,8 @@ _HYPER_OPERATORS = (
     "hyper_mega_moe_grad",
     "hyper_mega_gate",
     "hyper_mega_gate_grad",
+    "hyper_mega_moe_mxfp8",
+    "hyper_mega_moe_mxfp8_grad",
 )
 
 
@@ -65,6 +73,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ops-nn-source", required=True)
     parser.add_argument("--ops-transformer-source", required=True)
+    parser.add_argument("--architecture", choices=("arch22", "arch35"), required=True)
+    parser.add_argument("--ops-tensor-source", help="Locked Blaze source for the arch35 task adapters")
     parser.add_argument("--work-dir", required=True)
     return parser.parse_args()
 
@@ -72,14 +82,17 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     """Verify, export, adapt, and compose the selected kernel sources."""
     args = _parse_args()
+    if (args.architecture == "arch35") != bool(args.ops_tensor_source):
+        raise ValueError("--ops-tensor-source is required for arch35 and only used on that architecture")
     lock = load_dependency_locks(_LOCK_PATH)
     transformer_revisions = dependency_revisions(lock["ops_transformer"])
     ops_nn_source = Path(args.ops_nn_source).resolve()
     ops_transformer_source = Path(args.ops_transformer_source).resolve()
+    ops_tensor_source = Path(args.ops_tensor_source).resolve() if args.ops_tensor_source else None
     work_dir = Path(args.work_dir).resolve()
     _validate_new_work_dir(
         work_dir,
-        (ops_nn_source, ops_transformer_source),
+        (ops_nn_source, ops_transformer_source, *((ops_tensor_source,) if ops_tensor_source else ())),
     )
 
     verify_git_dependency(lock["ops_nn"], ops_nn_source, dependency_name="ops_nn")
@@ -93,6 +106,8 @@ def main() -> int:
         ops_transformer_source,
         dependency_name="ops_transformer.mhc",
     )
+    if ops_tensor_source is not None:
+        verify_git_dependency(lock["ops_tensor"], ops_tensor_source, dependency_name="ops_tensor")
 
     ops_nn_copy = work_dir / "adapter-inputs" / "ops-nn"
     transformer_copy = work_dir / "adapter-inputs" / "ops-transformer"
@@ -101,7 +116,7 @@ def main() -> int:
         ops_nn_source,
         ops_nn_copy,
         lock["ops_nn"]["commit"],
-        _OPS_NN_PATHS,
+        _OPS_NN_PATHS + (_ARCH35_OPS_NN_PATHS if ops_tensor_source else ()),
     )
     _export_git_tree(
         ops_transformer_source,
@@ -115,7 +130,7 @@ def main() -> int:
         transformer_revisions["mhc"]["commit"],
         _OPS_TRANSFORMER_MHC_PATHS,
     )
-    _apply_locked_adapters(ops_nn_copy, lock["ops_nn"])
+    _apply_locked_adapters(ops_nn_copy, lock["ops_nn"], architecture=args.architecture)
     _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"])
     _apply_locked_adapters(transformer_mhc_copy, transformer_revisions["mhc"])
 
@@ -126,9 +141,41 @@ def main() -> int:
         transformer_copy,
         transformer_mhc_copy,
     )
+    if ops_tensor_source is not None:
+        tensor_copy = work_dir / "adapter-inputs" / "ops-tensor"
+        _export_git_tree(ops_tensor_source, tensor_copy, lock["ops_tensor"]["commit"], ("include/blaze",))
+        _apply_locked_adapters(tensor_copy, lock["ops_tensor"], architecture="arch35")
+        _compose_arch35_sources(source_root, ops_nn_copy, tensor_copy, lock)
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0
+
+
+def _compose_arch35_sources(source_root: Path, ops_nn: Path, ops_tensor: Path, lock: dict[str, Any]) -> None:
+    """Share upstream arch35 mathematics without vendoring a second implementation.
+
+    The task adapters may change logical worker identity and entry boundaries;
+    mathematical kernels and relative includes are exported from locked Git trees.
+    The manifest describes actual build input, including any locked adapters.
+    """
+    target = source_root / "arch35"
+    shutil.copytree(ops_tensor / "include" / "blaze", target / "include" / "blaze")
+    shutil.copytree(ops_nn / "activation/swi_glu_grad/op_kernel/arch35", target / "swi_glu_grad/arch35")
+    for operator in ("dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
+                     "swiglu_backward_mx_quant_with_dual_axis"):
+        destination = target / operator
+        shutil.copytree(ops_nn / "quant" / operator / "op_kernel/arch35", destination / "arch35")
+    # These are standard relative dependencies of the exported arch35 headers.
+    for operator in ("swi_glu_grad", "dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
+                     "swiglu_backward_mx_quant_with_dual_axis"):
+        shutil.copytree(ops_nn / "common/inc/op_kernel", target / operator / "inc")
+    files = {str(path.relative_to(target)): _sha256(path)
+             for path in sorted(target.rglob("*")) if path.is_file()}
+    manifest = {"components": {name: {"commit": lock[name]["commit"],
+                                     "patches": lock[name].get("patches", [])}
+                               for name in ("ops_nn", "ops_tensor")},
+                "files": files}
+    (target / "sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _validate_new_work_dir(work_dir: Path, inputs: tuple[Path, ...]) -> None:
@@ -171,9 +218,13 @@ def _export_git_tree(
             source.extractall(destination_root)
 
 
-def _apply_locked_adapters(source_root: Path, dependency_lock: dict[str, Any]) -> None:
+def _apply_locked_adapters(
+    source_root: Path, dependency_lock: dict[str, Any], *, architecture: str | None = None,
+) -> None:
     """Verify and apply fusion adapters only to the isolated source copy."""
     for adapter in dependency_lock.get("patches", []):
+        if adapter.get("architectures") and architecture not in adapter["architectures"]:
+            continue
         adapter_path = (_REPO_ROOT / adapter["path"]).resolve()
         actual_hash = _sha256(adapter_path)
         if actual_hash != adapter["sha256"]:
@@ -231,6 +282,8 @@ def _compose_hyper_multicore_ops(
     transformer_mhc_copy: Path,
 ) -> None:
     """Compose HP operator code with selected adapted upstream kernel sources."""
+    shutil.copytree(_MULTICORE_OPS / "runtime", source_root / "runtime")
+    shutil.copytree(_MULTICORE_OPS / "common", source_root / "common")
     shmem_root = source_root / "shmem"
     shmem_root.mkdir(parents=True)
     (shmem_root / "cann").mkdir()
@@ -248,6 +301,9 @@ def _compose_hyper_multicore_ops(
         shutil.copytree(_MULTICORE_OPS / operator_name, operator_root)
         if operator_name == "hyper_mega_gate":
             shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
+            continue
+        if operator_name in ("hyper_mega_moe_mxfp8", "hyper_mega_moe_mxfp8_grad"):
+            # Share host ABI; MX device code is registered only for arch35.
             continue
         if operator_name == "hyper_mega_gate_grad":
             shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
@@ -330,6 +386,11 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "hyper_mega_gate_grad" / "op_host" / "hyper_mega_gate_route_grad_def.cpp",
         source_root / "hyper_mega_gate_grad" / "op_host" / "op_api" / "linear_index" / "linear_index.cpp",
         source_root / "hyper_mega_gate_grad" / "op_kernel" / "hyper_mega_gate_route_grad.cpp",
+        source_root / "common" / "mega_moe" / "transport_task.h",
+        source_root / "common" / "mega_moe" / "mxfp8_worker.h",
+        source_root / "common" / "mega_moe" / "op_host" / "mxfp8_schema.h",
+        source_root / "hyper_mega_moe_mxfp8" / "op_host" / "hyper_mega_moe_mxfp8_def.cpp",
+        source_root / "hyper_mega_moe_mxfp8_grad" / "op_host" / "hyper_mega_moe_mxfp8_grad_def.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
         source_root / "hyper_mega_mhc" / "op_host" / "hyper_mega_mhc_def.cpp",

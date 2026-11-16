@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.scheduler.config import RuntimeConfigC, TaskSplitValue, TaskType
 from hyper_multicore.scheduler.graph import ComputeGraph, OpType
+from hyper_multicore.scheduler.worker_queues import install_strided_worker_queues
 
 
 def compact_graph(graph: ComputeGraph, topology: TaskSplitValue, workers: int, nominal: bool = False) -> bool:
@@ -181,6 +182,7 @@ class MegaMoeSchedulePolicy:
     """Independent task ordering and ready selection after granularity lowering."""
 
     vector_ready_queue: bool = False
+    vector_ready_depth: int = 256
     pipeline_vector: bool = False
     pipeline_cube: bool = False
     batch_experts: bool = False
@@ -188,19 +190,26 @@ class MegaMoeSchedulePolicy:
 
     def apply(self, config: RuntimeConfigC, graph: ComputeGraph, topology: TaskSplitValue, workers: int) -> None:
         """Schedule existing typed stages while preserving their task/credit contract."""
+        if not self.vector_ready_queue:
+            config.queue_layout = 0
+            config.worker_queue_offset = 0
+            if hasattr(config, "worker_queues"):
+                del config.worker_queues
+            if config.completion_event:
+                config.all_event_num_triggers[config.completion_event] = config.num_workers
         if self.batch_experts and (self.pipeline_vector or self.pipeline_cube):
             raise ValueError("expert batching and per-expert pipeline ordering are separate policies")
         queue = list(config.cube_task_indices[:config.task_index_num[0]])
         queue += list(config.vector_task_indices[:config.task_index_num[1]])
         for task_id in queue:
-            config.all_tasks[task_id].extra_value_2 = self.dependency_poll_interval
-        config.vector_ready_queue = int(self.vector_ready_queue)
+            config.all_tasks[task_id].dependency_poll_interval_us = self.dependency_poll_interval
         if self.batch_experts:
             collapse_batched_tasks(config, workers)
-            return
-        if self.pipeline_vector:
+        elif self.pipeline_vector:
             pipeline_vector_queue(config, graph, topology)
         if self.pipeline_cube:
             pipeline_cube_queue(config, graph, topology, workers)
             for task_id in config.cube_task_indices[:config.task_index_num[0]]:
                 config.all_tasks[task_id].extra_value_1 = GroupedMatmulTaskMode.SINGLE_GROUP
+        if self.vector_ready_queue:
+            install_strided_worker_queues(config, vector_ready_depth=self.vector_ready_depth)

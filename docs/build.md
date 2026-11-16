@@ -10,6 +10,7 @@
 - [其他构建方式与参数](#其他构建方式与参数)
 - [日志与失败恢复](#日志与失败恢复)
 - [制品与构建参考](#制品与构建参考)
+- [Ascend950 MegaMoE 源码构建](#ascend950-megamoe-源码构建)
 
 ## 源码构建
 
@@ -80,15 +81,21 @@ python -c 'import hyper_multicore; print(hyper_multicore.__file__)'
 
 ### 激活本地 payload
 
-源码验证可直接使用构建生成的本地 payload。从仓库根目录激活：
+已构建的源码目录可直接使用本地 payload，无需安装 wheel。在启动模型的 shell 中激活兼容的 Python 环境和 CANN，再执行以下命令：
 
 ```bash
 source /path/to/cann/set_env.sh
-source build/native/payload/hyper_multicore/lib/set_env.bash
+hmc_checkout=/path/to/hyper-multicore
+source "$hmc_checkout/build/native/payload/hyper_multicore/lib/set_env.bash"
+export PYTHONPATH="$hmc_checkout${PYTHONPATH:+:$PYTHONPATH}"
+python -c 'from hyper_multicore import MegaMoeExperts; print(MegaMoeExperts.__name__)'
 ```
 
-随后按[测试指南的源码模式](../tests/README.md#npu-系统测试)执行 NPU 测试。
-同一进程使用一套激活环境，避免混用不同制品的 vendor、SHMEM 库和框架适配库。
+payload 的 `set_env.bash` 配置 native 库和 vendor 搜索路径，须在启动 Python 前执行。
+在源码仓根目录直接运行 `python -c` 或 `python -m` 验证时，Python 已能找到源码，可以省略 `PYTHONPATH` 设置。
+从模型仓启动时，将 HyperMulticore 的源码仓根目录加入 `PYTHONPATH`。
+部署时保留源码目录和 `build/native/payload/` 的相对位置，目标 Python/Torch/TorchNpu ABI、SoC 和系统库须与制品兼容。
+同一个 Python 进程使用一套制品。设备验证见[测试指南的源码模式](../tests/README.md#npu-系统测试)。
 
 ## 其他构建方式与参数
 
@@ -114,10 +121,16 @@ bash build.sh --all --jobs 24
 
 ### SoC 选择
 
-默认包含所有支持的 SoC。使用 `--soc-list` 选择本次构建目标，例如：
+默认包含所有支持的 SoC。使用 `--soc-list` 选择目标。
+
+| 产品系列 | 构建目标 | 内核架构 |
+| --- | --- | --- |
+| Atlas A2 系列 | `ascend910b` | `arch22` |
+| Atlas A3 系列 | `ascend910_93` | `arch22` |
+| Ascend950 系列 | `ascend950` | `arch35` |
 
 ```bash
-# 选择两个 SoC。
+# 构建 Atlas A2 和 Atlas A3 系列。
 bash build.sh --soc-list ascend910b,ascend910_93 --jobs 24
 
 # 选择 Ascend950。
@@ -286,7 +299,7 @@ CANN 版本不要求与构建时相等，仍需与框架和驱动兼容。
 
 vendor 位于 `lib/vendors/`，SHMEM 资源位于 `shmem/lib/<arch>/`。
 每个 `adapters/<ID>/` 包含一份 Torch 库和 `shmem/<arch>/` 下的 binding。
-vendor kernel 位于 `op_impl/ai_core/tbe/kernel/<arch>/`：910B/910C 共用 `arch22`，950 使用 `arch35`。
+vendor kernel 位于 `op_impl/ai_core/tbe/kernel/<arch>/`。Atlas A2/A3 系列共用 `arch22`，Ascend950 系列使用 `arch35`。
 CANN 注册和查找索引按所选 SoC 保存，并指向对应架构的 kernel。
 
 首次使用 SHMEM 时，查询可见逻辑设备 0 的 NPU 架构，按绝对路径加载一套后端，不创建 NPU 上下文。
@@ -421,3 +434,43 @@ SDK/ops、vendor 和 binding 的子工作区按 `arch22/arch35` 隔离。
 | [vendor_cache.py](../hyper_multicore/_build/vendor_cache.py) | vendor 输入摘要与共享快照 |
 | [prepare_dependencies.py](../hyper_multicore/_build/prepare_dependencies.py) | 锁定 native 源码获取与校验 |
 | [torch_compat.cmake](../hyper_multicore/cmake/torch_compat.cmake) | 从选定框架环境确定头文件、C++ 标准及 ABI |
+
+## Ascend950 MegaMoE 源码构建
+
+Ascend950 使用 `arch35`。构建器按[依赖锁](../hyper_multicore/_build/dependencies.lock.json)
+获取 ops-nn、ops-transformer、ops-tensor 和 SHMEM，在隔离目录应用适配补丁。
+在已准备好的 Python、Torch、TorchNpu 和 CANN 环境中执行：
+
+```bash
+bash hyper_multicore/build.sh --soc-list ascend950 --jobs 16
+source build/native/payload/hyper_multicore/lib/set_env.bash
+python -c 'from hyper_multicore import MegaMoeExperts; print(MegaMoeExperts.__name__)'
+```
+
+在其他目录或节点使用同一制品时，见[激活本地 payload](#激活本地-payload)。
+有关 BF16/MXFP8 权重、数值和逐层调优入口，见
+[MegaMoeExperts](../hyper_multicore/README.md#megamoeexperts)。
+
+Ascend950 的 SHMEM 默认启用 `mte_udma`。如需让专家通信使用 MTE，在各 rank 启动前设置
+`HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte`。固定堆预算和日志均沿用
+[SHMEM 配置](shmem.md#6-配置与日志)，默认设置足以运行常规示例。
+
+### 独立回放与队列诊断
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tests/torch/_replay_mega_moe_arch35.py --precision mxfp8 --tokens 512 \
+  --hidden 5120 --intermediate 1792 --mode pull --output ./replay-results
+```
+
+仅使用已确认空闲的设备。可选 `--precision bf16`、`--empty` 或 `--profile`。
+`--benchmark` 单独运行，预热 3 次后记录 7 次前反向耗时。
+
+```bash
+python -m hyper_multicore.modules.mega_moe.schedule list
+python -m hyper_multicore.modules.mega_moe.schedule describe two_expert_pipeline
+python -m hyper_multicore.modules.mega_moe.schedule compare plan-left.json plan-right.json
+```
+
+对已有 host runtime config 调用 `explain_schedule(cfg)` 并保存 JSON，可用 `compare`
+检查任务、依赖、每核队列和指纹。计划导出不读取设备张量。

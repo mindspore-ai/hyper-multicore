@@ -40,29 +40,38 @@ foreach(required_path IN ITEMS
     endif()
 endforeach()
 
-# Compile existing AscendC utility kernels separately from framework C++ headers.
-# Both supported products (910B and 910_93) use the dav-2201 device architecture.
+# Framework bindings link architecture-specific MoE utility providers.
+# Source and numerical implementation are shared; device objects are not.
 set(CANN_ROOT "$ENV{ASCEND_HOME_PATH}")
 find_program(ASCEND_BISHENG bisheng HINTS "${CANN_ROOT}/tools/bisheng_compiler/bin" REQUIRED)
 find_library(ASCENDC_HOST_RUNTIME ascendc_runtime
     PATHS "${CANN_ROOT}/lib64" "${CANN_ROOT}/aarch64-linux/lib64" REQUIRED NO_DEFAULT_PATH)
-add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
-    COMMAND "${ASCEND_BISHENG}" -x asc --npu-arch=dav-2201 --cce-auto-sync=off
-        -std=c++17 -O2 -fPIC -c "${CMAKE_CURRENT_SOURCE_DIR}/csrc/mega_moe_utilities.asc"
-        -o "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
-        "-I${CANN_ROOT}/asc" "-I${CANN_ROOT}/asc/include"
-        "-I${CANN_ROOT}/asc/include/interface" "-I${CANN_ROOT}/asc/include/utils"
-        "-I${CANN_ROOT}/asc/impl" "-I${CANN_ROOT}/include"
-        "-I${CANN_ROOT}/include/runtime" "-I${CANN_ROOT}/pkg_inc"
-        "-I${CANN_ROOT}/pkg_inc/runtime"
-    DEPENDS csrc/mega_moe_utilities.asc VERBATIM)
-set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
-    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+if(NOT HP_MULTICORE_NPU_ARCHS)
+    message(FATAL_ERROR "HP_MULTICORE_NPU_ARCHS must come from the build SoC selection")
+endif()
+set(UTILITY_SOURCE "${CMAKE_CURRENT_LIST_DIR}/../ops/common/mega_moe/utilities.asc")
+set(UTILITY_OBJECTS)
+foreach(utility_arch IN LISTS HP_MULTICORE_NPU_ARCHS)
+    if(NOT utility_arch MATCHES "^(2201|3510)$")
+        message(FATAL_ERROR "Unsupported MoE utility architecture ${utility_arch}")
+    endif()
+    set(utility_object "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities_${utility_arch}.o")
+    add_custom_command(OUTPUT "${utility_object}"
+        COMMAND "${ASCEND_BISHENG}" -x asc "--npu-arch=dav-${utility_arch}" --cce-auto-sync=off
+            "-DHMC_UTILITY_SUFFIX=_arch${utility_arch}" -std=c++17 -O2 -fPIC -c "${UTILITY_SOURCE}"
+            -o "${utility_object}"
+            "-I${CANN_ROOT}/asc" "-I${CANN_ROOT}/asc/include"
+            "-I${CANN_ROOT}/asc/include/interface" "-I${CANN_ROOT}/asc/include/utils"
+            "-I${CANN_ROOT}/asc/impl" "-I${CANN_ROOT}/include"
+            "-I${CANN_ROOT}/include/runtime" "-I${CANN_ROOT}/pkg_inc" "-I${CANN_ROOT}/pkg_inc/runtime"
+        DEPENDS "${UTILITY_SOURCE}" VERBATIM)
+    set_source_files_properties("${utility_object}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    list(APPEND UTILITY_OBJECTS "${utility_object}")
+endforeach()
 
 add_library(hyper_multicore_torch SHARED
     csrc/mega_moe_utilities.cpp
-    "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities.o"
+    ${UTILITY_OBJECTS}
     csrc/registration.cpp
     csrc/registration_mhc.cpp
     csrc/mega_mhc.cpp
@@ -72,7 +81,11 @@ add_library(hyper_multicore_torch SHARED
     csrc/moe_token_permute_out.cpp
     csrc/mega_moe_unpermute.cpp
     csrc/mega_gate_registration.cpp
-    csrc/mega_gate.cpp)
+    csrc/mega_gate.cpp
+    csrc/mega_moe_mxfp8.cpp)
+foreach(utility_arch IN LISTS HP_MULTICORE_NPU_ARCHS)
+    target_compile_definitions(hyper_multicore_torch PRIVATE "HMC_UTILITY_ARCH${utility_arch}=1")
+endforeach()
 hp_apply_torch_cxx_standard(
     hyper_multicore_torch "${TORCH_CXX_STANDARD}")
 # Match the active op-plugin compatibility headers.

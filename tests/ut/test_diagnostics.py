@@ -14,6 +14,9 @@
 # ============================================================================
 """CPU-only contract and end-to-end public diagnostics tests for a non-MoE graph."""
 
+# The assertions verify internal ownership and the native ABI.
+# pylint: disable=protected-access
+
 import json
 from functools import partial
 from pathlib import Path
@@ -46,7 +49,7 @@ from hyper_multicore import validate_mega_kernel_diagnostic_contract
 from hyper_multicore import diagnostics as diagnostics_module
 from hyper_multicore.diagnostics import profiler as multicore_profiler
 from hyper_multicore.diagnostics.dump import l1 as tensor_dump_l1
-from hyper_multicore.modules.mega_moe.plan import build_mega_moe_plan
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import build_mega_moe_plan
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_mhc.plan import build_mega_mhc_plan
 from hyper_multicore.modules.mega_mhc_grad.plan import build_mega_mhc_grad_plan

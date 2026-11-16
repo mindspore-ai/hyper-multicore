@@ -80,7 +80,7 @@ def _load_native() -> None:
         preload_vendor_library(vendor_root)
         try:
             torch.ops.load_library(str(adapter_path))
-            if torch.ops.hyper_multicore.mega_moe_transport_version() != 1:
+            if torch.ops.hyper_multicore.mega_moe_transport_version() != 2:
                 raise RuntimeError("adapter transport ABI mismatch; rebuild the Torch adapter")
             # Torch exposes operator alias metadata through this private schema attribute.
             schema = torch.ops.hyper_multicore.mega_moe_grad.default._schema  # pylint: disable=protected-access

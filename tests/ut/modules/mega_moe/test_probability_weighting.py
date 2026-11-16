@@ -22,12 +22,12 @@ from unittest.mock import patch
 import torch
 
 from hyper_multicore import _collective
-from hyper_multicore.modules.mega_moe import function as function_module
+from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
 
-from hyper_multicore.modules.mega_moe.function import (
+from hyper_multicore.modules.mega_moe.backends.bf16.autograd import (
     _execute_mega_moe_without_autograd, _kernel_workspace, _stage_backward_source, _stage_probabilities,
 )
-from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.workspace import MegaMoeWorkspace, _workspace_allocation_specs
 
@@ -35,7 +35,7 @@ from hyper_multicore.modules.mega_moe.workspace import MegaMoeWorkspace, _worksp
 from hyper_multicore.diagnostics.common.graph import validate_mega_kernel_diagnostic_contract
 from hyper_multicore.diagnostics.dump.l1 import L1TensorViewContext, L1TensorView
 from hyper_multicore.modules.mega_moe.diagnostics import _adapt_mega_moe_diagnostic_graph
-from hyper_multicore.modules.mega_moe.function import _diagnostic_parameters
+from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _diagnostic_parameters
 from hyper_multicore.modules.mega_moe.tensor_dump import resolve_mega_moe_l1_tensor_view
 from hyper_multicore.scheduler.config import TaskType
 from hyper_multicore.scheduler.graph import TensorSpec

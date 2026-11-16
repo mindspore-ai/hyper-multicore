@@ -26,12 +26,11 @@
 #define HYPER_MULTICORE_CORE_MULTICORE_OPS_RUNTIME_WORKER_KERNEL_H_
 
 #include "kernel_operator.h"
-#include "shmem.h"
 #include "runtime_config.hpp"
 #include "runtime_storage_bounds.h"
 #include "cycle_trace_recorder.h"
 #include "l1_tensor_dump.h"
-#include "vector_ready_queue.h"
+#include "worker_ready_queue.h"
 
 
 using namespace AscendC;  // NOLINT(build/namespaces)
@@ -54,9 +53,6 @@ constexpr int64_t EVENT_REFRESH_TIME_UNIT_CYCLES = 50;
 constexpr int64_t CUBE_EVENT_REFRESH_INTERVAL_UNITS = 50;     // 2,500 system cycles.
 constexpr int64_t VECTOR_EVENT_REFRESH_INTERVAL_UNITS = 150;  // 7,500 system cycles.
 #endif
-// The selected SwiGLU tiling uses baseRowLen=19; smaller dynamic tails must lower it.
-constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
-constexpr int64_t READY_SIGNAL_RADIX = 2;
 
 enum class VectorWorkerPolicy : uint32_t {
   LEGACY_ODD = 0,
@@ -68,9 +64,20 @@ enum class RuntimeStorageBoundsPolicy : uint32_t {
   GRAPH_OWNED = 1,
 };
 
+// Default workers have only local events; distributed operators supply a protocol.
+struct LocalInvocationProtocol {
+  template <class Worker>
+  __aicore__ static inline void Publish(Worker &worker, const ReadyHandshakeMeta &meta, bool completion) {
+    if (!completion) worker.TriggerEvent(meta.ready_event);
+  }
+};
+
 template <typename Derived, VectorWorkerPolicy WorkerPolicy = VectorWorkerPolicy::LEGACY_ODD,
-          RuntimeStorageBoundsPolicy StorageBoundsPolicy = RuntimeStorageBoundsPolicy::NATIVE_TILING>
+          RuntimeStorageBoundsPolicy StorageBoundsPolicy = RuntimeStorageBoundsPolicy::NATIVE_TILING,
+          typename InvocationProtocol = LocalInvocationProtocol>
 class KernelWorkerBase {
+  friend InvocationProtocol;
+
  public:
   __aicore__ inline KernelWorkerBase() {}
 
@@ -126,9 +133,8 @@ class KernelWorkerBase {
     // for operators whose sixth field is not the AIC count (for example mHC).
     this->vector_num = getNumWorkers(this->runtimeConfigPtr);
     this->core_num = this->vector_num / 2;
-    const auto header = reinterpret_cast<__gm__ RuntimeHeader *>(runtimeConfigPtr);
-    ready_queue_ = header->vector_ready_queue == 1;
-    this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_)
+    explicit_queues_ = usesExplicitWorkerQueues(this->runtimeConfigPtr);
+    this->active_vector_num = (WorkerPolicy == VectorWorkerPolicy::ALL || explicit_queues_)
                               ? this->vector_num : this->vector_num / 2;
   }
 
@@ -157,15 +163,15 @@ class KernelWorkerBase {
   // Share the compute call site across diagnostics. Replicating the entire
   // inlined task dispatcher for each mode exceeds the AIV scalar stack limit.
   __aicore__ inline void ProcessTasks(DiagnosticMode mode, CycleTraceRecorder &recorder) {
+    if (explicit_queues_) {
+      ProcessWorkerQueue(mode, recorder);
+      return;
+    }
 #ifdef HMC_RUNTIME_CUBE
     uint32_t block_idx = this->worker_id_;
     const uint32_t count = this->cube_task_num;
     const uint32_t stride = this->core_num;
 #else
-    if (ready_queue_) {
-      ProcessVectorReady(mode, recorder);
-      return;
-    }
     uint32_t block_idx = GetVectorScheduleIndex();
     if (block_idx == INVALID_VECTOR_SCHEDULE_INDEX) return;
     const uint32_t count = this->vector_task_num;
@@ -194,23 +200,47 @@ class KernelWorkerBase {
     KernelWorkerBase &worker;
     DiagnosticMode mode;
     CycleTraceRecorder &recorder;
+    WorkerQueue view;
+    uint64_t idle_start = 0;
     __aicore__ inline TaskId TaskAt(uint32_t index) { return worker.GetTaskIndex(index); }
     __aicore__ inline bool IsReady(TaskId task) { return worker.IsQueuedTaskReady(task); }
     __aicore__ inline void Execute(TaskId task) {
+      if (mode == DiagnosticMode::PROFILE && idle_start != 0) {
+        TaskDesc desc;
+        getTaskDesc(worker.runtimeConfigPtr, &desc, task);
+        recorder.Record(0x10008, task, desc.task_index, getTaskProfileOwnerId(worker.runtimeConfigPtr, task),
+                        idle_start, recorder.Now());
+        idle_start = 0;
+      }
       worker.ExecuteTask(task, mode, recorder);
     }
     __aicore__ inline void Wait(TaskId task) {
-      const uint32_t dependent = *reinterpret_cast<__gm__ uint32_t *>(worker.runtimeConfigPtr +
-        getAllTasksOffset(worker.runtimeConfigPtr) + task * sizeof(TaskDesc) + offsetof(TaskDesc, dependent_event));
-      worker.WaitForDependency(dependent, 5);
+      if (view.wait_mode == 0) {
+        const uint32_t dependent = *reinterpret_cast<__gm__ uint32_t *>(worker.runtimeConfigPtr +
+          getAllTasksOffset(worker.runtimeConfigPtr) + task * sizeof(TaskDesc) + offsetof(TaskDesc, dependent_event));
+        worker.WaitForDependency(dependent, view.poll_interval_us);
+      } else {
+        if (mode == DiagnosticMode::PROFILE && idle_start == 0) idle_start = recorder.Now();
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        constexpr auto cycles_per_us = SYSTEM_CYCLES_PER_US;
+#else
+        constexpr auto cycles_per_us = EVENT_REFRESH_TIME_UNIT_CYCLES;
+#endif
+        const int64_t until = AscendC::GetSystemCycle() + view.poll_interval_us * cycles_per_us;
+        while (AscendC::GetSystemCycle() < until) {}
+      }
     }
   };
 
-  __aicore__ inline void ProcessVectorReady(DiagnosticMode mode, CycleTraceRecorder &recorder) {
-    const uint32_t first = GetVectorScheduleIndex();
-    if (first == INVALID_VECTOR_SCHEDULE_INDEX) return;
-    ReadyExecution execution{*this, mode, recorder};
-    RunVectorReadyQueue(execution, first, this->vector_task_num, this->active_vector_num);
+  __aicore__ inline void ProcessWorkerQueue(DiagnosticMode mode, CycleTraceRecorder &recorder) {
+#ifdef HMC_RUNTIME_CUBE
+    const uint32_t index = this->worker_id_;
+#else
+    const uint32_t index = this->core_num + this->worker_id_;
+#endif
+    const WorkerQueue view = getWorkerQueue(this->runtimeConfigPtr, index);
+    ReadyExecution execution{*this, mode, recorder, view};
+    RunWorkerQueue(execution, view.begin, view.end, view.stride, view.ready_depth);
   }
 
   __aicore__ inline bool LoadReadyHandshakeMeta(ReadyHandshakeMeta *meta) {
@@ -218,45 +248,6 @@ class KernelWorkerBase {
     return meta->ready_event != 0;
   }
 
-  __aicore__ inline void PublishDeviceReady(const ReadyHandshakeMeta &meta, bool completion = false) {
-#ifndef HMC_RUNTIME_CUBE
-    int64_t ep = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 1);
-    int64_t rank = getExtraValueFromTiling(input_list[Derived::TILING_IDX], 0) % ep;
-    constexpr uint32_t ready_stride = DATA_CACHE_LINE_SIZE / INT32_T_SIZE;
-    __gm__ int32_t *ready = (__gm__ int32_t *)(input_list[Derived::EVENT_IDX]) + runtime_event_capacity;
-    if (completion) {
-      ready += (ep + 1) * ready_stride;
-    }
-
-    GlobalTensor<int32_t> ready_state;
-    ready_state.SetGlobalBuffer(ready, static_cast<uint32_t>((ep + 1) * ready_stride));
-    uint32_t generation_index = static_cast<uint32_t>(ep) * ready_stride;
-    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
-      ready_state[generation_index]);
-    int32_t previous_generation = ready_state.GetValue(generation_index);
-    if (previous_generation == INT32_MAX) {
-      AscendC::Trap();
-    }
-    int32_t generation = previous_generation + 1;
-    ready_state.SetValue(generation_index, generation);
-    DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
-      ready_state[generation_index]);
-    PipeBarrier<PIPE_ALL>();
-
-    uint32_t round = 0;
-    for (int64_t distance = 1; distance < ep; distance *= READY_SIGNAL_RADIX, ++round) {
-      int64_t target = (rank + distance) % ep;
-      __gm__ int32_t *round_ready = ready + round * ready_stride;
-      aclshmemx_signal_op(round_ready, generation, ACLSHMEM_SIGNAL_SET, static_cast<int>(target));
-      aclshmem_signal_wait_until(round_ready, ACLSHMEM_CMP_GE, generation);
-    }
-    if (!completion) {
-      TriggerEvent(meta.ready_event);
-    }
-#endif
-  }
-
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
   __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
 #ifndef HMC_RUNTIME_CUBE
     if (!IsActiveVectorWorker()) {
@@ -268,32 +259,11 @@ class KernelWorkerBase {
     if (this->worker_id_ == 1) {
       WaitForDependency(meta.completion_event);
       if (meta.ready_event != 0) {
-        PublishDeviceReady(meta, true);
+        InvocationProtocol::Publish(*static_cast<Derived *>(this), meta, true);
       }
     }
 #endif
   }
-#else
-  __aicore__ inline void CompleteDeviceReads(const ReadyHandshakeMeta &meta) {
-#ifndef HMC_RUNTIME_CUBE
-    if (this->worker_id_ % 2 == 0) {
-      return;
-    }
-#endif
-    TriggerEvent(meta.completion_event);
-#ifndef HMC_RUNTIME_CUBE
-    if (this->worker_id_ == 1) {
-      WaitForDependency(meta.completion_event);
-      if (meta.ready_event != 0) {
-        PublishDeviceReady(meta, true);
-      }
-    }
-#endif
-  }
-#endif
-
-
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
   __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
 #ifdef HMC_RUNTIME_CUBE
     WaitForDependency(meta.ready_event);
@@ -301,28 +271,12 @@ class KernelWorkerBase {
     if (!IsActiveVectorWorker()) {
       return;
     }
-    if (this->worker_id_ == 1) {
-      PublishDeviceReady(meta);
+    if (this->worker_id_ == ReadyLeader()) {
+      InvocationProtocol::Publish(*static_cast<Derived *>(this), meta, false);
     }
     WaitForDependency(meta.ready_event);
 #endif
   }
-#else
-  __aicore__ inline void WaitForDeviceReady(const ReadyHandshakeMeta &meta) {
-#ifdef HMC_RUNTIME_CUBE
-    WaitForDependency(meta.ready_event);
-#else
-    if (this->active_vector_num != this->vector_num && this->worker_id_ % VECTOR_WORKER_STRIDE == 0) {
-      return;
-    }
-    const uint32_t leader = this->active_vector_num == this->vector_num ? 0 : 1;
-    if (this->worker_id_ == leader) {
-      PublishDeviceReady(meta);
-    }
-    WaitForDependency(meta.ready_event);
-#endif
-  }
-#endif
 
   __aicore__ inline TaskId GetTaskIndex(uint32_t task_id) {
 #ifdef HMC_RUNTIME_CUBE
@@ -333,24 +287,30 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline uint32_t GetVectorScheduleIndex() {
-    if (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_) {
+    if (WorkerPolicy == VectorWorkerPolicy::ALL || explicit_queues_) {
       return this->worker_id_ < this->active_vector_num ? this->worker_id_ : INVALID_VECTOR_SCHEDULE_INDEX;
     }
     return this->worker_id_ % 2 == 0 ? INVALID_VECTOR_SCHEDULE_INDEX : this->worker_id_ / 2;
   }
 
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
   __aicore__ inline bool IsActiveVectorWorker() const {
-    if (WorkerPolicy == VectorWorkerPolicy::ALL || ready_queue_) {
+    if (WorkerPolicy == VectorWorkerPolicy::ALL || explicit_queues_) {
       return this->worker_id_ < this->active_vector_num;
     }
     return this->worker_id_ % VECTOR_WORKER_STRIDE != 0;
   }
+
+  __aicore__ inline uint32_t ReadyLeader() const {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+    return 1;
+#else
+    return this->active_vector_num == this->vector_num ? 0 : 1;
 #endif
+  }
 
   __aicore__ inline void AtomicAddForAllEventCounters(uint32_t event_index) {
 #if defined(HMC_RUNTIME_CUBE) && defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
-    // A5 cannot publish an L1 buffer to GM; preserve the original scalar atomic completion path.
+    // On arch35, the device cannot publish an L1 buffer to GM; preserve the original scalar atomic completion path.
     PipeBarrier<PIPE_ALL>();
     (void)AscendC::AtomicAdd<int32_t>(this->all_event_counters.GetPhyAddr(event_index), 1);
     PipeBarrier<PIPE_ALL>();
@@ -411,7 +371,7 @@ class KernelWorkerBase {
     const uint32_t owner_id = profile ? getTaskProfileOwnerId(this->runtimeConfigPtr, task_id) : 0;
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       const uint64_t start = profile ? recorder.Now() : 0;
-      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+      WaitForDependency(task_desc.dependent_event, task_desc.dependency_poll_interval_us);
       if (profile) {
         recorder.Record(Derived::PROFILE_DESC_WAIT_DEPENDENCY, task_id, task_desc.task_index, owner_id,
                         start, recorder.Now());
@@ -487,9 +447,7 @@ class KernelWorkerBase {
 
   bool pull_protocol_ = false;
   uint32_t worker_id_ = 0;
-#if !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510)
-  bool ready_queue_ = false;
-#endif
+  bool explicit_queues_ = false;
   uint32_t grouped_matmul_group_list_offset_ = 0;
   uint32_t task_num = 0;
   uint32_t runtime_task_capacity = 0;
@@ -508,9 +466,7 @@ class KernelWorkerBase {
   int64_t core_num = 0;
   int64_t vector_num = 0;
   uint32_t active_vector_num = 0;
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
-  bool ready_queue_ = false;
-#endif
+
   static constexpr uint32_t INVALID_VECTOR_SCHEDULE_INDEX = 0xFFFFFFFF;
 };
 

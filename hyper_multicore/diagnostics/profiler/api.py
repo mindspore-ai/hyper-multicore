@@ -44,6 +44,7 @@ class _RawInvocation:
     direction: str
     step: int
     invocation_id: int
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +70,7 @@ class _TraceAccumulator:
         self.dropped_count += metadata["droppedRecordCount"]
         self.record_count += metadata["recordCount"]
         invocation_metadata = {
+            **invocation.tags,
             "invocationId": invocation.invocation_id,
             "step": invocation.step,
             "direction": invocation.direction,
@@ -103,6 +105,7 @@ class _TraceAccumulator:
             copied_event["ts"] += shift_us
             copied_event["args"] = {
                 **event.get("args", {}),
+                **invocation.tags,
                 "invocation_id": invocation.invocation_id,
                 "step": invocation.step,
                 "direction": invocation.direction,
@@ -139,6 +142,7 @@ class _ProfileCall(DiagnosticCall):
         self.step = step
         self.invocation_id = invocation_id
         self.finished = False
+        self.tags: dict[str, str] = {}
 
     def complete(self) -> None:
         """Mark the direct-write profile buffer as complete after a successful launch."""
@@ -288,7 +292,14 @@ class TorchMegaKernelProfiler:
         if runtime is None:
             runtime = _PreparedProfileRuntime(context.runtime)
             self._profile_runtimes[context.runtime] = runtime
-        return self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        call = self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        tags = getattr(context, "tags", None)
+        if tags is not None:
+            if not all(isinstance(k, str) and isinstance(v, str) for k, v in tags.items()):
+                call.cancel()
+                raise TypeError("Profiler invocation tags must map strings to strings")
+            call.tags = dict(tags)
+        return call
 
     def acquire_call(
         self,
@@ -411,6 +422,7 @@ class TorchMegaKernelProfiler:
                         direction=call.direction,
                         step=call.step,
                         invocation_id=call.invocation_id,
+                        tags=dict(call.tags),
                     )
                 )
             self._release_profile_buffer(call, cache=True)

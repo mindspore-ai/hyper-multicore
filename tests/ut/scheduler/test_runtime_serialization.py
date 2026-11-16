@@ -33,17 +33,17 @@ from hyper_multicore.modules.mega_moe.probability import (
 from hyper_multicore.modules.mega_moe.task_options import (
     MegaMoeActivationWeighting, MegaMoeTransportPayload, validate_task_options,
 )
-from hyper_multicore.modules.mega_moe.backward.gen_runtime_data import (
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.gen_runtime_data import (
     build_config_for_rank as build_backward_config,
 )
-from hyper_multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
-from hyper_multicore.modules.mega_moe.backward.graph import (
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.storage import can_reuse_backward_dispatch
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.graph import (
     build_backward_graph,
 )
-from hyper_multicore.modules.mega_moe.forward.gen_runtime_data import (
+from hyper_multicore.modules.mega_moe.backends.bf16.forward.gen_runtime_data import (
     build_config_for_rank as build_forward_config,
 )
-from hyper_multicore.modules.mega_moe.forward.graph import (
+from hyper_multicore.modules.mega_moe.backends.bf16.forward.graph import (
     build_forward_graph,
 )
 from hyper_multicore.scheduler.config import (
@@ -469,7 +469,8 @@ class TestRuntimeCppReader(unittest.TestCase):
         cfg = allocate_runtime_config(17)
         cfg.task_num = 17
         data = bytearray(serialize_runtime_config(cfg))
-        data[40:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 40)
+        # Bytes 40..47 now explicitly describe optional per-worker queues.
+        data[48:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 48)
         self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
         struct.pack_into("<I", data, 36, 2)
         self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))

@@ -84,16 +84,16 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
     std::string message = std::string("SHMEM backend=") + kBackendSocType +
       " does not support device_soc_name=" + device_identity_->device_soc_name +
       " (npu_arch=" + std::to_string(device_identity_->npu_arch) + ")";
-    if (device_identity_->npu_arch == kAscend950NpuArch) {
+    if (device_identity_->npu_arch == kArch35NpuArch) {
       message += "; rebuild with: bash build.sh --soc-list ascend950";
-    } else if (device_identity_->npu_arch == kAscend910NpuArch) {
+    } else if (device_identity_->npu_arch == kArch22NpuArch) {
       message += "; rebuild with: bash build.sh --soc-list ascend910b,ascend910_93";
     }
     const Status error = MakeError(ErrorCode::UnsupportedCapability, std::move(message));
     return FailInitialization(DfxPhase::Validation, root.root_rank, error, __FILE__, __LINE__);
   }
 
-  if (config.data_engine == DataEngine::MteUdma && device_identity_->npu_arch != kAscend950NpuArch) {
+  if (config.data_engine == DataEngine::MteUdma && device_identity_->npu_arch != kArch35NpuArch) {
     return FailInitialization(DfxPhase::Validation, root.root_rank,
       MakeError(ErrorCode::UnsupportedCapability, "MTE/UDMA requires Ascend950"), __FILE__, __LINE__);
   }

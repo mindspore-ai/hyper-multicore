@@ -1,0 +1,33 @@
+// Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#ifndef HYPER_MULTICORE_MXFP8_GMM_RESOURCE_POLICY_H_
+#define HYPER_MULTICORE_MXFP8_GMM_RESOURCE_POLICY_H_
+#include "common/mega_moe/contracts/mx_gmm_descriptor.h"
+
+#ifdef __NPU_ARCH__
+#define MX_POLICY_INLINE __aicore__ inline
+#else
+#define MX_POLICY_INLINE inline
+#endif
+
+namespace MulticoreMx {
+struct MxGmmResources {
+  uint32_t scale_k;
+  uint8_t stages;
+  uint64_t l1_bytes;
+};
+
+MX_POLICY_INLINE MxGmmResources SelectMxGmmResources(const MxGmmDescriptor& r) {
+  // Match the arch35 T6 scale capacity and official three-buffer predicate.
+  const uint32_t scale = r.k < 8192 ? r.k : 8192;
+  const uint64_t a = static_cast<uint64_t>(r.base_m) * ((r.k_al1 + 63) / 64 * 64);
+  const uint64_t b = static_cast<uint64_t>(r.base_n) * ((r.k_bl1 + 63) / 64 * 64);
+  const uint64_t scales = static_cast<uint64_t>(r.base_m + r.base_n) * ((scale + 63) / 64) * 2;
+  const uint64_t common = a + b + scales;
+  const bool triple = r.layout != static_cast<uint32_t>(MxLayout::TN)
+      && common + a <= 262144 && common + b <= 262144;
+  return {scale, static_cast<uint8_t>(triple ? 3 : 2), 2 * common + (triple ? a + b : 0)};
+}
+
+}  // namespace MulticoreMx
+#undef MX_POLICY_INLINE
+#endif

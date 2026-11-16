@@ -142,17 +142,18 @@ loss.backward()
 
 ### MegaMoeExperts
 
-Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家，当前支持 Ascend NPU 上的 Torch BF16 训练。
-先按[构建与交付](../docs/build.md)运行 `bash build.sh`，激活 CANN 和 native payload，
-并为所有 EP rank 配置相同的 `HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT`（如 `tcp://<rank-zero-ip>:<port>`）。
+Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家。`precision="bf16"` 为默认后端，
+支持 Atlas A2/A3 系列（`arch22`）和 Ascend950 系列（`arch35`）。`precision="mxfp8"` 支持 Ascend950 系列。两种后端
+使用相同的 forward 参数。先按[构建与交付](../docs/build.md)激活 CANN 和 native payload。
 
 模型执行和数值配置从 `hyper_multicore` 导入，执行调优配置从 `hyper_multicore.experimental` 导入：
 
 | 公开接口 | 用途 | 使用约定 |
 | --- | --- | --- |
 | `MegaMoeExperts` | 配置模型尺寸和 EP 组，执行专家前反向并管理执行资源 | 公开稳定 API；专家参数由调用方持有，每次 forward 传入。 |
-| `MegaMoeNumericsOptions` | 配置 SwiGLU 裁剪及路由概率的应用位置 | 公开稳定 API；通过 `numerics_options=` 传入，按来源模型选择数值语义。 |
-| `MegaMoeTuningOptions` | 配置通信模式、容量倍数和通信分片 | 公开实验 API；通过 `tuning_options=` 传入。字段、可选值及默认执行策略不保证跨版本兼容，升级时须重新验证。 |
+| `MegaMoeNumericsOptions` | 配置 SwiGLU 裁剪、路由概率的应用位置及 partial dW 精度 | 公开稳定 API；通过 `numerics_options=` 传入，按来源模型选择数值语义。 |
+| `MegaMoeTuningOptions` | 配置通信模式、容量、分片和可选调度 | 公开实验 API；通过 `tuning_options=` 传入。字段、可选值及默认执行策略不保证跨版本兼容，升级时须重新验证。 |
+| `MegaMoeSchedulerOptions` | 配置数学任务顺序、就绪扫描和 lowering | 公开实验 API；作为 `MegaMoeTuningOptions(scheduler=...)` 传入。 |
 
 实验 API 同样校验参数和支持范围；API 稳定性不等于跨硬件或跨版本逐 bit 数值一致。
 概率与 clamp 的位置由调用方明确选择，调度器不会自动改变这些数值语义。
@@ -186,6 +187,33 @@ EP 大小从 `ep_group` 推导。独立单 rank 可省略 `ep_group`，
 MegaMoe 不接受 TP 大小参数。子组内部交换各自的 CANN bootstrap ID，不使用共享 WORLD rendezvous 端口。
 跨节点网卡选择及组内关闭要求见 [SHMEM 生命周期](../docs/shmem.md)。
 
+### 精度与调度合同
+
+| 配置 | BF16 | MXFP8 |
+|---|---|---|
+| `precision` | `"bf16"`，默认 | `"mxfp8"`，`arch35` |
+| `hidden_states` | BF16 | BF16；dispatch 后量化 |
+| token 规格 | 按调用自动管理 | 按调用自动管理 |
+| 权重 | 模型持有，每次 forward 传入 `expert_weights`；EIO/EOI | 模型持有的外部 MX root；EIO |
+| H / I | 按 BF16 算子约束 | 均须为64的倍数 |
+| `swiglu_limit` | 可配置正数 clamp | 必须为 `None` |
+| `dispatch_mode` | `push` / `pull` | `push` / `pull` |
+
+MX 权重 root 的 `col_data/col_scale` 必须由调用方提供；反向前还须提供当前
+`row_data/row_scale`。量化数据为 E4M3FN，scale 为 uint8 物理 E8M0 布局。
+执行器保留原始 root 供反向重新解析，不缓存 FSDP 临时权重 view，也不代替调用方量化权重。
+普通 BF16 Tensor 不能直接作为 MX 物理存储使用。
+
+Ascend950 的 SHMEM 默认启用 `mte_udma`，BF16 和 MXFP8 的专家通信随之使用 UDMA。
+如需强制使用 MTE，在各 rank 启动前设置 `HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte`。
+`arch22` 默认使用 MTE，显式请求 UDMA 时会在设备绑定时报错。
+`push` / `pull` 独立选择分发方向。堆预算和日志也沿用
+[SHMEM 配置](../docs/shmem.md#6-配置与日志)。
+
+调度可选项见 [MegaMoeSchedulerOptions](#megamoe-scheduler-options)，各精度的实现和约束见
+[BF16 与 MXFP8 执行能力](../docs/architecture.md#bf16-与-mxfp8-执行能力)。完整构建、回放及免编译部署见
+[Ascend950 构建指南](../docs/build.md#ascend950-megamoe-源码构建)。
+
 ### 下游模型集成
 
 DSV4.1、Qwen 和 TP/SP/CP/EP/FSDP 模型适配器及其集成测试由 HyperParallel 下游维护。
@@ -194,7 +222,7 @@ DSV4.1、Qwen 和 TP/SP/CP/EP/FSDP 模型适配器及其集成测试由 HyperPar
 ### 输入与权重
 
 - 分布式执行必须显式指定 `ep_group`，`E` 必须能被 EP 整除。
-  token 数由每次实际输入决定，无需构造时指定长度或上限，各 rank 可不等长或为空。
+  两种精度均按实际输入管理 token，各 rank 可不等长或为空。
   所有 EP rank 必须按相同顺序进入正反向，并使用一致的梯度参与策略。
   source/接收容量保留历史高水位，计划按几何桶缓存；待反向图保留原计划。
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
@@ -226,10 +254,11 @@ output = experts(
 
 `MegaMoeNumericsOptions` 是公开稳定的数值配置接口，可直接从 `hyper_multicore` 导入。
 类型定义位于 `modules/mega_moe/numerics.py`，由 MegaMoE 模块管理。
-通过 `MegaMoeExperts(..., numerics_options=...)` 按模型逐层配置以下三个字段：
+通过 `MegaMoeExperts(..., numerics_options=...)` 按模型逐层配置以下字段：
 
 | 字段 | 默认值 | 语义 |
 | --- | --- | --- |
+| `partial_weight_grad_dtype` | `None` | `None` 和 `"native"` 使用后端默认的 BF16 partial dW；`"float32"` 使用 FP32 partial dW。最终梯度按调用方权重及梯度归并合同处理。 |
 | `swiglu_limit` | `None` | 不进行 clamp；提供时须为正、有限且可由 FP32 表示的值。gate 分支只截上界，up 分支截到 `[-limit, limit]`。 |
 | `clamp_after_silu` | `False` | `False` 在 SiLU 前截 gate；`True` 在 SiLU(gate) 后、乘 up 前截 gate 激活。仅在提供 `swiglu_limit` 时生效。 |
 | `apply_probs_before_fc2` | `False` | `False` 在 FC2 后对专家输出加权；`True` 对 BF16 SwiGLU 激活加权，再送入 FC2。 |
@@ -295,13 +324,12 @@ FP32 乘 `p` 并舍入为 BF16。它通过重算恢复未加权激活，不执�
 `-L <= u <= L` 时传递梯度；越过边界后相应分支梯度为零。SiLU 前模式的 gate
 裁剪变量为 `g`，SiLU 后模式为 `SiLU(g)`。跨实现验收需同时核对这些边界和规约顺序。
 
-底层 plan 的 `weight_grad_dtype` 控制专家权重 partial dW 的写出 buffer 精度，属于内部框架对接选项。
-它不由当前公共构造器暴露，也不保证 BF16 叶子参数的最终 `.grad` 为 FP32；
-autograd、分布式梯度归并及优化器状态各自还有精度契约。
+公开的 `partial_weight_grad_dtype` 控制专家权重 partial dW 的写出精度。
+最终 `.grad` 仍由叶子参数 dtype、autograd 和外层的分布式梯度归并决定。
 
 ### 自动 token 与通信容量
 
-MegaMoe 从实际 forward 输入自动维护容量，无需 token 上限或动态/静态模式开关。
+自动 token 模式从实际 forward 输入维护容量，无需 token 上限或动态/静态模式开关。
 构造时不分配通信 workspace，首次绑定从128行的最小 source token 容量开始，按实际需求增长并保留高水位。
 调度计划按几何桶缓存，待反向图保留原计划；桶大小不改变真实 token 激活形状。
 初次绑定、进入新桶及扩容有额外成本；稳定容量和已缓存计划可复用。
@@ -325,7 +353,7 @@ source 容量、调度行数与实际 owner 接收量分别维护：source/返�
 
 普通模型使用 `MegaMoeExperts` 的默认配置。需要调优时，从 `hyper_multicore.experimental`
 显式导入 `MegaMoeTuningOptions`，仍使用同一个 `MegaMoeExperts` 入口。
-配置对象是不可变的 frozen dataclass，目前包含以下五个字段：
+配置对象是不可变的 frozen dataclass，包含以下字段：
 
 | 参数 | 默认值 | 作用与约束 |
 | --- | --- | --- |
@@ -334,6 +362,7 @@ source 容量、调度行数与实际 owner 接收量分别维护：source/返�
 | `capacity_growth_factor` | `None`；push 实际为 `1.25` | push 中 source token 和接收容量的扩容倍率；`1.0` 按当次需求对齐扩容。须为有限数且不小于 `1.0`，pull 不接受显式值。 |
 | `dispatch_split` | `128` | 正反向 dispatch 的通信分片行数，须为 `128` 的正整数倍。 |
 | `combine_split` | `128` | 正反向 combine 的通信分片行数，须为 `128` 的正整数倍。 |
+| `scheduler` | `None` | 可选 `MegaMoeSchedulerOptions`，保留硬件适用的默认调度。 |
 
 push 初始接收容量按 `ceil(min(initial_capacity_factor, EP) × 预留 source token 数 × top_k)`
 计算后向上对齐到 `128` 行，`EP` 为 `ep_group` 的成员数；首次绑定的预留 source token 数为 `128`。
@@ -357,9 +386,58 @@ experts = MegaMoeExperts(
 
 执行器在构造时绑定配置，改变执行策略应创建新的配置和执行器。
 同一个 EP 组的对应层必须使用一致的有效配置，同一个 workspace 不能切换通信模式。
-`batch_experts`、`nominal_schedule` 及 native task options 由内部计划和调度策略管理，
-不属于公开调优配置。参数、checkpoint 与优化器状态由外层模型管理，接入方式见
+参数、checkpoint 与优化器状态由外层模型管理，接入方式见
 [Checkpoint 与参数归属](../examples/README.md#checkpoint与参数归属)。
+
+### MegaMoE scheduler options
+
+`MegaMoeSchedulerOptions` 从 `hyper_multicore.experimental` 导入，通过
+`MegaMoeTuningOptions(scheduler=...)` 为单个 `MegaMoeExperts` 实例配置。
+省略 `scheduler` 或传入空对象都使用设备和精度对应的默认策略。
+各 EP rank 上同一层的配置须一致。
+
+| 参数 | 可选值 | BF16 · `arch22` | BF16 / MXFP8 · `arch35`（Ascend950） |
+| --- | --- | --- | --- |
+| `policy` | `None`（默认）、`"two_expert_pipeline"`、`"builder_order"` | 用 `None`，由 lowering 选择队列。指定策略名会报错。 | `None` 等同 `"two_expert_pipeline"`，交错相邻专家的数学阶段。`"builder_order"` 保留建图时的数学任务相对顺序。两者保持相同的任务覆盖、核归属和通信队列。 |
+| `queue_ready_lookahead` | `None`（默认）、整数 `0`、`1`、`8` | compact 的窗口只作用于 Vector 队列，`None` 保留默认 `256`，Cube 始终 FIFO。dense 使用 FIFO，接受 `None` 或 `0`。 | `None` 等同 `0`。窗口作用于 Cube 和数学 Vector 队列，通信 Vector 始终 FIFO。 |
+| `batch_experts` | `None`（默认）、`False`、`True` | `None` 等同 `False`。`True` 将每个 GMM 阶段的逐专家描述符合并为批处理，取消逐专家流水重排。dense 与 compact 均可用，compact 保留 Vector 就绪扫描。 | 接受 `None` 或 `False`。`True` 会报错。 |
+| `nominal_schedule` | `None`（默认）、`False`、`True` | `None` 等同 `False`。`True` 按名义均分行数限制 compact 的 lane 数，并跳过描述符压缩倍率门槛。要求 Push、`intermediate_size < 2048` 且 lowering 为 `"auto"` 或 `"compact"`。 | 接受 `None` 或 `False`。`True` 会报错。 |
+| `lowering` | `"auto"`（默认）、`"dense"`、`"compact"` | `"dense"` 保留固定分片。`"auto"` 在 Push、`intermediate_size < 2048` 且预计描述符数至少压缩四倍时选 compact，否则用 dense。显式 `"compact"` 要求满足这些条件，`nominal_schedule=True` 时免于倍率判定。 | `"auto"` 与 `"dense"` 都使用逐专家 dense。`"compact"` 会报错。 |
+
+`0` 按队首顺序执行，`1` 通过就绪检查只看队首，`8` 在当前 worker 的前 8 个槽中取最靠前的就绪任务。
+`256` 是 `arch22` compact 的内部默认值，使用 `None` 选择。窗口按单个 worker 队列中的任务槽计数，
+参与执行的 AIV 核数由设备规格和任务放置决定。compact 使用持久 lane 遍历运行时有效分片，
+`nominal_schedule` 调整参与分片的 lane 数，所有有效行仍会处理。
+
+例如，在 Ascend950 上为 BF16 或 MXFP8 使用同一个调度配置：
+
+```python
+from hyper_multicore.experimental import MegaMoeSchedulerOptions, MegaMoeTuningOptions
+
+tuning = MegaMoeTuningOptions(
+    dispatch_mode="pull",
+    scheduler=MegaMoeSchedulerOptions(policy="builder_order", queue_ready_lookahead=8),
+)
+# 构造 MegaMoeExperts 时传入 tuning_options=tuning。
+```
+
+在 `arch22` 上明确要求 BF16 Push 使用 compact 批处理和 8 槽 Vector 扫描：
+
+```python
+tuning = MegaMoeTuningOptions(
+    scheduler=MegaMoeSchedulerOptions(
+        lowering="compact",
+        nominal_schedule=True,
+        batch_experts=True,
+        queue_ready_lookahead=8,
+    ),
+)
+```
+
+构造阶段校验参数类型和值，并拒绝 MXFP8 的 compact、nominal 和 batching 请求。
+设备绑定及构图阶段校验架构和实际分桶。显式请求 compact 或非零 Vector 窗口时，
+若某个分桶只能使用 dense，会报错。`arch22` 使用策略名也会在构图时报错。
+`arch35` 的具名策略和数学窗口对 MTE 与 UDMA 都生效。
 
 ### 资源共享与关闭
 

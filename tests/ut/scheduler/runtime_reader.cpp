@@ -144,3 +144,7 @@ extern "C" void read_protocol_profile(uint8_t *image, uint32_t *result) {
 extern "C" bool valid_moe_task(const Runtime::TaskDesc *task, uint32_t position) {
   return Runtime::IsMoeTaskOptionsValid(*task, position);
 }
+
+extern "C" bool uses_explicit_worker_queues(uint8_t *image) {
+  return Runtime::usesExplicitWorkerQueues(image);
+}

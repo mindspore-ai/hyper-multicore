@@ -16,7 +16,7 @@
 from dataclasses import replace
 import unittest
 
-from hyper_multicore.modules.mega_moe.plan import _build_runtime_artifacts, _build_task_values
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts, _build_task_values
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.schedule_policy import MegaMoeSchedulePolicy, pipeline_cube_queue
 from hyper_multicore.modules.mega_moe.task_options import validate_task_options
@@ -133,5 +133,5 @@ class TestTaskContracts(unittest.TestCase):
         self.assertEqual(list(moved.cube_task_indices), list(config.cube_task_indices))
         policy = MegaMoeSchedulePolicy(vector_ready_queue=False, pipeline_vector=True, pipeline_cube=True)
         policy.apply(moved, graph, topology, spec.num_cube_cores)
-        self.assertEqual(moved.vector_ready_queue, 0)
+        self.assertEqual(moved.queue_layout, 0)
         self.assertEqual(list(moved.cube_task_indices), list(config.cube_task_indices))

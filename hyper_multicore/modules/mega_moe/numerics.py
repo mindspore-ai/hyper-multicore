@@ -15,6 +15,7 @@
 """Stable model numerical options owned by the MegaMoE component."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,9 @@ class MegaMoeNumericsOptions:
     tuning policies cannot override them.
 
     Args:
+        partial_weight_grad_dtype: None or "native" uses BF16 partial weight
+            gradients. "float32" writes the partial gradients in FP32 before
+            autograd converts or accumulates them for the parameter.
         swiglu_limit: Optional positive, finite float32-representable clamp
             limit. The gate branch is clipped only above the limit; the up
             branch is clipped to ``[-limit, limit]``. None disables clipping.
@@ -40,6 +44,7 @@ class MegaMoeNumericsOptions:
             probabilities, and rounds to BF16 again before FC2.
     """
 
+    partial_weight_grad_dtype: Literal["native", "float32"] | None = None
     swiglu_limit: float | None = None
     clamp_after_silu: bool = False
     apply_probs_before_fc2: bool = False

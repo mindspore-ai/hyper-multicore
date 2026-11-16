@@ -19,6 +19,8 @@
 #include <system_error>
 #include <utility>
 
+#include "device/device_identity.h"
+
 namespace hyper_multicore::shmem::runtime {
 namespace {
 
@@ -107,14 +109,15 @@ Result<Config> ParseConfig(const ConfigInput &input) {
     config.timeout_seconds = kDefaultTimeoutSeconds;
   }
 
-  const std::string_view data_engine =
-    input.data_engine.has_value() ? std::string_view(*input.data_engine) : kDefaultDataEngine;
-  if (data_engine != kDefaultDataEngine && data_engine != "mte_udma") {
-    return Result<Config>::Failure(InvalidConfig(std::string(kDataEngineEnv) +
-                                                 " only accepts 'mte' or 'mte_udma', but got '" +
-                                                 std::string(data_engine) + "'"));
+  config.data_engine = kBackendNpuArch == kArch35NpuArch ? DataEngine::MteUdma : DataEngine::Mte;
+  if (input.data_engine.has_value()) {
+    const auto &engine = *input.data_engine;
+    if (engine != "mte" && engine != "mte_udma") {
+      return Result<Config>::Failure(InvalidConfig(std::string(kDataEngineEnv) +
+                                                   " only accepts 'mte' or 'mte_udma', but got '" + engine + "'"));
+    }
+    config.data_engine = engine == "mte_udma" ? DataEngine::MteUdma : DataEngine::Mte;
   }
-  config.data_engine = data_engine == "mte_udma" ? DataEngine::MteUdma : DataEngine::Mte;
 
   const std::string_view endpoint = input.bootstrap_endpoint_base.has_value()
                                       ? std::string_view(*input.bootstrap_endpoint_base)

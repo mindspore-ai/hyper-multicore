@@ -15,10 +15,13 @@ hyper_multicore/_build/dependencies.lock.json):
 - ops-transformer: GMM v9.1.0.pre and the MHC sources selected by the lock file:
   selected GMM/MHC source primitives, with local patches.
   Source: https://gitcode.com/cann/ops-transformer.git
+- ops-tensor (source revision selected by the lock file):
+  standard A5 Blaze mathematics with logical-worker entry adapters.
+  Source: https://gitcode.com/cann/ops-tensor.git
 - CANN SHMEM (source version selected by the lock file):
   private SDK/runtime libraries built with the component's locked patches.
   Source: https://gitcode.com/cann/shmem.git
-  These three repositories use CANN Open Software License Agreement Version 2.0;
+  These four repositories use CANN Open Software License Agreement Version 2.0;
   their license texts are reproduced below.
 
 Framework headers incorporated by compiling the Torch/SHMEM adapters:
@@ -130,7 +133,7 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
 
 
-Software: ops-nn / ops-transformer
+Software: ops-nn / ops-transformer / ops-tensor
 License source: the corresponding upstream repository LICENSE.
 
 CANN Open Software License Agreement Version 2.0
