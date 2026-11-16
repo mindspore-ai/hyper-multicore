@@ -16,7 +16,9 @@ MX_BYTE_LIST_INLINE bool IsMxByteListHeaderValid(uint64_t pointer_offset, uint32
 
 MX_BYTE_LIST_INLINE bool IsMxByteVectorShapeValid(uint64_t rank_word, uint64_t bytes, uint64_t expected_bytes) {
   // The upper rank-word bits are CANN descriptor metadata, not the list length.
-  return (rank_word & 0xffffffffULL) == 1 && bytes == expected_bytes;
+  // CANN folds the physical storage extent for pooled contiguous views.
+  // The launch descriptor remains the exact logical bound used by each task.
+  return (rank_word & 0xffffffffULL) == 1 && bytes >= expected_bytes;
 }
 }  // namespace MulticoreMx
 #undef MX_BYTE_LIST_INLINE
