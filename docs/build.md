@@ -1,325 +1,423 @@
 # 构建与安装
 
-从源码构建 native wheel，或将已有 wheel 安装到配套环境。CPU/NPU 用例的执行和排错见
-[测试指南](../tests/README.md)。
+日常开发从[默认构建](#默认构建)开始；已有制品可直接[安装 wheel](#安装已有-wheel)，需要覆盖多个框架版本时使用[全量构建](#全量构建)。
+本文命令默认从仓库根目录执行，`/path/to/...`、`<version>` 等占位符需替换为实际路径或值。
 
-## 环境要求
+## 目录
 
-| 项目 | 要求 |
+- [源码构建](#源码构建)
+- [安装与验证](#安装与验证)
+- [其他构建方式与参数](#其他构建方式与参数)
+- [日志与失败恢复](#日志与失败恢复)
+- [制品与构建参考](#制品与构建参考)
+
+## 源码构建
+
+源码构建生成可安装的 wheel 和供源码验证的本地 native 资源（payload）。
+
+### 环境准备
+
+源码构建需要以下系统环境。CANN 自身的依赖按所用工具链的发行要求准备。
+
+| 环境 | 要求 |
 | --- | --- |
-| 系统 | Linux；CPU 架构需具备配套的 Torch/PTA wheel 和 CANN 工具链 |
+| 系统 | Linux，具有匹配 CPU 架构的 CANN 工具链 |
 | Python | >=3.10，具有开发头文件 |
-| 框架 | 相互配套的 Torch、torch-npu/PTA；NumPy >=1.26,<2 |
-| Ascend | 已配置的 CANN toolkit/ops；运行环境的 PTA、CANN 和驱动须彼此兼容 |
-| 构建工具 | GCC/G++、CMake >=3.18、GNU Make、Git 和 CANN 编译工具；pybind11 头文件使用 Torch 提供的版本 |
+| Ascend | CANN toolkit/ops，包含 `bisheng`、`asc_opc` |
+| 编译工具 | GCC/G++、配套的 CMake/CTest >=3.20、GNU Make、Git、binutils 和常用 GNU 工具 |
 
-激活调用者 Python 环境，配置 CANN 并安装构建依赖：
+### 默认构建
+
+默认构建使用当前 Python 环境中的 Torch/TorchNpu（Ascend 后端）。先按所用 CANN 环境安装配套的框架，
+再激活 CANN、安装项目依赖并构建。
+
+构建获锁后会清空 `dist/` 并替换上次日志；制品提交前失败或取消还会清除正式 payload。
+制品提交指产物通过最终校验并确认发布。
+需保留的制品和日志应提前归档，详细行为见[清理与保留规则](#清理与保留规则)。
 
 ```bash
 source /path/to/cann/set_env.sh
-python -m pip install -r requirements.txt setuptools wheel "packaging>=22" decorator attrs psutil
-```
-
-默认构建还需在调用者环境安装 Torch/PTA。`--all` 使用独立框架 venv，调用者环境只需公共 CANN 编译依赖。
-公共 SDK、ops 和 vendor 使用构建入口的 Python，保留调用者的 `PYTHONPATH`、user-site、搜索路径和编译参数。
-框架适配库使用各自选定的框架环境。构建器不会自动安装或升级调用者的软件。
-
-Torch adapter 和 SHMEM binding 的 C++ 标准由目标 TorchConfig 决定。Torch 2.14 要求正式 C++20，
-仅支持早期草案的编译器不能满足其头文件检查。需要时指定兼容目标头文件的框架编译器：
-
-```bash
-HYPER_MULTICORE_FRAMEWORK_CXX=/path/to/g++ \
-  bash build.sh --all --jobs 24
-```
-
-该变量只影响框架适配库；公共 CANN vendor/SDK/ops 使用 CANN 工具链。
-未设置时沿用 `CXX` 或系统默认编译器。编译失败会保留原始诊断，C++20 错误附带编译器重试命令。
-
-## 编译
-
-```bash
-# 使用当前安装的 Torch/PTA，默认包含三个 SoC。
+python -m pip install -r requirements.txt -r requirements-build.txt
+python -c 'import torch, torch_npu; print("Torch:", torch.__version__); print("TorchNpu:", torch_npu.__version__)'
 bash build.sh --jobs 24
-
-# 为框架矩阵中的全部目标生成一个 wheel。
-bash build.sh --all --jobs 24
-
-# 构建双 SoC 产物。
-bash build.sh --soc-list ascend910b,ascend910_93 --jobs 24
-
-# 构建 Ascend950 产物。
-bash build.sh --soc-list ascend950 --jobs 24
-
-# 仅生成 native payload。
-bash hyper_multicore/build.sh --soc-list ascend910b --jobs 24
 ```
 
-| 行为 | 默认构建 | `--all` |
-| --- | --- | --- |
-| 框架来源 | 当前解释器实际导入的 Torch/PTA | [框架矩阵](../hyper_multicore/_build/frameworks.lock.json)中的准确配对 |
-| 版本选择 | 接受正式版、开发版和自定义版本标识 | 使用配置指定的发行版本 |
-| 框架安装 | 使用本机环境 | 在指定目录创建或复用 venv，默认 `build/native/envs/` |
-| 公共资源 | 使用调用者 CANN 工具环境 | 使用调用者 CANN 工具环境 |
-| 框架适配库 | 编译一组 | 按预算并行编译全部配置目标 |
-| wheel | 包含当前 PTA 标签 | 不带单一 PTA 标签 |
-| 构建源码检查 | 默认关闭，`--tests on` 开启 | 默认开启，`--tests off` 关闭 |
+默认构建不安装或升级框架，也不读取框架矩阵。构建成功后，`dist/` 中生成适用于当前 Torch/TorchNpu 版本组合的 wheel，
+payload 位于 `build/native/payload/hyper_multicore/`。
+生成的 wheel 可安装到运行环境，本地 payload 可直接用于源码验证。
 
-`--tests on/off` 控制[轻量构建源码检查](../tests/ut/build/README.md)，显式设置覆盖模式默认值。
-检查使用入口 Python，在获得构建锁、初始化日志和输出事务后执行一次，先于环境准备及 native 编译。
-它不安装测试框架、不执行真实编译或设备操作；失败时停止构建并沿用提交前清理规则。
-关闭该检查不取消实际编译、加载检查或制品完整性校验。
+## 安装与验证
+
+### 安装已有 wheel
+
+先激活目标运行环境，准备 Linux、匹配 wheel 的 Python ABI/CPU 架构、Torch/TorchNpu，以及兼容的 CANN/驱动。
+[运行依赖](../requirements.txt)也需提前安装；下面的 `--no-deps` 不会补装依赖。
+wheel 路径使用构建命令打印的实际路径，或已有制品的保存路径。
 
 ```bash
-bash build.sh --tests on
-bash build.sh --all --tests off
-```
-
-默认路径不读取框架矩阵，也不按框架版本格式、分支或上下限拒绝构建。源码框架无需发行元数据，
-版本不可得时记为 `unknown`。日志展示实际 Python、Torch/PTA 版本和安装位置。
-两种模式均使用当前 CANN，不按其版本号拒绝构建；真实缺包、缺工具、头文件或符号问题由编译和加载检查报告。
-矩阵中的可选 `reference_cann` 用于提示和追溯，与实际版本不同或实际版本未知时告警并继续。
-
-每次构建准备一份公共资源。vendor 可复用，SHMEM SDK、ops 和框架适配库每次重新建立工作目录并编译。
-910B/910C 共用 `arch22`，950 使用 `arch35`；每架构只编译一次 vendor kernel，注册信息按 SoC 生成；每组框架构建一份 Torch 适配库和所需的 SHMEM binding。
-各后端在独立 Python 进程中完成加载检查，不执行 NPU 计算。
-最终清单始终按矩阵配置顺序排列。
-
-`--soc-list` 支持 `ascend910b`、`ascend910_93` 和 `ascend950`，保留列表顺序并去除各项两侧空白。
-两种模式均默认包含三个 SoC，显式指定时支持任意非空子集，每次只生成一个 wheel。
-重复项、空项和未知值会在获取构建锁及清理产物前被拒绝。
-
-950 构建包含 MegaMoE、MegaGate、MegaMHC 前后向六个算子及 SHMEM SDK/ops 和框架适配库。
-构建与加载校验不覆盖设备执行、数值正确性、通信及性能。
-
-`--jobs` 为 J、矩阵目标数为 N 时，框架适配库并行度如下：
-
-| 编译预算 | 并行框架适配库 |
-| --- | ---: |
-| J ≥ 2N | N |
-| 4 ≤ J < 2N | 2 |
-| J < 4 | 1 |
-
-预算均分到固定执行槽，余数依次分配。七组目标使用 `--jobs 24` 时配额为 `4、4、4、3、3、3、3`；
-`--jobs 8` 时两槽各用 4，`--jobs 2` 时串行使用 2。空闲槽领取下一目标时保留自己的配额。
-公共阶段先准备 SDK/ops 和依赖，再按架构编译未命中缓存的 vendor，最后统一合并。
-两个架构均需编译且 J≥4 时均分预算并行构建；J≤3 时串行使用完整预算。
-只有一个架构需编译时使用完整 J，全部命中缓存时不启动 vendor 编译。
-SDK/ops 和默认单组适配库构建使用完整 J。该预算限制编译任务数，不是内存或全部系统线程的硬限制。
-
-`--clean` 清除所选架构／SoC 的 vendor 缓存并重编；不删除框架 venv、依赖源码仓库或用户 pip 缓存。
-`--all --clean` 强制完整重编全部配置目标。
-
-### 输出与日志
-
-| 内容 | 位置 |
-| --- | --- |
-| 最新成功 wheel | `dist/` |
-| 正式 native payload | `build/native/payload/hyper_multicore/` |
-| 公共资源工作区 | `build/native/common/<CPU架构>/` |
-| SHMEM SDK/ops 工作区 | `build/native/sdk/<CPU架构>/<设备架构>/` |
-| 框架适配库工作区 | `build/native/variants/<框架组合>/` |
-| 依赖源码仓库 | `build/native/deps/<依赖>/` |
-| 框架安装环境 | `build/native/envs/<安装身份>/` |
-| vendor 缓存 | `build/native/vendor-cache/<CPU架构>-<设备架构>/` |
-| 终端记录 | `build/native/logs/build.log` |
-| 工具原始输出 | `build/native/logs/tools.log` |
-| 阶段、命令、耗时、退出码和日志字节区间 | `build/native/logs/stages.json` |
-
-终端实时显示 pip/CMake 输出、环境新建或复用、安装包版本、编译进度和 vendor 缓存决策。
-并行工具输出带架构或 PTA 及阶段标识，静默阶段定期显示已用时间；内部 JSON 只写入工具日志。
-失败摘要对应当前阶段，完整诊断可按 `stages.json` 中的区间定位。
-
-构建通过 `build/native/.build.lock` 互斥。等待时显示持锁信息，Ctrl-C 可取消等待而不影响持锁构建。
-独立 SHMEM SDK/ops 入口使用同一把锁，并复用相同的公共资源与 SDK 工作区。
-主构建入口获锁后替换上次日志；帮助命令、参数错误及等待锁不会清理日志。
-日志仅保留最近一次，如需长期保存应在下次构建前复制到构建目录外。
-
-组包成功后清理本次 staging；失败时保留日志和 staging，供排查使用，临时输出在下次构建开始时回收。
-源码在构建和发布期间变化会拒绝发布。任一框架适配库失败或收到 Ctrl-C/SIGTERM 时，停止领取新任务，
-终止活动进程组并归并日志。
-
-wheel 和 payload 在 staging 完成校验后发布。提交前失败或取消会清空 `dist/` 和正式 payload；
-提交后缓存维护或回收失败仅告警，保留本次有效制品。`dist/` 只保存本次成功制品，不用于历史归档。
-
-## 安装与激活
-
-### 使用 wheel
-
-按 Python ABI、CPU 架构及 Torch/PTA 分支选择构建命令打印的 wheel，先准备运行依赖再安装：
-
-```bash
+source /path/to/cann/set_env.sh
 python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<abi>-<platform>.whl"
 source "$(command -v hyper_multicore_set_env.bash)"
 ```
 
-激活脚本设置随包 vendor 的搜索路径，应在导入 Torch/torch-npu 之前执行。
-SHMEM loader 按设备后端选择库并使用绝对路径加载。
-更换制品或环境后启动新的 Python 进程。检查安装来源时，在源码目录外移除源码 `PYTHONPATH` 后运行：
+激活脚本设置项目 vendor 的搜索路径，须在导入 Torch/TorchNpu 之前执行。
+更换制品或环境后使用新的 Python 进程。安装、导入和算子调用均不触发 native 编译或依赖下载。
+
+### 验证安装
+
+在源码目录外执行以下命令，并先从 `PYTHONPATH` 移除指向 checkout 的路径，避免源码遮蔽安装包：
 
 ```bash
+hyper_multicore_build_info
 python -c 'import hyper_multicore; print(hyper_multicore.__file__)'
 ```
 
-输出应指向安装位置。功能使用见[快速开始](../README.md#快速开始)。
-预构建 wheel 的安装、导入和调用不会下载框架或 native 源码，也不会编译适配库。
-wheel 不包含外部 Torch/PTA、CANN 和驱动。
+`hyper_multicore_build_info` 展示构建环境并校验包内清单和资源完整性，无需导入 Torch/TorchNpu。
+包来源应指向目标安装位置。需要查看完整构建记录和文件列表时，见[查询构建记录与源码包](#查询构建记录与源码包)。
 
-### 使用源码 payload
+设备执行使用[双卡最小 NPU 示例](../README.md#快速开始)验证，示例完成前向、反向和设备通信。
+完整用例及执行方法见[测试指南](../tests/README.md#npu-用例执行)。
 
-构建 native 后，在源码根目录激活本地 payload：
+### 激活本地 payload
+
+源码验证可直接使用构建生成的本地 payload。从仓库根目录激活：
 
 ```bash
 source /path/to/cann/set_env.sh
 source build/native/payload/hyper_multicore/lib/set_env.bash
 ```
 
-此方式从当前源码导入 Python 实现、从本地 payload 加载 native 库。
-同一进程使用一套激活环境。
+随后按[测试指南的源码模式](../tests/README.md#npu-系统测试)执行 NPU 测试。
+同一进程使用一套激活环境，避免混用不同制品的 vendor、SHMEM 库和框架适配库。
 
-## 制品内容与兼容性
+## 其他构建方式与参数
 
-默认 wheel 版本包含 PTA 的安全文件名标签，例如 `0.1.0.dev0+pt.2.12.0`。
-开发版 `2.15.0.dev20261005+git2c8682d` 对应 `0.1.0.dev0+pt.2.15.0.dev20261005.git2c8682d`；
-特殊字符或过长标识使用可读前缀和摘要，版本原文保存在 `build_info.json`。
-全量 wheel 使用组件版本，例如 `hyper_multicore-0.1.0.dev0-cp310-cp310-linux_aarch64.whl`。
-Python ABI 和 CPU 架构由 wheel 标签约束。
+### 全量构建
 
-运行时按 Torch/PTA 数字分支、Python ABI、CPU 架构及 C++ ABI 唯一选择一组框架适配库。
-开发版日期、post 和 local 后缀不作为相等门禁；无法提取数字分支的标识按不透明标识匹配。
-这些选择规则不代表二进制兼容保证。不同 post 的 PTA 仍可能存在执行桥符号差异，
-运行环境须提供所选适配库实际依赖的接口。CANN 版本不要求相等，仍需与框架和驱动兼容。
-内部文件集合、哈希及算子注册仍需匹配，加载失败不会跨分支尝试其他框架适配库。
-
-vendor 位于 `lib/vendors/`，SHMEM 资源按 `arch22/arch35` 保存于 `shmem/lib/<arch>/`。
-每个 `adapters/<ID>/` 包含一份 Torch 库，以及 `shmem/<arch>/` 下的各架构 binding。
-ID 格式为 `pt<Torch版本>-pta<torch_npu版本>-<12位构建指纹>`，例如
-`pt2.7.1-pta2.7.1.post11-e53991cd6b50`。Torch 的标准 CPU 分发后缀不进入可读标识，完整版本保存在构建记录中。
-vendor kernel 位于 `op_impl/ai_core/tbe/kernel/<arch>/`；910B/910C 共用一份 `arch22` kernel，
-950 使用 `arch35`。CANN 注册和查找索引继续按已选 SoC 保存，并指向对应架构的 kernel。
-`build_info.json` 记录构建环境、来源和资源摘要；`adapters/manifest.json` 记录运行选择所需信息。
-首次使用 SHMEM 时，查询可见逻辑设备 0 的 NPU 架构，按绝对路径加载一套后端；不创建 NPU 上下文。
-同一进程可见设备须属于同一架构，SHMEM 实际初始化仍使用调用方设置的当前设备。
-设备查询失败或对应后端未打包时直接报错，不回退至另一后端。
-查看已安装制品的构建矩阵：
+需要为多个 Torch/TorchNpu 配对生成一个 wheel 时，使用 `--all`。
+准备前述[系统工具链](#环境准备)和 Python 的 `venv`/pip 能力后，在启动构建命令的 Python 环境中执行。
+该模式沿用默认构建的[输出清理规则](#清理与保留规则)：
 
 ```bash
-hyper_multicore_build_info
-hyper_multicore_build_info --json
-python -m pip show -f hyper-multicore
+source /path/to/cann/set_env.sh
+python -m pip install -r requirements-build.txt
+bash build.sh --all --jobs 24
 ```
 
-矩阵命令无需导入 Torch/PTA。文本输出展示框架配对和构建环境，`--json` 提供完整记录、框架适配库 ID 及 SO 路径。
-构建矩阵用于描述构建输入，不是运行兼容性认证。
+该环境无需预装 Torch/TorchNpu；构建器按[框架矩阵](../hyper_multicore/_build/frameworks.lock.json)创建或复用 venv，
+安装各目标的框架及补充依赖。公共 CANN 编译仍使用启动命令的 Python，框架 venv 不会补装调用者环境的依赖。
 
-源码包通过 `python setup.py sdist` 生成，包含源码、CMake、锁文件、补丁和构建所需测试资源。
+全量构建使用当前 Python ABI、CPU 架构和已激活的 CANN，输出位置与默认构建相同。
+成功后，一个 wheel 包含全部矩阵目标；安装时切换到配套的运行环境，再按[安装已有 wheel](#安装已有-wheel)操作。
 
-## 依赖与缓存
+两种构建模式都使用当前 CANN。仅全量构建在配置 `reference_cann` 时比较参考版本，实际版本不同或未知则告警并继续。
 
-### 框架环境
+### SoC 选择
 
-[框架矩阵](../hyper_multicore/_build/frameworks.lock.json)维护准确 Torch/PTA 配对、下载索引和公共构建依赖。
-开发者可直接增删目标或修改版本；可选参考 CANN 不参与环境身份。例如：
+默认包含所有支持的 SoC。使用 `--soc-list` 选择本次构建目标，例如：
 
-```json
-{
-  "reference_cann": "9.2.0",
-  "targets": [
-    {"id": "pt2.12.0-pta2.12.0.post3", "torch_version": "2.12.0+cpu", "pta_build_version": "2.12.0.post3"}
-  ]
-}
+```bash
+# 选择两个 SoC。
+bash build.sh --soc-list ascend910b,ascend910_93 --jobs 24
+
+# 选择 Ascend950。
+bash build.sh --soc-list ascend950 --jobs 24
 ```
 
-修改现有文件时保留 `schema_version`、`indexes` 和 `build_requirements`。
-可通过 `indexes.dependencies_extra` 配置框架下载及依赖安装共用的额外索引，例如：
+### 仅生成 native payload
 
-```json
-"dependencies_extra": ["https://mirrors.huaweicloud.com/repository/pypi/simple"]
+已准备默认构建环境时，可使用组件入口省略 wheel 打包，沿用统一控制器的[输出清理规则](#清理与保留规则)：
+
+```bash
+bash hyper_multicore/build.sh --soc-list ascend910b --jobs 24
 ```
 
-每个地址在 Torch/PTA 的 `pip download` 和依赖的 `pip install` 中均对应一组
-`--extra-index-url`；缺失或空列表时不追加索引。Torch、PTA 及依赖分别保留各自配置的主源，
-主源和额外索引共同参与选包，不按配置顺序作失败回退，也不保证优先从额外索引下载。
-准确框架版本要求保持不变。增删额外索引或修改展示 ID 不改变环境身份，已有成功 venv 继续复用；
-每次复用仍校验实际框架版本。`ready.json` 更新当前请求和 ID，保留原安装来源。默认开发构建不读取该配置。
+输出仍为 `build/native/payload/hyper_multicore/`；`--jobs` 默认取 `nproc`，`--clean` 清理所选 vendor 缓存。
+生成后按[激活本地 payload](#激活本地-payload)使用。
 
-pip 按当前 Python 和平台从各自索引选择准确框架 wheel，再解析必要依赖；缺少兼容 wheel 时失败，
-不换版本或回退源码安装。构建不主动安装 pytest，也不需要独立的 pybind11 Python 包。
-下载复用由 pip 自身缓存负责，尊重 `PIP_CACHE_DIR` 和 `PIP_NO_CACHE_DIR`，不清理用户全局缓存。
+### 构建参数
 
-`HYPER_MULTICORE_VENV_PATH` 可指定 `--all` 的 venv 根目录，每个框架目标使用独立子目录：
+下表适用于根入口 `bash build.sh`。payload 组件入口 `bash hyper_multicore/build.sh` 的公开构建参数为 `--soc-list`、`--jobs` 和 `--clean`。
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `--all` | 关闭 | 根入口遍历框架矩阵；关闭时使用当前 Torch/TorchNpu |
+| `--soc-list` | `ascend910b,ascend910_93,ascend950` | 选择目标 SoC，默认和全量构建均适用 |
+| `--jobs` | 根入口 Python 的 `os.cpu_count()` | 正整数编译预算，分配方式见[并行预算](#并行预算) |
+| `--tests on/off` | 默认构建为 `off`，全量构建为 `on` | 控制轻量构建源码检查，显式值覆盖默认值 |
+| `--clean` | 关闭 | 清除所选 vendor 缓存并重编，范围见[清理与保留规则](#清理与保留规则) |
+
+`--soc-list` 接受任意非空支持子集，保留列表顺序并去除两侧空白。
+重复项、空项和未知值在获取构建锁及清理产物前被拒绝。
+
+### 框架编译器
+
+框架适配库的 C++ 标准及 `_GLIBCXX_USE_CXX11_ABI` 由目标 Torch 的配置确定。
+例如，Torch 2.14 要求 C++20。
+需要时指定兼容的编译器，例如用于全量构建：
+
+```bash
+HYPER_MULTICORE_FRAMEWORK_CXX=/path/to/g++ \
+  bash build.sh --all --jobs 24
+```
+
+该变量只影响框架适配库，公共 CANN vendor/SDK/ops 沿用其工具链。
+未设置时沿用 `CXX` 或默认编译器。
+
+### 构建检查
+
+`--tests` 控制[轻量构建源码检查](../tests/ut/build/README.md)，例如：
+
+```bash
+bash build.sh --tests on
+bash build.sh --all --tests off
+```
+
+检查在获得构建锁、初始化输出事务和日志后执行一次，先于环境准备及 native 编译；失败按提交前失败处理。
+框架适配库编译、SHMEM CTest、加载检查和制品完整性校验始终执行。
+设备功能与数值验证使用[测试指南](../tests/README.md)中的对应入口。
+
+## 日志与失败恢复
+
+### 定位日志
+
+构建失败时，先查看终端记录中的失败阶段，再定位相应工具输出：
+
+| 内容 | 位置 |
+| --- | --- |
+| 终端记录 | `build/native/logs/build.log` |
+| 工具原始输出 | `build/native/logs/tools.log` |
+| 阶段、命令、耗时、退出码和工具日志字节区间 | `build/native/logs/stages.json` |
+
+工具命令失败时，在 `stages.json` 中找到 `status` 为 `failed` 的命令记录，
+按 `log` 指定的文件读取 `[log_start, log_end)` 字节区间。
+
+主入口获锁后替换上次日志；帮助命令、参数错误及等待锁不会清理日志。
+需长期保留的日志应在下次构建前复制到构建目录外，制品归档也应使用正式输出目录之外的位置。
+
+### 清理与保留规则
+
+| 时机或操作 | 产物与缓存的处理 |
+| --- | --- |
+| 帮助、参数错误、等待构建锁 | 保留已有制品和日志；取消等待不影响持锁构建 |
+| 获得构建锁并开始构建 | 清空 `dist/`，回收已知 staging 临时目录并替换日志；旧正式 payload 暂时保留 |
+| 制品提交前失败或取消 | 清空 `dist/` 和正式 payload；保留本次日志、staging、框架环境、源码仓库及既有缓存 |
+| 制品提交完成 | 保留本次制品，发布通过输入复核的 vendor 快照并清理 staging |
+| 提交后维护失败或取消 | 保留有效制品并告警；缓存更新、staging 清理或环境回收可能未完成 |
+| `--clean` | 执行相应阶段时清除所选 vendor 缓存并重编；保留 venv、依赖源码仓库和用户 pip 缓存 |
+| 成功全量构建后的环境回收 | 仅保留本次选定的框架环境，回收配置根目录中的其他受管环境；默认构建和提交前失败不执行此项回收 |
+
+SDK、ops 和框架适配库每次重建受管工作区，vendor 复用跨构建编译结果。
+`--all --clean` 对全部配置目标执行完整重编。提交后的维护告警不要求重新编译有效制品。
+源码在构建和发布期间变化时拒绝提交；框架任务失败或收到 Ctrl-C/SIGTERM 时，停止领取新任务、终止活动进程组并归并日志。
+
+### 缓存与环境恢复
+
+已安装 wheel，但激活提示找不到包时，检查 `python` 和 `python3` 是否来自同一目标环境。
+
+vendor 输入摘要相同且文件完整时复用，输入失配、文件缺失、损坏或无法采集必要身份时重编。
+同路径、同版本下修改摘要未覆盖的 CANN 内部资源，或原地修改 Python 构建依赖实现后，使用 `--clean` 强制重编。
+
+框架环境复用时严格核对 Torch/TorchNpu，其他包的版本变化只记录、不自动升级或重装。
+需要重建某个 venv 时，先停止使用它的构建，再删除对应环境目录；下次全量构建重新准备。
+安装中断且有有效归属标记的未完成环境，可在下次准备时重建。
+标记损坏、目录无归属或路径为软链时，构建器拒绝替换；确认归属并移走冲突目录后重试。
+
+native 源码校验失败时，检查锁定提交、tree、archive 和补丁。
+使用 `--verify-only` 可校验已有源码，不获取提交或修改缓存；`--source-dir` 指向 Git 仓库目录，例如：
+
+```bash
+python hyper_multicore/_build/prepare_dependencies.py \
+  --dependency shmem \
+  --source-dir /path/to/shmem \
+  --verify-only
+```
+
+校验失败不会自动删除源码或重新 clone。工作区归属错误也应先检查并移走冲突目录，避免清理未知数据。
+
+### 框架环境存储位置
+
+全量构建默认将 venv 放在 `build/native/envs/`。可通过绝对路径指定其他根目录：
 
 ```bash
 export HYPER_MULTICORE_VENV_PATH=/data/hyper-multicore/venvs
 bash build.sh --all --jobs 24
 ```
 
-未设置或为空时使用 `build/native/envs/`。配置值必须是绝对路径，不接受相对路径或未展开的 `~/...`。
-默认开发构建忽略此变量。环境创建、复用及回收使用同一根目录，启动日志显示实际位置。
-更换根目录不会迁移已有环境，也不会回退查找旧目录。不同 checkout 不得并发使用同一 venv 根目录；
-构建锁仅保护当前 checkout，不提供跨 checkout 的目录互斥。
+变量未设置或为空时使用默认目录；不接受相对路径或未展开的 `~/...`，默认构建忽略此变量。
+环境的创建、复用和回收使用同一根目录，启动日志展示实际位置。
+更换根目录不迁移已有环境，也不查找旧目录；删除项目 `build/` 不会清理外部 venv。
+不同 checkout 不得并发使用同一 venv 根目录，构建锁只保护当前 checkout。
+pip 下载缓存由 pip 管理，保留 `PIP_CACHE_DIR` 和 `PIP_NO_CACHE_DIR` 的作用，构建器不清理用户全局缓存。
 
-`--clean` 不删除 venv。需要重建框架环境时，应停止相关构建后手动删除对应环境目录。
-删除项目 `build/` 不会清理存放在外部的 venv。
+## 制品与构建参考
 
-存储位置、展示 ID 和额外索引不参与环境键。实际版本、主要安装源、构建依赖、Python 或架构变化会选择不同环境；
-复用只严格核对 Torch/PTA，其他包的变化记录到实际安装版本，不自动升级或重装。
-必要依赖缺失和接口问题由真实构建报告。`ready.json` 保存请求、安装来源和实际安装版本，作为追溯信息。
-环境键规则升级后，旧键环境需要重新准备，不自动迁移或回退查找。
-传递依赖由 pip 解析，不同时间创建的环境可能不同，不提供完整依赖离线重装快照。
+### 术语与配置来源
 
-成功全量构建后，仅保留本次使用的框架环境，回收其余受管环境。
-默认构建和提交前失败不触发该回收。
+| 术语 | 含义 |
+| --- | --- |
+| TorchNpu | PyTorch Ascend 后端；pip 分发名为 `torch-npu`，Python 导入名为 `torch_npu` |
+| vendor | 按 CANN custom OPP 规范组织的项目算子资源，包含注册信息、Host 库和 Device kernel |
+| 框架适配库 | 与选定 Torch/TorchNpu 编译接口及 ABI 匹配的 Torch 算子库和 SHMEM binding |
+| native payload | vendor、SHMEM 库、框架适配库、激活脚本和清单组成的 native 资源集合 |
+| 调用者环境 | 启动根构建入口所使用的 Python 及其继承的系统环境 |
 
-### vendor 与源码
+| 文件 | 职责 |
+| --- | --- |
+| [requirements.txt](../requirements.txt) | Python 运行依赖，由 `setup.py` 写入安装元数据 |
+| [requirements-build.txt](../requirements-build.txt) | 调用者环境的 Python 构建辅助依赖 |
+| [框架矩阵](../hyper_multicore/_build/frameworks.lock.json) | 全量构建的 Torch/TorchNpu 配对、下载索引和目标 venv 补充依赖 |
+| [native 依赖锁](../hyper_multicore/_build/dependencies.lock.json) | 第三方源码仓库、提交、校验值和补丁 |
 
-默认和全量共用 `build/native/vendor-cache/<CPU架构>-<设备架构>/`，每个设备架构保留一份 vendor。
-输入摘要覆盖锁定源码及补丁、vendor 构建脚本、SDK 头文件和链接库、CANN 实际路径及版本记录、
-所选工具、调用者 Python 和有效环境参数；`--jobs` 不参与缓存身份。
-仅切换构建模式而保持这些输入不变时可直接复用。
-本仓通信源码按 `shmem/ccsrc/cann/` 和 `shmem/ccsrc/data_plane/` 目录整体取摘要，
-目录内文件新增、删除或修改均触发 vendor 重编，包括未被当前 vendor 使用的文件。
+pybind11 头文件使用 Torch 提供的版本，无需独立安装 `pybind11` Python 包。
 
-命中时核对完整文件集合、SHA256 和 vendor 校验。输入失配、文件缺失、损坏或无法采集必要身份时重编。
-新快照仅在制品提交成功并复核输入后原子发布。`build_info.json` 的 `vendor_sources` 区分原始 vendor 来源
-与本次组包身份；激活脚本和最终制品每次重新生成。
+### 制品内容与兼容性
 
-该摘要不覆盖任意外部环境变化。同路径、同版本下修改未覆盖的 CANN 内部资源，或原地修改 Python 构建依赖的
-内部实现后，执行 `--clean`。SDK、ops 和框架适配库不复用跨构建产物或 CMake 增量结果。
+默认 wheel 的版本号包含 TorchNpu 版本标识，例如 `0.1.0.dev0+pt.2.12.0`。
+特殊字符或过长框架版本标识使用可读前缀和摘要，原文保存在 `build_info.json`。
+全量 wheel 使用组件版本，例如 `hyper_multicore-0.1.0.dev0-cp310-cp310-linux_aarch64.whl`。
+Python ABI 和 CPU 架构由 wheel 标签约束。
 
-native 源码版本和补丁由[依赖锁](../hyper_multicore/_build/dependencies.lock.json)指定。
-Git 仓库位于 `build/native/deps/`；只 fetch 缺失提交，已缓存提交不访问远端。
-`ops_transformer` 的 `gmm` 和 `mhc` 共用仓库，按各自锁定提交导出片段；工作目录 HEAD 不参与版本选择。
-950 SHMEM 使用的 JSON 头文件也从锁定提交导出，JSON 锁定记录参与其 SDK 工具链身份。
-提交、tree、archive 和补丁均按锁校验，补丁只应用于隔离源码副本。校验失败不删除源码或重新 clone。
-准备器的 `--source-dir` 可校验已有源码，`--verify-only` 不获取提交或修改缓存。
+运行时按 Torch/TorchNpu 的 `X.Y.Z` 三段版本号、Python ABI、CPU 架构和 C++ ABI 唯一选择框架适配库。
+开发版日期、post 和 local 后缀不参与版本相等比较；无法提取三段版本号时，按原始版本字符串匹配。
+运行环境须提供适配库依赖的 TorchNpu 共享库符号，这些符号可能随 TorchNpu post 版本变化。
+CANN 版本不要求与构建时相等，仍需与框架和驱动兼容。
+内部文件集合、哈希及算子注册必须匹配；加载失败直接报告，不跨分支尝试其他框架适配库。
 
-### 固定工作目录
+vendor 位于 `lib/vendors/`，SHMEM 资源位于 `shmem/lib/<arch>/`。
+每个 `adapters/<ID>/` 包含一份 Torch 库和 `shmem/<arch>/` 下的 binding。
+vendor kernel 位于 `op_impl/ai_core/tbe/kernel/<arch>/`：910B/910C 共用 `arch22`，950 使用 `arch35`。
+CANN 注册和查找索引按所选 SoC 保存，并指向对应架构的 kernel。
 
-公共资源使用 `common/<CPU架构>/`，所选 SoC 记录在构建身份与 SDK 交接记录中；框架适配库使用
-`variants/<PythonABI>-<架构>-pt<Torch版本>-pta<PTA版本>-abi<0或1>/`。
-SDK/ops、vendor 和 binding 的子工作区按 `arch22/arch35` 隔离。
-SDK 工作区位于 `build/native/sdk/<CPU架构>/<设备架构>/`，不同 SoC 选择使用同一 SDK 路径。
-目录中直接保存 `shmem-source/`、`shmem/`、`shmem-install/` 和 `ccsrc-ops/`；工具链指纹写入 SDK 交接记录。
-这些是编译工作区，每次编译前重建对应目录；成功后保留，便于检查 CMake、编译参数及中间文件。
-SDK 在准备入口按设备架构检查归属并重建，仅清理当前选择的架构。
-无归属的非空目录、归属不匹配的目录，以及自身或祖先为软链的路径均拒绝清理；已有无标记目录需先移走。
+首次使用 SHMEM 时，查询可见逻辑设备 0 的 NPU 架构，按绝对路径加载一套后端，不创建 NPU 上下文。
+同一进程可见设备须属于同一架构，实际 SHMEM 初始化使用调用方设置的当前设备。
+设备查询失败或对应后端未打包时直接报错。
 
-### 构建实现与故障恢复
+### 查询构建记录与源码包
 
-构建入口通过标准库引导私有构建包，辅助模块无需导入业务包或 Torch/PTA。
-`build_controller.py` 串联阶段，`framework_environments.py` 管理环境准备，`command_runner.py` 管理进程和日志，
-`build_workspace.py` 管理工作区与锁，`build_publication.py` 校验和发布制品，`vendor_cache.py` 管理共享快照。
-源码复核和输出提交状态分别由单一对象管理；提交后的维护错误不改变构建成功状态。
-
-## CPU 开发
+`build_info.json` 记录构建环境、来源和资源摘要，`adapters/manifest.json` 记录运行选择信息。
+查询已安装制品的完整记录及文件列表：
 
 ```bash
-python -m pip install -r requirements.txt setuptools wheel "packaging>=22"
-python -m pip install pytest
-python -m pip install --no-deps --no-build-isolation -e .
-python scripts/check_repository.py
-python -m pytest tests/ut -q
+hyper_multicore_build_info --json
+python -m pip show -f hyper-multicore
 ```
 
-CPU 单测包含 C++17 runtime ABI reader，需要 G++。无 native 的 editable 安装用于 Host 开发；
-NPU 用例需先构建并激活 native payload。
+JSON 输出包含框架适配库 ID、共享库路径和当前环境元数据。
+安装态查询应在源码目录外运行，并排除指向 checkout 的 `PYTHONPATH`。
+
+在仓库根目录使用构建环境生成源码包：
+
+```bash
+python setup.py sdist
+```
+
+源码包内容由 [MANIFEST.in](../MANIFEST.in) 管理，不携带预构建 native 库；解包后按本文准备环境并构建。
+
+### Python 环境分工
+
+| 构建阶段 | 默认构建使用的 Python | 全量构建使用的 Python |
+| --- | --- | --- |
+| 构建控制、轻量源码检查 | 调用者 | 调用者 |
+| 公共 vendor、SHMEM SDK/ops 编译 | 调用者 | 调用者 |
+| 框架适配库编译、CTest 和加载检查 | 调用者 | 对应框架 venv |
+| wheel 打包 | 调用者 | 矩阵中第一个目标的 venv |
+
+公共编译保留调用者的 `PYTHONPATH`、user-site、搜索路径和编译参数，并补充可用的 CANN Python 模块路径。
+默认构建接受实际可导入的正式版、开发版和自定义框架版本。源码框架无需发行元数据，版本不可得时记录为 `unknown`。
+
+### 框架矩阵与环境身份
+
+[框架矩阵](../hyper_multicore/_build/frameworks.lock.json)中的 `torch_version` 和 `pta_build_version`
+指定 Torch/TorchNpu 配对版本，`build_requirements` 指定 venv 补充依赖。
+
+`indexes.dependencies_extra` 为框架下载及依赖安装配置额外索引。局部字段示例：
+
+```json
+{
+  "indexes": {
+    "dependencies_extra": ["https://mirrors.huaweicloud.com/repository/pypi/simple"]
+  }
+}
+```
+
+每个地址对应 Torch/TorchNpu 的 `pip download` 和依赖 `pip install` 中的一组 `--extra-index-url`。
+缺失或空列表时不追加索引。Torch、TorchNpu 及依赖保留各自主源，主源与额外索引共同参与选包；
+索引顺序不表示失败回退顺序或下载优先级。
+pip 按当前 Python 和平台选择精确框架 wheel，再解析必要依赖；缺少兼容 wheel 时失败，不改选版本或源码安装。
+
+环境键包含框架版本、主要安装源、venv 补充依赖、Python 和 CPU 架构。
+存储位置、展示 ID、额外索引和参考 CANN 不参与环境键。
+`ready.json` 记录环境请求、安装来源和实际安装版本。
+传递依赖由 pip 解析，因此该配置不等同于全部传递依赖的锁定文件或完整离线重装快照。
+
+### 构建流程
+
+```mermaid
+flowchart TD
+    A["参数校验与构建锁"] --> B["初始化输出、日志；按配置执行源码检查"]
+    B --> C{"框架来源"}
+    C -->|默认构建| D["探测调用者 Torch/TorchNpu"]
+    C -->|全量构建| E["按矩阵准备并验证框架 venv"]
+    D --> F["调用者环境：编译公共资源；复用或生成 vendor"]
+    E --> F
+    F --> G["选定框架环境：编译框架适配库、CTest 与加载检查"]
+    G --> H["组装并校验 payload；按入口打包 wheel"]
+    H --> I["发布制品并复核源码"]
+    I --> J["提交完成；更新缓存与回收受管资源"]
+```
+
+### native 源码与 vendor 摘要
+
+锁定的第三方 Git 仓库位于 `build/native/deps/`，只 fetch 缺失提交，已缓存提交不访问远端。
+ops-transformer 的 GMM 和 MHC 共用仓库，按各自锁定提交导出片段，工作目录 HEAD 不决定版本。
+提交、tree、archive 和补丁按锁校验，补丁只应用于隔离源码副本。
+Ascend950 的 JSON 头文件同样从锁定提交导出，其记录参与 SDK 工具链身份。
+
+默认和全量构建共用 vendor 缓存，每个 CPU/设备架构组合保留一份。
+摘要覆盖锁定源码及补丁、vendor 构建脚本、SDK 头文件和链接库、CANN 实际路径及版本、
+所选工具、调用者 Python 和参与缓存计算的环境变量；`--jobs` 不参与缓存身份。
+`shmem/ccsrc/cann/` 和 `shmem/ccsrc/data_plane/` 按目录整体取摘要，文件新增、删除或修改均触发重编，
+包括未被当前 vendor 使用的文件。
+
+新快照在制品提交成功并复核输入后原子发布。
+`build_info.json` 的 `vendor_sources` 区分原始 vendor 来源和本次组包身份；激活脚本与最终制品每次重新生成。
+
+### 并行预算
+
+每架构只编译一次 vendor kernel，按 SoC 生成注册信息；每组框架编译一份 Torch 库及所选架构的 SHMEM binding。
+`--jobs` 是全局编译任务预算；SDK/ops 和单组框架适配库使用完整预算，多个框架或设备架构并行时共享预算。
+框架任务预算按执行槽分配，最终制品清单按矩阵配置顺序排列。
+具体调度见[构建控制器](../hyper_multicore/_build/build_controller.py)。该预算不是全部系统线程或内存的硬限制。
+
+### 工作区与源码入口
+
+构建使用 `build/native/.build.lock` 互斥；等待时显示持锁信息，Ctrl-C 可取消等待。
+独立 SHMEM SDK/ops 入口使用同一把锁和公共资源工作区。
+
+| 内容 | 位置 |
+| --- | --- |
+| 公共资源工作区 | `build/native/common/<CPU架构>/` |
+| SHMEM SDK/ops 工作区 | `build/native/sdk/<CPU架构>/<设备架构>/` |
+| 框架适配库工作区 | `build/native/variants/<框架组合>/` |
+| 临时组装及打包资源 | `build/native/staging/<运行标识>/` |
+| 依赖源码仓库 | `build/native/deps/<依赖>/` |
+| 框架安装环境 | 默认 `build/native/envs/<安装身份>/`，可指定外部根目录 |
+| vendor 缓存 | `build/native/vendor-cache/<CPU架构>-<设备架构>/` |
+
+框架工作区格式为 `variants/<PythonABI>-<架构>-pt<Torch版本>-pta<TorchNpu版本>-abi<0或1>/`。
+SDK/ops、vendor 和 binding 的子工作区按 `arch22/arch35` 隔离。
+成功构建后保留工作区中的编译参数和中间文件，SDK 工作区仅重建当前选择的设备架构。
+
+| 实现入口 | 职责 |
+| --- | --- |
+| [artifacts.py](../hyper_multicore/_build/artifacts.py) | 制品版本、构建身份及 payload 元数据 |
+| [_native_manifest.py](../hyper_multicore/_native_manifest.py) | 清单契约、资源完整性及运行变体选择 |
+| [build_controller.py](../hyper_multicore/_build/build_controller.py) | 串联构建阶段、框架任务及提交后维护 |
+| [framework_environments.py](../hyper_multicore/_build/framework_environments.py) | 环境选择、安装、复用及回收 |
+| [command_runner.py](../hyper_multicore/_build/command_runner.py) | 工具进程、并发输出、取消及日志记录 |
+| [build_workspace.py](../hyper_multicore/_build/build_workspace.py) | 工作区归属、构建锁、日志和正式输出生命周期 |
+| [build_publication.py](../hyper_multicore/_build/build_publication.py) | 源码复核、制品校验及原子发布操作 |
+| [vendor_cache.py](../hyper_multicore/_build/vendor_cache.py) | vendor 输入摘要与共享快照 |
+| [prepare_dependencies.py](../hyper_multicore/_build/prepare_dependencies.py) | 锁定 native 源码获取与校验 |
+| [torch_compat.cmake](../hyper_multicore/cmake/torch_compat.cmake) | 从选定框架环境确定头文件、C++ 标准及 ABI |

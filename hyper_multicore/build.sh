@@ -32,10 +32,13 @@ function show_help() {
 Usage:
   bash hyper_multicore/build.sh [OPTIONS]
 
+Build and validate a native payload using the caller's Torch/PTA; omit wheel packaging.
+Use the root build.sh for wheels or the complete framework matrix. See docs/build.md.
+
 Options:
   --soc-list VALUE    Comma-separated CANN SoC IDs. Default: ascend910b,ascend910_93,ascend950.
   --jobs VALUE        Parallel build jobs. Default: nproc.
-  --clean             Remove multicore work and install outputs before building.
+  --clean             Clear selected vendor caches and rebuild; keep framework venvs and source repositories.
   -h, --help          Show this help message.
 EOF
 }

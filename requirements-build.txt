@@ -1,0 +1,8 @@
+# Supplemental Python build dependencies; Torch/PTA are configured separately.
+numpy>=1.26,<2
+setuptools
+wheel
+packaging>=22
+attrs
+decorator
+psutil
