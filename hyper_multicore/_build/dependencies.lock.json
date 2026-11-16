@@ -39,8 +39,7 @@
           },
           {
             "path": "hyper_multicore/ops/patches/swi_glu_clamp.patch",
-            "sha256": "0eb8706fa9d62668adb388a7322fb57de0a638f1107280145e29002f4fc16fda",
-            "allow_zero_context": true,
+            "sha256": "b8c29dfa3b3f819a21441aaa62de466a6c159c1d09f14dd4085ca89c07cd2a7f",
             "purpose": "add optional pre/post-SiLU clipping and dynamic tail bounds"
           },
           {
