@@ -143,7 +143,7 @@ BF16 的图传播根据 `SplitSpec` 和上游张量的分块信息决定任务�
 ### 队列与通信进展
 
 worker 的队列选择、依赖等待和完成发布见[运行时模型](../architecture.md#运行时模型)。
-normal、profile 和支持 L1 dump 的路径复用队列执行逻辑；采集开销仍可能改变运行中实际观察到的就绪顺序。
+normal、profile 和支持 Task dump 的路径复用队列执行逻辑；采集开销仍可能改变运行中实际观察到的就绪顺序。
 
 arch22 BF16 支持 compact、nominal 和专家批处理；compact 的粒度变化先于队列编排。
 arch35 BF16 与 MXFP8 将各自数学阶段映射到共享专家调度策略，通信采用固定 owner 和 FIFO 队列，

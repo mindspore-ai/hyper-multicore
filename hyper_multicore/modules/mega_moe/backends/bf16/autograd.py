@@ -411,15 +411,15 @@ def _launch_forward_kernel(
         metadata.combine_src_off,
         metadata.combine_size,
     )
-    if not plan.fwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.fwd_runtime_config, stream=stream)
+    if not plan.fwd_diagnostics.requires_diagnostic_launch:
+        record_plan_stream(plan, plan.fwd_runtime_config_tensor, stream=stream)
         multicore_ops.mega_moe(
             *kernel_parameters,
             execution.gmm_workspace,
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            plan.fwd_runtime_config,
+            plan.fwd_runtime_config_tensor,
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -432,16 +432,16 @@ def _launch_forward_kernel(
     with plan.fwd_diagnostics.launch(
         _diagnostic_parameters(plan, kernel_parameters, execution.gmm_workspace),
         direction="forward",
-        fallback_event_counters=execution.event_counters,
+        event_counters=execution.event_counters,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
+        record_plan_stream(plan, diagnostic_call.runtime_config_tensor, stream=stream)
         multicore_ops.mega_moe_with_diagnostic_buffer(
             *kernel_parameters,
             execution.gmm_workspace,
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            diagnostic_call.runtime_config,
+            diagnostic_call.runtime_config_tensor,
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,
@@ -484,8 +484,8 @@ def _launch_backward_kernel(
         gradients.grad_weight1,
         saved.group_list,
     )
-    if not plan.bwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.bwd_runtime_config, stream=stream)
+    if not plan.bwd_diagnostics.requires_diagnostic_launch:
+        record_plan_stream(plan, plan.bwd_runtime_config_tensor, stream=stream)
         multicore_ops.mega_moe_grad(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -495,7 +495,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            plan.bwd_runtime_config,
+            plan.bwd_runtime_config_tensor,
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -510,9 +510,9 @@ def _launch_backward_kernel(
             plan.act_grad_tiling, plan.gate_grad_tiling, plan.w1_grad_tiling,
             plan.w2_grad_tiling, plan.swiglu_grad_tiling)),
         direction="backward",
-        fallback_event_counters=execution.event_counters,
+        event_counters=execution.event_counters,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
+        record_plan_stream(plan, diagnostic_call.runtime_config_tensor, stream=stream)
         multicore_ops.mega_moe_grad_with_diagnostic_buffer(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -522,7 +522,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            diagnostic_call.runtime_config,
+            diagnostic_call.runtime_config_tensor,
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,

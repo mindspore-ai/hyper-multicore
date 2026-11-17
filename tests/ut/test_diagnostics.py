@@ -44,11 +44,11 @@ from torch import (
 from torch.testing import assert_close
 
 from hyper_multicore import prepare_mega_kernel_diagnostics
-from hyper_multicore.diagnostics.dump import api as tensor_dump
+from hyper_multicore.diagnostics.dumper import api as tensor_dump
 from hyper_multicore import validate_mega_kernel_diagnostic_contract
 from hyper_multicore import diagnostics as diagnostics_module
 from hyper_multicore.diagnostics import profiler as multicore_profiler
-from hyper_multicore.diagnostics.dump import l1 as tensor_dump_l1
+from hyper_multicore.diagnostics.dumper import _task as tensor_dump_task
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import build_mega_moe_plan
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_mhc.plan import build_mega_mhc_plan
@@ -158,8 +158,8 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
         """
         for first, second in (("Same", "Same"), ("A/B", "A?B"), ("Copy", "..")):
             graph, config = _two_stage_graph()
-            graph.get_op("copy").diagnostic_name = first
-            graph.get_op("scale").diagnostic_name = second
+            graph.get_op("copy").diagnostic_stage_name = first
+            graph.get_op("scale").diagnostic_stage_name = second
             validate_mega_kernel_diagnostic_contract(graph, config, 3)
             with self.subTest(names=(first, second)), self.assertRaisesRegex(ValueError, "stage"):
                 tensor_dump._stage_names(graph.topological_sort())
@@ -195,7 +195,7 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_dynamic_view_constraints_belong_only_to_l1_dump(self):
+    def test_dynamic_view_constraints_belong_only_to_task_dump(self):
         """Feature: MegaKernel diagnostics.
         Description: Dynamic view constraints belong only to l1 dump.
         Expectation: Dynamic view constraints belong only to l1 dump.
@@ -203,14 +203,14 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
         graph, config = _two_stage_graph()
         config.all_tasks[0].inputs[0].dynamic_shape = 1
         for resolver in (None, mock.Mock(), 123):
-            graph.get_op("copy").diagnostic_view_resolver = resolver
+            graph.get_op("copy").task_dump_tensor_view_resolver = resolver
             validate_mega_kernel_diagnostic_contract(graph, config, 3)
             if callable(resolver):
                 resolver.assert_not_called()
 
 
 class TestMegaKernelDiagnostics(unittest.TestCase):
-    """Exercise the same public launch API for ordinary, L0, L1 and profiling modes."""
+    """Exercise the same public launch API for ordinary, Kernel, Task and profiling modes."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -220,13 +220,13 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         Expectation: Normal preparation ignores unused diagnostic semantics.
         """
         graph, config = _two_stage_graph()
-        graph.get_op("copy").diagnostic_name = 123
-        graph.get_op("copy").diagnostic_view_resolver = 123
+        graph.get_op("copy").diagnostic_stage_name = 123
+        graph.get_op("copy").task_dump_tensor_view_resolver = 123
         owner = mock.Mock(side_effect=AssertionError("ordinary execution must not resolve owners"))
         adapter = _prepare(graph, config, owner_resolver=owner)
         events = torch_zeros(16, dtype=torch_int32)
-        with adapter.launch([torch_ones(2)] * 3, direction="forward", fallback_event_counters=events) as call:
-            self.assertIs(call.runtime_config, adapter.runtime_config)
+        with adapter.launch([torch_ones(2)] * 3, direction="forward", event_counters=events) as call:
+            self.assertIs(call.runtime_config_tensor, adapter.runtime_config_tensor)
         self.assertIsNone(adapter._runtime._metadata)
         owner.assert_not_called()
 
@@ -244,15 +244,15 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         self.assertEqual(metadata.task_stage_names[0], "Copy")
         self.assertEqual(metadata.owner_label, "Owner")
         events = torch_zeros(16, dtype=torch_int32)
-        with adapter.launch([torch_ones(2)] * 3, direction="forward", fallback_event_counters=events) as call:
-            self.assertIs(call.runtime_config, adapter.runtime_config)
+        with adapter.launch([torch_ones(2)] * 3, direction="forward", event_counters=events) as call:
+            self.assertIs(call.runtime_config_tensor, adapter.runtime_config_tensor)
             self.assertIs(call.event_counters, events)
             self.assertIs(call.diagnostic_buffer, events)
         with multicore_profiler.mega_kernel_profile():
             with self.assertRaisesRegex(ValueError, "expects 3"):
-                adapter.launch([], direction="forward", fallback_event_counters=events)
+                adapter.launch([], direction="forward", event_counters=events)
             with self.assertRaisesRegex(ValueError, "direction"):
-                adapter.launch([torch_ones(2)] * 3, direction="sideways", fallback_event_counters=events)
+                adapter.launch([torch_ones(2)] * 3, direction="sideways", event_counters=events)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -269,11 +269,11 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         owner.assert_not_called()
         events = torch_zeros(16, dtype=torch_int32)
         with multicore_profiler.mega_kernel_profile() as profiler:
-            with adapter.launch([torch_ones(2)] * 3, direction="forward", fallback_event_counters=events) as call:
+            with adapter.launch([torch_ones(2)] * 3, direction="forward", event_counters=events) as call:
                 self.assertEqual(adapter.metadata.task_owner_ids[0], 7)
                 self.assertIs(owner.call_args.args[2], context)
                 self.assertEqual(bytes(config), original)
-                self.assertEqual(call.runtime_config[RuntimeConfigC.diagnostic_mode.offset].item(), 1)
+                self.assertEqual(call.runtime_config_tensor[RuntimeConfigC.diagnostic_mode.offset].item(), 1)
                 self.assertIsNot(call.diagnostic_buffer, events)
                 call.cancel()
             self.assertEqual(len(profiler._pending), 0)
@@ -288,19 +288,20 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         graph, config = _two_stage_graph()
         owner = mock.Mock(return_value=3)
         resolver = mock.Mock(side_effect=AssertionError("must not resolve views"))
-        graph.get_op("copy").diagnostic_view_resolver = resolver
+        graph.get_op("copy").task_dump_tensor_view_resolver = resolver
         adapter = _prepare(graph, config, owner_resolver=owner)
         events = torch_zeros(16, dtype=torch_int32)
-        self.assertFalse(adapter.is_active)
+        self.assertFalse(adapter.requires_diagnostic_launch)
         owner.assert_not_called()
         with tempfile.TemporaryDirectory() as directory:
             selection = tensor_dump.TensorDumpConfig(
-                directory, kernel_names="another_kernel", level="L1", stages="Copy",
+                directory, kernel_names="another_kernel", level="task", stages="Copy",
             )
             with tensor_dump.tensor_dump(selection):
+                self.assertTrue(adapter.requires_diagnostic_launch)
                 with adapter.launch([torch_ones(2)] * 3, direction="forward",
-                                    fallback_event_counters=events) as call:
-                    self.assertIs(call.runtime_config, adapter.runtime_config)
+                                    event_counters=events) as call:
+                    self.assertIs(call.runtime_config_tensor, adapter.runtime_config_tensor)
                     self.assertIs(call.diagnostic_buffer, events)
                 owner.assert_not_called()
             with mock.patch(
@@ -308,16 +309,16 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                 side_effect=AssertionError("dump must not prepare profiling"),
             ):
                 with tensor_dump.tensor_dump(tensor_dump.TensorDumpConfig(directory)):
-                    with adapter.launch([torch_ones(2)] * 3, direction="forward", fallback_event_counters=events):
+                    with adapter.launch([torch_ones(2)] * 3, direction="forward", event_counters=events):
                         pass
-            with mock.patch.object(tensor_dump, "_prepare_l1_dump",
+            with mock.patch.object(tensor_dump, "_prepare_task_dump",
                                    side_effect=AssertionError("profiling must not prepare dump")):
                 with multicore_profiler.mega_kernel_profile():
                     with adapter.launch([torch_ones(2)] * 3, direction="forward",
-                                        fallback_event_counters=events) as call:
+                                        event_counters=events) as call:
                         call.cancel()
             resolver.assert_not_called()
-            self.assertEqual(adapter.runtime_config[RuntimeConfigC.diagnostic_mode.offset].item(), 0)
+            self.assertEqual(adapter.runtime_config_tensor[RuntimeConfigC.diagnostic_mode.offset].item(), 0)
             self.assertEqual(config.diagnostic_mode, 0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -333,28 +334,61 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with tensor_dump.tensor_dump(tensor_dump.TensorDumpConfig(directory),
                                          schedule=diagnostics_module.schedule(wait=1, warmup=1, active=1)) as dumper:
-                self.assertFalse(adapter.is_active)
-                with adapter.launch([], direction="unused", fallback_event_counters=torch_zeros(16)) as call:
-                    self.assertIs(call.runtime_config, adapter.runtime_config)
+                self.assertFalse(adapter.requires_diagnostic_launch)
+                with adapter.launch([], direction="unused", event_counters=torch_zeros(16)) as call:
+                    self.assertIs(call.runtime_config_tensor, adapter.runtime_config_tensor)
                 dumper.step()
-                self.assertFalse(adapter.is_active)
+                self.assertFalse(adapter.requires_diagnostic_launch)
                 owner.assert_not_called()
                 dumper.step()
-                self.assertTrue(adapter.is_active)
+                self.assertTrue(adapter.requires_diagnostic_launch)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_l0_two_stage_dump_without_moe_semantics_or_port_customization(self):
+    def test_schedule_preparation_is_distinct_from_active_session(self):
         """Feature: MegaKernel diagnostics.
-        Description: L0 two stage dump without moe semantics or port customization.
-        Expectation: L0 two stage dump without moe semantics or port customization.
+        Description: Schedule preparation includes profiler warmup and excludes dump warmup.
+        Expectation: Only an active session can require the diagnostic launch path.
+        """
+        graph, config = _two_stage_graph()
+        diagnostics = _prepare(graph, config)
+        actions = diagnostics_module.DiagnosticAction
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = (
+                tensor_dump.tensor_dump(tensor_dump.TensorDumpConfig(directory),
+                                        schedule=diagnostics_module.schedule(wait=1, warmup=1, active=2, repeat=1)),
+                multicore_profiler.mega_kernel_profile(
+                    schedule=diagnostics_module.schedule(wait=1, warmup=1, active=2, repeat=1)),
+            )
+            for session, warmup_prepares in zip(sessions, (False, True)):
+                with self.subTest(session=type(session).__name__):
+                    self.assertFalse(diagnostics.requires_diagnostic_launch)
+                    with session:
+                        for action, expected in (
+                            (actions.NONE, False), (actions.WARMUP, warmup_prepares),
+                            (actions.RECORD, True), (actions.RECORD_AND_SAVE, True),
+                        ):
+                            self.assertIs(session.current_action, action)
+                            self.assertIs(session.should_prepare_call(), expected)
+                            self.assertIs(diagnostics.requires_diagnostic_launch, expected)
+                            if action is not actions.RECORD_AND_SAVE:
+                                session.step()
+                    self.assertTrue(session.should_prepare_call())
+                    self.assertFalse(diagnostics.requires_diagnostic_launch)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_kernel_two_stage_dump_without_moe_semantics_or_port_customization(self):
+        """Feature: MegaKernel diagnostics.
+        Description: Kernel two stage dump without moe semantics or port customization.
+        Expectation: Kernel two stage dump without moe semantics or port customization.
         """
         graph, config = _two_stage_graph()
         adapter = _prepare(graph, config)
         parameters = (torch_tensor([1.0, 2.0]), torch_zeros(2), torch_zeros(2))
         with tempfile.TemporaryDirectory() as directory:
             with tensor_dump.tensor_dump(tensor_dump.TensorDumpConfig(directory, kernel_names="copy_scale")) as dumper:
-                with adapter.launch(parameters, direction="forward", fallback_event_counters=torch_zeros(16)):
+                with adapter.launch(parameters, direction="forward", event_counters=torch_zeros(16)):
                     parameters[1].copy_(parameters[0] + 1)
                     parameters[2].copy_(parameters[1] * 2)
                     parameters[0].zero_()
@@ -372,29 +406,29 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_l1_public_launch_decodes_simulated_device_records(self):
+    def test_task_public_launch_decodes_simulated_device_records(self):
         """Feature: MegaKernel diagnostics.
-        Description: L1 public launch decodes simulated device records.
-        Expectation: L1 public launch decodes simulated device records.
+        Description: Task public launch decodes simulated device records.
+        Expectation: Task public launch decodes simulated device records.
         """
         graph, config = _two_stage_graph()
         adapter = _prepare(graph, config)
         parameters = (torch_tensor([3.0, 4.0]), torch_zeros(2), torch_zeros(2))
         with tempfile.TemporaryDirectory() as directory:
-            selection = tensor_dump.TensorDumpConfig(directory, level="L1", stages="Copy")
+            selection = tensor_dump.TensorDumpConfig(directory, level="task", stages="Copy")
             with tensor_dump.tensor_dump(selection) as dumper:
-                with adapter.launch(parameters, direction="forward", fallback_event_counters=torch_zeros(16)) as call:
-                    self.assertEqual(call.runtime_config[RuntimeConfigC.diagnostic_mode.offset].item(), 2)
+                with adapter.launch(parameters, direction="forward", event_counters=torch_zeros(16)) as call:
+                    self.assertEqual(call.runtime_config_tensor[RuntimeConfigC.diagnostic_mode.offset].item(), 2)
                     raw = bytearray(call.diagnostic_buffer.tolist())
-                    count = tensor_dump_l1.L1_DUMP_HEADER.unpack_from(raw)[3]
+                    count = tensor_dump_task.TASK_DUMP_HEADER.unpack_from(raw)[3]
                     self.assertEqual(count, 2)
                     for index in range(count):
-                        offset = (tensor_dump_l1.L1_DUMP_RECORDS_OFFSET
-                                  + index * tensor_dump_l1.L1_DUMP_RECORD.size)
-                        record = tensor_dump_l1.L1_DUMP_RECORD.unpack_from(raw, offset)
+                        offset = (tensor_dump_task.TASK_DUMP_RECORDS_OFFSET
+                                  + index * tensor_dump_task.TASK_DUMP_RECORD.size)
+                        record = tensor_dump_task.TASK_DUMP_RECORD.unpack_from(raw, offset)
                         value = parameters[0] if index == 0 else parameters[0] + 1
                         raw[record[5]:record[5] + record[6]] = bytes(value.view(torch_uint8).tolist())
-                        struct.pack_into("<I", raw, offset + 7 * 4, tensor_dump_l1.L1_DUMP_STATUS_CAPTURED)
+                        struct.pack_into("<I", raw, offset + 7 * 4, tensor_dump_task.TASK_DUMP_STATUS_CAPTURED)
                     call.diagnostic_buffer.copy_(torch_frombuffer(raw, dtype=torch_uint8))
             manifest_path = dumper.last_manifest_paths[0]
             task = json.loads(manifest_path.read_text(encoding="utf-8"))["invocations"][0]["tasks"][0]
@@ -412,44 +446,44 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         """
         graph, config = _two_stage_graph()
         config.all_tasks[0].inputs[0].dynamic_shape = 1
-        resolver = mock.Mock(return_value=tensor_dump_l1.L1TensorView(100, (2,)))
-        graph.get_op("copy").diagnostic_view_resolver = resolver
+        resolver = mock.Mock(return_value=tensor_dump_task.TaskDumpTensorView(100, (2,)))
+        graph.get_op("copy").task_dump_tensor_view_resolver = resolver
         adapter = _prepare(graph, config)
         resolver.assert_not_called()
         with tempfile.TemporaryDirectory() as directory:
-            selection = tensor_dump.TensorDumpConfig(directory, level="L1", stages="Copy")
+            selection = tensor_dump.TensorDumpConfig(directory, level="task", stages="Copy")
             with tensor_dump.tensor_dump(selection):
                 with self.assertRaisesRegex(ValueError, "exceeds its ABI"):
-                    adapter.launch([torch_ones(2)] * 3, direction="forward", fallback_event_counters=torch_zeros(16))
+                    adapter.launch([torch_ones(2)] * 3, direction="forward", event_counters=torch_zeros(16))
             with tensor_dump.tensor_dump(tensor_dump.TensorDumpConfig(directory)):
                 with self.assertRaisesRegex(RuntimeError, "native failure"):
                     with adapter.launch([torch_ones(2)] * 3, direction="forward",
-                                        fallback_event_counters=torch_zeros(16)):
+                                        event_counters=torch_zeros(16)):
                         raise RuntimeError("native failure")
             self.assertFalse(list(Path(directory).rglob("*.pt")))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_l1_rejects_invalid_views_noncontiguous_parameters_and_wrong_element_size(self):
+    def test_task_rejects_invalid_views_noncontiguous_parameters_and_wrong_element_size(self):
         """Feature: MegaKernel diagnostics.
-        Description: L1 rejects invalid views noncontiguous parameters and wrong element size.
-        Expectation: L1 rejects invalid views noncontiguous parameters and wrong element size.
+        Description: Task rejects invalid views noncontiguous parameters and wrong element size.
+        Expectation: Task rejects invalid views noncontiguous parameters and wrong element size.
         """
         for view, parameter, error in (
-            (tensor_dump_l1.L1TensorView(-4, (2,)), torch_ones(2), "non-negative"),
-            (tensor_dump_l1.L1TensorView(1, (1,)), torch_ones(2), "align"),
-            (tensor_dump_l1.L1TensorView(0, (-1,)), torch_ones(2), "non-negative"),
-            (tensor_dump_l1.L1TensorView(0, (2,)), torch_ones(2, 2).t(), "contiguous"),
-            (tensor_dump_l1.L1TensorView(0, (2,)), torch_ones(2, dtype=torch_bfloat16), "byte size"),
+            (tensor_dump_task.TaskDumpTensorView(-4, (2,)), torch_ones(2), "non-negative"),
+            (tensor_dump_task.TaskDumpTensorView(1, (1,)), torch_ones(2), "align"),
+            (tensor_dump_task.TaskDumpTensorView(0, (-1,)), torch_ones(2), "non-negative"),
+            (tensor_dump_task.TaskDumpTensorView(0, (2,)), torch_ones(2, 2).t(), "contiguous"),
+            (tensor_dump_task.TaskDumpTensorView(0, (2,)), torch_ones(2, dtype=torch_bfloat16), "byte size"),
         ):
             graph, config = _two_stage_graph()
-            graph.get_op("copy").diagnostic_view_resolver = mock.Mock(return_value=view)
+            graph.get_op("copy").task_dump_tensor_view_resolver = mock.Mock(return_value=view)
             adapter = _prepare(graph, config)
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
-                selection = tensor_dump.TensorDumpConfig(directory, level="L1", stages="Copy", io="input")
+                selection = tensor_dump.TensorDumpConfig(directory, level="task", stages="Copy", io="input")
                 with tensor_dump.tensor_dump(selection), self.assertRaisesRegex(ValueError, error):
                     adapter.launch((parameter, torch_zeros(2), torch_zeros(2)), direction="forward",
-                                   fallback_event_counters=torch_zeros(16))
+                                   event_counters=torch_zeros(16))
         graph, config = _two_stage_graph()
         operator = graph.get_op("copy")
         operator.inputs[0].shape = [10, 2]
@@ -457,13 +491,13 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         task = config.all_tasks[0]
         task.task_split_value = 4
         task.inputs[0].base_ptr_offset = 16
-        view = tensor_dump_l1._default_tensor_view(operator, task, task.inputs[0], operator.inputs[0], "input", 0)
+        view = tensor_dump_task._default_tensor_view(operator, task, task.inputs[0], operator.inputs[0], "input", 0)
         self.assertEqual((view.source_offset_bytes, view.shape), (64, (2, 2)))
         operator.inputs[0].shape = [2, 8]
         operator.split_spec.split_inputs = [(0, 1)]
         task.inputs[0].base_ptr_offset = 0
         with self.assertRaisesRegex(ValueError, "non-contiguous split"):
-            tensor_dump_l1._default_tensor_view(operator, task, task.inputs[0], operator.inputs[0], "input", 0)
+            tensor_dump_task._default_tensor_view(operator, task, task.inputs[0], operator.inputs[0], "input", 0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -478,17 +512,17 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
             plan = build_mega_moe_plan(spec, torch_device("cpu"))
         self.assertIsInstance(plan.fwd_diagnostics, diagnostics_module.MegaKernelDiagnostics)
         self.assertIsInstance(plan.bwd_diagnostics, diagnostics_module.MegaKernelDiagnostics)
-        self.assertIs(plan.fwd_runtime_config, plan.fwd_diagnostics.runtime_config)
+        self.assertIs(plan.fwd_runtime_config_tensor, plan.fwd_diagnostics.runtime_config_tensor)
         self.assertEqual(plan.fwd_diagnostics._runtime.rank, 7)
         self.assertEqual(plan.fwd_diagnostics._runtime.spec.owner_context.topology.rank_id, 0)
         with tempfile.TemporaryDirectory() as directory:
             parameters = [torch_empty(0)] * 16
             parameters[6] = torch_tensor([64, 128], dtype=torch_int64)
             parameters[7] = torch_zeros(128, 64, dtype=torch_bfloat16)
-            selection = tensor_dump.TensorDumpConfig(directory, level="L1", stages="SwiGLU", io="input", ranks=7)
+            selection = tensor_dump.TensorDumpConfig(directory, level="task", stages="SwiGLU", io="input", ranks=7)
             with tensor_dump.tensor_dump(selection):
                 call = plan.fwd_diagnostics.launch(
-                    parameters, direction="forward", fallback_event_counters=torch_zeros(8),
+                    parameters, direction="forward", event_counters=torch_zeros(8),
                 )
                 call.cancel()
 
@@ -505,16 +539,16 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
             plans = (build_mega_mhc_plan(64, 32, "cpu", 2),
                      build_mega_mhc_grad_plan(64, 32, "cpu", 2, 4))
         for plan in plans:
-            runtime = plan.runtime._runtime
+            runtime = plan.diagnostics._runtime
             self.assertEqual(runtime.rank, 7)
-            original = runtime.normal_tensor.clone()
+            original = runtime.runtime_config_tensor.clone()
             original_graph = runtime._graph
             self.assertIsNone(runtime._metadata)
-            self.assertTrue(plan.runtime.metadata.task_stage_names)
+            self.assertTrue(plan.diagnostics.metadata.task_stage_names)
             self.assertIsNot(runtime.graph, original_graph)
             self.assertTrue(all(op.diagnostic_host_ports for op in runtime.graph.topological_sort()))
             _PreparedProfileRuntime(runtime)
-            assert_close(runtime.normal_tensor, original)
+            assert_close(runtime.runtime_config_tensor, original)
         with tempfile.TemporaryDirectory() as directory:
             forward = [torch_empty(shape, dtype=dtype) for shape, dtype in (
                 ((1, 64, 32), torch_bfloat16), ((1, 64, 4, 32), torch_bfloat16),
@@ -526,9 +560,9 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                 ((1, 64, 1), torch_float32), ((40, 1, 64, 4), torch_float32),
                 ((40, 1, 64, 4, 4), torch_float32), ((1, 64, 32), torch_bfloat16), ((1, 64, 1), torch_float32),
             )]
-            all_stages = tuple(plans[0].runtime.metadata.stage_names.values())
-            with tensor_dump.tensor_dump(tensor_dump.TensorDumpConfig(directory, level="L1", stages=all_stages)):
-                plans[0].runtime.launch(forward, direction="forward", fallback_event_counters=torch_zeros(8)).cancel()
+            all_stages = tuple(plans[0].diagnostics.metadata.stage_names.values())
+            with tensor_dump.tensor_dump(tensor_dump.TensorDumpConfig(directory, level="task", stages=all_stages)):
+                plans[0].diagnostics.launch(forward, direction="forward", event_counters=torch_zeros(8)).cancel()
             parameters = [torch_empty(0)] * 33
             parameters[3] = torch_empty(1, 64, 4, 32, dtype=torch_bfloat16)
             for position, shape, dtype in (
@@ -537,19 +571,19 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
             ):
                 parameters[position] = torch_empty(shape, dtype=dtype)
             selection = tensor_dump.TensorDumpConfig(
-                directory, level="L1", stages="MhcGradPrevXAndPost", io="output",
+                directory, level="task", stages="MhcGradPrevXAndPost", io="output",
             )
             with tensor_dump.tensor_dump(selection):
-                call = plans[1].runtime.launch(parameters, direction="backward", fallback_event_counters=torch_zeros(8))
+                call = plans[1].diagnostics.launch(parameters, direction="backward", event_counters=torch_zeros(8))
                 call.cancel()  # Planning only: CPU tests do not execute a Device task.
-            unsupported = tensor_dump.TensorDumpConfig(directory, level="L1", stages="RmsNormGrad", io="output")
+            unsupported = tensor_dump.TensorDumpConfig(directory, level="task", stages="RmsNormGrad", io="output")
             with tensor_dump.tensor_dump(unsupported), self.assertRaisesRegex(ValueError, "multi-core reductions"):
-                plans[1].runtime.launch(parameters, direction="backward", fallback_event_counters=torch_zeros(8))
+                plans[1].diagnostics.launch(parameters, direction="backward", event_counters=torch_zeros(8))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_gate_broadcast_snapshots_keep_worker_payloads_and_files_separate(self):
-        """Feature: Broadcast L1. Description: Simulate four workers on one task ID.
+        """Feature: Broadcast Task. Description: Simulate four workers on one task ID.
 
         Expectation: Each worker receives a cache-line-aligned record and a unique file.
         Description: Gate broadcast snapshots keep worker payloads and files separate.
@@ -558,20 +592,20 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                                                 kernel_name="HyperMegaGateRoute")
         single_worker = type(config).from_buffer_copy(bytes(config))
         single_worker.num_workers = 1
-        self.assertEqual(len(tensor_dump_l1._task_locations(single_worker, broadcast_tasks=True)), config.task_num)
+        self.assertEqual(len(tensor_dump_task._task_locations(single_worker, broadcast_tasks=True)), config.task_num)
         adapter = prepare_mega_kernel_diagnostics(
             None, config, kernel_name="HyperMegaGateRoute", parameter_count=11, device="cpu",
             execution_mode="aiv_pipeline", vector_worker_stride=1, graph_adapter=bind_pipeline_graph,
         )
         scores = torch_arange(32, dtype=torch_float32).reshape(4, 8)
         parameters = (scores.clone(), torch_zeros(8), torch_zeros(8), torch_zeros(1, dtype=torch_bool),
-                      adapter.runtime_config, adapter.runtime_config, torch_zeros(4, 2),
+                      adapter.runtime_config_tensor, adapter.runtime_config_tensor, torch_zeros(4, 2),
                       torch_zeros(4, 2, dtype=torch_int64), scores, torch_zeros(4, 2), torch_zeros(4, 1))
         with tempfile.TemporaryDirectory() as directory:
-            selection = tensor_dump.TensorDumpConfig(directory, level="L1", stages="Sqrt", io="output")
+            selection = tensor_dump.TensorDumpConfig(directory, level="task", stages="Sqrt", io="output")
             with tensor_dump.tensor_dump(selection) as dumper:
                 with adapter.launch(parameters, direction="forward") as call:
-                    prepared = getattr(call, "_prepared_l1", None)
+                    prepared = getattr(call, "_prepared_task", None)
                     self.assertIsNotNone(prepared)
                     plans = prepared.records
                     self.assertEqual([record.worker_id for record in plans], [0, 1, 2, 3])
@@ -581,7 +615,9 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                         self.assertEqual(record.record_offset % 64, 0)
                         data = scores[record.core_id:record.core_id + 1].reshape(-1).view(torch_uint8)
                         raw[record.payload_offset:record.payload_offset + record.payload_bytes] = bytes(data.tolist())
-                        struct.pack_into("<I", raw, record.record_offset + 28, tensor_dump_l1.L1_DUMP_STATUS_CAPTURED)
+                        struct.pack_into(
+                            "<I", raw, record.record_offset + 28, tensor_dump_task.TASK_DUMP_STATUS_CAPTURED,
+                        )
                     call.diagnostic_buffer.copy_(torch_frombuffer(raw, dtype=torch_uint8))
             manifest = dumper.last_manifest_paths[0]
             tasks = json.loads(manifest.read_text(encoding="utf-8"))["invocations"][0]["tasks"]
@@ -593,9 +629,9 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_gate_acl_tail_output_is_captured_only_after_native_completion(self):
-        """Feature: ACLNN tail L0. Description: Supply the result after a native call.
+        """Feature: ACLNN tail Kernel. Description: Supply the result after a native call.
 
-        Expectation: L0 keeps the finished gradient, not an internal workspace alias.
+        Expectation: Kernel keeps the finished gradient, not an internal workspace alias.
         Description: Gate acl tail output is captured only after native completion.
         """
         config = _build_pipeline_runtime_config(MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES,
@@ -607,7 +643,8 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         )
         logits = torch_ones(3, 8)
         parameters = [torch_ones(3, 1), torch_ones(3, 1), torch_ones(3, 1), logits,
-                      torch_zeros(3, 1, dtype=torch_int64), adapter.runtime_config, adapter.runtime_config,
+                      torch_zeros(3, 1, dtype=torch_int64),
+                      adapter.runtime_config_tensor, adapter.runtime_config_tensor,
                       None, None, None, logits]
         with tempfile.TemporaryDirectory() as directory:
             with tensor_dump.tensor_dump(tensor_dump.TensorDumpConfig(directory)) as dumper:

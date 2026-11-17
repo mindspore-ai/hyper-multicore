@@ -737,8 +737,8 @@ def _check_mega_gate_route_score_operation_order(tokens: int, experts: int) -> N
         correction_bias,
         correction_bias,
         plan.vision_mask_placeholder,
-        plan.route_runtime.runtime_config,
-        plan.route_runtime.runtime_config,
+        plan.route_diagnostics.runtime_config_tensor,
+        plan.route_diagnostics.runtime_config_tensor,
         top_k=6,
         routed_scaling_factor=_SCALING,
         use_vision_bias=False,
@@ -765,10 +765,10 @@ def _check_mega_gate_route_grad_operation_order(top_k: int) -> None:
 
     gate = _make_gate()
     plan = gate._plan(logits)  # pylint: disable=protected-access
-    runtime = plan.route_grad_k1_runtime if top_k == 1 else plan.route_grad_runtime
+    diagnostics = plan.route_grad_k1_diagnostics if top_k == 1 else plan.route_grad_diagnostics
     actual = ops._mega_gate_route_grad(  # pylint: disable=protected-access
         logits.detach(), scores.detach(), selected.detach(), denominator.detach(),
-        indices, upstream, runtime.runtime_config, runtime.runtime_config,
+        indices, upstream, diagnostics.runtime_config_tensor, diagnostics.runtime_config_tensor,
         top_k=top_k, routed_scaling_factor=_SCALING,
     )
     torch.npu.synchronize()
@@ -795,11 +795,11 @@ def _check_mega_gate_route_grad_batch_parity(tokens: int, top_k: int) -> None:
 
     gate = _make_gate()
     plan = gate._plan(logits)  # pylint: disable=protected-access
-    runtime = plan.route_grad_k1_runtime if top_k == 1 else plan.route_grad_runtime
+    diagnostics = plan.route_grad_k1_diagnostics if top_k == 1 else plan.route_grad_diagnostics
     with torch.no_grad():
         actual = ops._mega_gate_route_grad(  # pylint: disable=protected-access
             logits.detach(), scores.detach(), selected.detach(), denominator.detach(),
-            indices, gradient, runtime.runtime_config, runtime.runtime_config,
+            indices, gradient, diagnostics.runtime_config_tensor, diagnostics.runtime_config_tensor,
             top_k=top_k, routed_scaling_factor=_SCALING,
         )
     torch.npu.synchronize()
@@ -851,8 +851,8 @@ def _check_mega_gate_route_grad_extremes() -> None:
                 denominator.detach(),
                 expert_indices.detach(),
                 routing_gradient,
-                plan.route_grad_runtime.runtime_config,
-                plan.route_grad_runtime.runtime_config,
+                plan.route_grad_diagnostics.runtime_config_tensor,
+                plan.route_grad_diagnostics.runtime_config_tensor,
                 top_k=top_k,
                 routed_scaling_factor=_SCALING,
             )

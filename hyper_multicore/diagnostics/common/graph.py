@@ -70,24 +70,24 @@ def bind_graph_tensor_ports(
     for operator in graph.topological_sort():
         operator.inputs, operator.outputs = ports[operator.name]
         operator.param_positions = [tensor.param_position for tensor in operator.inputs + operator.outputs]
-        operator.diagnostic_view_resolver = resolver
+        operator.task_dump_tensor_view_resolver = resolver
         operator.diagnostic_host_ports = True
     return graph
 
 
-def operator_diagnostic_name(operator: OperatorNode) -> str:
+def operator_stage_name(operator: OperatorNode) -> str:
     """Return an explicit diagnostic name or derive one from the graph node name.
 
     Args:
         operator: Graph operator associated with the selected task.
     """
-    diagnostic_name = operator.diagnostic_name
-    if diagnostic_name is not None:
-        if not isinstance(diagnostic_name, str) or not diagnostic_name.strip():
+    diagnostic_stage_name = operator.diagnostic_stage_name
+    if diagnostic_stage_name is not None:
+        if not isinstance(diagnostic_stage_name, str) or not diagnostic_stage_name.strip():
             raise ValueError(
-                f"OperatorNode.diagnostic_name must be a non-empty string when set: {diagnostic_name!r}"
+                f"OperatorNode.diagnostic_stage_name must be a non-empty string when set: {diagnostic_stage_name!r}"
             )
-        return diagnostic_name.strip()
+        return diagnostic_stage_name.strip()
     if not isinstance(operator.name, str) or not operator.name.strip():
         raise ValueError(f"OperatorNode.name must be a non-empty string, got {operator.name!r}")
     stage_name = "".join(part[:1].upper() + part[1:] for part in operator.name.strip().split("_") if part)
@@ -145,7 +145,7 @@ def _validate_task_ports(
 ) -> None:
     """Check a scheduled task's operand descriptors against the graph contract."""
     if operator.diagnostic_host_ports:
-        if not callable(operator.diagnostic_view_resolver):
+        if not callable(operator.task_dump_tensor_view_resolver):
             raise ValueError(f"native ABI stage {operator.name} requires a view resolver")
         return
     for io, descriptors, specs, count in (
@@ -200,7 +200,7 @@ def validate_mega_kernel_diagnostic_contract(
 
     Note:
         This read-only check does not call view resolvers or inspect Device Tensors.
-        Actual offset/shape memory bounds are validated when L1 prepares a launch.
+        Actual offset/shape memory bounds are validated when Task dump prepares a launch.
     """
     if not isinstance(graph, ComputeGraph):
         raise TypeError("graph must be ComputeGraph")
@@ -242,7 +242,7 @@ def build_graph_metadata(
     owners = {}
     task_id = 0
     for stage_id, operator in enumerate(graph.topological_sort()):
-        name = operator_diagnostic_name(operator)
+        name = operator_stage_name(operator)
         stages[stage_id] = name
         for current_id in range(task_id, task_id + operator.task_num):
             owner = None

@@ -23,6 +23,7 @@ import unittest
 from pathlib import Path
 
 import hyper_multicore
+from hyper_multicore.diagnostics.common.runtime import DeviceDiagnosticMode
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.tasks.alltoall import ShmemTaskPartition
 from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
@@ -240,6 +241,16 @@ class TestRuntimeCppReader(unittest.TestCase):
         cls.reader.valid_runtime_from_launch.restype = ctypes.c_bool
         cls.reader.read_transport_and_kernel_task_types.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
         cls.reader.read_transport_and_kernel_task_types.restype = None
+
+    def test_device_diagnostic_modes_match_cpp(self) -> None:
+        """Device path names retain the existing Host/C++ wire values."""
+        values = (ctypes.c_uint32 * 3)()
+        self.reader.read_device_diagnostic_modes.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        self.reader.read_device_diagnostic_modes.restype = None
+        self.reader.read_device_diagnostic_modes(values)
+        expected = tuple(int(mode) for mode in DeviceDiagnosticMode)
+        self.assertEqual(expected, (0, 1, 2))
+        self.assertEqual(tuple(values), expected)
 
     def test_mega_moe_task_encodings_match_cpp(self) -> None:
         """Named payloads keep their existing wire values on both sides of the ABI."""

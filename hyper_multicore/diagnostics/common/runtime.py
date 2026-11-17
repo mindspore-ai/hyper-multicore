@@ -29,12 +29,12 @@ from hyper_multicore.scheduler.graph import ComputeGraph
 from hyper_multicore.scheduler.runtime import copy_runtime_config, serialize_runtime_config
 
 
-class DiagnosticMode(IntEnum):
+class DeviceDiagnosticMode(IntEnum):
     """Device execution modes sharing one diagnostic_buffer ABI argument."""
 
-    NORMAL = 0
-    PROFILE = 1
-    TENSOR_DUMP_L1 = 2
+    DISABLED = 0
+    CYCLE_PROFILE = 1
+    TASK_TENSOR_DUMP = 2
 
 
 class PreparedDiagnosticRuntime:
@@ -53,12 +53,12 @@ class PreparedDiagnosticRuntime:
         self.kernel_name = spec.kernel_name
         self.owner_label = spec.owner_label
         self._tensor_factory = tensor_factory
-        self._host_config = copy_runtime_config(runtime_config)
-        self._host_config.diagnostic_mode = DiagnosticMode.NORMAL
-        self.normal_tensor = tensor_factory(serialize_runtime_config(self._host_config))
+        self._runtime_config = copy_runtime_config(runtime_config)
+        self._runtime_config.diagnostic_mode = DeviceDiagnosticMode.DISABLED
+        self.runtime_config_tensor = tensor_factory(serialize_runtime_config(self._runtime_config))
         self._metadata: GraphDiagnosticMetadata | None = None
         self._metadata_lock = Lock()
-        self._diagnostic_config: RuntimeConfigC | None = None
+        self._diagnostic_runtime_config: RuntimeConfigC | None = None
 
     @property
     def graph(self) -> ComputeGraph:
@@ -68,11 +68,17 @@ class PreparedDiagnosticRuntime:
         return self._graph
 
     @property
-    def host_config(self) -> RuntimeConfigC:
-        """Return the preserved Host configuration used to describe task operands."""
+    def diagnostic_runtime_config(self) -> RuntimeConfigC:
+        """Return the structured diagnostic configuration after lazy adaptation.
+
+        An adapter may rewrite task IDs and queues on its private copy, so this
+        configuration may differ from the standard runtime_config_tensor.
+        """
         if self.spec.graph_adapter is not None:
             _ = self.metadata
-        return self._diagnostic_config if self._diagnostic_config is not None else self._host_config
+        if self._diagnostic_runtime_config is not None:
+            return self._diagnostic_runtime_config
+        return self._runtime_config
 
     @property
     def metadata(self) -> GraphDiagnosticMetadata:
@@ -80,14 +86,14 @@ class PreparedDiagnosticRuntime:
         if self._metadata is None:
             with self._metadata_lock:
                 if self._metadata is None:
-                    config = copy_runtime_config(self._host_config)
+                    config = copy_runtime_config(self._runtime_config)
                     graph = self._graph
                     if self.spec.graph_adapter is not None:
                         graph = self.spec.graph_adapter(graph, config)
                     validate_mega_kernel_diagnostic_contract(graph, config, self.parameter_count)
                     metadata = build_graph_metadata(graph, config, self.spec)
                     self._graph = graph
-                    self._diagnostic_config = config
+                    self._diagnostic_runtime_config = config
                     self._metadata = metadata
         return self._metadata
 
@@ -96,15 +102,15 @@ class PreparedDiagnosticRuntime:
         """Return the lazily resolved task-to-stage names."""
         return self.metadata.task_stage_names
 
-    def copy_host_config(self) -> RuntimeConfigC:
-        """Create an independent Host configuration for one tool's device variant."""
-        config = self.host_config
+    def copy_diagnostic_runtime_config(self) -> RuntimeConfigC:
+        """Copy the adapted configuration for a tool-specific execution variant."""
+        config = self.diagnostic_runtime_config
         return copy_runtime_config(config)
 
     def tensor_from_config(self, runtime_config: RuntimeConfigC) -> Any:
-        """Serialize a tool-owned configuration without changing the normal image.
+        """Serialize a structured configuration into an execution Tensor.
 
         Args:
-            runtime_config: Complete Host configuration describing native task queues.
+            runtime_config: Complete structured configuration describing native task queues.
         """
         return self._tensor_factory(serialize_runtime_config(runtime_config))

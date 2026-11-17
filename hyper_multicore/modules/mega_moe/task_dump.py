@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Dynamic task-view resolution for MegaMoe L1 Tensor dumps."""
+"""Dynamic task-view resolution for MegaMoe Task Tensor dumps."""
 
 from __future__ import annotations
 
@@ -23,52 +23,52 @@ from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.scheduler.config import (
     TaskType,
 )
-from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
+from hyper_multicore.diagnostics.dumper import TaskDumpTensorView, TaskDumpTensorViewContext
 
 from .probability import PROBABILITY_DTYPE_BYTES, probability_capture_plane
 
 
-def _group_counts(context: L1TensorViewContext) -> tuple[int, int, int]:
+def _group_counts(context: TaskDumpTensorViewContext) -> tuple[int, int, int]:
     """Resolve this task's EP-local Expert token range from cumulative routing counts."""
-    dynamic_data = context.runtime_config.dynamic_data
+    dynamic_data = context.diagnostic_runtime_config.dynamic_data
     group_count = int(dynamic_data.dynamic_group_size)
     if group_count <= 0:
-        raise ValueError(f"MegaMoe L1 dump requires a positive dynamic group size, got {group_count}")
+        raise ValueError(f"MegaMoe Task dump requires a positive dynamic group size, got {group_count}")
     group_position = int(dynamic_data.dynamic_input_position)
     cumulative = context.parameter_cpu(group_position).reshape(-1).tolist()
     if len(cumulative) < group_count:
         raise ValueError(
-            f"MegaMoe L1 group list is too short: expected={group_count}, got={len(cumulative)}"
+            f"MegaMoe Task group list is too short: expected={group_count}, got={len(cumulative)}"
         )
     owner_id = context.owner_id
     if owner_id is None:
-        raise ValueError(f"MegaMoe L1 stage {context.stage!r} has no resolved expert owner")
+        raise ValueError(f"MegaMoe Task stage {context.stage!r} has no resolved expert owner")
     # Export rank is job-global; Expert IDs and routing offsets belong to this EP group.
     owner_context = context.owner_context
     ep_rank = context.rank if owner_context is None else owner_context.topology.rank_id
     local_owner = owner_id - ep_rank * group_count
     if not 0 <= local_owner < group_count:
         raise ValueError(
-            f"MegaMoe L1 owner {owner_id} is outside EP rank {ep_rank} local expert range"
+            f"MegaMoe Task owner {owner_id} is outside EP rank {ep_rank} local expert range"
         )
     end = int(cumulative[local_owner])
     start = 0 if local_owner == 0 else int(cumulative[local_owner - 1])
     if end < start:
-        raise ValueError(f"MegaMoe L1 group list is not cumulative at expert {local_owner}")
+        raise ValueError(f"MegaMoe Task group list is not cumulative at expert {local_owner}")
     return local_owner, start, end
 
 
-def _resolve_grouped_matmul(context: L1TensorViewContext) -> L1TensorView:
-    """Resolve a grouped-matmul operand without capturing collaborative partial outputs."""
+def _resolve_grouped_matmul(context: TaskDumpTensorViewContext) -> TaskDumpTensorView:
+    """Resolve a grouped-matmul operand without dumping collaborative partial outputs."""
     if context.io == "output":
         raise ValueError(
-            f"MegaMoe L1 cannot snapshot {context.stage!r} output atomically across Cube cores; "
+            f"MegaMoe Task cannot snapshot {context.stage!r} output atomically across Cube cores; "
             "select the downstream stage input after its dependency instead"
         )
     if context.task_desc.extra_value_1 in (GroupedMatmulTaskMode.BATCHED, GroupedMatmulTaskMode.BATCHED_READY):
         shape = list(context.tensor_spec.shape)
         if context.tensor_desc.dynamic_shape:
-            data = context.runtime_config.dynamic_data
+            data = context.diagnostic_runtime_config.dynamic_data
             counts = context.parameter_cpu(int(data.dynamic_input_position)).reshape(-1)
             shape[0] = int(counts[int(data.dynamic_group_size) - 1])
         return context.make_view(shape, source_offset_bytes=0, note="batched GMM input across local experts")
@@ -82,7 +82,7 @@ def _resolve_grouped_matmul(context: L1TensorViewContext) -> L1TensorView:
             source_offset_bytes=source_offset_bytes,
             note="expert-local dynamic GMM operand captured after dependency",
         )
-    group_count = int(context.runtime_config.dynamic_data.dynamic_group_size)
+    group_count = int(context.diagnostic_runtime_config.dynamic_data.dynamic_group_size)
     if len(shape) >= 3 and shape[0] == group_count:
         expert_elements = prod(shape[1:])
         return context.make_view(
@@ -93,19 +93,19 @@ def _resolve_grouped_matmul(context: L1TensorViewContext) -> L1TensorView:
     return context.default_view
 
 
-def _swiglu_rows(context: L1TensorViewContext) -> tuple[int, int]:
+def _swiglu_rows(context: TaskDumpTensorViewContext) -> tuple[int, int]:
     """Resolve the first contiguous tile owned by this vector task."""
     _, start, end = _group_counts(context)
-    groups = int(context.runtime_config.dynamic_data.dynamic_group_size)
+    groups = int(context.diagnostic_runtime_config.dynamic_data.dynamic_group_size)
     lanes = int(context.task_desc.task_split_num) // groups
     if lanes <= 0:
-        raise ValueError("MegaMoe L1 SwiGLU task count per expert must be positive")
+        raise ValueError("MegaMoe Task SwiGLU task count per expert must be positive")
     row_start = int(context.task_desc.task_index) % lanes * int(context.task_desc.task_split_value)
     rows = min(int(context.task_desc.task_split_value), max(end - start - row_start, 0))
     return start + row_start, rows
 
 
-def _resolve_swiglu(context: L1TensorViewContext) -> L1TensorView:
+def _resolve_swiglu(context: TaskDumpTensorViewContext) -> TaskDumpTensorView:
     """Resolve a SwiGLU task's contiguous expert-local token rows."""
     source_row, rows = _swiglu_rows(context)
     shape = list(context.tensor_spec.shape)
@@ -116,7 +116,7 @@ def _resolve_swiglu(context: L1TensorViewContext) -> L1TensorView:
     )
 
 
-def _alltoall_rows(context: L1TensorViewContext) -> tuple[int, int, int]:
+def _alltoall_rows(context: TaskDumpTensorViewContext) -> tuple[int, int, int]:
     """Resolve the local payload span independently of the selected operand."""
     is_pull = int(context.task_desc.task_type) == TaskType.TASK_SHMEM_GET_MEM
     payload = context.operator.outputs[0] if is_pull else context.operator.inputs[1]
@@ -124,7 +124,7 @@ def _alltoall_rows(context: L1TensorViewContext) -> tuple[int, int, int]:
     expert_count = int(context.operator.inputs[3].shape[0])
     tasks_per_expert = int(context.task_desc.task_split_num) // expert_count
     if tasks_per_expert <= 0:
-        raise ValueError("MegaMoe L1 AllToAll task count per expert must be positive")
+        raise ValueError("MegaMoe Task AllToAll task count per expert must be positive")
     expert = int(context.task_desc.task_index) // tasks_per_expert
     tile = int(context.task_desc.task_index) % tasks_per_expert
     sizes = context.parameter_cpu(int(context.operator.inputs[3].param_position)).reshape(-1)
@@ -133,18 +133,18 @@ def _alltoall_rows(context: L1TensorViewContext) -> tuple[int, int, int]:
     count = max(0, min(int(context.task_desc.task_split_value) * hidden_size, int(sizes[expert]) - tile_start))
     source_offset = int(offsets[expert]) + tile_start
     if count % hidden_size or source_offset % hidden_size:
-        raise ValueError("MegaMoe L1 AllToAll payload and offset must be row-aligned")
+        raise ValueError("MegaMoe Task AllToAll payload and offset must be row-aligned")
     return source_offset // hidden_size, count // hidden_size, hidden_size
 
 
-def _resolve_alltoall(context: L1TensorViewContext) -> L1TensorView:
+def _resolve_alltoall(context: TaskDumpTensorViewContext) -> TaskDumpTensorView:
     """Resolve local communication operands while rejecting remote-address reads."""
     is_pull = int(context.task_desc.task_type) == TaskType.TASK_SHMEM_GET_MEM
     if is_pull and context.io == "input" and context.index == 1:
         raise ValueError("MegaMoe pull sources belong to a remote rank; select the local dispatch output instead")
     if context.io == "output" and not is_pull:
         raise ValueError(
-            f"MegaMoe L1 stage {context.stage!r} output belongs to a possibly remote rank; "
+            f"MegaMoe Task stage {context.stage!r} output belongs to a possibly remote rank; "
             "select its local consumer input instead"
         )
     if context.io == "input" and context.index != 1:
@@ -157,7 +157,7 @@ def _resolve_alltoall(context: L1TensorViewContext) -> L1TensorView:
     )
 
 
-def _resolve_probability_workspace(context: L1TensorViewContext) -> L1TensorView:
+def _resolve_probability_workspace(context: TaskDumpTensorViewContext) -> TaskDumpTensorView:
     """Capture only the stable local scalar slice used or produced by this task."""
     task_type = int(context.task_desc.task_type)
     if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
@@ -172,15 +172,15 @@ def _resolve_probability_workspace(context: L1TensorViewContext) -> L1TensorView
     )
 
 
-def resolve_mega_moe_l1_tensor_view(context: Any) -> L1TensorView:
+def resolve_mega_moe_task_dump_tensor_view(context: Any) -> TaskDumpTensorView:
     """Resolve exact task-local Tensor views for MegaMoe dynamic operators.
 
     Args:
         context: Selected invocation or operand context supplied by the diagnostic framework.
     """
-    if not isinstance(context, L1TensorViewContext):
+    if not isinstance(context, TaskDumpTensorViewContext):
         raise TypeError(
-            f"MegaMoe L1 view context must be L1TensorViewContext, got {type(context).__name__}"
+            f"MegaMoe Task view context must be TaskDumpTensorViewContext, got {type(context).__name__}"
         )
     if context.tensor_spec.name == "probability_workspace":
         return _resolve_probability_workspace(context)
@@ -194,11 +194,11 @@ def resolve_mega_moe_l1_tensor_view(context: Any) -> L1TensorView:
     return context.default_view
 
 
-def attach_mega_moe_l1_view_resolvers(graph: Any) -> None:
+def attach_mega_moe_task_dump_tensor_view_resolvers(graph: Any) -> None:
     """Attach one shared dynamic-view resolver to every MegaMoe graph stage.
 
     Args:
         graph: Business compute graph whose scheduling storage remains unchanged.
     """
     for operator in graph.topological_sort():
-        operator.diagnostic_view_resolver = resolve_mega_moe_l1_tensor_view
+        operator.task_dump_tensor_view_resolver = resolve_mega_moe_task_dump_tensor_view

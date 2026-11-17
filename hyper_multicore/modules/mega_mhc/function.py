@@ -162,8 +162,8 @@ def _hyper_mega_mhc_forward(
     )
     events = torch.zeros(plan.event_capacity * 4, dtype=torch.uint8, device=residual.device)
     options = {}
-    if plan.runtime.is_active:
-        options["diagnostics"] = plan.runtime
+    if plan.diagnostics.requires_diagnostic_launch:
+        options["diagnostics"] = plan.diagnostics
     outputs = multicore_ops.hyper_mega_mhc(
         previous_output.reshape(1, token_count, hidden_size).contiguous(),
         residual.reshape(1, token_count, 4, hidden_size).contiguous(),
@@ -174,7 +174,7 @@ def _hyper_mega_mhc_forward(
         alpha.contiguous(),
         bias.contiguous(),
         norm_weight.contiguous(),
-        plan.runtime.runtime_config,
+        plan.runtime_config_tensor,
         events,
         events,
         hc_eps=hc_eps,

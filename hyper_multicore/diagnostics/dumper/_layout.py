@@ -17,7 +17,7 @@
 from collections.abc import Sequence
 import re
 
-from hyper_multicore.diagnostics.common.graph import operator_diagnostic_name
+from hyper_multicore.diagnostics.common.graph import operator_stage_name
 from hyper_multicore.scheduler.graph import OperatorNode
 
 
@@ -29,7 +29,7 @@ def _stage_names(operators: Sequence[OperatorNode]) -> dict[str, str]:
     names = {}
     used_directories = set()
     for operator in operators:
-        name = operator_diagnostic_name(operator)
+        name = operator_stage_name(operator)
         directory = _SAFE_FILE_NAME.sub("_", name)
         if directory in ("", ".", "..", "__kernel_boundary__") or directory in used_directories:
             raise ValueError(f"duplicate, colliding or reserved MegaKernel dump stage directory: {name!r}")

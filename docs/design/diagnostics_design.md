@@ -15,7 +15,7 @@
 
 ### 并列工具与公共层
 
-profiling 与 L0/L1 dump 同属于 `diagnostics`，通过协议与组合接入，不相互继承或调用：
+profiling 与 Kernel/Task dump 同属于 `diagnostics`，通过协议与组合接入，不相互继承或调用：
 
 ```text
 diagnostics/
@@ -30,27 +30,36 @@ diagnostics/
 │   ├── api.py                   # profiling session、buffer 池、pending、窗口
 │   ├── cycle_trace.py           # profiler 私有配置、容量、解析
 │   └── trace_merger.py           # 离线融合
-└── dump/                        # 独立的 L0/L1 工具；不导入 profiler
+└── dumper/                      # 独立的 Kernel/Task dump 工具；不导入 profiler
+    ├── __init__.py              # 对外导出
+    ├── api.py                   # 配置、session、调用编排与导出
+    ├── _kernel.py               # 调用边界快照与 stage 文件
+    ├── _task.py                 # 任务端口视图、设备采集规划与解码
+    └── _layout.py               # stage 目录名称规则
 ```
 
-依赖方向是 `profiler → common ← dump`；公共层不导入具体工具或 MegaMoe。
+依赖方向是 `profiler → common ← dumper`；公共层不导入具体工具或 MegaMoe。
 业务接入提供 owner 规则与动态 Tensor 视图 resolver；这些解释由对应 megakernel 的主机侧维护。
 通用 profiler 不认识 Expert、GMM 或 MoE 路由。
+
+用户和组件接入方从 `hyper_multicore.diagnostics.dumper` 导入公开对象，包括配置、Session、
+`tensor_dump()` 以及 `TaskDumpTensorView`、`TaskDumpTensorViewContext`。带 `_` 前缀的实现模块仅供
+dumper 内部使用；这是接口约定，Python 不禁止显式导入。内部单测可直接验证这些模块。
 
 ### 数据流
 
 ```text
-plan：只创建 normal RuntimeConfig image
+plan：只创建标准 runtime_config_tensor
     │
-每次调用检查 diagnostics.is_active
+每次调用检查 diagnostics.requires_diagnostic_launch
     ├─ False：直接调用普通 native wrapper → mode=0 → ProcessFast
     └─ True：通用 launch → 唯一活动 session.prepare_call(context)
                               │
                     选中调用后解析公共 metadata
                               │
                     ┌─────────┼──────────┐
-                 Profiler     L0         L1
-                 mode=1       mode=0     mode=2
+                 Profiler   Kernel dump   Task dump
+                 mode=1       mode=0       mode=2
                  cycle记录    调用边界    task端口
                     │         复制       快照
                  pending      │          │
@@ -72,15 +81,38 @@ plan：只创建 normal RuntimeConfig image
 |---|---|---|
 | normal | plan 构造 | diagnostic_mode=0；普通 task/queue 数据 |
 | profiler 私有配置 | 首次选中 WARMUP/RECORD/RECORD_AND_SAVE | diagnostic_mode=1；trace ID、owner 与每核容量 |
-| L1 dump 私有配置 | 每次选中 L1 调用 | diagnostic_mode=2；不使用 profiler 的 trace ID/容量 |
+| Task dump 私有配置 | 每次选中 Task 调用 | diagnostic_mode=2；不使用 profiler 的 trace ID/容量 |
 
-`prepare_mega_kernel_diagnostics()` 保存完整 Host 配置并创建一个普通 image，
-不解析诊断 metadata、不执行 resolver、不计算 profile layout。
+配置名称按表示形式区分：`runtime_config` 是可按字段访问的 `RuntimeConfigC` 结构化配置，
+`runtime_config_tensor` 是序列化后的 `torch.uint8` Tensor，用于传给执行设备。二者描述的都是 Device 执行，
+名称不以 Host/Device 表示生效边界；Tensor 也可以位于 CPU，例如 CPU 单测。
+底层 native 接口和 Torch schema 的固定参数名沿用 ABI 合同；Python plan 和诊断调用对象按上述表示形式命名。
+
+`prepare_mega_kernel_diagnostics()` 保存标准结构化配置 `_runtime_config`，并创建标准执行
+`runtime_config_tensor`，不解析诊断 metadata、不执行 resolver、不计算 profile layout。
 关闭或 action=NONE 时，业务直接走普通 wrapper，不进入 diagnostic launch，不创建诊断句柄。
 
-首次选中 profiler 时，`_PreparedProfileRuntime` 复制 Host 配置，在副本中编码 trace 描述符、owner，
-计算容量并上传独立的 profile image。普通 Host/Device 配置不受 profiler 私有配置影响。
+首次选中 profiler 时，`_PreparedProfileRuntime` 复制诊断结构化配置，在副本中编码 trace 描述符、owner，
+计算容量。该副本为 `profile_runtime_config`，序列化后的独立 Tensor 为 `profile_runtime_config_tensor`。
+标准配置及其 Tensor 不受 profiler 私有配置影响。
 session 按公共 runtime 对象缓存 profiler 配置，退出时释放该 session 的缓存。
+
+`PreparedDiagnosticRuntime.diagnostic_runtime_config` 返回惰性适配后的诊断结构化配置。业务 Adapter 可在
+私有副本中重排 Task 和队列，因此它不一定逐项对应标准 `runtime_config_tensor`。
+`TaskDumpTensorViewContext.diagnostic_runtime_config` 指向该诊断配置。Profiler 和 Task dump 均通过
+`copy_diagnostic_runtime_config()` 取得独立副本，再配置并序列化自己的执行版本，保证观测记录与实际执行的
+Task 编号、描述和队列对应。Task dump 的结构化副本为 `task_dump_runtime_config`，对应 Tensor 为
+`task_dump_runtime_config_tensor`。
+
+Plan 中的 `diagnostics`（或 `fwd_diagnostics`、`route_diagnostics`）保存 `MegaKernelDiagnostics` 诊断句柄；
+`MegaKernelDiagnostics.runtime_config_tensor` 和 plan 的对应属性提供标准执行 Tensor；
+`DiagnosticCall.runtime_config_tensor` 提供本次调用最终选中的标准、profiling 或 Task dump 配置 Tensor。
+`requires_diagnostic_launch` 只判断当前 session 和 schedule 是否需要
+进入诊断准备流程，invocation 的 Kernel/rank/direction 过滤仍由 `prepare_call()` 完成。Kernel dump 也需要该
+Host 调用路径，但 Device mode 为 DISABLED，不表示启用了 Device 插桩或最终一定会采集。
+Session 的 `should_prepare_call()` 只判断当前 step 的 schedule：profiler 包含 WARMUP、RECORD 和
+RECORD_AND_SAVE，WARMUP 的采样结果会被丢弃；dump 只包含 RECORD 和 RECORD_AND_SAVE，NONE 均不准备。
+该方法不检查 session 是否处于活动作用域，也不执行具体调用过滤；活动 session 的判断由诊断入口负责。
 
 公共 owner 是 `GraphDiagnosticMetadata.task_owner_ids`；`profile_owner_id` 只是 profiler 在私有配置中的
 Device 编码，dump 不读取它。动态视图 resolver 和 dump 目录校验不会进入 profiler 准备路径。
@@ -130,9 +162,12 @@ Python `RuntimeConfigC` 与 AscendC `RuntimeHeader` 必须保持 64 Byte 固定�
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `diagnostic_mode` | `uint32` | 0=普通/L0，1=profiling，2=L1 dump |
+| `diagnostic_mode` | `uint32` | 0=普通/Kernel dump，1=profiling，2=Task dump |
 | `aic_profile_record_capacity` | `uint32` | 每个 AIC worker 的 record 容量 |
 | `aiv_profile_record_capacity` | `uint32` | 每个 AIV worker 的 record 容量 |
+
+`DeviceDiagnosticMode` 的成员为 `DISABLED=0`、`CYCLE_PROFILE=1`、`TASK_TENSOR_DUMP=2`。
+它控制设备插桩；Host 的 `_ACTIVE_SESSION_KIND` 区分活动 session 是 `profiler` 还是 `tensor_dump`。
 
 每个 `TaskDesc` 额外包含：
 
@@ -144,7 +179,7 @@ Python `RuntimeConfigC` 与 AscendC `RuntimeHeader` 必须保持 64 Byte 固定�
 公共 Device runtime 不理解 Expert、layer 等业务概念，只透传 ID。阶段名称和 owner label 只保存在 Host
 metadata 中，不占用 Device record 的字符串空间。Host 按 `ComputeGraph.topological_sort()` 遍历节点，
 使用每个节点的 `task_num` 还原其连续 TaskDesc 区间，并自动分配内部 descId；展示名优先取
-`OperatorNode.diagnostic_name`，未设置时由节点 `name` 转成驼峰形式。descId 是 RuntimeConfig 内部标识，
+`OperatorNode.diagnostic_stage_name`，未设置时由节点 `name` 转成驼峰形式。descId 是 RuntimeConfig 内部标识，
 调用方不应依赖具体数值。
 
 ### Profiler buffer 布局
@@ -169,8 +204,8 @@ diagnostic_buffer（普通 NPU 显存，仅采集 action 分配）
 `stage_task_index` 和 `owner_id`。profile slot 从 `diagnostic_buffer` 的 offset 0 开始，不占用 symmetric
 heap。
 
-`diagnostic_buffer` 是 profiling 与 L1 Tensor dump 平等使用的公共诊断入参；当前两种工具的 session 互斥。
-profiling 模式写入 cycle trace，L1 dump 模式写入 Tensor 快照，普通执行与 L0 dump 不读取其诊断内容。
+`diagnostic_buffer` 是 profiling 与 Task dump Tensor dump 平等使用的公共诊断入参；当前两种工具的 session 互斥。
+profiling 模式写入 cycle trace，Task dump 模式写入 Tensor 快照，普通执行与 Kernel dump 不读取其诊断内容。
 它通过内部 native ABI 传递：正反向 OpProto、OpDef、ACLNN GetWorkspaceSize、L0 和 Device
 kernel 的输入列表都显式传递它。Python 公共 `mega_moe()`、`mega_moe_grad()` 和
 `MegaMoeExperts` 不要求调用者传入诊断 buffer，由私有 adapter 提供该参数。BF16 MoE 的普通路径使用
@@ -211,7 +246,7 @@ duration_us  = (end_cycle - start_cycle) / cycle_frequency_mhz
 具体区间的解释见[时间线说明](../diagnostics.md#查看与理解时间线)。同一 worker 的 record 保持写入顺序，
 Host 导出时按 cycle 稳定排序。
 
-worker 在 ready handshake 之后、`Process()` 的任务循环之前读取 `DiagnosticMode`，并在进入任务循环前选择快慢实现。关闭路径具有以下约束：
+worker 在 ready handshake 之后、`Process()` 的任务循环之前读取 `DeviceDiagnosticMode`，并在进入任务循环前选择快慢实现。关闭路径具有以下约束：
 
 - 不读取 system cycle；
 - 不执行 profiling barrier；
@@ -224,9 +259,9 @@ worker 在 ready handshake 之后、`Process()` 的任务循环之前读取 `Dia
 
 ## 张量快照的准备与存储
 
-### L0 调用边界
+### Kernel dump 调用边界
 
-L0 根据诊断图上的端口整理逻辑 Tensor：没有生产者的是外部输入，有生产者且被后续节点使用的是
+Kernel dump 根据诊断图上的端口整理逻辑 Tensor：没有生产者的是外部输入，有生产者且被后续节点使用的是
 阶段输出，其余是最终输出。调用前复制选中的外部输入，调用完成后复制选中的阶段及最终输出，
 因此保存的是边界实际值，不是每个图节点执行时的历史值。
 
@@ -234,20 +269,20 @@ L0 根据诊断图上的端口整理逻辑 Tensor：没有生产者的是外部�
 同一逻辑 Tensor 的多个 stage 端口通过硬链接共享文件；stage 视图只描述图上的关系。
 文件格式中影响用户读取的字段集中说明在[读取快照与 manifest](../diagnostics.md#读取快照与-manifest)。
 
-### L1 视图解析
+### Task dump 视图解析
 
-L1 先按调用、task、worker 与端口筛选，再为每个选中的端口解析实际存储范围。
+Task dump 先按调用、task、worker 与端口筛选，再为每个选中的端口解析实际存储范围。
 静态连续切片使用默认视图；动态或硬编码地址语义由业务 resolver 在每次发射前返回
-`L1TensorView(source_offset_bytes, shape)`。Host 校验真实 ABI Tensor 的 dtype、连续性和完整范围，
+`TaskDumpTensorView(source_offset_bytes, shape)`。Host 校验真实 ABI Tensor 的 dtype、连续性和完整范围，
 再处理可选截断及 payload 分配，Device 不执行 Python resolver。
 
 静态切片根据源偏移裁剪尾块。跨行的内维切片不能按同等元素数直接解释成连续字节段；
 这类视图需要业务 resolver 明确选择可复制的连续范围。只改变 shape 无法修正非连续地址。
 任务协作产生的输出还必须在采样时已满足可见性，不能仅因它出现在图上就开放采集。
 
-### L1 buffer 与设备写入
+### Task dump buffer 与设备写入
 
-L1 Device buffer 使用版本 2：
+Task dump Device buffer 使用版本 2：
 
 ```text
 [0, 32)       Header：版本、有效条数、区域偏移和总大小
@@ -307,12 +342,11 @@ Device kernel。
 ### 默认图节点名称
 
 接入 `ComputeGraph` 的新 MegaKernel 默认以 `OperatorNode.name` 生成阶段名，例如 `qkv_proj` 显示为
-`QkvProj`。需要保留缩写或使用更易读的业务术语时，在节点定义旁设置 `diagnostic_name`。图外 task 仍可
-显示 WaitDependency、TriggerEvent、TerminateTask 和 task-type fallback。多个节点可以使用相同展示名，
-公共逻辑仍按拓扑位置为它们分配不同的内部 descId。
+`QkvProj`。需要保留缩写或使用更易读的业务术语时，在节点定义旁设置 `diagnostic_stage_name`。图外 task 仍可
+显示 WaitDependency、TriggerEvent、TerminateTask 和 task-type fallback。
 
-Dump 的 stage 目录还要求名称经文件名规范化后唯一，并排除保留名称；仅满足 Profiler 的阶段标识要求
-不足以保证 dump 可导出。应在接入时为需要采集的阶段提供不冲突的名称。
+Profiling 允许多个节点使用相同展示名，仍按拓扑位置分配不同的内部 descId。Kernel dump 和 Task dump
+要求同一图中的 stage 展示名唯一，且净化后的目录名不能冲突或使用保留名称；这些目录约束不影响 profiling。
 
 ### 组件接入流程
 
@@ -320,7 +354,7 @@ Dump 的 stage 目录还要求名称经文件名规范化后唯一，并排除�
 
 1. 使用同一份 `ComputeGraph` 按拓扑顺序构造 RuntimeConfig task，并保证每个节点的 `task_num` 与实际连续
    TaskDesc 区间一致；
-2. 在需要自定义名称的 `OperatorNode` 上填写 `diagnostic_name`；其余节点直接复用 `name`；
+2. 在需要自定义名称的 `OperatorNode` 上填写 `diagnostic_stage_name`；其余节点直接复用 `name`；
 3. 需要 owner 时，由业务接入实现接收节点、TaskDesc 和 topology 的 resolver；
    不属于任何 owner 的节点返回 `None`；
 4. RuntimeConfig builder 只生成普通执行的 task/queue，不写诊断字段；
@@ -328,7 +362,7 @@ Dump 的 stage 目录还要求名称经文件名规范化后唯一，并排除�
    `validate_mega_kernel_diagnostic_contract()` 检查图/task/ABI；诊断 metadata 与 profile image 自动惰性准备；
 6. 在内部 OpProto、OpDef、ACLNN、L0、Device kernel 和框架 adapter 中贯通 `diagnostic_buffer` 输入，但保持
    模型用户接口不变；
-7. 正反向先检查 `diagnostics.is_active`；关闭时直接走普通 wrapper，开启时通过
+7. 正反向先检查 `diagnostics.requires_diagnostic_launch`；关闭时直接走普通 wrapper，开启时通过
    `with diagnostics.launch(...)` 提供完整参数并管理完成/取消；
 8. 增加布局、metadata、Torch session、导出、merge 和真实 NPU 测试。
 
@@ -362,15 +396,15 @@ Device 配置。`bind_graph_tensor_ports()` 在图副本上设置 `diagnostic_ho
 普通队列以 `execution_mode="event_driven"` 接入；MoE 配对 AIV worker 使用 `vector_worker_stride=2`，
 MHC 全 AIV worker 使用 `vector_worker_stride=1`。MegaGate 使用 `execution_mode="aiv_pipeline"`：每个
 worker 在自己的 token 行分片上执行同一组 task ID，没有调度事件。Profiler 按完整阶段序列计算每核容量；
-L1 按 `(task_id, worker_id)` 分配 record/slot，并由 Device 检查 worker ID，防止不同核写入同一份快照。
+Task dump 按 `(task_id, worker_id)` 分配 record/slot，并由 Device 检查 worker ID，防止不同核写入同一份快照。
 广播目录使用 `task_<id>_worker_<id>`，普通队列仍使用 `task_<id>`。
 
 MHC 在 Torch wrapper 分配输出之后、发射之前绑定真实 ABI Tensor。MegaGate 正向在诊断开启时通过
-`mega_gate_route_out` 预分配同样的 5 个输出；关闭时调用普通 native wrapper。地址列表只在 Device L1 分支
+`mega_gate_route_out` 预分配同样的 5 个输出；关闭时调用普通 native wrapper。地址列表只在 Device Task dump 分支
 临时构造，不给普通 worker 增加诊断地址数组或初始化工作。
 
-RouteGrad 的后处理由一个 `task_num=0` 的 Host 边界节点描述。它可参加 L0 的来源/去向整理，
-但没有设备 task ID，不生成 L1 record，也不会在 timeline 中伪造 megakernel task。
+RouteGrad 的后处理由一个 `task_num=0` 的 Host 边界节点描述。它可参加 Kernel dump 的来源/去向整理，
+但没有设备 task ID，不生成 Task dump record，也不会在 timeline 中伪造 megakernel task。
 各组件当前可采集的端口范围见[支持范围](../diagnostics.md#支持范围与使用限制)。
 
 ### MegaMoE 接入示例
@@ -378,7 +412,7 @@ RouteGrad 的后处理由一个 `task_num=0` 的 Host 边界节点描述。它�
 MegaMoe 的阶段顺序来自生成普通 RuntimeConfig 的正反向 `ComputeGraph`。诊断 graph adapter 在副本中
 保留实际入队的 task，更新节点的 task 数量，并同步重映射描述与队列中的 task ID；普通配置不被修改。
 因此诊断输出的 task ID 应在本次采集内解释，不能直接当作普通配置中的序号。每个
-`OperatorNode` 可就地设置 `diagnostic_name`；GMM1、GMM2、DispatchGrad 等业务名称与对应算子定义放在
+`OperatorNode` 可就地设置 `diagnostic_stage_name`；GMM1、GMM2、DispatchGrad 等业务名称与对应算子定义放在
 一起。公共 metadata 在首次采集时按拓扑顺序解析；profiler 将 descId 写入自己的配置副本，阶段信息直接来自图节点。
 
 业务接入同时提供 `Expert` owner label 和全局 expert ID resolver。resolver 接收
@@ -389,7 +423,7 @@ AllToAll task builder 不写 MegaMoe owner，模型用户也无需传阶段名�
 
 ```text
 _MegaMoeFunction.forward / backward
-    ├─ diagnostics.is_active=False → 原 mega_moe/mega_moe_grad wrapper
+    ├─ diagnostics.requires_diagnostic_launch=False → 原 mega_moe/mega_moe_grad wrapper
     └─ True → diagnostics.launch(runtime ABI parameters, direction, events)
                 → profiler.prepare_call → 完整 profile 参数
                 → native wrapper_with_diagnostic_buffer
@@ -407,7 +441,7 @@ _MegaMoeFunction.forward / backward
 - 调用隔离：关闭态不新增诊断 buffer；pending 调用独占 buffer，drain 后按 device/size 复用；
   诊断配置不修改普通 plan、事件计数器或其他调用的状态。
 - 设备结果：各组件正反向正确，trace 的 cycle、方向、关键阶段和记录数完整，dropped 为零；
-  L0 保留 dtype 与端口关系，L1 task/worker 隔离且 payload 数值正确，失败路径能清理资源。
+  Kernel dump 保留 dtype 与端口关系，Task dump task/worker 隔离且 payload 数值正确，失败路径能清理资源。
 - 对齐结果：各 rank 独立输出，invocation 数量与外层设备 kernel 对应，降级与越界告警可以解释。
 
 关闭态性能需比较“不含诊断 runtime 的基线”和“包含能力但 action 为 NONE 的产物”，

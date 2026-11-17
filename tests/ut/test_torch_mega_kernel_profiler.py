@@ -36,14 +36,14 @@ from hyper_multicore.torch import ops as multicore_adapter
 from tests.common.mark_utils import arg_mark
 
 
-def _prepare_profile_call(runtime, *, direction, fallback_event_counters):
+def _prepare_profile_call(runtime, *, direction, event_counters):
     """Test private profiler lifecycle with a synthetic prepared trace runtime."""
     session = _get_active_session("profiler")
     if session is None:
         return DiagnosticCall(LaunchArguments(
-            runtime.normal_tensor, fallback_event_counters, fallback_event_counters, fallback_event_counters,
+            runtime.runtime_config_tensor, event_counters, event_counters, event_counters,
         ))
-    return session.acquire_call(runtime, fallback_event_counters, direction)
+    return session.acquire_call(runtime, event_counters, direction)
 
 
 class _FakeStorage:
@@ -119,8 +119,8 @@ class _FakeRuntime:
     """Prepared-runtime stand-in that returns deterministic parsed traces."""
 
     rank = 2
-    normal_tensor = "disabled-config"
-    profile_tensor = "enabled-config"
+    runtime_config_tensor = "disabled-config"
+    profile_runtime_config_tensor = "enabled-config"
     device = "runtime-device"
     device_id = 0
     kernel_name = "FakeMegaKernel"
@@ -257,10 +257,10 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             call = _prepare_profile_call(
                 runtime,
                 direction="forward",
-                fallback_event_counters=event_counters,
+                event_counters=event_counters,
             )
 
-        self.assertEqual(call.runtime_config, runtime.normal_tensor)
+        self.assertEqual(call.runtime_config_tensor, runtime.runtime_config_tensor)
         self.assertEqual(call.event_counters, event_counters)
         self.assertIs(call.diagnostic_buffer, event_counters)
         self.assertEqual(call.clear_event_counters, event_counters)
@@ -277,9 +277,9 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         runtime = _FakeRuntime()
 
         with patch.object(torch_profiler.torch, "empty") as mock_empty:
-            call = _prepare_profile_call(runtime, direction="forward", fallback_event_counters=None)
+            call = _prepare_profile_call(runtime, direction="forward", event_counters=None)
 
-        self.assertEqual(call.runtime_config, runtime.normal_tensor)
+        self.assertEqual(call.runtime_config_tensor, runtime.runtime_config_tensor)
         self.assertIsNone(call.event_counters)
         mock_empty.assert_not_called()
 
@@ -301,8 +301,8 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
 
         with patch.object(torch_profiler.torch, "empty", return_value=profile_buffer) as mock_empty:
             with profiler:
-                call = _prepare_profile_call(runtime, direction="forward", fallback_event_counters=None)
-                self.assertEqual(call.runtime_config, runtime.profile_tensor)
+                call = _prepare_profile_call(runtime, direction="forward", event_counters=None)
+                self.assertEqual(call.runtime_config_tensor, runtime.profile_runtime_config_tensor)
                 self.assertIsNone(call.event_counters)
                 self.assertIsNone(call.clear_event_counters)
                 self.assertIs(call.diagnostic_buffer, profile_buffer)
@@ -345,9 +345,9 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
                 call = _prepare_profile_call(
                     runtime,
                     direction="forward",
-                    fallback_event_counters=event_counters,
+                    event_counters=event_counters,
                 )
-                self.assertEqual(call.runtime_config, runtime.profile_tensor)
+                self.assertEqual(call.runtime_config_tensor, runtime.profile_runtime_config_tensor)
                 self.assertEqual(
                     call.clear_event_counters,
                     event_counters,
@@ -560,10 +560,10 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         ):
             with profiler:
                 first = _prepare_profile_call(
-                    runtime, direction="forward", fallback_event_counters=event_counters
+                    runtime, direction="forward", event_counters=event_counters
                 )
                 second = _prepare_profile_call(
-                    runtime, direction="forward", fallback_event_counters=event_counters
+                    runtime, direction="forward", event_counters=event_counters
                 )
                 self.assertIsNot(first.diagnostic_buffer, second.diagnostic_buffer)
                 first.complete()

@@ -8,8 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef MULTICORE_SCHEDULER_L1_TENSOR_DUMP_H
-#define MULTICORE_SCHEDULER_L1_TENSOR_DUMP_H
+#ifndef MULTICORE_SCHEDULER_TASK_TENSOR_DUMP_H
+#define MULTICORE_SCHEDULER_TASK_TENSOR_DUMP_H
 
 #include "kernel_operator.h"
 
@@ -17,15 +17,15 @@ namespace MulticoreRuntime {
 
 using namespace AscendC;  // NOLINT(build/namespaces)
 
-constexpr uint32_t L1_DUMP_MAGIC = 0x4C314450;
-constexpr uint32_t L1_DUMP_VERSION = 2;
-constexpr uint32_t L1_DUMP_MAX_RECORDS = 4096;
-constexpr uint32_t L1_DUMP_PHASE_BEFORE = 1;
-constexpr uint32_t L1_DUMP_PHASE_AFTER = 2;
-constexpr uint32_t L1_DUMP_STATUS_PENDING = 0;
-constexpr uint32_t L1_DUMP_STATUS_CAPTURED = 1;
+constexpr uint32_t TASK_DUMP_MAGIC = 0x4C314450;
+constexpr uint32_t TASK_DUMP_VERSION = 2;
+constexpr uint32_t TASK_DUMP_MAX_RECORDS = 4096;
+constexpr uint32_t TASK_DUMP_PHASE_BEFORE = 1;
+constexpr uint32_t TASK_DUMP_PHASE_AFTER = 2;
+constexpr uint32_t TASK_DUMP_STATUS_PENDING = 0;
+constexpr uint32_t TASK_DUMP_STATUS_CAPTURED = 1;
 
-struct L1DumpHeader {
+struct TaskDumpHeader {
   uint32_t magic;
   uint32_t version;
   uint32_t enabled;
@@ -36,7 +36,7 @@ struct L1DumpHeader {
   uint32_t total_bytes;
 };
 
-struct L1DumpRecord {
+struct TaskDumpRecord {
   uint32_t task_id;
   uint32_t phase;
   uint32_t parameter_position;
@@ -50,17 +50,17 @@ struct L1DumpRecord {
   uint32_t padding[6];  // A core must not write a cache line containing another core's status.
 };
 
-static_assert(sizeof(L1DumpHeader) == 32, "L1DumpHeader ABI must remain 32 bytes");
-static_assert(sizeof(L1DumpRecord) == 64, "L1DumpRecord ABI must remain one 64-byte data-cache line");
+static_assert(sizeof(TaskDumpHeader) == 32, "TaskDumpHeader ABI must remain 32 bytes");
+static_assert(sizeof(TaskDumpRecord) == 64, "TaskDumpRecord ABI must remain one 64-byte data-cache line");
 
-__aicore__ inline void CaptureL1TaskTensors(GM_ADDR buffer, GM_ADDR *parameters, uint32_t task_id, uint32_t phase,
+__aicore__ inline void CaptureTaskTensors(GM_ADDR buffer, GM_ADDR *parameters, uint32_t task_id, uint32_t phase,
                                             uint32_t worker_id) {
   __gm__ uint8_t *dump_buffer = (__gm__ uint8_t *)(buffer);
   GlobalTensor<uint32_t> header_words;
-  header_words.SetGlobalBuffer((__gm__ uint32_t *)(dump_buffer), sizeof(L1DumpHeader) / sizeof(uint32_t));
+  header_words.SetGlobalBuffer((__gm__ uint32_t *)(dump_buffer), sizeof(TaskDumpHeader) / sizeof(uint32_t));
   DataCacheCleanAndInvalid<uint32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(header_words[0]);
   PipeBarrier<PIPE_ALL>();
-  if (header_words.GetValue(0) != L1_DUMP_MAGIC || header_words.GetValue(1) != L1_DUMP_VERSION ||
+  if (header_words.GetValue(0) != TASK_DUMP_MAGIC || header_words.GetValue(1) != TASK_DUMP_VERSION ||
       header_words.GetValue(2) == 0) {
     return;
   }
@@ -70,18 +70,18 @@ __aicore__ inline void CaptureL1TaskTensors(GM_ADDR buffer, GM_ADDR *parameters,
   uint32_t payload_offset = header_words.GetValue(6);
   uint32_t total_bytes = header_words.GetValue(7);
   uint64_t records_end = static_cast<uint64_t>(records_offset) + static_cast<uint64_t>(record_count) * record_stride;
-  if (record_count > L1_DUMP_MAX_RECORDS || record_stride != sizeof(L1DumpRecord) ||
-      records_offset < sizeof(L1DumpHeader) || records_end > payload_offset || payload_offset > total_bytes) {
+  if (record_count > TASK_DUMP_MAX_RECORDS || record_stride != sizeof(TaskDumpRecord) ||
+      records_offset < sizeof(TaskDumpHeader) || records_end > payload_offset || payload_offset > total_bytes) {
     AscendC::Trap();
   }
   for (uint32_t record_index = 0; record_index < record_count; ++record_index) {
     __gm__ uint8_t *record_address = dump_buffer + records_offset + record_index * record_stride;
     GlobalTensor<uint32_t> record_words;
-    record_words.SetGlobalBuffer((__gm__ uint32_t *)(record_address), sizeof(L1DumpRecord) / sizeof(uint32_t));
+    record_words.SetGlobalBuffer((__gm__ uint32_t *)(record_address), sizeof(TaskDumpRecord) / sizeof(uint32_t));
     DataCacheCleanAndInvalid<uint32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(record_words[0]);
     PipeBarrier<PIPE_ALL>();
     if (record_words.GetValue(0) != task_id || record_words.GetValue(1) != phase ||
-        record_words.GetValue(7) != L1_DUMP_STATUS_PENDING ||
+        record_words.GetValue(7) != TASK_DUMP_STATUS_PENDING ||
         (record_words.GetValue(9) != 0xFFFFFFFF && record_words.GetValue(9) != worker_id)) {
       continue;
     }
@@ -107,7 +107,7 @@ __aicore__ inline void CaptureL1TaskTensors(GM_ADDR buffer, GM_ADDR *parameters,
       DataCacheCleanAndInvalid<uint8_t, CacheLine::ENTIRE_DATA_CACHE>(destination_bytes);
       PipeBarrier<PIPE_ALL>();
     }
-    record_words.SetValue(7, L1_DUMP_STATUS_CAPTURED);
+    record_words.SetValue(7, TASK_DUMP_STATUS_CAPTURED);
     DataCacheCleanAndInvalid<uint32_t, CacheLine::SINGLE_CACHE_LINE>(record_words[0]);
     PipeBarrier<PIPE_ALL>();
   }
@@ -115,4 +115,4 @@ __aicore__ inline void CaptureL1TaskTensors(GM_ADDR buffer, GM_ADDR *parameters,
 
 }  // namespace MulticoreRuntime
 
-#endif  // MULTICORE_SCHEDULER_L1_TENSOR_DUMP_H
+#endif  // MULTICORE_SCHEDULER_TASK_TENSOR_DUMP_H

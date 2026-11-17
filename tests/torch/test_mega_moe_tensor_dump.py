@@ -58,7 +58,7 @@ def _run_dump_case(monkeypatch, output_dir: Path, case_name: str) -> None:
 )
 def test_mega_moe_forward_tensor_dump(monkeypatch, tmp_path: Path) -> None:
     """Feature: MegaKernel diagnostics.
-    Description: Export and validate one forward L0 dump window.
+    Description: Export and validate one forward Kernel dump window.
     Expectation: Mega moe forward tensor dump.
     """
     _run_dump_case(monkeypatch, tmp_path, "test_mega_moe_forward_tensor_dump_worker")
@@ -70,9 +70,23 @@ def test_mega_moe_forward_tensor_dump(monkeypatch, tmp_path: Path) -> None:
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_forward_l1_tensor_dump(monkeypatch, tmp_path: Path) -> None:
+def test_mega_moe_forward_task_tensor_dump(monkeypatch, tmp_path: Path) -> None:
     """Feature: MegaKernel diagnostics.
-    Description: Export and validate one forward L1 dump window.
-    Expectation: Mega moe forward l1 tensor dump.
+    Description: Export and validate one forward Task dump window.
+    Expectation: Mega moe forward Task dump.
     """
-    _run_dump_case(monkeypatch, tmp_path, "test_mega_moe_forward_l1_tensor_dump_worker")
+    _run_dump_case(monkeypatch, tmp_path, "test_mega_moe_forward_task_tensor_dump_worker")
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="unessential",
+)
+def test_mega_moe_batched_task_tensor_dump(monkeypatch, tmp_path: Path) -> None:
+    """Feature: MegaKernel diagnostics.
+    Description: Validate remapped Task snapshots using the internal batched-expert plan.
+    Expectation: All selected tasks are captured without changing the execution result.
+    """
+    _run_dump_case(monkeypatch, tmp_path, "test_mega_moe_batched_task_tensor_dump_worker")

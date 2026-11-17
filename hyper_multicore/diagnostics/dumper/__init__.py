@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Independent L0/L1 MegaKernel Tensor-dump tool."""
+"""Public Tensor dump entry points; underscored modules are internal implementations."""
 
-from hyper_multicore.diagnostics.dump.api import (
-    TensorDumpConfig, TorchMegaKernelTensorDumper, tensor_dump,
+from hyper_multicore.diagnostics.dumper.api import (
+    TensorDumpConfig, TensorDumpLevel, TensorDumpSession, tensor_dump,
 )
-from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
+from hyper_multicore.diagnostics.dumper._task import TaskDumpTensorView, TaskDumpTensorViewContext
 
-__all__ = ["TensorDumpConfig", "TorchMegaKernelTensorDumper", "tensor_dump", "L1TensorView", "L1TensorViewContext"]
+__all__ = [
+    "TensorDumpConfig", "TensorDumpLevel", "TensorDumpSession", "tensor_dump",
+    "TaskDumpTensorView", "TaskDumpTensorViewContext",
+]

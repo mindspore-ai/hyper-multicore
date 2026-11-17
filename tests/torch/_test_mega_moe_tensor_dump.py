@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Two-rank Torch worker for one MegaMoe forward L0 Tensor dump."""
+"""Two-rank Torch worker for one MegaMoe forward Kernel Tensor dump."""
 
 from __future__ import annotations
 
 import json
 import os
+from functools import partial
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -25,7 +27,7 @@ import torch_npu  # noqa: F401  # pylint: disable=unused-import
 
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.diagnostics import schedule
-from hyper_multicore.diagnostics import dump as tensor_dump
+from hyper_multicore.diagnostics.dumper import TensorDumpConfig, tensor_dump
 from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts as _MegaMoeExperts
 from tests.torch import _test_mega_moe as common
 
@@ -68,7 +70,7 @@ def test_mega_moe_forward_tensor_dump_worker() -> None:
     result_dir = os.getenv("HP_MEGA_MOE_DUMP_RESULT_DIR")
     if not result_dir:
         raise ValueError("HP_MEGA_MOE_DUMP_RESULT_DIR must name the dump output directory")
-    config = tensor_dump.TensorDumpConfig(
+    config = TensorDumpConfig(
         result_dir, kernel_names="mega_moe", tensor_names=_DUMP_TENSORS, directions="forward", ranks=0,
     )
     capture_schedule = schedule(wait=0, warmup=0, active=1, repeat=1)
@@ -77,7 +79,7 @@ def test_mega_moe_forward_tensor_dump_worker() -> None:
             layer(hidden_states, topk_ids, topk_weights, tokens_per_expert=tokens_per_expert)
             torch.npu.synchronize()
             dist.barrier()
-            with tensor_dump.tensor_dump(config, schedule=capture_schedule) as dumper:
+            with tensor_dump(config, schedule=capture_schedule) as dumper:
                 layer(hidden_states, topk_ids, topk_weights, tokens_per_expert=tokens_per_expert)
                 dumper.step()
         if common.RANK == 0:
@@ -88,9 +90,10 @@ def test_mega_moe_forward_tensor_dump_worker() -> None:
             assert names == set(_DUMP_TENSORS), (
                 f"unexpected dump tensors: expected={set(_DUMP_TENSORS)}, got={names}"
             )
-            assert manifest["schemaVersion"] == 4, (
-                f"unexpected manifest schema: expected=4, got={manifest['schemaVersion']}"
+            assert manifest["schemaVersion"] == 5, (
+                f"unexpected manifest schema: expected=5, got={manifest['schemaVersion']}"
             )
+            assert manifest["level"] == "kernel", f"unexpected dump level: {manifest['level']}"
             assert manifest["tensorSerialization"] == "torch.save", (
                 f"unexpected Tensor serialization: {manifest['tensorSerialization']}"
             )
@@ -142,11 +145,8 @@ def test_mega_moe_forward_tensor_dump_worker() -> None:
     dist.barrier()
 
 
-def test_mega_moe_forward_l1_tensor_dump_worker() -> None:
-    """Feature: MegaKernel diagnostics.
-    Description: Dump task-local SwiGLU inputs and outputs from one forward invocation.
-    Expectation: Mega moe forward l1 tensor dump worker.
-    """
+def _run_forward_task_tensor_dump(*, batch_experts: bool) -> None:
+    """Check task-local SwiGLU snapshots against their inputs and the undumped result."""
     shape = common.MoeShape()
     topk_ids, topk_weights, tokens_per_expert = common.make_balanced_route(shape)
     hidden_states, _ = common.make_data(shape)
@@ -154,9 +154,9 @@ def test_mega_moe_forward_l1_tensor_dump_worker() -> None:
     result_dir = os.getenv("HP_MEGA_MOE_DUMP_RESULT_DIR")
     if not result_dir:
         raise ValueError("HP_MEGA_MOE_DUMP_RESULT_DIR must name the dump output directory")
-    config = tensor_dump.TensorDumpConfig(
+    config = TensorDumpConfig(
         result_dir,
-        level="L1",
+        level="task",
         kernel_names="mega_moe",
         stages="SwiGLU",
         directions="forward",
@@ -166,21 +166,26 @@ def test_mega_moe_forward_l1_tensor_dump_worker() -> None:
     )
     capture_schedule = schedule(wait=0, warmup=0, active=1, repeat=1)
     try:
-        with torch.no_grad():
-            layer(hidden_states, topk_ids, topk_weights, tokens_per_expert=tokens_per_expert)
+        resources = layer._get_execution_resources(hidden_states)
+        # Select the existing internal plan option without expanding the public API.
+        with torch.no_grad(), patch.object(
+            resources, "plan_for_tokens", partial(resources.plan_for_tokens, batch_experts=batch_experts),
+        ):
+            expected = layer(hidden_states, topk_ids, topk_weights, tokens_per_expert=tokens_per_expert)
             torch.npu.synchronize()
             dist.barrier()
-            with tensor_dump.tensor_dump(config, schedule=capture_schedule) as dumper:
-                layer(hidden_states, topk_ids, topk_weights, tokens_per_expert=tokens_per_expert)
+            with tensor_dump(config, schedule=capture_schedule) as dumper:
+                actual = layer(hidden_states, topk_ids, topk_weights, tokens_per_expert=tokens_per_expert)
                 dumper.step()
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=5e-3)
         if common.RANK == 0:
             manifest_path = dumper.last_manifest_paths[0]
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             invocation = manifest["invocations"][0]
             tasks = invocation["tasks"]
-            assert manifest["level"] == "L1", f"unexpected dump level: {manifest['level']}"
-            assert manifest["schemaVersion"] == 4, (
-                f"unexpected manifest schema: expected=4, got={manifest['schemaVersion']}"
+            assert manifest["level"] == "task", f"unexpected dump level: {manifest['level']}"
+            assert manifest["schemaVersion"] == 5, (
+                f"unexpected manifest schema: expected=5, got={manifest['schemaVersion']}"
             )
             assert manifest["tensorSerialization"] == "torch.save", (
                 f"unexpected Tensor serialization: {manifest['tensorSerialization']}"
@@ -191,13 +196,13 @@ def test_mega_moe_forward_l1_tensor_dump_worker() -> None:
             assert manifest["capturePhaseSemantics"] == "task_boundary", (
                 f"unexpected capture semantics: {manifest['capturePhaseSemantics']}"
             )
-            assert tasks, "L1 dump did not export any SwiGLU tasks"
+            assert tasks, "Task dump did not export any SwiGLU tasks"
             assert len({task["taskId"] for task in tasks}) == len(tasks), (
-                f"L1 task IDs are not unique: tasks={tasks}"
+                f"Task IDs are not unique: tasks={tasks}"
             )
             for task in tasks:
-                assert task["stage"] == "SwiGLU", f"unexpected L1 stage: task={task}"
-                assert task["coreType"] == "AIV", f"unexpected L1 core type: task={task}"
+                assert task["stage"] == "SwiGLU", f"unexpected Task stage: task={task}"
+                assert task["coreType"] == "AIV", f"unexpected Task core type: task={task}"
                 assert (manifest_path.parent / task["metadataFile"]).is_file(), (
                     f"missing task metadata: task={task}"
                 )
@@ -217,7 +222,7 @@ def test_mega_moe_forward_l1_tensor_dump_worker() -> None:
                         f"stored shape mismatch: metadata={metadata}, shape={payload.shape}"
                     )
                     assert torch.isfinite(payload).all().item(), (
-                        f"non-finite L1 payload: metadata={metadata}, payload={payload}"
+                        f"non-finite Task payload: metadata={metadata}, payload={payload}"
                     )
                     assert str(payload.dtype).removeprefix("torch.") == metadata["storedDtype"], (
                         f"stored dtype mismatch: metadata={metadata}, dtype={payload.dtype}"
@@ -229,8 +234,24 @@ def test_mega_moe_forward_l1_tensor_dump_worker() -> None:
                 gate, up = task_values["input"].float().chunk(2, dim=-1)
                 torch.testing.assert_close(task_values["output"].float(), torch.nn.functional.silu(gate) * up,
                                            rtol=2e-2, atol=5e-3,
-                                           msg=f"rank={common.RANK}: incorrect L1 SwiGLU task snapshot: {task}")
-            print(f"MEGA_KERNEL_L1_TENSOR_DUMP={manifest_path}")
+                                           msg=f"rank={common.RANK}: incorrect Task SwiGLU task snapshot: {task}")
+            print(f"MEGA_KERNEL_TASK_TENSOR_DUMP={manifest_path}")
     finally:
         layer.close()
     dist.barrier()
+
+
+def test_mega_moe_forward_task_tensor_dump_worker() -> None:
+    """Feature: MegaKernel diagnostics.
+    Description: Dump task-local SwiGLU inputs and outputs from one forward invocation.
+    Expectation: Mega moe forward Task dump worker.
+    """
+    _run_forward_task_tensor_dump(batch_experts=False)
+
+
+def test_mega_moe_batched_task_tensor_dump_worker() -> None:
+    """Feature: MegaKernel diagnostics.
+    Description: Dump remapped SwiGLU tasks in a batched-expert plan on two ranks.
+    Expectation: Snapshots match SwiGLU math and the dump preserves execution results.
+    """
+    _run_forward_task_tensor_dump(batch_experts=True)
