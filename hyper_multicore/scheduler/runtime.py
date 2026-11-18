@@ -193,8 +193,9 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     capacity = runtime_config_task_capacity(cfg)
     validator = getattr(cfg, "task_validator", None)
     if validator is not None:
-        for task in cfg.all_tasks[:capacity]:
-            validator(task)
+        tasks = cfg.all_tasks
+        for index in range(capacity):
+            validator(tasks[index])
     event_capacity = len(cfg.all_event_num_triggers)
     if len(cfg.all_events) != event_capacity:
         raise ValueError("runtime event and trigger arrays must have equal capacity")

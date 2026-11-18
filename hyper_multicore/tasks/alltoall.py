@@ -16,12 +16,14 @@
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 
+import numpy as np
+
 from hyper_multicore.scheduler.config import (
-    TaskDescC, TensorDescC, RuntimeConfigC,
+    TaskDescC, RuntimeConfigC,
     TaskAiCoreType, TaskType, TaskSplitValue,
 )
 from hyper_multicore.scheduler.graph import OperatorNode
-from hyper_multicore.tasks.task_base import FillConfig
+from hyper_multicore.tasks.task_base import FillConfig, fill_task_block
 from hyper_multicore.tasks.utils import (
     advance_tsv_vector, advance_tsv_vector_only,
 )
@@ -97,63 +99,56 @@ class AllToAllFillConfig(FillConfig):
         per_g_e_num = task_num // tsv.all_expert_num
         param       = op.param_positions
 
-        for i in range(task_num):
-            task = TaskDescC()
-            task.task_type = (
-                TaskType.TASK_SHMEM_GET_MEM
-                if self.moe_type == AllToAllType.DISPATCH and tsv.dispatch_mode == "pull"
-                else TaskType.TASK_SHMEM_PUT_MEM_SIGNAL
-            )
-            task.task_aicore_type = TaskAiCoreType.TASK_AICORE_CUBE
-            task.num_inputs       = len(op.inputs)
-            task.num_outputs      = len(op.outputs)
+        if task_num:
+            dispatch = self.moe_type == AllToAllType.DISPATCH
+            pull = dispatch and tsv.dispatch_mode == "pull"
+            template = TaskDescC()
+            template.task_type = TaskType.TASK_SHMEM_GET_MEM if pull else TaskType.TASK_SHMEM_PUT_MEM_SIGNAL
+            template.task_aicore_type = TaskAiCoreType.TASK_AICORE_CUBE
+            template.num_inputs = len(op.inputs)
+            template.num_outputs = len(op.outputs)
+            template.task_split_num = task_num
+            template.task_split_value = op.split_value
+            template.extra_value_1 = ShmemTaskPartition.RUNTIME_ROWS if hasattr(op, "compact_lanes") else 0
+            template.tiling_data_position = 0xFFFFFFFF
 
             for j, spec in enumerate(op.inputs):
-                td = TensorDescC()
-                td.data_type       = spec.dtype_size
-                td.input_position  = param[j]
-                td.base_ptr_offset = 0
-
-                if j == 1:   # src data: tensor_type and is_dynamic from TensorSpec
-                    td.tensor_type   = spec.tensor_type
-                    td.dynamic_shape = int(spec.is_dynamic)
-                else:        # metadata (target_offset / src_offset / size): fixed type=0
-                    td.tensor_type     = 0
-                    td.base_ptr_offset = i // per_g_e_num   # expert-group index
-
-                task.inputs[j] = td
-
+                operand = template.inputs[j]
+                operand.input_position = param[j]
+                operand.data_type = spec.dtype_size
+                if j == 1:
+                    operand.tensor_type = spec.tensor_type
+                    operand.dynamic_shape = int(spec.is_dynamic)
             out_spec = op.outputs[0]
-            out = TensorDescC()
-            out.tensor_type     = out_spec.tensor_type
-            out.data_type       = out_spec.dtype_size
-            out.input_position  = param[task.num_inputs]
-            out.base_ptr_offset = 0
-            out.dynamic_shape   = int(out_spec.is_dynamic)
-            task.outputs[0] = out
+            out = template.outputs[0]
+            out.tensor_type = out_spec.tensor_type
+            out.data_type = out_spec.dtype_size
+            out.input_position = param[len(op.inputs)]
+            out.dynamic_shape = int(out_spec.is_dynamic)
 
-            if self.moe_type == AllToAllType.DISPATCH:
-                res = (tsv.rank_id * tsv.single_rank_expert_num + (i // per_g_e_num) % tsv.single_rank_expert_num
-                       if tsv.dispatch_mode == "pull" else i // per_g_e_num)
-                task.dependent_event = tsv.pre_pre_event_num + 0
-                task.trigger_event   = tsv.pre_event_num + res + 1
-                cfg.all_event_num_triggers[task.trigger_event] = (
-                    task_num * tsv.ep // tsv.all_expert_num
-                )
-            else:   # COMBINE (or OTHER)
-                current_dep = (i // per_g_e_num) % tsv.single_rank_expert_num
-                task.dependent_event = tsv.pre_pre_event_num + current_dep + 1
-                task.trigger_event   = tsv.all_event_num
-                cfg.all_event_num_triggers[task.trigger_event] = task_num
-
-            task.task_index           = i
-            task.task_split_num       = task_num
-            task.task_split_value     = op.split_value
-            task.extra_value_1 = ShmemTaskPartition.RUNTIME_ROWS if hasattr(op, "compact_lanes") else 0
-            task.tiling_data_position = 0xFFFFFFFF
-
-            cfg.all_tasks[tsv.pre_task_num + i] = task
-            cfg.vector_task_indices[tsv.pre_vector_task_num + i] = tsv.pre_task_num + i
+            tasks = fill_task_block(cfg, tsv.pre_task_num, task_num, template)
+            index = np.arange(task_num, dtype=np.int64)
+            if per_g_e_num == 0:
+                raise ValueError("communication schedule needs at least one task per expert")
+            expert = index // per_g_e_num
+            tasks["task_index"] = index
+            for j in range(len(op.inputs)):
+                if j != 1:
+                    tasks["inputs"][:, j]["base_ptr_offset"] = expert
+            events = np.ctypeslib.as_array(cfg.all_event_num_triggers)
+            if dispatch:
+                owner = (tsv.rank_id * tsv.single_rank_expert_num + expert % tsv.single_rank_expert_num
+                         if pull else expert)
+                trigger = tsv.pre_event_num + owner + 1
+                tasks["dependent_event"] = tsv.pre_pre_event_num
+                tasks["trigger_event"] = trigger
+                events[trigger] = task_num * tsv.ep // tsv.all_expert_num
+            else:
+                tasks["dependent_event"] = tsv.pre_pre_event_num + expert % tsv.single_rank_expert_num + 1
+                tasks["trigger_event"] = tsv.all_event_num
+                events[tsv.all_event_num] = task_num
+            queue = np.ctypeslib.as_array(cfg.vector_task_indices)
+            queue[tsv.pre_vector_task_num:tsv.pre_vector_task_num + task_num] = tsv.pre_task_num + index
 
         cfg.task_index_num[1] += task_num
         if self.advance == "vector":
