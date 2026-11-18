@@ -17,7 +17,7 @@ from enum import IntEnum
 from typing import Any
 
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
-from hyper_multicore.tasks.alltoall import ShmemTaskPartition
+from hyper_multicore.tasks.alltoall import ShmemTaskPartition, ShmemTransferEngine
 from hyper_multicore.scheduler.config import TaskType
 from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
 from .probability_abi import ProbabilityLayout
@@ -62,7 +62,7 @@ def _activation_options(task: Any) -> bool:
 
 def _transport_options(task: Any) -> bool:
     allowed = int(ShmemTaskPartition.RUNTIME_ROWS | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES
-                  | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS)
+                  | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS | ShmemTransferEngine.UDMA)
     if task.extra_value_1 & ~allowed:
         raise ValueError(f"invalid transport flags {task.extra_value_1:#x}")
     payload = transport_payload(task)

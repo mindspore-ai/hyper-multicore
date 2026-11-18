@@ -44,9 +44,9 @@ bash examples/moe/run_benchmark.sh \
 
 如果需要固定全局专家总数，附加 `--num-experts 48 --top-k 8`；EP4 时这会改为每卡12个专家，负载不同于默认 E24。
 
-### 910C 单机 EP16
+### Atlas A3 系列单机 EP16
 
-使用适配 910C 的 Torch/torch_npu 与 CANN，并构建包含 `ascend910_93` 目标的 native payload：
+使用适配 Atlas A3 系列的 Torch/torch_npu 与 CANN，并构建包含 `ascend910_93` 目标的 native payload：
 
 ```bash
 source /path/to/cann/set_env.sh

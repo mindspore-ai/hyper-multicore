@@ -15,14 +15,14 @@
 
 namespace hyper_multicore::shmem {
 
-inline constexpr int64_t kAscend910NpuArch = 2201;
-inline constexpr int64_t kAscend950NpuArch = 3510;
+inline constexpr int64_t kArch22NpuArch = 2201;
+inline constexpr int64_t kArch35NpuArch = 3510;
 
 #ifdef HP_SHMEM_ASCEND950
-inline constexpr int64_t kBackendNpuArch = kAscend950NpuArch;
+inline constexpr int64_t kBackendNpuArch = kArch35NpuArch;
 inline constexpr char kBackendSocType[] = "Ascend950";
 #else
-inline constexpr int64_t kBackendNpuArch = kAscend910NpuArch;
+inline constexpr int64_t kBackendNpuArch = kArch22NpuArch;
 inline constexpr char kBackendSocType[] = "Ascend910B";
 #endif
 

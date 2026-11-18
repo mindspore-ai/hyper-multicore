@@ -21,19 +21,31 @@
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
+#include "common/mega_moe/invocation_protocol.h"
 #include "common/mega_moe/transport.h"
+#include "common/mega_moe/transport_task.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
+#include "common/mega_moe/adapters/arch35/gmm/bf16_worker.h"
+#endif
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
+
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+#include "common/mega_moe/adapters/arch35/swiglu/bf16_grad_worker.h"
+#endif
 
 using namespace AscendC;
 
 namespace MulticoreRuntime {
 
-class KernelWorker : public KernelWorkerBase<KernelWorker> {
+class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::LEGACY_ODD,
+                                              RuntimeStorageBoundsPolicy::NATIVE_TILING,
+                                              MulticoreMoE::InvocationProtocol> {
  public:
   // input_list layout for hyper_mega_moe_grad (backward):
   //   [30] = tiling params  [31] = all_event_counters  [32] = diagnostic_buffer
   //   [25] = gmm_workspace  [26] = swi_glu_grad_workspace
+  static constexpr int64_t SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT = 19;
   static constexpr uint32_t TILING_IDX              = 30;
   static constexpr uint32_t EVENT_IDX               = 31;
   static constexpr uint32_t DIAGNOSTIC_IDX          = 32;
@@ -66,10 +78,20 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteGroupedMatmul(task_desc);
         break;
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
+                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
+#else
         ExecuteShmemPutMem(task_desc);
+#endif
         break;
       case TaskType::TASK_SHMEM_GET_MEM:
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+        MulticoreMoE::ExecuteTransfer<DTYPE_DISPATCH_TARGET>(task_desc, input_list,
+                                                          input_list[TILING_IDX], input_list[EVENT_IDX]);
+#else
         ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
+#endif
         break;
       case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);
@@ -160,6 +182,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                 row * sizeof(float), rows, width);
       }
     }
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      if (GetSwiGluClampLimit(task) == 0.0f && task.inputs[1].dim[1] % 64 == 0) {
+        MulticoreBf16::ExecuteSwiGluGrad(gradient, input, output, rows, task.inputs[1].dim[1] / 2);
+        return;
+      }
+    }
+#endif
     swi_glu_grad(gradient, input, output, input_list[SWIGLU_GRAD_WORKSPACE_IDX], tiling,
                  GetSwiGluClampLimit(task), GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
   }
@@ -245,6 +275,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
+    if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
+      GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
+      MulticoreBf16::ExecuteGmmTask<DTYPE_HIDDEN_DW>(task_desc, input_list, this->core_num, task_tiling);
+      return;
+    }
+#endif
     if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
       DynamicData dynamic_data;
       getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
@@ -264,7 +301,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         const bool batched = IsBatchedGroupedMatmulTask(task_desc);
         if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
           for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
-            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.extra_value_2);
+            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.dependency_poll_interval_us);
           }
         }
         int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index);

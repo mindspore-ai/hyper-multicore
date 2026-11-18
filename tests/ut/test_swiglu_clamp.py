@@ -18,10 +18,10 @@ import math
 import struct
 import unittest
 
-from hyper_multicore.modules.mega_moe.backward.graph import (
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.graph import (
     build_backward_graph,
 )
-from hyper_multicore.modules.mega_moe.forward.graph import (
+from hyper_multicore.modules.mega_moe.backends.bf16.forward.graph import (
     build_forward_graph,
 )
 from hyper_multicore.scheduler.builder import build_runtime_config

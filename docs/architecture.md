@@ -15,7 +15,7 @@ AllToAll-Dispatch → GMM1(up_proj) → SwiGLU → GMM2(down_proj) → AllToAll-
 每个算子是独立的 NPU kernel，算子之间存在大量 HBM 读写（激活值中间结果落盘再读回）。
 在 Expert Parallel（EP）场景下，AllToAll 通信与 GMM 计算通常串行执行，造成大量空闲等待。
 
-实测数据（昇腾 A3，DeepSeek-V3 规模 MoE 负载）：
+实测数据（Atlas A3 系列，DeepSeek-V3 规模 MoE 负载）：
 
 | 指标 | 测量值 |
 |---|---|
@@ -62,7 +62,7 @@ GMM1 与 GMM4 并行，AllToAll-Combine 与 GMM3 并行，进一步减少空闲�
 
 ### 2.1 设计原则
 
-本框架针对昇腾 A3/A2 NPU 的 AIC/AIV 双路硬件特点制定如下分层规则：
+本框架面向 Atlas A2/A3 系列及 Ascend950 系列 NPU 的 AIC/AIV 混合执行，按下表组织各层职责。
 
 | 层次 | Python 模块 | C++ 模块 | 职责 | 不包含 |
 |---|---|---|---|---|
@@ -231,7 +231,7 @@ FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
 ```text
 用户 (Python)
     ↓ build_forward_graph(tsv)
-ComputeGraph [modules/mega_moe/forward/graph.py]
+ComputeGraph [modules/mega_moe/backends/bf16/forward/graph.py]
     ↓ propagate_splits(tsv)
 各 OperatorNode 的 task_num / split_dim 被自动填充
     ↓ build_runtime_config(graph, tsv, rank_id)
@@ -452,7 +452,8 @@ trigger_event = all_event_num  （全局唯一 event）
 header 的前五个 uint32 字段依次为 task_num、num_workers、task_capacity、event_capacity、ready_event；
 ready_event 为 0 表示无需跨 rank ready。接着三个 uint32 为 diagnostic_mode、
 aic_profile_record_capacity、aiv_profile_record_capacity；再两个为 completion_event、protocol_version，
-最后 24 字节用于对齐。diagnostic_mode=0 表示普通执行，=1 表示 profiling，=2 表示 L1 dump。
+byte40 为 queue_layout，byte44 为 worker_queue_offset；最后16字节用于对齐。
+queue_layout=2 表示追加的24字节 WorkerQueue 描述表，0表示隐式队列。diagnostic_mode=0 表示普通执行，=1 表示 profiling，=2 表示 L1 dump。
 protocol_version=0 表示 push，=1 表示 pull；pull 的 completion_event
 用于等待所有参与 worker 完成，随后跨 rank 确认 source 可安全复用。
 task capacity 覆盖计算 task、terminate、队列长度和所有引用的最大 task ID，并按 16 对齐，没有固定 task 数上限。
@@ -564,7 +565,7 @@ Torch adapter 是由 CMake 构建、通过 `torch.ops.load_library()` 加载的 
 `PyInit_*` 入口，也不链接 `libpython` 或 `libtorch_python`。adapter 运行时按组件相对路径定位并绝对加载
 自带 vendor；`set_env.bash` 按 CANN custom OPP 契约设置 vendor 的 OPP 与动态库搜索路径。
 
-910B/910C 共用 `Ascend910B` SHMEM 后端，950 使用 `Ascend950` 后端，私有资源分别按 `arch22/arch35` 保存于
+Atlas A2/A3 系列共用 `Ascend910B` SHMEM 后端，Ascend950 系列使用 `Ascend950` 后端，私有资源分别按 `arch22/arch35` 保存于
 `shmem/lib/<arch>/`。每个框架变体包含一份 Torch adapter，以及 `shmem/<arch>/` 中的各后端 binding。
 首次使用 SHMEM 时查询可见逻辑设备 0 的架构，仅加载匹配的一套 SDK、ops 和 binding；查询不创建 NPU 上下文。
 同一进程可见设备须属于同一架构，实际 Runtime 初始化仍校验调用方当前设备。
@@ -748,7 +749,7 @@ def build_attention_fwd_graph(tsv: TaskSplitValue, ...) -> ComputeGraph:
     return g
 ```
 
-**Step 3** — 实现 CLI（参考 `modules/mega_moe/forward/gen_runtime_data.py`）：
+**Step 3** — 实现 CLI（参考 `modules/mega_moe/backends/bf16/forward/gen_runtime_data.py`）：
 
 ```python
 def main():
@@ -862,8 +863,8 @@ _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
 四个逻辑区域共用一块 FP32 对称内存：`source_p`、`received_p`、`received_dp`、`returned_dp`。
 这块内存由 MegaMoE workspace 分配和管理，物理布局由 `ProbabilityLayout` 描述。
 `TensorEffect` 标明本地和远端读写及 `token_and_scalar` 完成条件；Push 在 token signal 之前
-完成 scalar PUT，Pull 在本地 dispatch event 之前完成 scalar 和 token GET。反向消费者继续沿既有
-DAG 等待，token 与 scalar 共享同一个 task 的完成信号。空 task、待反向图、源 buffer 和 workspace lease
+完成 scalar PUT，Pull 在本地 dispatch event 之前完成 scalar 和 token GET。反向消费者按
+DAG 依赖等待，token 与 scalar 共享同一个 task 的完成信号。空 task、待反向图、源 buffer 和 workspace lease
 由 MegaMoE 执行资源管理；通用 runtime 和 SHMEM 负责调度与传输，不解释概率数学。
 
 ### Task descriptor 与校验
@@ -890,29 +891,35 @@ C++ 对应定义位于 `ops/common/*_task_options.h` 和 `ops/common/mega_moe/ta
 | GMM | 0/1/2/3 互斥 mode | 不按位组合 activation 或 transport options |
 
 表中 SwiGLU 和 SHMEM 的数值为十进制掩码。`extra_value_0` 由 SwiGLU 持有，用 FP32 bit pattern 表达裁剪限值；
-`extra_value_2` 由 runtime 持有，用于依赖轮询间隔。`ProbabilityLayout` 固定四个 plane、FP32
+`dependency_poll_interval_us` 由 runtime 持有，用于依赖轮询间隔。
+SHMEM engine 使用独立 typed option 的 bit16，不与轮询字段混用。`ProbabilityLayout` 固定四个 plane、FP32
 元素宽度和 scalar-row 单位；host 拒绝未知位、冲突 payload、缺失辅助 operand、错误单位和激活方向。
 MoE device adapter 在解码前重复校验。host validator 由 graph 绑定，normal/profile/dump 的 runtime
 副本保留相同的 validator。
 
 ### 调度与诊断
 
-normal、profile、L1 dump 使用同一个 `RunVectorReadyQueue` 扫描函数和相同静态 worker placement。
+normal、profile 和支持 L1 dump 的路径使用同一个 `RunWorkerQueue` 扫描函数和相同静态 worker placement。
 `ProcessTasks` 和 `ExecuteTask` 使用运行时诊断模式参数，分别执行普通任务、采集时间戳或转储 L1，
 共用任务分发逻辑。动态就绪次序可能受记录开销影响，因此不同运行的实际 task 顺序可能不同。
-`MegaMoeSchedulePolicy` 分别表达 Vector/Cube 顺序、ready 选择、batching 和 polling；compact 仍是
-先执行的独立粒度 lowering。默认策略按 compact 选择 ready 和全 AIV；活动核集合与 ready 策略关联，
-没有独立的序列化 placement 字段。Cube stage 通过图节点身份定位。
+`MegaMoeSchedulePolicy` 分别表达 Vector/Cube 顺序、ready 选择、batching 和 polling。compact 粒度 lowering
+先于队列编排执行。`arch22` BF16 的 compact 使用跨步 Vector 队列与 256 槽默认窗口，
+覆盖全 AIV，专家批处理也使用这份队列表。`arch35` 使用固定通信 owner 与独立数学队列。
+WorkerQueue 的 begin/end/stride 表达 placement，ready_depth 只控制当前 worker 的有限就绪选择。
+无任务窃取；等待策略由同一描述表下发。stage 当前按组件内 operator.name 绑定。
+
+MoE 跨 rank source-ready/read-complete 协议由 `ops/common/mega_moe/invocation_protocol.h` 持有；
+通用 runtime 只调用协议 hook，负责本地事件计数与队列完成。
 
 ### 辅助 kernel 与概率数学
 
-| 功能 | 当前实现与执行边界 |
+| 功能 | 实现与执行边界 |
 | --- | --- |
 | 冷专家梯度清零 | `ZeroEmptyExpertGrad` 独立 kernel，以累计 counts 识别冷专家并选择性写零。 |
 | 路由 metadata | `Metadata` 独立 kernel，一次生成 row/element 描述符；同时提供基于标准 cumsum/reshape 的 fallback。 |
 | saved mapping 搬运 | `PermuteFromMapping` 独立 kernel，复用 forward mapping，在一次调用中展开 `[T,H]` token 并重排 p。 |
 | 概率数学 | `hyper_multicore/ops/common/mega_moe/routing_probabilities.h` 中的业务 helper 在 task 内执行 Cast/Mul/ReduceSum 循环，未复用标准算子源码片段。 |
-| A3 SwiGLU 裁剪 | 在锁定的 ops-nn `39e54ece7ee5ff64c8015d3ba418f891e640f242` 上应用 fusion 与 clamp patch；两个 patch 分别维护。 |
+| BF16 SwiGLU 裁剪 | `arch22` 和 `arch35` 共用锁定的 ops-nn `39e54ece7ee5ff64c8015d3ba418f891e640f242` 源码、fusion patch 与 clamp patch。 |
 
 FC2 前加权路径的概率数学为：`a0=BF16(a)`、`a1=BF16(FP32(a0)*p)`，反向
 `dp=sum(FP32(a0)*FP32(d_fc2_input))`、`d_a=BF16(FP32(d_fc2_input)*p)`。
@@ -921,5 +928,33 @@ FC2 前加权路径的概率数学为：`a0=BF16(a)`、`a1=BF16(FP32(a0)*p)`，�
 这些计算在激活及其反向 task 内完成，使用 task 的 UB 和完成信号，不为每个 task 单独 launch 概率算子。
 
 上述三个独立辅助 kernel 通过 host launch bridge 由 Torch 调用，具有单独的构建入口，
-不属于 MegaKernel 内部的 task。辅助 kernel 的编译目标固定为 `dav-2201`；
-该构建路径不提供 A5 目标。构建依赖与制品要求见[构建说明](build.md)，设备验证方式见[测试指南](../tests/README.md)。
+不属于 MegaKernel 内部的 task。辅助 kernel 按构建目标编译为 `dav-2201` 或 `dav-3510`。
+构建依赖与制品要求见[构建说明](build.md)，设备验证方式见[测试指南](../tests/README.md)。
+
+### BF16 与 MXFP8 执行能力
+
+| 能力 | 共用实现 |
+| --- | --- |
+| 对外接口与模型持有权重 | 共用 `MegaMoeExperts`、EP 推导、输入检查、`numerics_options` 和 `tuning_options`。两种精度逐次接收当前权重，执行器管理资源而不持有模型参数。 |
+| 路由和动态容量 | 共用可选 `tokens_per_expert`、路由缓存及 metadata 生成、跨 rank 错误收敛、Push/Pull workspace 扩容及 Pull source lease。各后端分别管理计划缓存。 |
+| worker 队列和就绪扫描 | `WorkerQueue` 定义队列布局，`RunWorkerQueue` 执行队列。`arch22` BF16 compact 使用覆盖全 AIV 的跨步 Vector 队列和就绪扫描。`arch35` 的 BF16 与 MXFP8 共用显式核归属、窗口和等待机制。 |
+| 逐专家流水和通信 | `arch35` 共用 `two_expert_pipeline` 和 `builder_order`，两种精度将各自数学阶段映射给同一策略。两种策略及两种引擎共用通信 owner 和完成协议，通信保持 FIFO。`arch22` BF16 分别重排相邻专家的 Cube 和 Vector 任务。 |
+| 传输和依赖等待 | 引擎和轮询分别编码。Ascend950 的 SHMEM 默认启用 `mte_udma`，两种精度共用此配置。Push 使用 PUT 分发，Pull 使用 GET 分发，返回均用 PUT。 |
+| 概率梯度、partial dW 和观测 | 两种精度默认在 FC2 后加权，返回路由概率梯度，共用相关 unpermute/permute 辅助入口并支持 FP32 partial dW。两种精度均接入任务 profiler，并各自管理 native 启动参数和 saved tensors。 |
+
+下面的差异不涉及量化算子实现。调度参数的完整取值见
+[用户接口](../hyper_multicore/README.md#megamoe-scheduler-options)。
+
+| 能力 | BF16 | MXFP8 | 配置或提示 |
+| --- | --- | --- | --- |
+| 设备和 lowering | arch22 具备 compact、nominal 和 GMM 专家批处理。arch35 使用逐专家 dense。 | arch35 使用逐专家 dense。 | MXFP8 请求 compact、nominal 或 batching 在构造时报 `ValueError`。BF16 在构图时检查架构、策略名、compact 条件和非零窗口。MXFP8 在首次设备绑定时拒绝 arch22。 |
+| SwiGLU 裁剪和 FC2 前概率加权 | 支持 SiLU 前后两种裁剪位置。FC2 前加权使用概率 plane 传输 `p` 与 `dp`。 | 使用普通 SwiGLU 和 FC2 后加权。 | MXFP8 设置 `swiglu_limit` 或 `apply_probs_before_fc2=True` 在构造时报 `ValueError`。`clamp_after_silu` 只在提供 `swiglu_limit` 时生效。 |
+| 权重布局和当前存储 | EIO/EOI 首次绑定。EIO 可以整理成连续存储，EOI 要求连续。 | 使用 EIO 语义的原始 root，前后向分别获取当前阶段的物理存储。 | 两种后端均校验形状和设备。MXFP8 缺少阶段所需字段时报告缺失方向。 |
+| 冷专家梯度与反向暂存 | 按 group list 清零冷专家的 dW，已知全部专家活跃时跳过清零。dX 可复用已消费的 dispatch 暂存。 | 预先清零两个 partial dW 输出，并单独分配 dX 暂存。 | 两种精度共用公开梯度合同。 |
+| 无梯度执行与反向保存 | 使用独立 no-grad 路径，归并完成后释放 workspace。 | 无反向需求时直接归并共享返回区。训练时保存反向所需结果，在 backward 重新解析当前权重 root。 | BF16 测试覆盖 checkpoint 和 saved mapping。MXFP8 组件回放覆盖 no-grad、再次前向及待反向 ctx。 |
+| 执行计划复用 | token 向上取几何桶，计入 partial dW 精度。有活跃反向图时保留旧 plan。 | 按实际对齐 token 和接收容量缓存至多四个 plan。Pull 用固定容量上界归并 key。反向从 ctx 读原 plan。 | 缓存粒度为内部策略。 |
+| L1 Tensor dump | 支持专用 L1 view resolver 和 dump 参数。 | 提供任务 profiler。 | MXFP8 在启用 tensor dump 捕获的 launch 上报 `RuntimeError`。 |
+
+共享 ready ABI 保证同一设备执行器理解两类队列布局。它不保证不同精度或架构具有相同的任务序、
+缓存命中率或通信重排。arch35 两种精度的 `builder_order` / `two_expert_pipeline` 对照测试
+验证同一精度内的任务覆盖、通信队列和事件阈值保持一致。

@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_multicore._core_spec import get_device_core_spec
+from hyper_multicore._loader import query_npu_arch
 
 
 _COMMUNICATION_SPLIT = 128
@@ -51,6 +52,7 @@ class MegaMoeSpec:
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
+    partial_weight_grad_dtype: str | None = None
     swiglu_limit: float | None = None
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
@@ -60,6 +62,12 @@ class MegaMoeSpec:
     nominal_schedule: bool = False
     apply_probs_before_fc2: bool = False
     clamp_after_activation: bool = False
+    architecture: int = 2201
+    precision: str = "bf16"
+    transport_engine: str | None = "mte"
+    ready_depth: int | None = None
+    schedule_policy: str = "auto"
+    lowering: str = "auto"
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -189,6 +197,10 @@ def bind_mega_moe_spec(
         device.index if device.index is not None else torch.npu.current_device()
     )
     core_spec = get_device_core_spec(device_index)
+    architecture = query_npu_arch(device_index)
+    transport_engine = specification.get("transport_engine", "mte")
+    if transport_engine == "udma" and architecture != 3510:
+        raise ValueError("UDMA expert transport requires arch35")
 
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
@@ -212,6 +224,7 @@ def bind_mega_moe_spec(
         rank_id=rank_id,
         num_cube_cores=core_spec.num_cube_cores,
         swiglu_limit=swiglu_limit,
+        partial_weight_grad_dtype=specification.get("partial_weight_grad_dtype"),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
@@ -223,4 +236,10 @@ def bind_mega_moe_spec(
         nominal_schedule=specification.get("nominal_schedule", False),
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
         clamp_after_activation=specification.get("clamp_after_activation", False),
+        architecture=architecture,
+        precision=specification.get("precision", "bf16"),
+        transport_engine=transport_engine,
+        ready_depth=specification.get("ready_depth"),
+        schedule_policy=specification.get("schedule_policy", "auto"),
+        lowering=specification.get("lowering", "auto"),
     )

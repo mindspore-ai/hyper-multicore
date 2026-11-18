@@ -182,16 +182,18 @@ def validate_native_compatibility() -> dict:
         return _selection
 
 
-def query_npu_arch() -> int:
-    """Read visible logical device 0's architecture without creating a device context."""
+def query_npu_arch(device_index: int = 0) -> int:
+    """Read a visible logical device's architecture without creating a context."""
     acl = ctypes.CDLL("libascendcl.so", mode=ctypes.RTLD_LOCAL)
     query = acl.aclrtGetDeviceInfo
     query.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int64)]
     query.restype = ctypes.c_int32
     arch = ctypes.c_int64()
-    status = query(0, _ACL_DEV_ATTR_NPU_ARCH, ctypes.byref(arch))
+    status = query(device_index, _ACL_DEV_ATTR_NPU_ARCH, ctypes.byref(arch))
     if status != 0:
-        raise NativeComponentUnavailableError(f"aclrtGetDeviceInfo(NPU_ARCH) failed for visible device 0: {status}")
+        raise NativeComponentUnavailableError(
+            f"aclrtGetDeviceInfo(NPU_ARCH) failed for visible device {device_index}: {status}"
+        )
     return arch.value
 
 

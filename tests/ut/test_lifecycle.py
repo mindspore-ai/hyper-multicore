@@ -25,7 +25,7 @@ from torch.autograd import Function
 
 from hyper_multicore import _automatic, _collective
 from hyper_multicore.modules import module as module_api
-from hyper_multicore.modules.mega_moe.function import _release_completed_graph
+from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _release_completed_graph
 from hyper_multicore.modules.mega_moe.workspace import MegaMoeWorkspace
 from tests.common.mark_utils import arg_mark
 
@@ -173,7 +173,8 @@ class TestLifecycle(unittest.TestCase):
             patch.object(_collective.dist, "all_gather_object") as gather_mock,
         ):
             for group in (None, explicit_group):
-                self.assertEqual(_collective.exchange("local", group=group, failure_prefix="exchange failed"), ["local"])
+                observed = _collective.exchange("local", group=group, failure_prefix="exchange failed")
+                self.assertEqual(observed, ["local"])
             gather_mock.assert_not_called()
         for method in ("is_initialized", "get_world_size", "all_gather_object"):
             error = ValueError("invalid communicator")

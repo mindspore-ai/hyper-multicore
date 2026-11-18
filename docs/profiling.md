@@ -210,15 +210,15 @@ kernel 的输入列表都显式传递它。Python 公共 `mega_moe()`、`mega_mo
 Host 根据完整调度表复现每个 worker 可能执行的任务，分别计算最忙 AIC 和 AIV 的记录数：
 
 ```text
-capacity = min(round_up(required_records, 16), 256)
+capacity = round_up(required_records, 16)
 ```
 
-每个有依赖的普通 task 最多记录 WaitDependency、Compute 和 TriggerEvent 三段；SHMEM put 不重复记录公共
-trigger 区间。达到 256 条上限后停止写入新 record 并累计 dropped count，不覆盖既有数据。
+每个有依赖的普通 task 最多记录 WaitDependency、Compute 和 TriggerEvent 三段。SHMEM put 使用自己的
+trigger 记录。显式 worker 队列也为就绪等待事件预留记录。设备在记录槽满时累计 dropped count。
 
-profile buffer 总容量为 `24 * AIC_stride + 48 * AIV_stride`，最大值为
-`72 * (64 + 256 * 32) = 594432` Byte；不包含调度 event workspace。
-`max_pending_calls` 控制 Host session 的 buffer drain 频率，与这里的每核 record 容量无关。
+profile buffer 依据运行时计划的槽位数分配，每个槽位包含 core header 和该类 worker 的记录区。
+总字节数为 `AIC 槽位数 * AIC_stride + AIV 槽位数 * AIV_stride`，调度 event workspace 单独分配。
+`max_pending_calls` 控制 Host session 的 buffer drain 频率。
 
 ### 4.4 Cycle 与时间换算
 
@@ -229,7 +229,7 @@ timestamp_us = (start_cycle - anchor_cycle) / cycle_frequency_mhz
 duration_us  = (end_cycle - start_cycle) / cycle_frequency_mhz
 ```
 
-当前内部频率映射支持 Ascend 910B/910C/910_93 系列，A2/A3 使用 50 MHz。SoC 名称来自
+系统计数器在 Atlas A2/A3 系列使用 50 MHz，在 Ascend950 系列使用 1000 MHz。SoC 名称来自
 `torch_npu.npu.get_device_name()`；未知型号会在解析采集结果时显式失败，不接受用户从前端传入猜测值。
 
 ### 4.5 关闭态快路径
@@ -262,11 +262,19 @@ WaitDependency → Compute → TriggerEvent
 - SHMEM put 的信号触发由自身计算核完成，不额外记录公共 TriggerEvent；
 - 同一 worker 内 record 保持写入顺序，Host 导出时再按 cycle 稳定排序。
 
+显式 worker 队列启用就绪扫描和窗口重扫时，如果窗口内没有就绪任务，profiler 用
+`ReadyQueueWait` 记录 worker 从首次等待到选中下一任务的时间。该事件关联随后选中的任务，
+可能涵盖多个任务的依赖等待。`WaitDependency` 记录选中任务进入执行后对其自身依赖 event 的检查与等待，
+两种事件可以出现在同一条 worker 时间线上。FIFO 队列直接选队首，只记录任务级依赖等待。
+
 ### 5.2 通用名称
 
-公共 descId 至少覆盖 `WaitDependency` 和 `TriggerEvent`。图中的节点阶段会自动获得内部 descId；
+公共 descId 包括 `WaitDependency`、`ReadyQueueWait` 和 `TriggerEvent`。图中的节点阶段会自动获得内部 descId；
 Wait/Trigger 名称会携带当前 task 对应的图节点名称，例如 `GMM1_WaitDependency`。图外且没有阶段信息的
 task 仍使用 task type 兜底名称。
+
+只有以 task type 编码的记录才在 `args` 中输出 `task_type`。图阶段记录保留原始 `desc_id` 和可解析的
+`task_stage`。
 
 ### 5.3 简洁与详细名称
 
@@ -579,11 +587,9 @@ profiler.export_chrome_trace(f"rank{rank}_train_trace.json")
 from pathlib import Path
 from hyper_multicore.diagnostics import schedule as diagnostic_schedule
 
-
 def on_trace_ready(profiler):
     path = Path("./traces") / f"rank{rank}_window{profiler.step_num}.json"
     profiler.export_chrome_trace(path)
-
 
 with multicore_profiler.mega_kernel_profile(
     schedule=diagnostic_schedule(wait=1, warmup=1, active=2, repeat=3),
@@ -777,7 +783,7 @@ pytest -v tests/torch/test_mega_moe_profiling.py
 关闭态性能必须比较“完全没有 profiling runtime 的基线”和“包含能力但 schedule action 为 `NONE` 的产物”。
 测试应固定 workload、预热、采样轮数和 rank 聚合方式，并使用预先定义的回退门槛判断，而不是只比较一次均值。
 
-### 12.4 当前回归结果
+### 12.4 回归覆盖
 
 测试覆盖各 MegaKernel 的普通正反向结果、Profiler trace 完整性、L0 原始 dtype/硬链接、L1 task/worker
 隔离和 payload 数值，以及失败清理、调用计数器和缓存 plan 的隔离。CPU 模拟的规划/解码测试不能替代 NPU
@@ -801,6 +807,20 @@ pytest -v tests/torch/test_mega_moe_profiling.py
 | context 冲突 | 同一进程只允许一个非嵌套 active session |
 
 ---
+
+## MegaMoE 精度后端的采集范围
+
+BF16 与 MXFP8 使用公共 `TorchMegaKernelProfiler` 采集 task 内部时间线。
+MXFP8 的外层算子为 `HyperMegaMoeMxfp8` / `HyperMegaMoeMxfp8Grad`；正反向分别作为 invocation 记录。
+重计算执行正向算子；forward/recompute 的业务标签由调用方提供。MXFP8 后端的
+`mx_profile_scope(layer=..., phase=...)` 可附加 layer 与 forward/recompute/backward 标签。
+step、micro 和采样 rank 的筛选由训练框架适配层负责。
+
+MXFP8 使用展开后的 UINT8 buffer-list 物理 ABI，内部 profiler 按其真实参数布局绑定。
+该后端只支持 task profiler，尚无 L0/L1 Tensor dump 的物理端口合同；开启 dump 会报错。
+BF16 的 Tensor dump 支持范围以对应算子的端口定义及测试为准。
+normal 不分配内部 profiling buffer，不生成任务记录。profile 与 normal 的队列和数学配置相同，
+但采集本身具有执行和显存开销，采集样本不作为无打点性能数据。
 
 ## 14. 相关文档
 

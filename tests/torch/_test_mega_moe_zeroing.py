@@ -22,7 +22,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
-from hyper_multicore.modules.mega_moe import function as function_module
+from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
 from hyper_multicore.modules.mega_moe.workspace import MegaMoeWorkspace
 from tests.torch import _test_mega_moe as baseline
 from tests.common.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence

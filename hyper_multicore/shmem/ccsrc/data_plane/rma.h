@@ -17,6 +17,9 @@
 
 namespace hyper_multicore::shmem::data_plane {
 
+/** @brief Backend selected by the caller after Host capability validation. */
+enum class TransferEngine : uint32_t { Mte = 0, Udma = 1 };
+
 /** @brief Return the calling PE's Root rank. */
 ACLSHMEM_DEVICE int32_t my_pe() { return cann::device::my_pe(); }
 
@@ -32,6 +35,18 @@ template <typename T>
 __aicore__ inline void get_udma(GM_ADDR destination, GM_ADDR source, int64_t elements, int32_t source_pe, uint32_t qp) {
   if (elements != 0) {
     cann::device::get_udma<T>(destination, source, elements, source_pe, qp);
+  }
+}
+
+/**
+ * @brief Complete a PUT on the caller-selected, exclusively owned QP.
+ * @note A later Signal must be published only after this call returns.
+ * Source reuse is safe after return. Ordering across QPs is not implied.
+ */
+template <typename T>
+__aicore__ inline void put_udma(GM_ADDR destination, GM_ADDR source, int64_t elements, int32_t target_pe, uint32_t qp) {
+  if (elements != 0) {
+    cann::device::put_udma<T>(destination, source, elements, target_pe, qp);
   }
 }
 #endif
@@ -148,6 +163,66 @@ __aicore__ inline void get_pipelined(GM_ADDR destination, GM_ADDR source, int64_
   }
   AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
   AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+}
+
+/**
+ * @brief Complete one GET before a consumer may access the destination.
+ * @pre UDMA callers exclusively own the peer's QP0, including its quiet calls.
+ * @note Self traffic uses local MTE without the remote small-burst limit.
+ */
+template <typename T>
+__aicore__ inline void get_complete(GM_ADDR destination, GM_ADDR source, int64_t elements,
+                                  int32_t peer, TransferEngine engine) {
+  if (elements < 0 || static_cast<uint64_t>(elements) > ~uint64_t{0} / sizeof(T)) AscendC::Trap();
+  if (elements == 0) return;
+  if (peer == my_pe()) {
+    if (destination != source) get_pipelined<T>(destination, source, elements, peer, 0);
+    return;
+  }
+  if (engine == TransferEngine::Mte) {
+    get_pipelined<T>(destination, source, elements, peer);
+    return;
+  }
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+  if (engine == TransferEngine::Udma) {
+    get_udma<T>(destination, source, elements, peer, 0);
+    return;
+  }
+#endif
+  AscendC::Trap();
+}
+
+/**
+ * @brief Complete one PUT before publishing its separate remote-ready Signal.
+ * @pre UDMA callers exclusively own the peer's QP0 across post and quiet.
+ * @note Return permits source reuse; no expert, credit or task policy is implied.
+ */
+template <typename T>
+__aicore__ inline void put_complete(GM_ADDR destination, GM_ADDR source, int64_t elements,
+                                  int32_t peer, TransferEngine engine) {
+  if (elements < 0 || static_cast<uint64_t>(elements) > ~uint64_t{0} / sizeof(T)) AscendC::Trap();
+  if (elements == 0) return;
+  if (peer == my_pe()) {
+    if (destination != source) get_pipelined<T>(destination, source, elements, peer, 0);
+    return;
+  }
+  if (engine == TransferEngine::Mte) {
+    const uint64_t total = static_cast<uint64_t>(elements) * sizeof(T);
+    for (uint64_t offset = 0; offset < total;) {
+      const uint32_t bytes = total - offset < (1ULL << 28) ? total - offset : (1ULL << 28);
+      put(reinterpret_cast<__gm__ uint8_t*>(destination) + offset,
+          reinterpret_cast<__gm__ uint8_t*>(source) + offset, bytes, peer);
+      offset += bytes;
+    }
+    return;
+  }
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+  if (engine == TransferEngine::Udma) {
+    put_udma<T>(destination, source, elements, peer, 0);
+    return;
+  }
+#endif
+  AscendC::Trap();
 }
 
 }  // namespace hyper_multicore::shmem::data_plane

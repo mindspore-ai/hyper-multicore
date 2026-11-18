@@ -77,7 +77,7 @@ class SwiGLUFillConfig(FillConfig):
     SwiGLU fill config — forward (TASK_SWI_GLU) and backward (TASK_SWI_GLU_GRAD).
 
     ``clamp_limit`` is serialized in ``TaskDesc.extra_value_0``.  Zero keeps
-    the legacy unclamped path; a positive value enables clipped SwiGLU.
+    the unclamped path; a positive value enables clipped SwiGLU.
     """
 
     clamp_limit: float | None = None

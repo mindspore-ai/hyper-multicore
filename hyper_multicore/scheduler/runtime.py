@@ -30,6 +30,8 @@ from hyper_multicore.scheduler.config import (
     TaskDescC,
 )
 
+from hyper_multicore.scheduler.worker_queues import serialize_worker_queues
+
 RUNTIME_HEADER_BYTES = ctypes.sizeof(RuntimeConfigC)
 TASK_DESC_SIZE = ctypes.sizeof(TaskDescC)
 RUNTIME_FIXED_BYTES = (
@@ -169,7 +171,9 @@ def runtime_config_task_capacity(cfg: RuntimeConfigC) -> int:
 def copy_runtime_config(cfg: RuntimeConfigC) -> RuntimeConfigC:
     """Copy wire storage and retain the graph-owned host validation contract."""
     result = type(cfg).from_buffer_copy(bytes(cfg))
-    result.task_validator = getattr(cfg, "task_validator", None)
+    result.__dict__.update(cfg.__dict__)
+    if hasattr(cfg, "worker_queues"):
+        result.worker_queues = type(cfg.worker_queues).from_buffer_copy(bytes(cfg.worker_queues))
     return result
 
 
@@ -202,7 +206,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     layout = type(cfg)
     address = ctypes.addressof(cfg)
     prefix = struct.pack(
-        "<11I20x",
+        "<12I16x",
         cfg.task_num,
         cfg.num_workers,
         capacity,
@@ -213,7 +217,8 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         cfg.aiv_profile_record_capacity,
         cfg.completion_event,
         cfg.protocol_version,
-        cfg.vector_ready_queue,
+        cfg.queue_layout,
+        expected if cfg.queue_layout == 2 else 0,
     )
     sections = [
         (layout.all_event_num_triggers.offset, event_capacity * 4),
@@ -230,4 +235,8 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     data = prefix + b"".join(ctypes.string_at(address + offset, size) for offset, size in sections)
     if len(data) != expected:
         raise RuntimeError(f"runtime serialization produced {len(data)} bytes, expected {expected}")
+    if cfg.queue_layout == 2:
+        data += serialize_worker_queues(cfg)
+    elif cfg.queue_layout != 0:
+        raise ValueError(f"Unknown worker queue layout: {cfg.queue_layout}")
     return data

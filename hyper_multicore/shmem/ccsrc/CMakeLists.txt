@@ -114,10 +114,11 @@ if(BUILD_TESTING)
     set(multicore_test_root
         "${CMAKE_CURRENT_LIST_DIR}/../../../tests/ut")
     add_executable(hyper_multicore_shmem_native_config_test
-        ${multicore_test_root}/shmem/cpp/native_config_test.cpp
-        runtime/config.cpp)
+        ${multicore_test_root}/shmem/cpp/native_config_test.cpp)
     target_include_directories(hyper_multicore_shmem_native_config_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(hyper_multicore_shmem_native_config_test PRIVATE
+        hyper_multicore_shmem_runtime)
     hp_enable_compile_hardening(hyper_multicore_shmem_native_config_test)
     add_test(NAME shmem_config
         COMMAND hyper_multicore_shmem_native_config_test)

@@ -1,0 +1,48 @@
+--- a/activation/swi_glu_grad/op_kernel/arch35/swi_glu_grad_base.h
++++ b/activation/swi_glu_grad/op_kernel/arch35/swi_glu_grad_base.h
+@@ -44,7 +44,7 @@
+ class SwiGluGradBaseKernel {
+ public:
+     __aicore__ inline SwiGluGradBaseKernel() = default;
+-    __aicore__ inline bool InitBase(const GluBaseTilingData& tilingData);
++    __aicore__ inline bool InitBase(const GluBaseTilingData& tilingData, int32_t logicalIndex = -1);
+ 
+ protected:
+     __aicore__ inline void LoadOneTensor(const __local_mem__ void *input, MicroAPI::RegTensor<float> &dst, MicroAPI::MaskReg &preg, uint32_t offset);
+@@ -80,9 +80,9 @@
+ };
+ 
+ template <typename T>
+-__aicore__ inline bool SwiGluGradBaseKernel<T>::InitBase(const GluBaseTilingData& tilingData)
+-{
+-    blockIdx_ = GetBlockIdx();
++__aicore__ inline bool SwiGluGradBaseKernel<T>::InitBase(const GluBaseTilingData& tilingData, int32_t logicalIndex)
++{
++    blockIdx_ = logicalIndex < 0 ? GetBlockIdx() : logicalIndex;
+     usedCoreNum_ = tilingData.usedCoreNum;
+     if (blockIdx_ >= usedCoreNum_) {
+         return false;
+--- a/activation/swi_glu_grad/op_kernel/arch35/swi_glu_grad_move_align.h
++++ b/activation/swi_glu_grad/op_kernel/arch35/swi_glu_grad_move_align.h
+@@ -25,7 +25,7 @@
+ class SwiGluGradMoveAlignKernel : public SwiGluGradBaseKernel<T> {
+ public:
+     __aicore__ inline SwiGluGradMoveAlignKernel(TPipe &pipe): pipe_(pipe) {};
+-    __aicore__ inline void Init(GM_ADDR grad, GM_ADDR x, GM_ADDR out, const GluBaseTilingData& tilingData);
++    __aicore__ inline void Init(GM_ADDR grad, GM_ADDR x, GM_ADDR out, const GluBaseTilingData& tilingData, int32_t logicalIndex = -1);
+     __aicore__ inline void Process();
+ 
+ protected:
+@@ -63,9 +63,9 @@
+ };
+ 
+ template <typename T>
+-__aicore__ inline void SwiGluGradMoveAlignKernel<T>::Init(GM_ADDR grad, GM_ADDR x, GM_ADDR out, const GluBaseTilingData& tilingData)
+-{
+-    if (!this->InitBase(tilingData)) {
++__aicore__ inline void SwiGluGradMoveAlignKernel<T>::Init(GM_ADDR grad, GM_ADDR x, GM_ADDR out, const GluBaseTilingData& tilingData, int32_t logicalIndex)
++{
++    if (!this->InitBase(tilingData, logicalIndex)) {
+         return;
+     }
+ 

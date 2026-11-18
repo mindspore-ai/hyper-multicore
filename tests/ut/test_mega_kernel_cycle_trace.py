@@ -19,6 +19,7 @@ import unittest
 from hyper_multicore.diagnostics.profiler.cycle_trace import (
     CORE_HEADER,
     CUBE_SLOT_COUNT,
+    GRAPH_STAGE_DESC_BASE,
     INVALID_OWNER_ID,
     PROFILE_RECORD,
     TASK_TYPE_NAMES,
@@ -94,7 +95,7 @@ def _parse(
             detailed_task_names=detailed_task_names,
             kernel_name="MegaMoe",
             owner_label="Expert",
-            stage_names={0x10002: "GMM1"},
+            stage_names={0x10002: "GMM1", GRAPH_STAGE_DESC_BASE: "GMM1"},
             soc_name="Ascend910B3",
             task_stage_names={9: "GMM1"},
             cube_slot_count=cube_slot_count,
@@ -159,6 +160,22 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
 
         self.assertEqual(event["name"], f"TaskType_{unknown_task_type}")
         self.assertEqual(event["args"]["task_type"], unknown_task_type)
+
+    def test_graph_stage_descriptor_does_not_imply_task_type(self):
+        """Preserve graph stage labels and raw IDs without inventing task types."""
+        for desc_id, name in (
+            (GRAPH_STAGE_DESC_BASE, "GMM1"),
+            (GRAPH_STAGE_DESC_BASE + 1, f"DescId_{GRAPH_STAGE_DESC_BASE + 1}"),
+        ):
+            with self.subTest(desc_id=desc_id):
+                trace = _parse(_profile_buffer(desc_id=desc_id))
+                event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
+
+                self.assertEqual(event["name"], name)
+                self.assertEqual(event["args"]["desc_id"], desc_id)
+                self.assertEqual(event["args"]["task_stage"], "GMM1")
+                self.assertNotIn("task_type", event["args"])
+                self.assertEqual(trace["megaKernelCycleTrace"]["recordCount"], 1)
 
     def test_registered_mhc_post_task_type_preserves_its_name(self):
         """Decode registered MHC task 107 instead of treating it as unknown."""

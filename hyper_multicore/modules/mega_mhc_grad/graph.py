@@ -194,7 +194,7 @@ def _append_task(
     task.task_split_value = split_value
     # Reuse the current runtime ABI's third task-specific value for the
     # dependency polling interval required by the 4-task backward pipeline.
-    task.extra_value_2 = dependency_poll_interval_us
+    task.dependency_poll_interval_us = dependency_poll_interval_us
     task_id = tsv.pre_task_num
     cfg.all_tasks[task_id] = task
     if core_type == TaskAiCoreType.TASK_AICORE_CUBE:

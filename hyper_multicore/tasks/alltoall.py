@@ -160,3 +160,17 @@ class AllToAllFillConfig(FillConfig):
             advance_tsv_vector(tsv, task_num, event_group_size=self.event_group)
         else:   # "vector_only"
             advance_tsv_vector_only(tsv, task_num)
+
+
+class ShmemTransferEngine(IntEnum):
+    """Transport-owned engine bit; independent of dependency polling and payload."""
+    MTE = 0
+    UDMA = 16
+
+
+def set_transfer_engine(task: TaskDescC, engine: str) -> None:
+    """Encode an engine without touching partition, scalar payload or runtime fields."""
+    if engine not in ("mte", "udma"):
+        raise ValueError("SHMEM transfer engine must be mte or udma")
+    task.extra_value_1 = (task.extra_value_1 & ~16) | int(
+        ShmemTransferEngine.UDMA if engine == "udma" else ShmemTransferEngine.MTE)

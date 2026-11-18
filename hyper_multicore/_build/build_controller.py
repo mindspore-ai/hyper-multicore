@@ -102,7 +102,8 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
     payload.mkdir()
     env = adapter_environment(python, isolated=run.isolated)
     compile_adapter(python, directory / "torch", payload, "torch",
-                    [f"-DHP_MULTICORE_VENDOR_ROOT={common / 'lib/vendors/hyper_multicore_nn'}"],
+                    [f"-DHP_MULTICORE_VENDOR_ROOT={common / 'lib/vendors/hyper_multicore_nn'}",
+                     "-DHP_MULTICORE_NPU_ARCHS=" + ";".join(str(sdk["npu_arch"]) for sdk in sdks.values())],
                     args, run, env, identifier)
     validate_elf(payload / "libhyper_multicore_torch.so", identity["host_arch"], run.commands, env)
     for backend, sdk in sdks.items():
@@ -365,6 +366,7 @@ def build_common(args, run: BuildContext, python: Path):
                    kernel_root=f"lib/vendors/hyper_multicore_nn/op_impl/ai_core/tbe/kernel/{name}")
     env.update(HP_OPS_NN_SOURCE=prepared["ops_nn_source"],
                HP_OPS_TRANSFORMER_SOURCE=prepared["ops_transformer_source"],
+               HP_OPS_TENSOR_SOURCE=prepared.get("ops_tensor_source", ""),
                HP_VENDOR_HOST_IDENTITY=prepared["host_input_identity"])
     build_vendors(command, prepared["pending"], args.jobs, run, env)
     run.commands(command + ["--phase", "merge"], label="common-merge", env=env)

@@ -18,7 +18,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +25,7 @@ from pathlib import Path
 import torch
 
 from tests.common.mark_utils import arg_mark
+from tests.common.native_sources import native_source
 
 _STUB_HEADERS = {
     "launch_test_state.h": """#pragma once
@@ -33,6 +33,7 @@ namespace launch_test {
 extern int callback_status;
 extern int last_status;
 extern int status_reads;
+extern int npu_arch;
 }
 """,
     "torch_npu/csrc/core/npu/NPUStream.h": """#pragma once
@@ -64,32 +65,18 @@ struct OpCommand {
 #include "launch_test_state.h"
 constexpr int ACL_SUCCESS = 0;
 constexpr int ACL_DEV_ATTR_VECTOR_CORE_NUM = 1;
+constexpr int ACL_DEV_ATTR_NPU_ARCH = 601;
 constexpr int ACL_RT_THREAD_LEVEL = 0;
-inline int aclrtGetDeviceInfo(int, int, int64_t* cores) { *cores = 40; return ACL_SUCCESS; }
+inline int aclrtGetDeviceInfo(int, int attr, int64_t* value) {
+    *value = attr == ACL_DEV_ATTR_NPU_ARCH ? launch_test::npu_arch : 40;
+    return ACL_SUCCESS;
+}
 inline int aclrtPeekAtLastError(int) {
     ++launch_test::status_reads;
     return launch_test::last_status;
 }
 """,
 }
-
-
-def _native_utility_source(root: Path) -> Path:
-    """Read production C++ from a checkout or the source archive in the CI test bundle."""
-    source_root = Path(__file__).resolve().parents[3]
-    relative = Path("hyper_multicore/torch/csrc/mega_moe_utilities.cpp")
-    source = source_root / relative
-    if source.is_file():
-        return source
-    with tarfile.open(source_root / "hyper-multicore.tar") as archive:
-        members = [member for member in archive.getmembers()
-                   if member.isfile() and Path(member.name).parts[-len(relative.parts):] == relative.parts]
-        if len(members) != 1:
-            raise RuntimeError("The test bundle must contain exactly one production mega_moe_utilities.cpp")
-        with archive.extractfile(members[0]) as content:
-            source = root / relative.name
-            source.write_bytes(content.read())
-    return source
 
 
 def _compile_native_utilities(root: Path) -> Path:
@@ -102,7 +89,7 @@ def _compile_native_utilities(root: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
     torch_root = Path(torch.__file__).resolve().parent
-    source = _native_utility_source(root)
+    source = native_source(Path("hyper_multicore/torch/csrc/mega_moe_utilities.cpp"), root)
     standard = re.search(r"C\+\+ Version: (\d+)", torch.__config__.show())
     if standard is None:
         raise RuntimeError("Torch does not report its required C++ standard")
@@ -111,7 +98,7 @@ def _compile_native_utilities(root: Path) -> Path:
     library_path = ":".join(str(path) for path in (torch_root / "lib", torch_root.parent / "torch.libs")
                             if path.is_dir())
     result = subprocess.run([
-        compiler, f"-std={cpp_standard}", "-O0",
+        compiler, f"-std={cpp_standard}", "-O0", "-DHMC_UTILITY_ARCH2201=1", "-DHMC_UTILITY_ARCH3510=1",
         f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
         "-I", str(root), "-I", str(torch_root / "include"),
         "-I", str(torch_root / "include/torch/csrc/api/include"),
@@ -134,13 +121,13 @@ class TestNativeUtilities(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_route_offsets_propagates_launch_status(self) -> None:
         """Feature: Native routing launch error propagation.
-        Description: Execute the real RouteOffsets callback with successful and failed launches.
-        Expectation: RunOpApi receives the immediate status and reports launch failures to the caller.
+        Description: Execute RouteOffsets for supported NPU architectures and an unsupported architecture.
+        Expectation: Select the matching provider, propagate launch errors and reject unsupported devices before launch.
         """
         with tempfile.TemporaryDirectory(prefix="hmc-native-utilities-") as directory:
             executable = _compile_native_utilities(Path(directory))
-            for status in (0, 17):
-                with self.subTest(status=status):
-                    result = subprocess.run([str(executable), str(status)],
+            for arch, status in ((2201, 0), (2201, 17), (3510, 0), (3510, 17), (9999, 0)):
+                with self.subTest(arch=arch, status=status):
+                    result = subprocess.run([str(executable), str(status), str(arch)],
                                             check=False, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)

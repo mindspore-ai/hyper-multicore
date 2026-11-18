@@ -98,7 +98,7 @@ MegaKernel是融合任务的执行方式；MegaMoe是使用该方式的业务模
 | 所有者 | 负责的状态与行为 |
 | --- | --- |
 | [Multicore资源管理](../hyper_multicore/modules/module.py) | 模块成员、兼容资源共享、延迟绑定、协调关闭 |
-| [MegaMoe spec与plan](../hyper_multicore/modules/mega_moe/plan.py) | 业务规格、正反向计算图、任务/事件配置和tiling |
+| [MegaMoe spec](../hyper_multicore/modules/mega_moe/spec.py)、[BF16 plan](../hyper_multicore/modules/mega_moe/backends/bf16/plan.py)、[MX graph](../hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py) | 业务规格、精度后端的正反向图、任务/事件及 tiling |
 | [MegaMoe HeapManager](../hyper_multicore/modules/mega_moe/heap_manager.py) | reservation、layout、容量预算、替换描述、业务epoch和growth record |
 | [MegaMoe workspace](../hyper_multicore/modules/mega_moe/workspace.py) | Tensor字段映射、lease、完成事件、反向图使用关系和业务计数器布局 |
 | [SHMEM lifecycle](../hyper_multicore/shmem/_lifecycle.py) | 引用、Root一致性、阶段收敛、物理restart编排和进程级不可用标记 |
@@ -237,7 +237,7 @@ Put、Get和Signal均为stream入队语义，返回不表示远端消费已经�
 Runtime初始化时冻结当前NPU设备。`empty`、`barrier`、`signal`、`wait_signal`以及实际发射设备任务的非零
 `put`、`get`和`all_gather`会拒绝其他设备的stream。零字节Put、Get和AllGather完成本地参数校验后不发射任务。
 
-后端兼容性使用CANN查询的NPU架构判断：910B/910C为`2201`，950PR/950DT为`3510`。
+后端兼容性按 CANN 查询的 NPU 架构判断。Atlas A2/A3 系列为 `2201`（`arch22`），Ascend950 PR/DT 为 `3510`（`arch35`）。
 `device_soc_name`保留`aclrtGetSocName()`返回的完整型号原文。
 
 ### 3.5 诊断
@@ -402,12 +402,13 @@ flowchart TB
 | `HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 普通WORLD或单进程初始化endpoint；子组及显式heap初始化使用独立unique ID |
 | `SHMEM_UID_SOCK_IFNAME` | CANN自动选择 | 子组UID bootstrap使用的Host网卡，所有group成员必须可达 |
 | `HYPER_MULTICORE_SHMEM_TIMEOUT_SEC` | 120 | Runtime超时秒数 |
-| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `mte` | 数据搬移引擎，支持`mte`；Ascend950后端另支持`mte_udma` |
+| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | Ascend950 为 `mte_udma`，arch22 为 `mte` | 数据搬移引擎。两种后端都支持 `mte`，只有 Ascend950 支持 `mte_udma`。 |
 | `SHMEM_LOG_LEVEL` | `ERROR` | CANN及HP SHMEM日志级别：`DEBUG`、`INFO`、`WARN`、`ERROR`或`FATAL` |
 | `SHMEM_LOG_TO_STDOUT` | `0` | `1`输出到stdout且不落盘；其他值使用文件sink |
 | `SHMEM_LOG_PATH` | `${HOME}/shmem/log` | CANN及HP SHMEM日志的统一落盘目录 |
 
-引擎配置控制SHMEM初始化，`mte_udma`的UDMA QP数固定为1，算子的具体传输路径由设备代码决定。
+在各 rank 启动前设置相同的引擎配置，并在 SHMEM 生命周期内保持不变。未显式设置时，MegaMoE
+沿用已初始化的 SHMEM 引擎。`mte_udma` 的 UDMA QP 数固定为 1，算子的具体传输路径由设备代码决定。
 
 CANN和HP日志共用SHMEM原生sink，由它统一补充时间戳、级别、TID和PID，并负责级别过滤、stdout选择及文件
 轮转。原始CANN正文保持`[SHM_SHMEM file:line]`格式；HP正文使用

@@ -25,10 +25,15 @@ void check(bool condition, const char *message) {
 }
 
 void test_data_engine_configuration() {
+#ifdef HP_SHMEM_ASCEND950
+  constexpr auto default_engine = DataEngine::MteUdma;
+#else
+  constexpr auto default_engine = DataEngine::Mte;
+#endif
   const struct {
     const char *engine;
     DataEngine expected;
-  } cases[] = {{nullptr, DataEngine::Mte}, {"mte", DataEngine::Mte}, {"mte_udma", DataEngine::MteUdma}};
+  } cases[] = {{nullptr, default_engine}, {"mte", DataEngine::Mte}, {"mte_udma", DataEngine::MteUdma}};
   for (const auto &entry : cases) {
     unsetenv("HYPER_MULTICORE_SHMEM_DATA_ENGINE");
     if (entry.engine != nullptr) setenv("HYPER_MULTICORE_SHMEM_DATA_ENGINE", entry.engine, 1);

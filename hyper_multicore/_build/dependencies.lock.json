@@ -18,11 +18,6 @@
       "torch_cxx11_abi": "reported by the active torch package"
     }
   },
-  "local_compatibility": {
-    "cann": [
-      "9.2.0"
-    ]
-  },
   "components": {
     "multicore": {
       "ops_nn": {
@@ -44,8 +39,7 @@
           },
           {
             "path": "hyper_multicore/ops/patches/swi_glu_clamp.patch",
-            "sha256": "76b7b95498bee3560bb1068a6592e672aa326aa4b06c0d2459d4217864faeb06",
-            "allow_zero_context": true,
+            "sha256": "b8c29dfa3b3f819a21441aaa62de466a6c159c1d09f14dd4085ca89c07cd2a7f",
             "purpose": "add optional pre/post-SiLU clipping and dynamic tail bounds"
           },
           {
@@ -57,6 +51,22 @@
             "path": "hyper_multicore/ops/patches/rms_norm_grad_worker_fusion.patch",
             "sha256": "0d6eacd29418c897cd3ac42bd4b62eb331912a62a36fa506a4df80f6fffd1ce2",
             "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
+          },
+          {
+            "path": "hyper_multicore/ops/patches/swiglu_grad_logical_worker.patch",
+            "sha256": "113578566e9f254061f746bd25e0df03d8440c75f46d6b16fdad445ab4120a50",
+            "purpose": "supply a task-local logical vector index without changing SwiGLUGrad mathematics",
+            "architectures": [
+              "arch35"
+            ]
+          },
+          {
+            "path": "hyper_multicore/ops/patches/mx_quant_logical_workers.patch",
+            "sha256": "e29002ac109e79cf1ef6171101f4a6ddabc1a7cc0edbf9a9dfbba66bdd2b86c3",
+            "purpose": "supply logical vector indices for standard MX quant and activation kernels",
+            "architectures": [
+              "arch35"
+            ]
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -152,16 +162,28 @@
         "git_archive_tar_sha256": "0a59c5f4e31190d4ab72e4adaac69a978199c2da1989bfc6273de21f4dc016e4",
         "resolution": "SHMEM Ascend950 topology-reader header dependency; copied only to the isolated SDK source",
         "packaging_policy": "build-only header dependency; not a Python runtime requirement"
+      },
+      "ops_tensor": {
+        "version": "c350b98e15",
+        "repository": "https://gitcode.com/cann/ops-tensor.git",
+        "fetch_ref": "c350b98e15dfd31c9b06464d1dfdfa1ad06a939b",
+        "tag_object": null,
+        "commit": "c350b98e15dfd31c9b06464d1dfdfa1ad06a939b",
+        "tree": "f60225e2beb7d59a55c095a7c0c650f46540aa78",
+        "git_archive_tar_sha256": "6ac45efc6377f5843a2ba0db908075a0008f1d6679e01646b466990b75e907b4",
+        "resolution": "Blaze GMM source pinned by ops-transformer dff221330e; exported from this exact Git revision",
+        "patches": [
+          {
+            "path": "hyper_multicore/ops/patches/blaze_gmm_logical_workers.patch",
+            "sha256": "76cd743f4ce1f41cdde5ae1ba8953a32d2535f58f64dcaaa6a56821bd3fd9f36",
+            "purpose": "BF16 and MXFP8 GMM task-local entry and logical-worker binding for arch35; standard mathematics unchanged",
+            "architectures": [
+              "arch35"
+            ]
+          }
+        ],
+        "upgrade_policy": "preserve task-local numerical and resource contracts; verify BF16 and MX independently"
       }
     }
-  },
-  "current_repository_baseline": {
-    "shmem": "v1.8.0",
-    "ops_nn": "v9.1.0.pre",
-    "ops_transformer": {
-      "gmm": "v9.1.0.pre",
-      "mhc": "58b4a6bde"
-    },
-    "multicore_input": "locked ops-nn and ops-transformer kernel source plus the selected installed CANN >=9.1.0 toolchain"
   }
 }

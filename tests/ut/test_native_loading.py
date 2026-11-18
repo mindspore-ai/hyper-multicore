@@ -123,21 +123,21 @@ class TestNativeLoading(unittest.TestCase):
                     self.assertRaisesRegex(_loader.NativeComponentUnavailableError, "No packaged SHMEM backend"):
                 _loader.select_native_shmem(selected)
 
-    def test_arch_query_uses_visible_device_zero_and_propagates_failure(self):
+    def test_arch_query_uses_requested_visible_device_and_propagates_failure(self):
         """The ACL query needs no selected device or framework initialization."""
         def query(device: int, attribute: int, output: object) -> int:
             """Write the fixture architecture through the ACL output pointer."""
-            self.assertEqual((device, attribute), (0, 601))
+            self.assertEqual((device, attribute), (2, 601))
             ctypes.cast(output, ctypes.POINTER(ctypes.c_int64))[0] = 3510
             return 0
 
         function = Mock(side_effect=query)
         with patch.object(_loader.ctypes, "CDLL", return_value=SimpleNamespace(aclrtGetDeviceInfo=function)):
-            self.assertEqual(_loader.query_npu_arch(), 3510)
+            self.assertEqual(_loader.query_npu_arch(2), 3510)
             function.side_effect = None
             function.return_value = 507899
-            with self.assertRaisesRegex(_loader.NativeComponentUnavailableError, "507899"):
-                _loader.query_npu_arch()
+            with self.assertRaisesRegex(_loader.NativeComponentUnavailableError, "visible device 2: 507899"):
+                _loader.query_npu_arch(2)
 
     def test_shmem_first_use_loads_one_local_dependency_chain(self):
         """Concurrent first use loads only the chosen backend and subsequent calls reuse it."""

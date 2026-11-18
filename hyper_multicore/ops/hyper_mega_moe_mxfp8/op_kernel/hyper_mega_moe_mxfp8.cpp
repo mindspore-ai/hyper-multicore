@@ -1,0 +1,10 @@
+// Copyright (c) 2026 Huawei Technologies Co., Ltd.
+#include "common/mega_moe/mxfp8_worker.h"
+#include "hyper_mega_moe_mxfp8_tiling_key.h"
+template <int8_t MX_MIX>
+__global__ __aicore__ void hyper_mega_moe_mxfp8(
+    GM_ADDR buffers, GM_ADDR runtime, GM_ADDR events, GM_ADDR diagnostic,
+    GM_ADDR launch_metadata, GM_ADDR buffers_ref, GM_ADDR workspace, GM_ADDR tiling) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+  RunMegaMoeMxfp8(buffers, runtime, events, diagnostic, launch_metadata);
+}

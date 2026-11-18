@@ -26,7 +26,6 @@ inline constexpr std::string_view kBootstrapEndpointEnv = "HYPER_MULTICORE_SHMEM
 
 inline constexpr uint64_t kDefaultHeapSizeBytes = 1073741824ULL;
 inline constexpr uint32_t kDefaultTimeoutSeconds = 120U;
-inline constexpr std::string_view kDefaultDataEngine = "mte";
 inline constexpr std::string_view kDefaultBootstrapEndpoint = "tcp://127.0.0.1:8662";
 inline constexpr std::size_t kMaxBootstrapEndpointBytes = 63U;
 

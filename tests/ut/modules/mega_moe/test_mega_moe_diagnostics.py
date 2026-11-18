@@ -18,7 +18,7 @@ import unittest
 
 from hyper_multicore.diagnostics.common.graph import DiagnosticSpec, build_graph_metadata
 from hyper_multicore.modules.mega_moe.diagnostics import _mega_moe_owner_options
-from hyper_multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_multicore.modules.mega_moe.backends.bf16.forward.graph import build_forward_graph
 from hyper_multicore.scheduler.config import TaskDescC, TaskSplitValue, TaskType
 from hyper_multicore.scheduler.runtime import allocate_runtime_config
 from tests.common.mark_utils import arg_mark

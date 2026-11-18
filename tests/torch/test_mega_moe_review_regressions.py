@@ -40,7 +40,7 @@ def _run_review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: st
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", "1")
     monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment(), capture_worker_logs(_WORKER, case, tmp_path / "worker_logs"):
-        run_multicore_case(_WORKER, case, num_proc=1, timeout=420)
+        run_multicore_case(_WORKER, case, num_proc=1, timeout=420, device_timeout=900)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",

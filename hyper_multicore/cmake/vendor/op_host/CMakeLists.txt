@@ -19,6 +19,8 @@ set(MHC_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_mhc/op_host)
 set(MHC_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_mhc_grad/op_host)
 set(GATE_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate/op_host)
 set(GATE_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate_grad/op_host)
+set(MX_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_host)
+set(MX_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8_grad/op_host)
 set(CANN_PACKAGE_ARCH_ROOT ${ASCEND_CANN_PACKAGE_PATH})
 string(APPEND CANN_PACKAGE_ARCH_ROOT "/${CMAKE_SYSTEM_PROCESSOR}-linux")
 set(MHC_GRAD_TILING
@@ -51,6 +53,8 @@ set(OP_SCHEMA_SOURCES
     ${GATE_HOST}/hyper_mega_gate_route_infershape.cpp
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_def.cpp
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_infershape.cpp
+    ${MX_HOST}/hyper_mega_moe_mxfp8_def.cpp
+    ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_def.cpp
 )
 set(OP_TILING_SOURCES
     ${FWD_HOST}/hyper_mega_moe_tiling.cpp
@@ -62,7 +66,11 @@ set(OP_TILING_SOURCES
     ${MHC_GRAD_TILING}/mhc_pre_sinkhorn_backward_arch22_tiling.cpp
     ${GATE_HOST}/hyper_mega_gate_route_tiling.cpp
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
+    ${MX_HOST}/hyper_mega_moe_mxfp8_tiling.cpp
+    ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_tiling.cpp
 )
+
+include_directories(${MX_HOST} ${MX_GRAD_HOST} ${HP_MULTICORE_SOURCE_ROOT})
 
 function(hp_generate_op_definitions)
     set(ASCEND_COMPUTE_UNIT ${HP_MULTICORE_REGISTERED_SOCS})
@@ -74,15 +82,27 @@ function(hp_generate_op_definitions)
         COMPILE_OPTIONS
             -I${CANN_OP_COMMON_INCLUDE}
             -I${CANN_OP_HOST_INCLUDE}
+            -I${HP_MULTICORE_SOURCE_ROOT}
     )
 endfunction()
 hp_generate_op_definitions()
 
 foreach(hp_soc IN LISTS HP_MULTICORE_REGISTERED_SOCS)
+    set(hp_ops_ini "${ASCEND_AUTOGEN_PATH}/aic-${hp_soc}-ops-info.ini")
+    if(hp_soc STREQUAL "ascend910b" OR hp_soc STREQUAL "ascend910_93")
+        # CANN generates default device entries even for schemas without an AddConfig for this SoC.
+        execute_process(
+            COMMAND "${ASCEND_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/filter_mxfp8_ops_info.py" "${hp_ops_ini}"
+            RESULT_VARIABLE hp_filter_result
+        )
+        if(NOT hp_filter_result STREQUAL "0")
+            message(FATAL_ERROR "Failed to filter MXFP8 from ${hp_ops_ini}: ${hp_filter_result}")
+        endif()
+    endif()
     if(NOT hp_soc STREQUAL ASCEND_COMPUTE_UNIT)
         set(hp_ops_info "${CMAKE_CURRENT_BINARY_DIR}/aic-${hp_soc}-ops-info.json")
         add_ops_info_target(TARGET hp_ops_info_${hp_soc}
-            OPS_INFO ${ASCEND_AUTOGEN_PATH}/aic-${hp_soc}-ops-info.ini
+            OPS_INFO ${hp_ops_ini}
             OUTPUT ${hp_ops_info}
         )
         install(FILES ${hp_ops_info} DESTINATION
@@ -106,6 +126,10 @@ set(ACLNN_SOURCES
     ${GATE_GRAD_HOST}/op_api/hyper_mega_gate_route_grad_post.cpp
     ${GATE_GRAD_HOST}/op_api/linear_index/linear_index.cpp
 )
+list(APPEND ACLNN_SOURCES
+    ${MX_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
+    ${MX_GRAD_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp)
+
 npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
 target_include_directories(cust_opapi PRIVATE
@@ -183,6 +207,8 @@ npu_op_package_add(${package_name}
 npu_op_package_add(${package_name}
     TYPE ACLNN
     FILES
+        ${MX_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8.h
+        ${MX_GRAD_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8_grad.h
         ${FWD_HOST}/op_api/aclnn_hyper_mega_moe.h
         ${BWD_HOST}/op_api/aclnn_hyper_mega_moe_grad.h
         ${MHC_HOST}/op_api/aclnn_hyper_mega_mhc.h
