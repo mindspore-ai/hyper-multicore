@@ -183,14 +183,17 @@ M 和 N 必须均为 64 的倍数。root 上的物理字段按以下布局解释
 
 | 属性 | dtype | 消费时的视图 | 何时必须存在 |
 | --- | --- | --- | --- |
-| `col_data` | `torch.float8_e4m3fn` | `[e,M,N]` | 前向和反向 |
-| `col_scale` | `torch.uint8`，物理 E8M0 编码 | `[e,M/64,N,2]` | 前向和反向 |
+| `col_data` | `torch.float8_e4m3fn` | `[e,M,N]` | 前向（包括重算） |
+| `col_scale` | `torch.uint8`，物理 E8M0 编码 | `[e,M/64,N,2]` | 前向（包括重算） |
 | `row_data` | `torch.float8_e4m3fn` | `[e,M,N]` | 反向 |
 | `row_scale` | `torch.uint8`，物理 E8M0 编码 | `[e,M,N/64,2]` | 反向 |
 
 当前阶段所需的物理 Tensor 必须连续，元素数量能按表中形状建立视图，并与 root、输入位于同一 NPU；
 执行器不会通过隐式复制修复存储。scale 最后一维的两个值分别对应同一 64 元素组中的两个 32 元素量化块。
 行向和列向数据分别与各自的 scale 配套，不能用同一份量化结果任意替代两种方向。
+
+前向需要当前的 `col_data/col_scale`，反向只需要当前的 `row_data/row_scale`。
+如果反向期间执行前向重算，重算时仍需提供 col 方向数据。
 
 调用方负责量化并提供这些字段。FSDP 等参数管理机制应在前向、反向各自的 gather 完成后，
 将当前物理字段更新到同一个原始 root 上；执行器保留 root，并在反向重新读取字段，
