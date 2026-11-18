@@ -68,8 +68,8 @@ pip and Python imports do not compile native code.
 ## Development and tests
 
 Python, device kernels and native bindings live under `hyper_multicore/`.
-HyperParallel is a downstream consumer; building, testing and using this package
-does not require it.
+Other software projects can use this package through its public APIs. Building,
+testing and using this package does not require a downstream project.
 
 From the source root, install development dependencies and run the CPU tests:
 
@@ -127,6 +127,7 @@ and are not part of these three hooks.
 
 | Guide | Contents |
 | --- | --- |
+| [Development instructions](AGENTS.md) | Ownership rules, change workflow and validation navigation |
 | [Build and installation](docs/build.md) | Environment, build commands, artifacts, installation and activation |
 | [Component usage](hyper_multicore/README.md) | Public APIs and configuration |
 | [Testing](tests/README.md) | Test scope, contribution, execution and troubleshooting |

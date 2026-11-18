@@ -216,7 +216,7 @@ Ascend950 的 SHMEM 默认启用 `mte_udma`，BF16 和 MXFP8 的专家通信随�
 
 ### 下游模型集成
 
-DSV4.1、Qwen 和 TP/SP/CP/EP/FSDP 模型适配器及其集成测试由 HyperParallel 下游维护。
+具体模型及 TP/SP/CP/EP/FSDP 适配器与集成测试由使用本包的各下游项目维护。
 本仓只提供独立组件及其公共接口，不包含模型 YAML 或下游训练入口，也不依赖下游来完成测试。
 
 ### 输入与权重
@@ -347,7 +347,7 @@ source 容量、调度行数与实际 owner 接收量分别维护：source/返�
 
 扩容可能集体重启同一 SHMEM root 的 runtime，再恢复受管 workspace；外部专家参数不移动。
 `HYPER_MULTICORE_SHMEM_HEAP_SIZE` 可设置固定字节预算；预算不足或不能安全重启时明确失败。
-容量策略、固定预算和失败恢复的完整契约见 [SHMEM runtime restart](../docs/shmem.md#4-runtime-restart)。
+容量策略、固定预算和失败恢复的完整契约见 [SHMEM runtime restart](../docs/shmem.md#runtime-restart)。
 
 ### 公开实验性调优配置
 
