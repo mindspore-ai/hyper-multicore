@@ -106,6 +106,9 @@ class PreparedTopKRoute:
     received_counts: torch.Tensor
     metadata: RouteMetadata
     maximum_received_slots: int = 0
+    execution_resources: Any = field(default=None, repr=False, compare=False)
+    weight_binding: Any = field(default=None, repr=False, compare=False)
+    checkpoint_record: Any = field(default=None, repr=False, compare=False)
 
 
 _record_metadata_stream = RouteMetadata.record_stream
@@ -387,11 +390,12 @@ def _compute_route_metadata(
     )
 
 
+@torch.inference_mode(False)
 def _upload_route_tensor(tensor: torch.Tensor, device: Any) -> torch.Tensor:
     """Keep Host metadata alive through the pinned allocator during asynchronous upload."""
     if torch.device(device).type == "npu":
         return tensor.pin_memory().to(device, non_blocking=True)
-    return tensor.to(device)
+    return tensor.to(device).clone() if tensor.is_inference() else tensor.to(device)
 
 
 def _host_route_metadata(
@@ -504,6 +508,7 @@ def prepare_topk_route(
     *,
     autograd_mask: int = 0,
     prepare_workspace: Callable[[int, int], None] | None = None,
+    select_placement: Callable | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -524,7 +529,7 @@ def prepare_topk_route(
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
-                                      workspace, autograd_mask, prepare_workspace)
+                                      workspace, autograd_mask, prepare_workspace, select_placement)
     permuted = None
     if _can_fuse_count(hidden_states, spec, tokens_per_expert):
         permuted, counts = _permute_and_count(hidden_states, topk_ids, spec)
@@ -935,6 +940,7 @@ def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
     prepare_workspace: Callable[[int, int], None] | None = None,
+    select_placement: Callable | None = None,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
     # Invalid dynamic ranks must still enter the original collective before failing.
@@ -954,11 +960,49 @@ def _prepare_dynamic_route(
     # Ordinary storage remains valid if count agreement triggers a SHMEM restart.
     if permuted is None:
         permuted = _stage_dynamic_permutation(hidden_states, topk_ids, spec, invalid, workspace)
+    if select_placement is not None:
+        return _prepare_placed_route(hidden_states, topk_ids, spec, workspace, permuted,
+                                     counts, gathered, work, route_stream, prepare_workspace,
+                                     select_placement, autograd_mask)
     permuted, summary, host_rows, metadata, work = _resolve_dynamic_permutation(
         hidden_states, topk_ids, spec, workspace, permuted, invalid, route_stream,
         prepare_workspace, gathered, work)
     return _finalize_dynamic_route(
         permuted, counts, summary, host_rows, metadata, work, gathered, spec, workspace, hidden_states.device, tokens)
+
+
+
+def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,
+                          work, stream, prepare_workspace, select_placement, autograd_mask=0):
+    """Select a per-call route between count validation and capacity commitment."""
+    if work is not None:
+        work.wait()
+    source_rows = []
+    summary, host_rows, metadata = _read_cached_route(
+        gathered, spec, workspace, hidden.device, source_rows, stream=stream)
+    selected = select_placement(
+        hidden, ids, gathered, summary, source_rows, permuted[1], autograd_mask, host_rows=host_rows,
+    )
+    if selected is None:
+        # Preserve every ordinary route, schedule and capacity decision.
+        prepare_workspace(summary[1], summary[2])
+        return _finalize_dynamic_route(
+            permuted, counts, summary, host_rows, metadata, None, gathered, spec,
+            workspace, hidden.device, hidden.shape[0])
+    resources, placement, binding = selected
+    virtual_spec, virtual_workspace = resources.spec, resources.workspace
+    table = placement.counts_by_source
+    virtual_spec = replace(virtual_spec, num_experts=table.shape[1])
+    virtual_counts = table[virtual_spec.rank_id].contiguous()
+    virtual_table = torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
+    local_load = placement.received_rows(virtual_spec.rank_id)
+    virtual_summary = max(1, local_load), summary[1], placement.receive_capacity
+    resources.prepare_auto_workspace(virtual_summary[1], virtual_summary[2], hidden)
+    virtual_tokens = _permute_topk_input(hidden, placement.virtual_ids)
+    route = _finalize_dynamic_route(
+        virtual_tokens, virtual_counts, virtual_summary, None, None, None, virtual_table,
+        virtual_spec, virtual_workspace, hidden.device, hidden.shape[0])
+    return replace(route, execution_resources=resources, weight_binding=binding)
 
 
 class _EmptyTopKOutput(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ

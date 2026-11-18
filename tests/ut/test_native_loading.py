@@ -35,7 +35,7 @@ from hyper_multicore.shmem import _runtime as shmem_runtime
 class TestNativeLoading(unittest.TestCase):
     """Reject wrong or damaged adapters and preserve shared initialization state."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Create a minimal multi-backend payload using only the installed runtime contract."""
         self.resources = ExitStack()
         self.addCleanup(self.resources.close)
@@ -72,6 +72,48 @@ class TestNativeLoading(unittest.TestCase):
                      "variants": [copy.deepcopy(self.variant)], "requested_target_ids": ["fixture"],
                      "payload_sha256": hashes,
                      "native_sha256": {name: value for name, value in hashes.items() if name.endswith(".so")}}
+
+    def _add_hot_replica_artifacts(self):
+        """Extend the ordinary fixture with signed common kernels and variant bridges."""
+        replica = {
+            "soc": "ascend910_93", "kernels": "shmem/lib/arch22/hot_replica/libhmc_hot_replica_kernels.so",
+            "allocator": "adapters/fixture/shmem/arch22/hot_replica/_a3_allocator.so",
+            "bridge": "adapters/fixture/shmem/arch22/hot_replica/_hot_replica_shared_bridge.so",
+        }
+        self.variant["hot_replica"] = replica
+        for key in ("kernels", "allocator", "bridge"):
+            path = self.root / replica[key]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic HotReplica")
+        self.index_path.write_text(json.dumps(self.index), encoding="utf-8")
+        hashes = {p.relative_to(self.root).as_posix(): manifest.file_sha256(p)
+                  for p in self.root.rglob("*") if p.is_file()}
+        self.info.update(variants=[copy.deepcopy(self.variant)], payload_sha256=hashes,
+                         native_sha256={k: v for k, v in hashes.items() if k.endswith(".so")})
+        return replica
+
+    def test_hot_replica_common_kernel_is_integrity_checked(self):
+        """A replaced shared device kernel must fail before any host adapter loads."""
+        replica = self._add_hot_replica_artifacts()
+        index = manifest.read_manifest(self.root)
+        manifest.check_integrity(self.root, self.info, index)
+        (self.root / replica["kernels"]).write_bytes(b"unexpected replacement")
+        with self.assertRaisesRegex(ValueError, "Changed payload"):
+            manifest.check_integrity(self.root, self.info, index)
+
+    def test_hot_replica_requires_complete_selected_artifacts(self):
+        """The capability cannot claim support when its framework bridge is missing."""
+        replica = self._add_hot_replica_artifacts()
+        (self.root / replica["bridge"]).unlink()
+        with self.assertRaisesRegex(ValueError, "Missing HotReplica artifact"):
+            manifest.read_manifest(self.root)
+
+    def test_hot_replica_capability_matches_build_provenance(self):
+        """A capability in only the runtime index must fail provenance validation."""
+        self._add_hot_replica_artifacts()
+        self.info["variants"][0].pop("hot_replica")
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            manifest.check_integrity(self.root, self.info, self.index)
 
     def test_branch_and_abi_select_exactly_one_framework(self):
         """Post suffixes do not gate selection; another branch or ABI must not load this variant."""
@@ -171,7 +213,8 @@ class TestNativeLoading(unittest.TestCase):
         barrier = Barrier(4)
         calls = []
 
-        def first_use(index):
+        def first_use(index: int) -> None:
+            """Record the single caller responsible for native registration."""
             barrier.wait(timeout=5)
             with _loader.native_loading("torch") as needed:
                 if needed:

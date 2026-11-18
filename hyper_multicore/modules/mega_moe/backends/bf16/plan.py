@@ -87,6 +87,7 @@ class MegaMoePlan:
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
     weight_grad_dtype: torch.dtype | None = None
+    event_counter_bytes: int | None = None
     _recorded_streams: set = field(default_factory=set, repr=False, compare=False)
 
     @property

@@ -64,11 +64,11 @@ struct OpCommand {
 #include <cstdint>
 #include "launch_test_state.h"
 constexpr int ACL_SUCCESS = 0;
-constexpr int ACL_DEV_ATTR_VECTOR_CORE_NUM = 1;
-constexpr int ACL_DEV_ATTR_NPU_ARCH = 601;
+// Mirror an older PTA header: the attribute type exists, the arch enum name does not.
+enum aclrtDevAttr { ACL_DEV_ATTR_VECTOR_CORE_NUM = 1 };
 constexpr int ACL_RT_THREAD_LEVEL = 0;
-inline int aclrtGetDeviceInfo(int, int attr, int64_t* value) {
-    *value = attr == ACL_DEV_ATTR_NPU_ARCH ? launch_test::npu_arch : 40;
+inline int aclrtGetDeviceInfo(int, aclrtDevAttr attr, int64_t* value) {
+    *value = static_cast<int>(attr) == 601 ? launch_test::npu_arch : 40;
     return ACL_SUCCESS;
 }
 inline int aclrtPeekAtLastError(int) {

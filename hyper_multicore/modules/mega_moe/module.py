@@ -34,10 +34,12 @@ from ..module import MulticoreModule
 from .backends import get_backend
 from .invocation import prepare_expert_invocation
 from .resources import _MegaMoeExecutionResources
+from ..base_planner import BasePlanner
 from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
 )
+from .placement_options import MegaMoePlacementOptions
 from .transport import requested_transport
 from .schedule import validate_schedule_options
 
@@ -89,6 +91,28 @@ def _resolve_ep_size(ep_group: Any | None) -> int:
     return 1
 
 
+def _placement_planner(options: MegaMoePlacementOptions | None) -> BasePlanner | None:
+    """Validate the placement strategy before allocating any EP resources."""
+    if options is None:
+        return None
+    if not isinstance(options, MegaMoePlacementOptions):
+        raise TypeError("expert_placement must be MegaMoePlacementOptions or None")
+    if options.strategy == "none":
+        if options.planner is not None:
+            raise ValueError("placement strategy 'none' requires planner=None")
+        return None
+    if options.strategy != "adaptive":
+        raise ValueError(f"Unsupported expert placement strategy: {options.strategy!r}")
+    if not isinstance(options.planner, BasePlanner):
+        raise TypeError("placement strategy 'adaptive' requires a BasePlanner instance")
+    return options.planner
+
+
+def _validate_precision_schedule(precision, scheduler):
+    """Check precision-specific scheduling constraints."""
+    if precision == "mxfp8" and (scheduler.batch_experts or scheduler.nominal_schedule
+                                 or scheduler.lowering == "compact"):
+        raise ValueError("MXFP8 requires dense per-expert lowering")
 
 
 def _resolve_expert_options(precision, numerics_options, tuning_options):
@@ -110,9 +134,7 @@ def _resolve_expert_options(precision, numerics_options, tuning_options):
     if numerics.partial_weight_grad_dtype not in (None, "native", "float32"):
         raise ValueError("partial_weight_grad_dtype must be native, float32 or None")
     scheduler = validate_schedule_options(tuning.scheduler)
-    if precision == "mxfp8" and (scheduler.batch_experts or scheduler.nominal_schedule
-                                 or scheduler.lowering == "compact"):
-        raise ValueError("MXFP8 requires dense per-expert lowering")
+    _validate_precision_schedule(precision, scheduler)
     return numerics, tuning, scheduler
 
 
@@ -150,6 +172,7 @@ class MegaMoeExperts(MulticoreModule):
         precision: str = "bf16",
         numerics_options: MegaMoeNumericsOptions | None = None,
         tuning_options: MegaMoeTuningOptions | None = None,
+        expert_placement: MegaMoePlacementOptions | None = None,
     ) -> None:
         """Initialize a parameterless lazy execution owner.
 
@@ -168,6 +191,8 @@ class MegaMoeExperts(MulticoreModule):
                 weighting. Options specify the clamp limit and its position relative
                 to SiLU, plus the probability position relative to FC2. The before-FC2
                 path rounds activations to BF16 both before and after FP32 weighting.
+            expert_placement: Placement strategy and planner. Adaptive placement
+                requires A3 BF16 push execution and a multi-rank EP group.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.
                 Options are validated and copied into the instance configuration;
@@ -177,6 +202,16 @@ class MegaMoeExperts(MulticoreModule):
         Construct another executor to change them.
         """
         numerics, tuning, scheduler = _resolve_expert_options(precision, numerics_options, tuning_options)
+        planner = _placement_planner(expert_placement)
+        if planner is not None and (precision != "bf16" or tuning.dispatch_mode != "push"):
+            raise ValueError("HotReplica requires BF16 precision and push dispatch")
+        source_bound = planner.source_token_bound if planner is not None else None
+        planner_key = None
+        if planner is not None:
+            settings = planner.configuration_key()
+            if not isinstance(settings, str):
+                raise TypeError("Planner configuration_key() must return a string")
+            planner_key = (type(planner).__module__, type(planner).__qualname__, settings)
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
@@ -195,6 +230,9 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": tuning.dispatch_split,
             "combine_split": tuning.combine_split,
             "precision": precision,
+            "hot_replica": planner is not None,
+            "planner_key": planner_key,
+            "source_token_bound": source_bound,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",
@@ -202,6 +240,12 @@ class MegaMoeExperts(MulticoreModule):
             "nominal_schedule": bool(scheduler.nominal_schedule),
             "lowering": scheduler.lowering,
         }
+        if planner is not None and specification["ep_size"] <= 1:
+            raise ValueError("HotReplica requires an explicit EP group with more than one rank")
+        if source_bound is not None:
+            limit = (2**31 - 1) // max(hidden_size, top_k) // _COMMUNICATION_SPLIT * _COMMUNICATION_SPLIT
+            if source_bound > limit:
+                raise ValueError(f"HotReplica source_token_bound exceeds {limit} rows")
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
@@ -212,6 +256,7 @@ class MegaMoeExperts(MulticoreModule):
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self._base_compatibility_key = compatibility_key
+        self._planner = planner
         self._pending_layout = None
         self._initialize_module_state(specification)
 
@@ -339,6 +384,23 @@ class MegaMoeExperts(MulticoreModule):
             f"expert_weights must have EIO shapes {self._weight_shapes['EIO']} or "
             f"EOI shapes {self._weight_shapes['EOI']}, got {actual}.")
 
+    @staticmethod
+    def _validate_weight_storage(hidden_states, weight1, weight2, layout):
+        """Validate device, dtype and layout without reading device values."""
+        if (
+            weight1.device != hidden_states.device
+            or weight2.device != hidden_states.device
+        ):
+            raise _InvalidExpertWeights(
+                "expert weights and hidden states must be on the same NPU."
+            )
+        if weight1.dtype != hidden_states.dtype or weight2.dtype != hidden_states.dtype:
+            raise _InvalidExpertWeightType("expert weights and hidden states must all use BF16.")
+        if layout == "EOI" and (
+            not weight1.is_contiguous() or not weight2.is_contiguous()
+        ):
+            raise _InvalidExpertWeights("EOI expert weights must be contiguous for zero-copy execution.")
+
     def _validate_tensors(self, hidden_states: torch.Tensor, expert_weights: tuple) -> None:
         """Validate activation and parameter metadata before acquiring resources."""
         if hidden_states.dtype != torch.bfloat16 or not getattr(hidden_states, "is_npu", False):
@@ -369,19 +431,7 @@ class MegaMoeExperts(MulticoreModule):
             if shape2 != expected_weight2:
                 raise _InvalidExpertWeights(
                     f"down_weight must have shape {expected_weight2}, got {shape2}.")
-        if (
-            weight1.device != hidden_states.device
-            or weight2.device != hidden_states.device
-        ):
-            raise _InvalidExpertWeights(
-                "expert weights and hidden states must be on the same NPU."
-            )
-        if weight1.dtype != hidden_states.dtype or weight2.dtype != hidden_states.dtype:
-            raise _InvalidExpertWeightType("expert weights and hidden states must all use BF16.")
-        if layout == "EOI" and (
-            not weight1.is_contiguous() or not weight2.is_contiguous()
-        ):
-            raise _InvalidExpertWeights("EOI expert weights must be contiguous for zero-copy execution.")
+        self._validate_weight_storage(hidden_states, weight1, weight2, layout)
         if resources is None:
             self._pending_layout = layout
             self._resource_group.compatibility_key = (self._base_compatibility_key, layout)
@@ -479,7 +529,7 @@ class MegaMoeExperts(MulticoreModule):
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
         with prepare_expert_invocation(hidden_flat, topk_ids, topk_weights, tokens_per_expert,
-                                       weights, resources, weight_error=weight_error) as route:
+                                       weights, resources, weight_error=weight_error, planner=self._planner) as route:
             return self._backend.forward(
                 self, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route,
             )

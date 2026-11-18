@@ -1,0 +1,165 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Compile HotReplica in the normal native-build workspace; publication owns staging."""
+
+import argparse
+import os
+from pathlib import Path
+import platform
+import shlex
+import subprocess
+import sysconfig
+
+
+def cann_includes(cann: Path, source: Path, sdk: Path) -> list[str]:
+    """Use the same CANN and private SHMEM SDK as the enclosing native build."""
+    paths = [source.parent, sdk / "include", sdk / "include/device", sdk / "src", sdk / "src/device"]
+    paths += [
+        cann / path
+        for path in (
+            "include",
+            "include/runtime",
+            "pkg_inc",
+            "pkg_inc/runtime",
+            "asc",
+            "asc/include",
+            "asc/include/interface",
+            "asc/include/utils",
+            "asc/impl",
+            "compiler/tikcpp",
+            "compiler/tikcpp/tikcfw",
+            "compiler/tikcpp/tikcfw/impl",
+            "compiler/tikcpp/tikcfw/interface",
+            f"{platform.machine()}-linux/include",
+        )
+    ]
+    paths += [p.parent.parent for p in cann.rglob("bfloat16.h") if p.parent.name == "opdev"]
+    return [f"-I{path}" for path in paths if path.is_dir()]
+
+
+def build_kernels(output: Path, sdk: Path) -> None:
+    """Compile framework-independent AscendC code once per selected A3 backend."""
+    source = Path(__file__).parent / "csrc"
+    cann = Path(os.environ["ASCEND_HOME_PATH"])
+    output.mkdir(parents=True, exist_ok=True)
+    command = [
+        "bisheng",
+        "-x",
+        "asc",
+        "--npu-arch=dav-2201",
+        "--cce-auto-sync=off",
+        "--cce-fatobj-link",
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-std=c++17",
+        "-Wl,-z,relro,-z,now,-z,noexecstack",
+        *[
+            str(source / name)
+            for name in ("a3_allocator.asc", "hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp")
+        ],
+        "-o",
+        str(output / "libhmc_hot_replica_kernels.so"),
+        "-Wl,-soname,libhmc_hot_replica_kernels.so",
+        *cann_includes(cann, source, sdk),
+        f"-L{sdk / 'lib'}",
+        f"-L{cann / 'lib64'}",
+        "-lhyper_multicore_shmem",
+        "-lhyper_multicore_shmem_utils",
+        "-lascendcl",
+        "-lruntime",
+        "-ldl",
+    ]
+    subprocess.run(command, check=True)
+
+
+def build_adapters(output: Path, sdk: Path, device_root: Path, standard: int) -> None:
+    """Compile only host bridges with each selected framework's compiler and ABI."""
+    import torch  # pylint: disable=import-outside-toplevel
+    import torch_npu  # pylint: disable=import-outside-toplevel
+
+    source = Path(__file__).parent / "csrc"
+    cann = Path(os.environ["ASCEND_HOME_PATH"])
+    torch_root, npu_root = Path(torch.__file__).parent, Path(torch_npu.__file__).parent
+    includes = cann_includes(cann, source, sdk)
+    includes += [
+        f"-I{p}"
+        for p in (
+            torch_root / "include",
+            torch_root / "include/torch/csrc/api/include",
+            npu_root / "include",
+            Path(sysconfig.get_path("include")),
+        )
+    ]
+    output.mkdir(parents=True, exist_ok=True)
+    common = [
+        *shlex.split(os.environ.get("CXX", "g++")),
+        "-shared",
+        "-fPIC",
+        "-O2",
+        f"-std=c++{standard}",
+        f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",  # pylint: disable=protected-access
+        "-Wl,-z,relro,-z,now,-z,noexecstack",
+    ]
+    libraries = [f"-L{p}" for p in (device_root, torch_root / "lib", npu_root / "lib", sdk / "lib", cann / "lib64")]
+    libraries += [
+        "-lhmc_hot_replica_kernels",
+        "-ltorch_npu",
+        "-ltorch",
+        "-lc10",
+        "-ltorch_python",
+        "-lhyper_multicore_shmem",
+        "-lhyper_multicore_shmem_utils",
+        "-lascendcl",
+        "-lruntime",
+        "-ldl",
+    ]
+    for name, filename in (
+        ("_a3_allocator", "allocator_bridge.cpp"),
+        ("_hot_replica_shared_bridge", "hot_replica_shared_bridge.cpp"),
+    ):
+        subprocess.run(
+            [
+                *common,
+                f"-DTORCH_EXTENSION_NAME={name}",
+                str(source / filename),
+                "-o",
+                str(output / (name + ".so")),
+                *includes,
+                *libraries,
+            ],
+            check=True,
+        )
+
+
+def main() -> None:
+    """Build isolated artifacts; the enclosing build publishes and hashes them."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phase", choices=("common", "adapter"), required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--sdk-root", type=Path, required=True)
+    parser.add_argument("--device-root", type=Path)
+    parser.add_argument("--cxx-standard", type=int, default=17)
+    args = parser.parse_args()
+    if args.phase == "common":
+        build_kernels(args.output_dir, args.sdk_root)
+    else:
+        if args.device_root is None:
+            parser.error("--device-root is required for adapter builds")
+        build_adapters(args.output_dir, args.sdk_root, args.device_root, args.cxx_standard)
+
+
+if __name__ == "__main__":
+    main()

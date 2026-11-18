@@ -28,7 +28,10 @@ extern "C" void HmcLaunchZeroCold_arch3510(unsigned blocks, void* stream, uint8_
 namespace {
 template <typename Fn> Fn SelectUtility(int32_t device, Fn arch22, Fn arch35) {
   int64_t npu_arch = 0;
-  const auto status = aclrtGetDeviceInfo(device, ACL_DEV_ATTR_NPU_ARCH, &npu_arch);
+  // Older PTA-bundled ACL headers omit the enum name; CANN's public attribute
+  // number matches _loader._ACL_DEV_ATTR_NPU_ARCH and is supported by the runtime.
+  constexpr auto kNpuArchAttribute = static_cast<aclrtDevAttr>(601);
+  const auto status = aclrtGetDeviceInfo(device, kNpuArchAttribute, &npu_arch);
   TORCH_CHECK(status == ACL_SUCCESS, "cannot query NPU architecture for device ", device, ": ", status);
   switch (npu_arch) {
     case 2201:

@@ -29,7 +29,7 @@ from hyper_multicore.tasks.task_base import _TASK_DTYPE
 def test_bulk_field_offsets(layout):
     dtype = _TASK_DTYPE if layout is TaskDescC else _TASK_DTYPE["inputs"].base
     assert dtype.itemsize == ctypes.sizeof(layout)
-    for name, field in layout._fields_:
+    for name, field in layout._fields_:  # pylint: disable=protected-access
         field_dtype, offset = dtype.fields[name]
         assert offset == getattr(layout, name).offset
         assert field_dtype.itemsize == ctypes.sizeof(field)
@@ -72,6 +72,7 @@ def _scalar_task(kind, index, n):
 
 @pytest.mark.parametrize("kind", ["gmm", "push", "pull", "combine"])
 def test_bulk_matches_scalar_abi(kind):
+    """Compare every emitted descriptor byte with the independent scalar writer."""
     gmm = kind == "gmm"
     cfg = allocate_runtime_config(16)
     state = SimpleNamespace(pre_task_num=2, pre_cube_task_num=1, pre_vector_task_num=1,
