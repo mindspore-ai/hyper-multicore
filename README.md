@@ -59,7 +59,7 @@ from hyper_multicore.diagnostics import MegaKernelDiagnostics
 ## 开发与测试
 
 Python 实现、设备 kernel 和 native binding 位于 `hyper_multicore/`。
-HyperParallel 是下游消费方，构建、测试及使用本包均不依赖它。
+其他软件项目可通过公共接口使用本包；构建、测试及使用本包均不依赖下游工程。
 
 从源码根目录安装开发所需工具并运行 CPU 单测：
 
@@ -117,5 +117,6 @@ Lizard、Markdownlint、Node 和 pre-commit 不固定版本；环境需满足所
 | [组件使用](hyper_multicore/README.md) | 公共 API 与配置 |
 | [测试](tests/README.md) | 用例范围、添加、执行与排错 |
 | [架构](docs/architecture.md) | 运行时、调度与算子扩展 |
+| [开发指令](AGENTS.md) | 变更流程、架构归属、代码质量与验证导航 |
 | [SHMEM](docs/shmem.md) | 通信资源与生命周期 |
 | [诊断工具](docs/profiling.md) | Profiling 与 tensor dump |
