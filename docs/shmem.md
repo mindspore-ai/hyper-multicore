@@ -124,7 +124,7 @@ SHMEM知道Tensor的shape、dtype、alignment及字节范围，但不知道其�
 - 调用方必须在释放或restart前停止旧Storage的使用，并建立所需的stream完成关系。对象仍存在不代表Storage仍有效。
 - plan缓存只能复用与当前规格匹配的调度描述；重建后使用的物理Tensor由workspace重新绑定，不将旧地址视为稳定标识。
 
-通信任务的具体调度见[MoE-FFN架构设计](architecture.md)，SHMEM完成语义见第3节。控制面检查位于Host调用边界，
+通信任务的具体调度见[MegaMoE 调度设计](design/mega_moe_design.md#队列与通信进展)，SHMEM完成语义见第3节。控制面检查位于Host调用边界，
 设备通信任务不逐次经过Host检查；普通执行的正确性独立于诊断采集。
 
 架构图展示主要调用关系。MegaMoe部分设备代码还直接访问CANN设备状态，这些调用与私有SDK版本存在耦合。
@@ -237,7 +237,7 @@ Put、Get和Signal均为stream入队语义，返回不表示远端消费已经�
 Runtime初始化时冻结当前NPU设备。`empty`、`barrier`、`signal`、`wait_signal`以及实际发射设备任务的非零
 `put`、`get`和`all_gather`会拒绝其他设备的stream。零字节Put、Get和AllGather完成本地参数校验后不发射任务。
 
-后端兼容性按 CANN 查询的 NPU 架构判断。Atlas A2/A3 系列为 `2201`（`arch22`），Ascend950 PR/DT 为 `3510`（`arch35`）。
+后端兼容性按 CANN 查询的 NPU 架构判断。`ascend910b`、`ascend910_93` 为 `2201`（`arch22`），`ascend950` 为 `3510`（`arch35`）。
 `device_soc_name`保留`aclrtGetSocName()`返回的完整型号原文。
 
 ### 3.5 诊断
@@ -402,7 +402,7 @@ flowchart TB
 | `HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 普通WORLD或单进程初始化endpoint；子组及显式heap初始化使用独立unique ID |
 | `SHMEM_UID_SOCK_IFNAME` | CANN自动选择 | 子组UID bootstrap使用的Host网卡，所有group成员必须可达 |
 | `HYPER_MULTICORE_SHMEM_TIMEOUT_SEC` | 120 | Runtime超时秒数 |
-| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | Ascend950 为 `mte_udma`，arch22 为 `mte` | 数据搬移引擎。两种后端都支持 `mte`，只有 Ascend950 支持 `mte_udma`。 |
+| `HYPER_MULTICORE_SHMEM_DATA_ENGINE` | `ascend950` 为 `mte_udma`，`ascend910b`、`ascend910_93` 为 `mte` | 数据搬移引擎。两种后端都支持 `mte`，只有 `ascend950` 支持 `mte_udma`。 |
 | `SHMEM_LOG_LEVEL` | `ERROR` | CANN及HP SHMEM日志级别：`DEBUG`、`INFO`、`WARN`、`ERROR`或`FATAL` |
 | `SHMEM_LOG_TO_STDOUT` | `0` | `1`输出到stdout且不落盘；其他值使用文件sink |
 | `SHMEM_LOG_PATH` | `${HOME}/shmem/log` | CANN及HP SHMEM日志的统一落盘目录 |

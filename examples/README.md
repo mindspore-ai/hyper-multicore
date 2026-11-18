@@ -1,7 +1,7 @@
 # Multicore 模型接入指南与示例
 
 本文说明如何在已有 Torch 模型中替换组件、迁移参数并接入训练。
-组件能力、设备要求、动态 token 及资源生命周期见 [Multicore 使用指南](../hyper_multicore/README.md)，
+各特性的能力、设备要求、动态 token 及资源生命周期可从 [Python 接口入口](../hyper_multicore/README.md)查阅，
 安装环境见 [构建说明](../docs/build.md)。
 
 示例由源码仓或 sdist 提供，不作为 wheel 运行资源。安装组件后，可将整个 `examples/` 复制到
@@ -10,16 +10,36 @@
 
 | 需求 | 阅读位置 |
 | --- | --- |
-| 安装后快速运行单层 MoE | [minimal](mega_moe_minimal.py)，支持 `--warmup` 和 `--iterations` |
+| 安装后快速运行单层 MoE | [单层 MoE 示例](#运行单层-moe-示例)，支持 `--warmup` 和 `--iterations` |
 | 替换已有 Router、专家或四流 mHC | 下方[模块与权重迁移](#已有模块与权重迁移) |
 | 保留 checkpoint 和参数管理 | [Checkpoint与参数归属](#checkpoint与参数归属) |
 | 运行仅含 MoE 的完整训练对照 | [MoE Transformer](moe/README.md) |
 | 运行仅含 mHC 的完整训练对照 | [Dense mHC Transformer](mhc/README.md) |
 
-以下片段使用已加载的原模块和真实模型输入，EP 组、模块替换及跨层状态由原模型提供。
-三个组件可以分别接入；mHC 仅用于已有四流 shifted 连接结构。
+## 运行单层 MoE 示例
+
+将与 wheel 同版本的 [mega_moe_minimal.py](mega_moe_minimal.py) 单独保存到源码外目录；
+脚本不包含在 wheel 中，可从对应源码仓或 sdist 获取，也可单独下载该文件。
+按[安装与验证](../docs/build.md#安装与验证)准备环境并确认包来源。运行需要两张可用 NPU 和可工作的 HCCL 环境。
+在保存脚本的目录执行以下命令，设备编号 `0,1` 按实际环境调整：
+
+```bash
+(
+    set -e
+    export ASCEND_RT_VISIBLE_DEVICES=0,1
+    python -m torch.distributed.run --standalone --nproc-per-node=2 mega_moe_minimal.py
+)
+```
+
+`mega_moe_minimal.py` 检查输出是否有限，以及输入、路由概率和两组专家权重的梯度是否存在。
+成功时 rank 0 输出包含 `world_size`、`shape`、`median_ms` 和 `build_info` 的 JSON。
+这只验证基础执行路径，未验证梯度数值正确性或性能达标，结果中的 `performance_acceptance` 为 `false`。
+默认 `--warmup=0`、`--iterations=1`；增加这两个参数可进行预热和重复采样。
 
 ## 已有模块与权重迁移
+
+以下片段使用已加载的原模块和真实模型输入，EP 组、模块替换及跨层状态由原模型提供。
+三个组件可以分别接入；mHC 仅用于已有四流 shifted 连接结构。
 
 ### Gate：保留评分函数与原参数
 
@@ -71,17 +91,17 @@ class RoutedExperts(torch.nn.Module):
 
 示例中的模块应在 FSDP 包装和优化器创建前安装，调用时经过该模块的 `__call__`，使 FSDP hook
 先 unshard 参数；EP DTensor 由模型 adapter 在此时取出本地专家片段。执行器按两组权重形状自动识别
-EIO/EOI，契约见[输入与权重](../hyper_multicore/README.md#输入与权重)。如果原模型的 gate/up 是两个
+EIO/EOI，契约见[输入与权重](../docs/mega_moe.md#输入与权重)。如果原模型的 gate/up 是两个
 独立参数，需要模型侧合并或调整存储；每次 forward 拼接可能产生额外复制。
 
 按来源模型逐层构造 `MegaMoeNumericsOptions(swiglu_limit=..., clamp_after_silu=...,
 apply_probs_before_fc2=...)`，再通过 `numerics_options=` 传入 adapter。
 省略时使用不截断、FC2 后乘概率的默认语义。`clamp_after_silu=True` 指 SiLU 后、乘 up 前截断，
 概率前移则保留激活 BF16 写出和乘概率后 BF16 写出两处舍入，详见
-[数值语义](../hyper_multicore/README.md#模型数学与数值语义)。这些选项由模型语义决定。
+[数值语义](../docs/mega_moe.md#模型数学与数值语义)。这些选项由模型语义决定。
 需要调整 push/pull、容量或通信分片时，使用同一执行器的 `tuning_options=`，
 传入公开实验性的 `MegaMoeTuningOptions`；示例与兼容性边界见
-[调优配置](../hyper_multicore/README.md#公开实验性调优配置)。
+[调优配置](../docs/mega_moe.md#公开实验性调优配置)。
 
 ### mHC：保留四流结构与显式状态
 
@@ -127,7 +147,7 @@ Gate/mHC 可绑定原 Parameter，MegaMoe 的参数由调用方持有。权重�
 gate/up 动量按相同次序转置拼接，down 动量转置，gate/up step 必须一致。不能直接加载旧优化器 state_dict 并宣称等价。
 
 保留已有 FSDP/参数管理器时，forward 内通过 `expert_weights=(gate_up, down)`
-传入当前已 unshard 的本地专家；形状和连续性契约见[输入与权重](../hyper_multicore/README.md#输入与权重)。
+传入当前已 unshard 的本地专家；形状和连续性契约见[输入与权重](../docs/mega_moe.md#输入与权重)。
 不要保留两套可训练参数或跨更新缓存转换权重；非连续/拼接转换可能逐步复制，autograd 连接和生命周期由 adapter 维护。
 
 EP checkpoint 按组内 rank 顺序解释，避免框架和 adapter 重复应用 EP。
@@ -154,8 +174,7 @@ MoE 的组件选择只改变 Router/专家实现；已有模型接入无需采�
 python -m pytest -q tests/ut/examples
 ```
 
-CPU 接线测试位于 `tests/ut/examples/`，参数迁移测试见
-[test_frontend_migration.py](../tests/ut/modules/test_frontend_migration.py)。
+CPU 接线与参数迁移用例的选择和执行方式见[测试指南](../tests/README.md)。
 真实设备组件检查分别见 [MegaGate](../tests/torch/test_mega_gate.py)、
 [MegaMoe](../tests/torch/test_mega_moe.py)、[MegaMhc](../tests/torch/test_mega_mhc.py)。
 CPU 接线、设备组件 ST 和完整模型 benchmark 各自验证不同范围。

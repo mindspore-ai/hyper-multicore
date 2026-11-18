@@ -1,136 +1,84 @@
-# hyper-multicore
+# HyperMulticore
 
 [简体中文](README.md) | English
 
-Ascend multicore operators and a PyTorch runtime for MegaMoE, MegaGate and MegaMHC.
-The runtime overlaps communication and computation on AI Cores and manages its
-private SHMEM communication resources.
+HyperMulticore is a megakernel programming framework for Ascend NPUs. It combines computation and
+communication operations within a single kernel execution. The framework manages task dependencies
+on the device to reduce separate kernel launches and enable finer-grained compute-communication overlap.
 
-- **MegaMoE**: expert-parallel forward and backward with push/pull dispatch.
-- **MegaGate**: text/vision expert routing with autograd support.
-- **MegaMHC**: residual-stream mixing with forward and backward operators.
-- **Diagnostics**: kernel profiling and tensor dumps.
+Developers can describe execution through computation graphs or direct task assembly, or integrate
+existing components into models through PyTorch APIs. Current components include MegaMoE, MegaGate
+and MegaMHC, alongside tools for task timelines and tensor snapshots.
+
+[Python APIs](hyper_multicore/README.md) · [Build and installation](docs/build.md) ·
+[Architecture](docs/architecture.md) · [Model integration](examples/README.md) · [Development entry](AGENTS.md)
+
+Most detailed guides linked below are currently written in Chinese.
+
+## Main capabilities
+
+- **[MegaMoE](docs/mega_moe.md)**: expert-parallel dispatch, expert computation and result combination, with forward and backward support.
+- **[MegaGate](docs/mega_gate.md)**: expert routing for text and vision tokens.
+- **[MegaMHC](docs/mega_mhc.md)**: mixing and normalization of four residual streams.
+- **[Diagnostics](docs/diagnostics.md)**: internal task timelines and tensor snapshots.
 
 ## Quick start
 
-Use Linux with an Ascend NPU, Python/CPU architecture matching the wheel tags, and mutually compatible
-Torch/torch-npu, CANN and driver installations. Source builds use the active CANN toolkit.
-The optional matrix CANN reference is informational; a mismatch warns without stopping the build.
-Runtime selection does not impose a PTA post-release floor or a CANN version pairing. See the
-[build and installation guide](docs/build.md) for prerequisites and source builds.
+### Obtain and install
 
-Install a wheel built for that environment. Replace the paths below with your
-CANN installation and the exact wheel printed by the build command:
+Running HyperMulticore requires Linux, Ascend NPUs, Python ≥3.10, and compatible Torch/torch-npu,
+CANN and driver installations. Activate the target Python environment, install the
+[runtime dependencies](requirements.txt), and obtain a wheel matching your environment.
+With source only, first produce a wheel using the [default build](docs/build.md#默认构建).
+
+Run the following commands in Bash, replacing the placeholder paths. `--no-deps` does not install runtime dependencies:
 
 ```bash
 source /path/to/cann/set_env.sh
 python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<abi>-<platform>.whl"
 source "$(command -v hyper_multicore_set_env.bash)"
-hyper_multicore_build_info
 ```
 
-To run the two-NPU MoE example against the installed package, copy the example
-from the source checkout or extracted sdist into a separate directory:
+Complete activation before starting a Python process that imports Torch/torch-npu. For compatibility,
+import-origin and package-integrity checks, see [installation and verification](docs/build.md#安装与验证).
+
+### Run the two-NPU MoE example
+
+The [minimal MoE example](examples/mega_moe_minimal.py) requires two available NPUs and a working HCCL environment.
+Follow the [example setup](examples/README.md#运行单层-moe-示例) to obtain the script from the same version as your wheel.
+Run it from a directory outside the source checkout containing only that script; adjust device IDs `0,1` for your environment:
 
 ```bash
-# Start in the source root.
-example_dir=$(mktemp -d)
-cp examples/mega_moe_minimal.py "$example_dir/"
-cd "$example_dir"
-export ASCEND_RT_VISIBLE_DEVICES=0,1
-torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py
+(
+    set -e
+    export ASCEND_RT_VISIBLE_DEVICES=0,1
+    python -m torch.distributed.run --standalone --nproc-per-node=2 mega_moe_minimal.py
+)
 ```
 
-The example runs forward and
-backward and prints its shape, native build identity and elapsed time.
-Use `--warmup` and `--iterations` to increase sampling. The [examples guide](examples/README.md)
-provides complete [MoE](examples/moe/README.md) and [MHC](examples/mhc/README.md)
-network integration and training comparisons.
+The example runs forward, backward and communication, and checks outputs and gradients.
+On success, rank 0 prints JSON containing the run configuration and timings. This validates basic execution;
+see the [test guide](tests/README.md) for accuracy and performance validation.
 
-Applications import the public components directly:
-
-```python
-from hyper_multicore import MegaMoeExperts, MegaGate, MegaMhc
-from hyper_multicore.diagnostics import MegaKernelDiagnostics
-```
-
-`MegaMoeExperts` provides one stable entry point for model inputs; the public, stable
-`MegaMoeNumericsOptions` configures numerical semantics through `numerics_options=`.
-Client tuning uses the public, API-unstable `hyper_multicore.experimental.MegaMoeTuningOptions`
-through `tuning_options=`; its fields do not carry cross-version compatibility guarantees.
-See the [MegaMoE component guide](hyper_multicore/README.md#megamoeexperts) for numerical options,
-default execution policies and migration details.
-
-See the [component guide](hyper_multicore/README.md) for configuration and usage.
-Activate native paths before starting a Python process that uses the operators.
-pip and Python imports do not compile native code.
-
-## Development and tests
-
-Python, device kernels and native bindings live under `hyper_multicore/`.
-Other software projects can use this package through its public APIs. Building,
-testing and using this package does not require a downstream project.
-
-From the source root, install development dependencies and run the CPU tests:
-
-```bash
-python -m pip install -r requirements.txt setuptools wheel "packaging>=22"
-python -m pip install pytest
-python -m pip install --no-deps --no-build-isolation -e .
-python scripts/check_repository.py
-python -m pytest tests/ut -q
-```
-
-Select `tests/ut` for CPU tests or `tests/torch` for NPU tests explicitly;
-without a path, pytest may collect both. The [test guide](tests/README.md) covers
-CPU/NPU test placement, adding and running cases, and troubleshooting.
-
-### Code checks
-
-The three pre-commit hooks run Pylint, Lizard and Markdownlint.
-Pylint uses version 3.3.7 and `.pylintrc`, loading the license, public function
-annotations and docstrings, `sys.path` and subprocess rules from
-`scripts/pylint_hypermulticore.py`. Lizard limits cyclomatic complexity to 15 and
-function NLOC to 100, reporting only violations. Markdown rules are defined in
-`.markdownlint.jsonc`.
-
-Install pre-commit to check selected files manually. Developers who want checks
-on commit can also enable the Git hook:
-
-```bash
-python -m pip install pre-commit
-pre-commit run --files scripts/check_repository.py README.md
-pre-commit install
-```
-
-pre-commit manages the hook dependencies. To run the Python wrappers directly,
-install their tools in the current Python environment:
-
-```bash
-python -m pip install "pylint==3.3.7" lizard
-python scripts/pre-commit/run_pylint.py scripts/check_repository.py
-python scripts/pre-commit/run_lizard.py scripts/check_repository.py
-```
-
-Markdownlint needs a Node environment. With `markdownlint-cli2` installed, run:
-
-```bash
-markdownlint-cli2 --config .markdownlint.jsonc README.md README.en.md
-```
-
-Lizard, Markdownlint, Node and pre-commit are not version-pinned; the environment
-must meet the selected tools' runtime requirements. `.clang-format`,
-`hyper_multicore/CPPLINT.cfg` and `.codespellrc` remain available for their tools
-and are not part of these three hooks.
+For single-NPU usage, start with [MegaGate](docs/mega_gate.md#基本用法) or [MegaMHC](docs/mega_mhc.md#基本用法).
 
 ## Documentation
 
-| Guide | Contents |
+| Goal | Reading |
 | --- | --- |
-| [Development instructions](AGENTS.md) | Ownership rules, change workflow and validation navigation |
-| [Build and installation](docs/build.md) | Environment, build commands, artifacts, installation and activation |
-| [Component usage](hyper_multicore/README.md) | Public APIs and configuration |
-| [Testing](tests/README.md) | Test scope, contribution, execution and troubleshooting |
-| [Architecture](docs/architecture.md) | Runtime, scheduling and operator extension |
-| [SHMEM](docs/shmem.md) | Communication resources and lifecycle |
-| [Diagnostics](docs/profiling.md) | Profiling and tensor dumps |
+| Select public APIs and configuration | [Python APIs](hyper_multicore/README.md) |
+| Prepare the environment, build and install | [Build guide](docs/build.md) |
+| Integrate existing models and preserve parameters | [Model integration and examples](examples/README.md) |
+| Understand framework responsibilities and execution | [Architecture](docs/architecture.md) |
+| Capture timelines and inspect tensor values | [Diagnostics](docs/diagnostics.md) |
+| Prepare a development environment, run tests and static checks | [Test guide](tests/README.md) |
+
+## Development and contributing
+
+Before modifying the implementation, read the [development entry](AGENTS.md) for module responsibilities
+and development conventions. Environment setup, test execution and static checks are covered in the
+[test guide](tests/README.md).
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).

@@ -44,9 +44,9 @@ bash examples/moe/run_benchmark.sh \
 
 如果需要固定全局专家总数，附加 `--num-experts 48 --top-k 8`；EP4 时这会改为每卡12个专家，负载不同于默认 E24。
 
-### Atlas A3 系列单机 EP16
+### ascend910_93 单机 EP16
 
-使用适配 Atlas A3 系列的 Torch/torch_npu 与 CANN，并构建包含 `ascend910_93` 目标的 native payload：
+使用适配 `ascend910_93` 的 Torch/torch_npu 与 CANN，并构建包含 `ascend910_93` 目标的 native payload：
 
 ```bash
 source /path/to/cann/set_env.sh
@@ -63,9 +63,9 @@ bash examples/moe/run_benchmark.sh \
 逻辑 NPU 数须至少为16；不能在8个逻辑 NPU 上通过重复设备 ID 启动 EP16。
 本例使用 `MegaMoeExperts` 的默认执行策略。JSON 的 `topology` 应为 `world_size=16, tp=1, ep=16`。
 用户调优使用公开实验性的 `MegaMoeTuningOptions`，字段及约束见
-[组件指南](../../hyper_multicore/README.md#公开实验性调优配置)。
+[调优配置](../../docs/mega_moe.md#公开实验性调优配置)。
 模型数值语义通过从 `hyper_multicore` 导入的公开稳定接口 `MegaMoeNumericsOptions`
-和 `numerics_options=` 设置，字段及示例见[数值语义](../../hyper_multicore/README.md#模型数学与数值语义)；
+和 `numerics_options=` 设置，字段及示例见[数值语义](../../docs/mega_moe.md#模型数学与数值语义)；
 本示例保持不 clamp、FC2 后乘概率的默认语义。
 
 ### 参数

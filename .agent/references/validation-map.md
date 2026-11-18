@@ -8,8 +8,9 @@
 | plan、descriptor、ABI 与调度 | [scheduler UT](../../tests/ut/scheduler/) 中的序列化、reader 与调度用例，以及相关组件设备入口 | 字段宽度、offset、单位、flags、版本、缓存隔离、队列边界、生产者信用和完成 |
 | SHMEM、资源重建与通信 | [SHMEM UT](../../tests/ut/shmem/)、native CTest、[SHMEM 设备用例](../../tests/torch/shmem/) | Root 与设备归属、分配身份、post/quiet 所有权、可见性、stream 和 buffer 复用；失败可重试或终止范围 |
 | 构建、依赖锁、patch 与加载 | [仓库检查](../../scripts/check_repository.py)、[独立构建检查](../../tests/ut/build/check_build.py)，按测试指南定位加载用例，并做实际构建/安装态验证 | 锁源、隔离 patch、架构与 ABI、缓存输入、制品身份及源码外加载 |
-| profiling、dump 与性能 | 按测试指南在 [UT](../../tests/ut/) 和设备入口中定位相应工具、组件的用例及基准 | 支持的诊断模式复用正常执行与完成机制；同配、无打点性能对照并保留波动 |
-| 文档与指令 | [Markdownlint 配置](../../.markdownlint.jsonc)、相对链接与内容核对；指令行为变化再选代表性任务试用 | 指针可达、正文一致；行为效果以实际试用为限，静态检查不证明开发质量改善 |
+| 诊断采集与结果 | [诊断指南](../../docs/diagnostics.md)核对行为，[诊断设计的验证重点](../../docs/design/diagnostics_design.md#验证重点)确定范围；按测试指南定位相应 UT 和设备用例 | 按影响检查窗口、输出格式、采集范围和完成边界；支持的诊断模式复用正常执行机制。影响执行开销时按下文性能要求验证 |
+| 性能调优与基准 | 按[测试指南](../../tests/README.md)定位相关基准，证据要求见[证据与结论](#证据与结论) | 验证完整工作量与可比计时条件，报告性能变化及波动 |
+| 文档与指令 | [Markdownlint 配置](../../.markdownlint.jsonc)、相对链接与内容核对；指令行为变化再选代表性任务试用 | 指针可达、引用目的准确、任务阅读路径完整、正文一致；行为效果以实际试用为限，静态检查不证明开发质量改善 |
 
 ## 选择与编写用例
 

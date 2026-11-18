@@ -1,122 +1,77 @@
-# hyper-multicore
+# HyperMulticore
 
 简体中文 | [English](README.en.md)
 
-HyperMulticore 为 MegaMoE、MegaGate 和 MegaMHC 提供 Ascend 多核算子及 PyTorch 运行时，
-在 AI Core 上实现通信与计算重叠，并管理内部使用的 SHMEM 通信资源。
+HyperMulticore 是面向 Ascend NPU 的 megakernel 编程框架，用于将多个计算与通信操作组织到同一次
+kernel 执行中。框架在设备侧管理任务依赖，减少独立 kernel 启动，并为计算与通信重叠提供更细粒度的调度。
 
-- **MegaMoE**：支持 push/pull 分发的专家并行前向与反向计算。
-- **MegaGate**：支持自动求导的文本/视觉专家路由。
-- **MegaMHC**：提供残差流混合的前向与反向算子。
-- **诊断工具**：支持 kernel profiling 和 tensor dump。
+开发者可以通过计算图或任务组装描述执行过程，也可以通过 PyTorch 接口将已有组件接入模型。
+当前提供 MegaMoE、MegaGate、MegaMHC，以及任务时间线和张量快照诊断工具。
+
+[Python 接口](hyper_multicore/README.md) · [构建与安装](docs/build.md) ·
+[系统架构](docs/architecture.md) · [模型接入](examples/README.md) · [开发入口](AGENTS.md)
+
+## 主要能力
+
+- **[MegaMoE](docs/mega_moe.md)**：专家并行的分发、专家计算和结果汇合，支持前向与反向。
+- **[MegaGate](docs/mega_gate.md)**：文本与视觉 token 的专家路由。
+- **[MegaMHC](docs/mega_mhc.md)**：四路残差流的混合与归一化。
+- **[诊断工具](docs/diagnostics.md)**：内部任务时间线与张量快照。
 
 ## 快速开始
 
-需要 Linux、Ascend NPU、与制品标签匹配的 Python/CPU 架构，以及彼此兼容的 Torch/torch-npu、CANN 和驱动。
-源码构建使用当前激活的 CANN；矩阵中的参考 CANN 仅用于提示和追溯；运行时不强制 PTA post 下限或 CANN 版本配对。完整环境要求和源码构建方法见[构建与安装指南](docs/build.md)。
+### 获取并安装
 
-安装与当前环境匹配的 wheel。将下面的路径替换为实际 CANN 安装路径及构建命令打印的 wheel 路径：
+运行需要 Linux、Ascend NPU、Python ≥3.10，以及配套的 Torch/torch-npu、CANN 和驱动。
+先激活目标 Python 环境，安装[运行依赖](requirements.txt)，并准备与环境匹配的 wheel；
+只有源码时，先按[默认构建](docs/build.md#默认构建)生成 wheel。
+
+在 Bash 中执行以下命令，将占位路径替换为实际路径。`--no-deps` 不会补装运行依赖：
 
 ```bash
 source /path/to/cann/set_env.sh
 python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<abi>-<platform>.whl"
 source "$(command -v hyper_multicore_set_env.bash)"
-hyper_multicore_build_info
 ```
 
-将源码仓或解包后的 sdist 中的示例复制到独立目录，使用已安装包运行双卡 MoE 示例：
+在启动导入 Torch/torch-npu 的 Python 进程前完成激活。环境兼容、包来源和完整性检查见
+[安装与验证](docs/build.md#安装与验证)。
+
+### 运行双卡 MoE 示例
+
+[最小 MoE 示例](examples/mega_moe_minimal.py)需要两张可用 NPU 和可工作的 HCCL 环境。
+按[示例运行说明](examples/README.md#运行单层-moe-示例)准备与 wheel 同版本的脚本，
+在仅放置该脚本的源码外目录执行；设备编号 `0,1` 按实际环境调整：
 
 ```bash
-# 从源码根目录开始。
-example_dir=$(mktemp -d)
-cp examples/mega_moe_minimal.py "$example_dir/"
-cd "$example_dir"
-export ASCEND_RT_VISIBLE_DEVICES=0,1
-torchrun --standalone --nproc-per-node=2 mega_moe_minimal.py
+(
+    set -e
+    export ASCEND_RT_VISIBLE_DEVICES=0,1
+    python -m torch.distributed.run --standalone --nproc-per-node=2 mega_moe_minimal.py
+)
 ```
 
-示例执行前向与反向计算，
-并输出形状、native 构建身份及耗时。通过 `--warmup` 和 `--iterations` 可增加采样次数。
-完整网络接入与训练对照见 [examples 指南](examples/README.md)，包括
-[MoE](examples/moe/README.md) 和 [MHC](examples/mhc/README.md)。
+示例完成前向、反向和通信，并检查输出及梯度。成功时，rank 0 输出包含运行配置和耗时的 JSON。
+这用于基础运行验证；精度与性能验证见[测试指南](tests/README.md)。
 
-应用程序可直接导入公共组件：
-
-```python
-from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, MegaGate, MegaMhc
-from hyper_multicore.diagnostics import MegaKernelDiagnostics
-```
-
-`MegaMoeExperts` 的模型输入使用统一的稳定入口，数值语义通过公开稳定的
-`MegaMoeNumericsOptions` 及 `numerics_options=` 设置。用户调优通过公开实验 API
-`hyper_multicore.experimental.MegaMoeTuningOptions` 及 `tuning_options=` 配置，
-实验字段不保证跨版本兼容。数值语义、默认执行策略及调优参数见
-[MegaMoE 组件指南](hyper_multicore/README.md#megamoeexperts)。
-
-配置与使用方式见[组件指南](hyper_multicore/README.md)。使用算子的 Python 进程启动前，
-需先激活 native 路径。pip 安装及 Python 导入均不会编译 native 代码。
-
-## 开发与测试
-
-Python 实现、设备 kernel 和 native binding 位于 `hyper_multicore/`。
-其他软件项目可通过公共接口使用本包；构建、测试及使用本包均不依赖下游工程。
-
-从源码根目录安装开发所需工具并运行 CPU 单测：
-
-```bash
-python -m pip install -r requirements.txt setuptools wheel "packaging>=22"
-python -m pip install pytest
-python -m pip install --no-deps --no-build-isolation -e .
-python scripts/check_repository.py
-python -m pytest tests/ut -q
-```
-
-运行测试时，显式指定 `tests/ut`（CPU）或 `tests/torch`（NPU）；
-不指定路径可能同时收集两者。[测试指南](tests/README.md)说明 CPU/NPU 用例的归属、
-添加方式、执行命令及失败定位方法。
-
-### 代码检查
-
-三个 pre-commit hook 分别执行 Pylint、Lizard 和 Markdownlint。
-Pylint 使用 3.3.7 及 `.pylintrc`，加载 `scripts/pylint_hypermulticore.py` 中的
-许可证、公共函数类型注解与文档字符串、`sys.path` 和 subprocess 调用规则。
-Lizard 要求圈复杂度不超过 15、函数有效行数不超过 100，并仅输出违规函数。
-Markdown 规则见 `.markdownlint.jsonc`。
-
-安装 pre-commit 后，可手动检查指定文件；需要提交时自动检查的开发者可启用 Git hook：
-
-```bash
-python -m pip install pre-commit
-pre-commit run --files scripts/check_repository.py README.md
-pre-commit install
-```
-
-pre-commit 为 hook 管理工具依赖。也可在当前 Python 环境中安装工具并直接运行包装器：
-
-```bash
-python -m pip install "pylint==3.3.7" lizard
-python scripts/pre-commit/run_pylint.py scripts/check_repository.py
-python scripts/pre-commit/run_lizard.py scripts/check_repository.py
-```
-
-Markdownlint 使用 Node 环境；已安装 `markdownlint-cli2` 时可直接运行：
-
-```bash
-markdownlint-cli2 --config .markdownlint.jsonc README.md README.en.md
-```
-
-Lizard、Markdownlint、Node 和 pre-commit 不固定版本；环境需满足所用工具的运行要求。
-`.clang-format`、`hyper_multicore/CPPLINT.cfg` 和 `.codespellrc` 保留为相应工具的配置，
-不属于上述三个 hook。
+单卡调用可从 [MegaGate](docs/mega_gate.md#基本用法) 或 [MegaMHC](docs/mega_mhc.md#基本用法) 开始。
 
 ## 文档
 
-| 指南 | 内容 |
+| 需求 | 阅读位置 |
 | --- | --- |
-| [构建与安装](docs/build.md) | 环境、构建命令、制品、安装与激活 |
-| [组件使用](hyper_multicore/README.md) | 公共 API 与配置 |
-| [测试](tests/README.md) | 用例范围、添加、执行与排错 |
-| [架构](docs/architecture.md) | 运行时、调度与算子扩展 |
-| [开发指令](AGENTS.md) | 变更流程、架构归属、代码质量与验证导航 |
-| [SHMEM](docs/shmem.md) | 通信资源与生命周期 |
-| [诊断工具](docs/profiling.md) | Profiling 与 tensor dump |
+| 选择公开接口与配置 | [Python 接口](hyper_multicore/README.md) |
+| 准备环境、构建和安装 | [构建指南](docs/build.md) |
+| 接入已有模型与保留参数 | [模型接入与示例](examples/README.md) |
+| 理解框架的职责与执行方式 | [系统架构](docs/architecture.md) |
+| 采集时间线与检查张量值 | [诊断指南](docs/diagnostics.md) |
+| 准备开发环境、运行测试与静态检查 | [测试指南](tests/README.md) |
+
+## 开发与贡献
+
+修改实现前，请阅读[开发入口](AGENTS.md)，了解模块职责与开发约定。
+开发环境、测试执行和静态检查见[测试指南](tests/README.md)。
+
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE)。
