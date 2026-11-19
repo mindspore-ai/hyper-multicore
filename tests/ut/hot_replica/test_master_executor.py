@@ -21,8 +21,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from hyper_multicore.modules.hot_replica.bounded_placement import supports_bounded_placement
-from hyper_multicore.modules.hot_replica.pipeline import ReplicaPipeline, supports_pipeline
+from hyper_multicore.modules.hot_replica._planner._dispatch import _materialize
+from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica.bounded_placement import _render_geometry, supports_bounded_placement
+from hyper_multicore.modules.hot_replica.pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 
 
@@ -74,10 +76,46 @@ def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident
                            expert_weight_layout="EOI", leased_banks=bank, generation=0)
     pipeline = ReplicaPipeline(pool)
     pipeline.storage = torch.empty(pipeline.signal_words, dtype=torch.int32)
-    binding = SimpleNamespace(token=object(), edges=(0, (), ()))
-    pipeline.begin(bank, binding, backward=False)
+    binding = SimpleNamespace(token=object(), edges=(0, (), ()), placement=SimpleNamespace(borrowed_capacity=1))
+    weights = pipeline.begin(bank, binding, backward=False)
+    assert all(weight.shape[0] == 3 for weight in weights)
     assert pool.generation == 1
     staged = pool.generation
     pipeline.begin(bank, binding, backward=True)
     assert binding.weight_epoch == 1 and binding.gradient_epoch == 2
     assert pool.generation > staged
+
+
+@pytest.mark.parametrize("layout", ["EIO", "EOI"])
+@pytest.mark.parametrize(("used", "batch_experts", "width"), [(4, False, 4), (5, False, 6),
+                                                            (6, False, 6), (5, True, 6)])
+def test_fusion_accepts_an_empty_tail_in_the_padded_copy_table(layout, used, batch_experts, width):
+    """Retain the original cached geometry and only expose actual guests to the fused bank."""
+    home, ranks = 8, 2
+    config = ExpertReplicaConfig(home * ranks, ranks, 6)
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=batch_experts, dispatch_mode="push", transport_engine="mte",
+        expert_weight_layout=layout, hidden_size=512, intermediate_size=256, local_experts=home, rank_id=1, top_k=1,
+    )
+    counts = ((2,) * config.num_experts,) * ranks
+    quotas = [{expert: 4 for expert in range(rank * home, (rank + 1) * home)} for rank in range(ranks)]
+    for expert in range(home, home + used):
+        quotas[0][expert] = quotas[1][expert] = 2
+    plan = _materialize(counts, quotas, config)
+    plan.validate()
+    geometry = _render_geometry(plan, spec, "cpu", config.num_experts * 2)
+    assert geometry.width == width
+    assert geometry.owners == tuple(row[home:home+width] for row in plan.slot_to_logical)
+    expected = torch.tensor(plan.dispatch_counts).reshape(ranks, ranks, config.slots_per_rank)
+    expected = expected[:, :, :home+width].reshape(ranks, -1)
+    assert torch.equal(geometry.counts, expected)
+    # The local rank has no guests. Its published_slots value must not affect
+    # the fused extent agreed by the whole EP group.
+    placement = SimpleNamespace(published_slots=0, borrowed_capacity=geometry.width, copies_by_rank=geometry.owners)
+    slots = fused_replica_slots(spec, placement)
+    assert slots == (used if not batch_experts and used <= 5 else 0)
+    if slots:
+        pipeline = ReplicaPipeline(SimpleNamespace(local_experts=home, rank=1))
+        planned, received, owned = pipeline.plan(placement, slots)
+        assert planned == len(received) == used
+        assert owned == tuple((0, j, j) for j in range(used))

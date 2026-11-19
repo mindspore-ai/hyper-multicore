@@ -34,17 +34,27 @@ def _band_layout(shape):
     return rows_per_band, (rows + rows_per_band - 1) // rows_per_band
 
 
-def supports_pipeline(spec, borrowed):
-    """Require disjoint BF16 weight and FP32 gradient addresses in the existing banks."""
-    home = spec.local_experts
+def _pipeline_capacity(spec):
+    """Limit BF16 guest weights and FP32 guest dW to disjoint bank spans."""
     h, i = spec.hidden_size, spec.intermediate_size
-    return (
-        supports_bounded_placement(spec)
-        and 0 < 3 * borrowed <= 2 * home
-        and h * i % 16 == 0
-        and all(_band_layout(shape)[1] <= _MAX_BANDS
-                for shape in projection_shapes(h, i, spec.expert_weight_layout))
-    )
+    if supports_bounded_placement(spec) and h * i % 16 == 0 and all(
+            _band_layout(shape)[1] <= _MAX_BANDS for shape in projection_shapes(h, i, spec.expert_weight_layout)):
+        return 2 * spec.local_experts // 3
+    return 0
+
+
+def supports_pipeline(spec, borrowed):
+    """Check whether the requested width fits the fused bank."""
+    return 0 < borrowed <= _pipeline_capacity(spec)
+
+
+def fused_replica_slots(spec, placement):
+    """Keep the physical stride and exclude padding from the fused bank extent."""
+    width = placement.borrowed_capacity
+    slots = min(width, _pipeline_capacity(spec))
+    if slots and slots < width and any(owner >= 0 for row in placement.copies_by_rank for owner in row[slots:]):
+        return 0
+    return slots
 
 
 def _words_tensor(words, device, padding=0):
@@ -91,15 +101,16 @@ class ReplicaPipeline:
         self.resident = None
         self.streams.clear()
 
-    def plan(self, placement):
+    def plan(self, placement, slots=None):
         """Use the allocator's agreed copy rows without a backward device readback."""
         pool = self.pool
-        slots = placement.borrowed_capacity
+        if slots is None:
+            slots = placement.borrowed_capacity
         table = placement.copies_by_rank
         home = pool.local_experts
-        received = tuple(_NO_OWNER if source < 0 else source // home for source in table[pool.rank])
+        received = tuple(_NO_OWNER if source < 0 else source // home for source in table[pool.rank][:slots])
         owned = tuple((peer, slot, source % home) for peer, row in enumerate(table)
-                      for slot, source in enumerate(row) if source >= 0 and source // home == pool.rank)
+                      for slot, source in enumerate(row[:slots]) if source >= 0 and source // home == pool.rank)
         return slots, received, owned
 
     def begin(self, weights, binding, backward):
@@ -111,7 +122,7 @@ class ReplicaPipeline:
         # Projection weights and dW alias the generic bank, including a
         # checkpoint suffix staged between this binding's forward and backward.
         pool.generation += 1
-        slots, received, owned = binding.edges
+        _, received, owned = binding.edges
         rank_lines = pool.ranks * pool.local_experts * _LINE_WORDS
         credit = self.storage[:rank_lines].view(pool.ranks, pool.local_experts, _LINE_WORDS)
         ready = self.storage[3 * rank_lines:3 * rank_lines + 2 * pool.local_experts * _LINE_WORDS]
@@ -153,7 +164,9 @@ class ReplicaPipeline:
                           *(entry.data_ptr() for entry in ready), *(w.data_ptr() for w in weights),
                           *(w.data_ptr() for w in bank))
         binding.gradient_epoch = self.epoch
-        return tuple(w[:pool.local_experts + slots] for w in bank)
+        # GMM descriptors still use the padded expert count. Zero-row guests
+        # have no weight reads or gradient producers.
+        return tuple(w[:pool.local_experts + binding.placement.borrowed_capacity] for w in bank)
 
     def complete(self, binding):
         """Keep local parameter lifetimes and bank reuse ordered with the peer copies."""

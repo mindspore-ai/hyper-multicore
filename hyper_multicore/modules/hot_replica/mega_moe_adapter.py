@@ -30,7 +30,7 @@ from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
 from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
 from .checkpoint import is_checkpointing
 from .placement import placement_receive_limit
-from .pipeline import supports_pipeline
+from .pipeline import fused_replica_slots, supports_pipeline
 from .planner import HotReplicaPlanner
 from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
 
@@ -245,11 +245,10 @@ class PlacementResources:
         self.statistics["placements"] += 1
         resources = self._geometry(hidden, placement)
         spec = self.parent.spec
-        fused = (
-            fused and bool(placement.copies_by_rank)
-            and supports_pipeline(spec, placement.borrowed_capacity)
+        slots = fused_replica_slots(spec, placement) if fused and placement.copies_by_rank else 0
+        binding = ExpertWeightBinding(
+            self.pool, placement, spec.expert_weight_layout, fused=bool(slots), fused_slots=slots,
         )
-        binding = ExpertWeightBinding(self.pool, placement, spec.expert_weight_layout, fused=fused)
         return resources, placement, binding
 
     def _geometry(self, hidden, placement):

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 import threading
 import weakref
 from typing import Any
@@ -386,9 +386,10 @@ class ExpertWeightBinding:
     token: object = field(default_factory=object)
     transfers: tuple = ()
     gradient_storage: tuple = ()
+    fused_slots: InitVar[int | None] = None
 
-    def __post_init__(self):
-        self.edges = self.pool.pipeline.plan(self.placement) if self.fused else None
+    def __post_init__(self, fused_slots):
+        self.edges = self.pool.pipeline.plan(self.placement, fused_slots) if self.fused else None
 
     @property
     def owns_returns(self):
