@@ -199,6 +199,8 @@ uintptr_t StreamHandle(const c10_npu::NPUStream &stream) {
   // ABI dependency: callers reinterpret_cast this handle back to aclrtStream, which relies on torch_npu's
   // stream representation being exactly an aclrtStream. If torch_npu changes that representation, every
   // direct-ACL entry (Barrier, AllGather) must be revisited.
+  // Queued Tensor cleanup can need the GIL; let it finish while waiting for the queue to drain.
+  py::gil_scoped_release release;
   return reinterpret_cast<uintptr_t>(stream.stream());
 }
 

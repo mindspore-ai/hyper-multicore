@@ -53,6 +53,7 @@
 
 ### ABI 与队列
 
+- 流身份比较使用设备和逻辑 stream ID；Python 的 `npu_stream` 和 native 的 `stream()` 可能等待 PTA 队列，不用于判重。直接 CANN 调用需要真实句柄时，在框架桥接入口释放 GIL 后等待队列，返回前恢复 GIL；队列消费者释放 Tensor 引用时也可能需要 GIL。保留队列顺序及 `record_stream` 生命周期登记。
 - 同一物理 ABI 维护一套明确的字段与版本合同。不同语言的表示保持一致，不各自扩展语义；不因跨语言重复声明就自动引入代码生成机制。Python serializer、C++ reader 和设备消费方的宽度、offset、单位、flags、版本一致。索引、行数、元素数和字节数明确区分，保留实际需要的 64 位地址/偏移。
 - runtime 维护一套版本化 header/队列协议，同一 ready 机制不保留两套独立开关。核参与、任务放置、扫描窗口和等待方式各自表达，窗口不等于队列容量。
 - 数学 tiling 由算子/provider 决定，外层 launch tiling 与 task 内数学 tiling 分开；框架桥接不重写数学。
