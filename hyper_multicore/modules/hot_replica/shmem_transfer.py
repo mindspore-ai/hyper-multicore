@@ -99,7 +99,7 @@ class SharedExpertPool:
     def allocation_bytes(self) -> int:
         """Report the aligned combined bank and optional peer-event requirement."""
         weights = 6 * self.local_experts * self.hidden * self.intermediate * self.dtype.itemsize + 1024
-        signal_bytes = 0 if self.pipeline is None else 4 * self.pipeline.signal_words + 512
+        signal_bytes = 0 if self.pipeline is None or self.pipeline.inline else 4 * self.pipeline.signal_words + 512
         return weights + signal_bytes
 
     def allocate(self) -> None:
@@ -116,7 +116,7 @@ class SharedExpertPool:
                     allocated.append(shmem.empty(shape, dtype=self.dtype, alignment=512))
             finally:
                 self.weights = tuple(allocated)
-            if self.pipeline is not None:
+            if self.pipeline is not None and not self.pipeline.inline:
                 self.pipeline.allocate()
             if self.completion_event is None:
                 self.completion_event = torch.npu.Event()
@@ -140,7 +140,7 @@ class SharedExpertPool:
 
     def _allocations(self, dtype):
         specs = tuple((shape, dtype) for shape in self._bank_shapes())
-        if self.pipeline is None:
+        if self.pipeline is None or self.pipeline.inline:
             return self.weights, specs
         return (*self.weights, self.pipeline.storage), (*specs, ((self.pipeline.signal_words,), torch.int32))
 
@@ -208,8 +208,10 @@ class SharedExpertPool:
         """Bind new bank tensors after HMC replaces the symmetric heap."""
         del spec, dtype, device, receive_capacity
         self._alternate_banks = ()
-        if self.pipeline is None:
+        if self.pipeline is None or self.pipeline.inline:
             self.weights = tensors
+            if self.pipeline is not None:
+                self.pipeline.free()
         else:
             self.weights = tensors[:-1]
             self.pipeline.bind(tensors[-1])
@@ -299,7 +301,7 @@ class SharedExpertPool:
         if not self.in_use:
             raise RuntimeError("HotReplica prefetch requires an active bank lease")
         if self.pipeline is not None:
-            self.pipeline.resident = None
+            self.pipeline.invalidate()
         with _ordered_transfers(self):
             if snapshot is None:
                 prefetch_banks(weights, self.leased_banks, copies, self.rank, self.blocks)
@@ -330,6 +332,8 @@ class SharedExpertPool:
         published_slots: int | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Sum borrowed gradients into the expert producer's home gradients."""
+        if self.pipeline is not None:
+            self.pipeline.invalidate()
         with _ordered_transfers(self):
             home = reduce_banks(
                 gradients,

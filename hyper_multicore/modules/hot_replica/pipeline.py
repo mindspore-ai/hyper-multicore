@@ -48,10 +48,11 @@ def supports_pipeline(spec, borrowed):
     return 0 < borrowed <= _pipeline_capacity(spec)
 
 
-def fused_replica_slots(spec, placement):
+def fused_replica_slots(spec, placement, *, slot_limit=None):
     """Keep the physical stride and exclude padding from the fused bank extent."""
     width = placement.borrowed_capacity
-    slots = min(width, _pipeline_capacity(spec))
+    capacity = _pipeline_capacity(spec)
+    slots = min(width, capacity if slot_limit is None else min(capacity, slot_limit))
     if slots and slots < width and any(owner >= 0 for row in placement.copies_by_rank for owner in row[slots:]):
         return 0
     return slots
@@ -65,20 +66,40 @@ def _words_tensor(words, device, padding=0):
 class ReplicaPipeline:
     """Own persistent peer epochs and stream-ordered projections for one pool."""
 
-    def __init__(self, pool):
+    def __init__(self, pool, *, inline=False):
         self.pool = pool
+        self.inline = inline
         self.storage = None
         self.epoch = 0
         self.resident = None
         self.streams = {}
+        self.slot_limit = self._inline_capacity() if inline else None
 
     @property
     def signal_words(self):
         """Return the same reserved extent on every member of a bank."""
         pool = self.pool
-        band_count = sum(_band_layout(shape)[1]
-                         for shape in projection_shapes(pool.hidden, pool.intermediate, pool.expert_weight_layout))
+        layouts = ("EIO", "EOI") if self.inline else (pool.expert_weight_layout,)
+        band_count = max(sum(_band_layout(shape)[1]
+                             for shape in projection_shapes(pool.hidden, pool.intermediate, layout))
+                         for layout in layouts)
         return (3 * pool.ranks + 2 + band_count * pool.blocks) * pool.local_experts * _LINE_WORDS
+
+    def _inline_capacity(self):
+        """Fit flags between the weight prefix and dW suffix in the W13 bank."""
+        pool = self.pool
+        matrix_words = pool.hidden * pool.intermediate
+        matrices = (self.signal_words + matrix_words - 1) // matrix_words
+        home = pool.local_experts
+        # The generic replay suffix starts at home and may be written on only
+        # some ranks. Keep even the inline flags out of that suffix.
+        return max(0, min((2 * home - matrices) // 3, home - matrices))
+
+    def invalidate(self):
+        """Forget prepared weights after a generic bank write."""
+        self.resident = None
+        if self.inline:
+            self.storage = None
 
     def allocate(self):
         """Clear peer words once after the symmetric allocation or a heap restart."""
@@ -94,9 +115,9 @@ class ReplicaPipeline:
 
     def free(self):
         """Retire epochs before another heap can reuse their addresses."""
-        if self.storage is not None:
+        if self.storage is not None and not self.inline:
             shmem.free(self.storage)
-            self.storage = None
+        self.storage = None
         self.epoch = 0
         self.resident = None
         self.streams.clear()
@@ -116,6 +137,11 @@ class ReplicaPipeline:
     def begin(self, weights, binding, backward):
         """Publish projection epochs directly to their current guest consumers."""
         pool = self.pool
+        if self.inline and self.storage is None:
+            start = self.slot_limit * pool.hidden * pool.intermediate
+            self.storage = pool.leased_banks[0].view(-1).view(torch.int32).narrow(0, start, self.signal_words)
+            self.storage.zero_()
+            shmem.barrier(blocking=False)
         self.epoch += 1
         if self.epoch > _MAX_EPOCH:
             raise RuntimeError("HotReplica replica epochs exhausted")

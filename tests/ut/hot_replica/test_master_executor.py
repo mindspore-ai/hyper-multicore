@@ -119,3 +119,40 @@ def test_fusion_accepts_an_empty_tail_in_the_padded_copy_table(layout, used, bat
         planned, received, owned = pipeline.plan(placement, slots)
         assert planned == len(received) == used
         assert owned == tuple((0, j, j) for j in range(used))
+
+
+def test_inline_pipeline_fits_between_weight_gradient_and_checkpoint_views():
+    """Inline epochs have no extra allocations and clear after a generic write."""
+    home, hidden, inner = 6, 256, 128
+    bank = torch.ones((2*home, hidden, 2*inner), dtype=torch.bfloat16)
+    pool = SimpleNamespace(local_experts=home, rank=0, ranks=2, blocks=24, hidden=hidden, intermediate=inner,
+                           expert_weight_layout="EIO", leased_banks=(bank, bank), generation=0)
+    pipeline = ReplicaPipeline(pool, inline=True)
+    assert pipeline.slot_limit == 3
+    binding = SimpleNamespace(edges=(3, (), ()), token=object(), placement=SimpleNamespace(borrowed_capacity=4))
+    with patch("hyper_multicore.modules.hot_replica.pipeline.shmem.barrier") as barrier:
+        pipeline.begin((bank, bank), binding, backward=False)
+        storage = pipeline.storage
+        assert storage.data_ptr() == bank[3].data_ptr()
+        dW_offset = (2*home-2*pipeline.slot_limit) * bank[0].numel() * bank.element_size()
+        end = storage.data_ptr() + storage.numel() * storage.element_size()
+        assert end <= bank.data_ptr() + dW_offset and end <= bank[home].data_ptr()
+        assert bool((storage == 0).all())
+        storage.fill_(123)
+        pipeline.invalidate()
+        assert pipeline.resident is None
+        pipeline.begin((bank, bank), binding, backward=True)
+        assert pipeline.storage.data_ptr() == storage.data_ptr()
+        assert bool((pipeline.storage == 0).all())
+        assert barrier.call_count == 2
+
+
+def test_inline_signal_capacity_cannot_admit_a_real_fourth_slot_for_six_home_experts():
+    """A full weight and dW bank leaves its occupied fourth slot on the generic path."""
+    placement = SimpleNamespace(borrowed_capacity=4, copies_by_rank=((6, 7, 8, 9), (-1,)*4))
+    spec = SimpleNamespace(architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+                           expert_weight_layout="EOI", hidden_size=256, intermediate_size=128, local_experts=6)
+    assert fused_replica_slots(spec, placement) == 4
+    assert fused_replica_slots(spec, placement, slot_limit=3) == 0
+    placement.copies_by_rank = ((6, 7, 8, -1), (-1,)*4)
+    assert fused_replica_slots(spec, placement, slot_limit=3) == 3

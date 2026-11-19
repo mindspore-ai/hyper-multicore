@@ -34,32 +34,28 @@ def forward(
     module_resources = resources
     resources = route.execution_resources or resources
     binding = route.weight_binding
-    pipeline = binding is not None and binding.fused
-    if pipeline:
-        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device,
-                                         weight_grad_dtype=torch.float32, replica_pipeline=True,
-                                         reserve_merge_workers=binding.owns_returns)
-        if plan.fwd_diagnostics.is_active or plan.bwd_diagnostics.is_active:
-            binding.fused = False
-            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
-    elif binding is None or module_resources.placement.source_bound is None:
-        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
-    else:
-        placement = binding.placement
-        num_experts = placement.counts_by_source.shape[1]
-        placement_owner = module_resources.placement
+    ordinary_options = {}
+    if binding is not None and module_resources.placement.source_bound is not None:
         home = module_resources.spec.local_experts
-        nominal = (
-            placement_owner.source_bound is not None
-            and home >= 2 * resources.spec.num_cube_cores and resources.spec.intermediate_size < 2048
-            and resources.spec.lowering != "dense" and resources.spec.ready_depth is None
-        )
-        plan = resources.plan_for_tokens(
-            route.metadata.plan_tokens, hidden_flat.device,
-            weight_grad_dtype=torch.float32 if placement_owner.source_bound is not None else None,
-            route_experts=num_experts, nominal_schedule=nominal,
+        nominal = (home >= 2 * resources.spec.num_cube_cores and resources.spec.intermediate_size < 2048
+                   and resources.spec.lowering != "dense" and resources.spec.ready_depth is None)
+        ordinary_options = dict(
+            weight_grad_dtype=torch.float32, route_experts=binding.placement.counts_by_source.shape[1],
+            nominal_schedule=nominal,
             batch_experts=nominal and route.metadata.plan_tokens * resources.spec.top_k <= 128 * home,
         )
+        if ordinary_options["batch_experts"]:
+            binding.fused = False
+    if binding is not None and binding.fused:
+        plan = resources.plan_for_tokens(
+            route.metadata.plan_tokens, hidden_flat.device,
+            weight_grad_dtype=torch.float32, route_experts=ordinary_options.get("route_experts"),
+            replica_pipeline=True, reserve_merge_workers=binding.owns_returns,
+        )
+        if plan.fwd_diagnostics.is_active or plan.bwd_diagnostics.is_active:
+            binding.fused = False
+    if binding is None or not binding.fused:
+        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **ordinary_options)
     pull = resources.spec.dispatch_mode == "pull"
     before_fc2 = resources.spec.apply_probs_before_fc2
     options = {} if route.weight_binding is None else {"weight_binding": route.weight_binding}

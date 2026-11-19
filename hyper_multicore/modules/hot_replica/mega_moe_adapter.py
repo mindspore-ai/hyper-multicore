@@ -30,7 +30,7 @@ from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
 from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
 from .checkpoint import is_checkpointing
 from .placement import placement_receive_limit
-from .pipeline import fused_replica_slots, supports_pipeline
+from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
 from .planner import HotReplicaPlanner
 from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
 
@@ -98,8 +98,8 @@ def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reserva
     """Register a HotReplica allocation in the existing MegaMoE heap transaction."""
     spec = parent.spec
     manager = parent.heap_manager
-    # Fused peer epochs and MX returns belong to one execution owner.
-    owner_id = id(owner) if pipeline or pool_type is not SharedExpertPool else None
+    dedicated = pipeline and owner.source_bound is None and manager.heap_limit is None
+    owner_id = id(owner) if dedicated or pool_type is not SharedExpertPool else None
     key = (spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id)
     with manager.access():
         banks = _SHARED_BANKS.setdefault(manager, weakref.WeakValueDictionary())
@@ -108,7 +108,7 @@ def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reserva
             pool = pool_type(
                 hidden, spec.ep_group, spec.local_experts, spec.intermediate_size,
                 spec.num_cube_cores, spec.expert_weight_layout, root=manager, access=manager.access,
-                pipeline=pipeline,
+                pipeline=dedicated,
             )
             reservation = {
                 "kind": pool.pool_kind, "layout": spec.expert_weight_layout, "local_experts": spec.local_experts,
@@ -132,6 +132,8 @@ def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reserva
                 raise
             banks[key] = pool
             pool.owners = weakref.WeakSet()
+        if pipeline and pool.pipeline is None:
+            pool.pipeline = ReplicaPipeline(pool, inline=True)
         pool.owners.add(owner)
         return pool
 
@@ -156,10 +158,7 @@ class PlacementResources:
             self.bounded = BoundedPlacement(parent.spec) if has_reservation or not heap_limited else None
         else:
             self.bounded = None
-        self.pipeline_enabled = (
-            self.bounded is not None and self.source_bound is None
-            and parent.heap_manager.heap_limit is None and supports_pipeline(parent.spec, 1)
-        )
+        self.pipeline_enabled = self.bounded is not None and supports_pipeline(parent.spec, 1)
         self.statistics = {
             "invocations": 0, "placements": 0,
             "route_replays": 0, "route_replay_misses": 0, "skipped_recomputes": 0,
@@ -199,7 +198,7 @@ class PlacementResources:
                 )
 
             selected = HotReplicaPlanner._plan_reserved(request, _build_reserved, HotReplicaPlanner._build)
-            return self.bind(hidden, selected)
+            return self.bind(hidden, selected, fused=self.pipeline_enabled and not checkpointing)
         self.statistics["invocations"] += 1
         peak = summary.maximum
         spec = self.parent.spec
@@ -245,7 +244,10 @@ class PlacementResources:
         self.statistics["placements"] += 1
         resources = self._geometry(hidden, placement)
         spec = self.parent.spec
-        slots = fused_replica_slots(spec, placement) if fused and placement.copies_by_rank else 0
+        pipeline = self.pool.pipeline
+        slots = 0
+        if fused and pipeline is not None and placement.copies_by_rank and self.pool.blocks == spec.num_cube_cores:
+            slots = fused_replica_slots(spec, placement, slot_limit=pipeline.slot_limit)
         binding = ExpertWeightBinding(
             self.pool, placement, spec.expert_weight_layout, fused=bool(slots), fused_slots=slots,
         )
