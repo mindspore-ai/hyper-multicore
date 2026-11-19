@@ -122,7 +122,12 @@ class MXFP8Execution:
                                                 backward=False) as (guests, ready):
                     self._launch([*buffers, *guests, ready], forward, events, plan)
             expert_output = routed_buffer[:route.routed_tokens.shape[0]]
-            if retain_backward or not self.nograd_no_clone:
+            if (retain_backward and not pull and source_buffer.numel()
+                    and source_buffer.untyped_storage().data_ptr() != hidden.untyped_storage().data_ptr()):
+                # This stream orders the copy after the Push graph's last use of the permutation.
+                # The private buffer keeps the dProbs input alive beyond the workspace lease.
+                expert_output = source_buffer.copy_(expert_output)
+            elif retain_backward or not self.nograd_no_clone:
                 expert_output = expert_output.clone()
             probabilities = probs.float().contiguous()
             output = torch_npu.npu_moe_token_unpermute(expert_output, route.unpermute_mapping, probs=probabilities)
