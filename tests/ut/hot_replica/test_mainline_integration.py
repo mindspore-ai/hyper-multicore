@@ -526,6 +526,50 @@ def test_checkpoint_request_is_training_independently_of_reservation(bound):
     assert request.ordinary_receive_capacity == (128 if bound else None)
 
 
+@pytest.mark.parametrize("bound", [None, 4096])
+def test_a3_saved_route_uses_shared_quota_geometry(bound):
+    """Use the reserved quotas across F and R, retaining unreserved bank admission."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        ep_size=2, rank_id=0, local_experts=4, hidden_size=32, intermediate_size=64,
+        top_k=2, num_cube_cores=24, apply_probs_before_fc2=True, expert_weight_layout="EOI",
+    )
+    owner = SimpleNamespace(
+        spec=spec, workspace=SimpleNamespace(capacity_floor=4096), heap_manager=SimpleNamespace(heap_limit=None),
+    )
+    planner = HotReplicaPlanner(source_token_bound=bound)
+    resources = PlacementResources(owner, {
+        "source_token_bound": bound, "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__),
+    }, False)
+    resources.bounded.nodes = (0, 0)
+    ids = torch.arange(2, dtype=torch.int32).expand(2048, 2).contiguous()
+    wire = torch.tensor([[1, 2048, 12, 2048, 2048, 0, 0, 0, 0, 0, 0]] * 2, dtype=torch.int32)
+    hidden = torch.empty(2048, 32, dtype=torch.bfloat16)
+    summary = route._RouteSummary(8192, 2048, 8192)
+    if bound is None:
+        with patch.object(planner, "plan", return_value=None) as plan:
+            assert resources.select(
+                hidden, ids, wire, summary, [4096, 4096], None, 12, planner=planner, checkpointing=True,
+            ) is None
+        plan.assert_called_once()
+        assert resources.bounded.geometry is None
+        return
+
+    with (
+        patch.object(resources, "bind") as bind,
+        patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True),
+    ):
+        resources.select(hidden, ids, wire, summary, [4096, 4096], None, 12, planner=planner, checkpointing=True)
+        owner.workspace.capacity_floor = 8192
+        resources.select(hidden, ids, wire, summary, [4096, 4096], None, 13, planner=planner, checkpointing=True)
+    before, after = (call.args[1] for call in bind.call_args_list)
+    assert before.receive_capacity == 4096
+    assert before.counts_by_source is after.counts_by_source
+    assert before.copies_by_rank == after.copies_by_rank
+    assert before.published_slots == sum(expert >= 0 for expert in before.copies_by_rank[0])
+    assert all(not call.kwargs.get("fused") for call in bind.call_args_list)
+
+
 def test_manifest_checks_custom_policy_settings():
     """Different settings on two ranks fail in the resource configuration exchange."""
     cls = resource_module._MegaMoeExecutionResources

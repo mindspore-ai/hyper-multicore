@@ -27,7 +27,7 @@ from hyper_multicore.modules.mega_moe.heap_manager import _WorkspaceLayout, _wor
 from hyper_multicore.modules.mega_moe.spec import _align_capacity
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from .bounded_placement import BoundedPlacement, supports_bounded_placement
+from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
 from .checkpoint import is_checkpointing
 from .placement import placement_receive_limit
 from .pipeline import supports_pipeline
@@ -94,12 +94,11 @@ def workspace_reservations(
 _SHARED_BANKS = weakref.WeakKeyDictionary()
 
 
-def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reservations=()):
+def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reservations=(), pipeline=False):
     """Register a HotReplica allocation in the existing MegaMoE heap transaction."""
     spec = parent.spec
     manager = parent.heap_manager
     # Fused peer epochs and MX returns belong to one execution owner.
-    pipeline = owner.bounded is not None and supports_pipeline(spec, 1)
     owner_id = id(owner) if pipeline or pool_type is not SharedExpertPool else None
     key = (spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id)
     with manager.access():
@@ -148,15 +147,27 @@ class PlacementResources:
         self.pool = None
         self.geometries = {}
         self.source_bound = specification.get("source_token_bound")
+        self.initial_receive_floor = parent.workspace.capacity_floor if self.source_bound is not None else None
         planner_key = specification.get("planner_key")
         built_in = planner_key and planner_key[:2] == (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__)
-        self.bounded = (BoundedPlacement(parent.spec) if built_in and self.source_bound is None
-                        and supports_bounded_placement(parent.spec)
-                        and parent.heap_manager.heap_limit is None else None)
+        if built_in and supports_bounded_placement(parent.spec):
+            heap_limited = parent.heap_manager.heap_limit is not None
+            has_reservation = self.source_bound is not None
+            self.bounded = BoundedPlacement(parent.spec) if has_reservation or not heap_limited else None
+        else:
+            self.bounded = None
+        self.pipeline_enabled = (
+            self.bounded is not None and self.source_bound is None
+            and parent.heap_manager.heap_limit is None and supports_pipeline(parent.spec, 1)
+        )
         self.statistics = {
             "invocations": 0, "placements": 0,
             "route_replays": 0, "route_replay_misses": 0, "skipped_recomputes": 0,
         }
+
+    def uses_shared_quotas(self, checkpointing: bool) -> bool:
+        """Keep unreserved checkpoint admission tied to the generic allocator."""
+        return self.bounded is not None and (self.source_bound is not None or not checkpointing)
 
     def select(
         self,
@@ -165,32 +176,44 @@ class PlacementResources:
         gathered: torch.Tensor,
         summary: _RouteSummary,
         source_rows: list[int],
-        inverse: torch.Tensor,
+        inverse: torch.Tensor | None,
         autograd_mask: int,
-        *, planner: BasePlanner, host_rows: list[list[int]] | None = None,
+        *,
+        planner: BasePlanner,
+        host_rows: list[list[int]] | None = None,
+        snapshot: PlacementWire | None = None,
+        checkpointing: bool = False,
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Choose a virtual route only after the existing count exchange validates it."""
-        request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, host_rows=host_rows)
-        return self.bind(hidden, planner.plan(request))
+        shared_quotas = self.uses_shared_quotas(checkpointing)
+        if not shared_quotas or self.source_bound is not None:
+            request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
+                                   host_rows=host_rows)
+            if not shared_quotas:
+                return self.bind(hidden, planner.plan(request))
 
-    def select_bounded(self, hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, *,
-                       host_rows=None, snapshot=None):
-        """Run the bounded A3 policy over the existing route readback."""
-        del host_rows
+            def _build_reserved(current, _target):
+                return self.bounded.select(
+                    hidden, ids, current.counts_by_source, source_rows, inverse, 0, snapshot,
+                    reserved=current.ordinary_receive_capacity,
+                )
+
+            selected = HotReplicaPlanner._plan_reserved(request, _build_reserved, HotReplicaPlanner._build)
+            return self.bind(hidden, selected)
         self.statistics["invocations"] += 1
-        spec = self.parent.spec
         peak = summary.maximum
+        spec = self.parent.spec
         average = (sum(source_rows) + spec.ep_size - 1) // spec.ep_size
         projections = 2 * bool(autograd_mask & 4) + bool(autograd_mask & 8) if autograd_mask & 1 else 0
         saved = peak - average
         if not saved or (4 * saved < peak if projections == 3 else 5 * saved < 2 * peak):
             return None
         placement = self.bounded.select(hidden, ids, gathered[:, 3:], source_rows, inverse, projections, snapshot)
-        return self.bind(hidden, placement, fused=True)
+        return self.bind(hidden, placement, fused=self.pipeline_enabled)
 
     def request(
         self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: _RouteSummary,
-        source_rows: list[int], inverse: torch.Tensor, autograd_mask: int, *,
+        source_rows: list[int], inverse: torch.Tensor | None, autograd_mask: int, *,
         host_rows: list[list[int]] | None,
     ) -> PlacementRequest:
         """Expose counts and available capacity from one validated MegaMoE route."""
@@ -198,6 +221,10 @@ class PlacementResources:
         spec = self.parent.spec
         bounded = self.source_bound is not None
         replay = is_checkpointing()
+        # Replanning during recompute must not depend on an intervening heap growth.
+        floor = self.parent.workspace.capacity_floor if bounded else None
+        if replay and self.bounded is not None:
+            floor = self.initial_receive_floor
         key = (
             (autograd_mask, replay, tuple(tuple(row) for row in host_rows))
             if host_rows is not None and not bounded else None
@@ -205,7 +232,7 @@ class PlacementResources:
         return PlacementRequest(
             hidden, ids, gathered[:, 3:], inverse, summary.maximum, sum(source_rows), spec.rank_id,
             spec.intermediate_size, spec.num_cube_cores, replay or bool(autograd_mask & 1),
-            checkpointing=replay, ordinary_receive_capacity=self.parent.workspace.capacity_floor if bounded else None,
+            checkpointing=replay, ordinary_receive_capacity=floor,
             apply_probs_before_fc2=spec.apply_probs_before_fc2, count_key=key,
         )
 
@@ -236,7 +263,7 @@ class PlacementResources:
         if width in self.geometries:
             return self.geometries[width]
         if self.pool is None:
-            self.pool = _get_mega_bank(hidden, self.parent, self)
+            self.pool = _get_mega_bank(hidden, self.parent, self, pipeline=self.pipeline_enabled)
         specification = {
             **self.specification,
             "hot_replica": False, "source_token_bound": None, "planner_key": None,

@@ -80,11 +80,12 @@ def prepare_expert_invocation(
 
     options = {"autograd_mask": mask}
     if planner is not None and not mx_placement:
-        if placement.bounded is not None and record is None and not replay:
-            options["select_placement"] = placement.select_bounded
+        checkpointing = record is not None or replay
+        options["select_placement"] = partial(
+            placement.select, planner=planner, checkpointing=checkpointing,
+        )
+        if placement.uses_shared_quotas(checkpointing):
             options["reuse_placement_geometry"] = resources.spec.ep_size * resources.spec.num_experts <= 16384
-        else:
-            options["select_placement"] = partial(placement.select, planner=planner)
     if resources.spec.auto_tokens:
         options["prepare_workspace"] = prepare_workspace
     elif pull:

@@ -37,6 +37,8 @@ class HotReplicaPlanner(BasePlanner):
     @torch.no_grad()
     def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
         """Return a placement if saved work repays movement or prevents heap growth."""
+        if request.ordinary_receive_capacity is not None:
+            return self._plan_reserved(request, self._build)
         counts = request.counts_by_source
         ranks, experts = counts.shape
         local = experts // ranks
@@ -45,26 +47,6 @@ class HotReplicaPlanner(BasePlanner):
         target = (request.total_rows + ranks - 1) // ranks
         maximum = request.maximum_received
         receive_limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
-        floor = request.ordinary_receive_capacity
-        if floor is not None:
-            if maximum <= target:
-                return None
-
-            def _worth_moving(after):
-                return bounded_move_pays(
-                    maximum, after, hidden, request.intermediate_size, request.cube_cores,
-                    ranks, local, size, training=request.training, replay=request.checkpointing,
-                    apply_probs_before_fc2=request.apply_probs_before_fc2,
-                )
-
-            must_balance = maximum > floor
-            if not must_balance and (maximum <= receive_limit or not _worth_moving(target)):
-                return None
-            placement = self._build(request, target)
-            if placement is not None and (
-                    must_balance and placement.receive_capacity <= floor or _worth_moving(placement.receive_capacity)):
-                return placement
-            return None
 
         key = request.count_key
         if key is not None and key in self._rejected_routes:
@@ -90,6 +72,43 @@ class HotReplicaPlanner(BasePlanner):
             self._rejected_routes[key] = None
             if len(self._rejected_routes) > 32:
                 self._rejected_routes.popitem(last=False)
+        return None
+
+    @staticmethod
+    def _plan_reserved(request, build, capacity_fallback=None):
+        """Maintain the reservation admission policy across quota implementations."""
+        maximum, floor = request.maximum_received, request.ordinary_receive_capacity
+        ranks, experts = request.counts_by_source.shape
+        target = (request.total_rows + ranks - 1) // ranks
+        if maximum <= target:
+            return None
+        local = experts // ranks
+        hidden, size = request.hidden.shape[-1], request.hidden.element_size()
+        receive_limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
+
+        def _worth_moving(after):
+            return bounded_move_pays(
+                maximum, after, hidden, request.intermediate_size, request.cube_cores, ranks, local, size,
+                training=request.training, replay=request.checkpointing,
+                apply_probs_before_fc2=request.apply_probs_before_fc2,
+            )
+
+        must_balance = maximum > floor
+        if not must_balance and (maximum <= receive_limit or not _worth_moving(target)):
+            return None
+        placement = build(request, target)
+        if must_balance and capacity_fallback is not None and (
+            placement is None or placement.receive_capacity > floor
+        ):
+            # A different quota search can miss a feasible placement. Try the
+            # established allocator before requiring a workspace resize.
+            fallback = capacity_fallback(request, target)
+            if fallback is not None and (placement is None or fallback.receive_capacity < placement.receive_capacity):
+                placement = fallback
+        if placement is not None and (
+            (must_balance and placement.receive_capacity <= floor) or _worth_moving(placement.receive_capacity)
+        ):
+            return placement
         return None
 
     @torch.no_grad()
