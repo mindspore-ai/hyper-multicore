@@ -616,11 +616,12 @@ def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 
 def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec, source_rows: list | None = None) -> _RouteSummary:
     """Use one Host summary for shape, participation, receive limits, and schedule."""
+    implementation = os.environ.get('HYPER_MULTICORE_MX_ROUTE_SUMMARY')
     if (spec.architecture == 3510 and spec.precision == 'mxfp8' and payload.device.type == 'npu'
             and payload.dtype == torch.int32 and payload.is_contiguous()
             and spec.ep_size <= 128 and spec.num_experts <= 4096
-            and os.environ.get('HYPER_MULTICORE_MX_ROUTE_SUMMARY') == 'warp'):
-        summary = multicore_ops.mx_route_summary(payload)
+            and implementation in ('warp', 'nddma')):
+        summary = multicore_ops.mx_route_summary(payload, nddma=implementation == 'nddma')
     else:
         counts = payload[:, 3:]
         # Each column belongs to one expert. Reduce over every source before checking for empty experts.

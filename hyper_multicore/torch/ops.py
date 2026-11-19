@@ -1071,7 +1071,7 @@ def route_offsets_and_summary(payload: torch.Tensor, rank: int, ub_bytes: int,
     return torch.ops.hyper_multicore.route_offsets_and_summary(payload, rank, ub_bytes, hidden_size)
 
 
-def mx_route_summary(payload: torch.Tensor) -> torch.Tensor:
+def mx_route_summary(payload: torch.Tensor, *, nddma: bool = False) -> torch.Tensor:
     """Reduce the INT32 gathered count table into exact INT64 summary rows."""
     _load_native()
-    return torch.ops.hyper_multicore.mx_route_summary(payload)
+    return torch.ops.hyper_multicore.mx_route_summary(payload, nddma)

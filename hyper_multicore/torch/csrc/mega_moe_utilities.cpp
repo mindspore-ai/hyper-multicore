@@ -193,10 +193,11 @@ TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
 
 #if HMC_UTILITY_ARCH3510
 extern "C" void HmcLaunchMxRouteSummary_arch3510(
-    unsigned workers, void* stream, const int32_t* payload, int64_t* output, uint32_t peers, uint32_t experts);
+    unsigned workers, void* stream, const int32_t* payload, int64_t* output,
+    uint32_t peers, uint32_t experts, bool nddma);
 
 namespace {
-at::Tensor MxRouteSummary(const at::Tensor& payload) {
+at::Tensor MxRouteSummary(const at::Tensor& payload, bool nddma) {
   TORCH_CHECK(payload.dim() == 2 && payload.scalar_type() == at::kInt && payload.is_contiguous() &&
                   payload.device().type() == c10::DeviceType::PrivateUse1,
               "MX route summary requires a contiguous INT32 NPU wire table");
@@ -212,7 +213,7 @@ at::Tensor MxRouteSummary(const at::Tensor& payload) {
   const auto stream = c10_npu::getCurrentNPUStream(device).stream(false);
   auto run = [=]() -> int {
     HmcLaunchMxRouteSummary_arch3510(std::min(cores, peers), stream, payload.data_ptr<int32_t>(),
-                                    result.data_ptr<int64_t>(), peers, experts);
+                                    result.data_ptr<int64_t>(), peers, experts, nddma);
     return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
   };
   at_npu::native::OpCommand::RunOpApi("HmcMxRouteSummary", run);
@@ -235,7 +236,7 @@ void PublishMxProjectionReady(const at::Tensor& flag, const at::Tensor& epoch) {
 }
 }  // namespace
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
-  m.def("mx_route_summary(Tensor payload) -> Tensor");
+  m.def("mx_route_summary(Tensor payload, bool nddma=False) -> Tensor");
   m.def("hot_replica_publish_mx_projection_ready_(Tensor(a!) flag, Tensor epoch) -> ()");
 }
 TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
