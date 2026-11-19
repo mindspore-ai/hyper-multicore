@@ -1,7 +1,7 @@
 # 测试指南
 
 `tests/` 包含 HyperMulticore 的 CPU 单测、真实 NPU 系统测试和共用测试工具。
-本文说明用例归属、添加方式、执行命令以及失败定位。命令示例默认从仓库根目录执行；
+本文说明测试环境、用例归属、执行命令、代码检查以及失败定位。命令示例默认从仓库根目录执行；
 也可在 `tests/` 下使用相对用例路径。NPU 安装态验证在下文所述的源码外测试目录运行。
 
 ## 哪些用例放在这里
@@ -42,7 +42,8 @@ rank 日志仍保存到调用者启动目录下的 `logs/`。
 
 ### CPU 单测
 
-使用配套的 Python/Torch/PTA 环境，从源码根目录安装开发依赖：
+激活 Python ≥3.10 及配套的 Torch/torch-npu 环境，确保 `python` 与 `python3` 指向该环境。
+从源码根目录安装开发依赖：
 
 ```bash
 python -m pip install -r requirements.txt setuptools wheel "packaging>=22"
@@ -51,6 +52,7 @@ python -m pip install --no-deps --no-build-isolation -e .
 ```
 
 CPU 单测不需要分配 NPU 卡；Torch 适配层的导入检查仍使用当前框架环境。
+环境中安装了 torch-npu 时，先激活配套 CANN，让 Torch 导入后端时能够加载 `libhccl.so` 等库；不占用 NPU 卡不代表无需这些动态库。
 C++ runtime ABI reader 检查需要支持 C++17 的 G++。示例模型检查需要配套的 `examples/` 源码。
 构建源码检查单独执行，不要求安装态 UT 具备 native 源码、CMake 配置或仓库检查脚本。
 支持从仓库根目录或 `tests/` 启动，例如：
@@ -217,6 +219,26 @@ python -m pytest tests/torch -v --junitxml=logs/npu.xml
 
 也可以用 `-m level0` 选择基础检查，或 `-k` 按名称过滤。当前 MHC 多 stream 用例标记为 level1，
 不会包含在 level0 选择中。默认 pytest 串行执行各 launcher；不要用 pytest-xdist 并行扩展整套测试。
+
+## 代码检查
+
+从仓库根目录检查本地导入、测试路径、下游依赖隔离和锁定补丁：
+
+```bash
+python scripts/check_repository.py
+```
+
+pre-commit 运行 Pylint、Lizard 和 Markdownlint，工具范围、版本及参数以
+[hook 配置](../.pre-commit-config.yaml)和对应工具配置为准。
+准备兼容的 Node.js/npm 后，安装 pre-commit 并检查本次修改的文件；以下文件名仅为示例：
+
+```bash
+python -m pip install pre-commit
+pre-commit run --files scripts/pre-commit/run_pylint.py README.md
+```
+
+首次运行需要下载工具依赖，须有可用网络或已准备的缓存。
+若需在提交时自动检查，可执行 `pre-commit install`。
 
 ## 添加或扩展用例
 

@@ -1,960 +1,227 @@
-# Multicore MoE-FFN 架构设计
+# HyperMulticore 架构
 
----
+本文解释 megakernel 的编程方式、执行机制和状态管理，面向使用框架组织计算的开发者。
+MegaMoE、MegaGate 和 MegaMHC 的接口与用法见[Python 接口导航](../hyper_multicore/README.md)。修改代码应遵守的职责、依赖与正确性约束见[架构规则](../.agent/rules/architecture.md)，开发流程与导航见[开发入口](../AGENTS.md)。
 
-## 1. 背景与融合思路
+## 设计概述
 
-### 1.1 问题
+HyperMulticore 是面向 Ascend NPU 的 megakernel 编程框架，支持在一次 kernel 执行中融合计算与通信操作。
 
-标准 MoE-FFN 正向计算流程为：
+模型计算通常由多个算子组成，算子之间通过张量传递数据。当这些操作分别通过独立 kernel 执行时，每次启动都会产生开销；并且以 kernel 为单位建立的执行依赖，还可能限制不同数据块之间的并行以及计算算子和通信算子之间的时间重叠。
 
-```text
-AllToAll-Dispatch → GMM1(up_proj) → SwiGLU → GMM2(down_proj) → AllToAll-Combine
+HyperMulticore 在 NPU 侧维护计算与通信操作之间的依赖，将这些操作组织到同一次 megakernel 执行中，并允许分配到不同计算核、且依赖已满足的任务并行执行。这种融合执行不仅减少了独立 kernel 的启动次数，而且 NPU 侧的任务调度允许不同数据块在依赖满足后继续执行，为计算与通信的时间重叠提供机会。实际收益取决于任务粒度、依赖关系、硬件资源和通信负载。
+
+为表达 megakernel 内的算子和依赖关系，开发者可以通过计算图编译或直接组装，在主机侧生成执行配置，描述各个任务（task）的操作、数据范围及执行顺序或依赖关系。megakernel 启动后，NPU 侧 runtime 读取配置，按阶段顺序或依赖关系调用对应任务的计算或通信实现，完成这些 task。
+
+框架当前通过 PyTorch 扩展接入应用，MegaMoE、MegaGate 和 MegaMHC 基于上述机制实现各自的计算与自动微分衔接。
+
+## 总体架构
+
+HyperMulticore 将计算的准备与执行分布在主机和 NPU 两侧：主机侧确定要执行的任务及其依赖，准备数据与资源；NPU 侧根据这些描述执行任务。执行配置和本次调用的张量参数连接这两侧。
+
+这里的 megakernel 主机侧指具体 megakernel 的计算描述、执行计划（plan）管理与调用逻辑。它描述计算操作、数据依赖和 task 划分，通过公共的任务编译或直接组装接口生成执行配置。调用时，它准备当前张量与工作存储；涉及跨 rank 通信时，还通过通信资源管理接口取得所需的存储和地址。
+
+准备好的执行配置、张量和计算参数通过 PyTorch 接入提交。C++ binding 连接 PyTorch 接口与 CANN 算子入口，由调用路径按接口约定绑定设备参数，再经 torch_npu/CANN runtime 发射 megakernel。主机侧实现决定执行什么计算，接入层负责将本次调用的数据与参数交给 NPU 执行。
+
+megakernel 启动后，NPU 侧 runtime 读取执行配置，按阶段顺序或依赖关系选择 task，并分发到对应实现。计算 task 由计算核适配器解释算子参数和 tiling（计算核内部的分块与资源配置），调用具体计算实现，并管理局部存储与同步，使结果满足后续消费条件。通信 task 则通过通信接口发起传输，由通信协议保证数据与完成通知的顺序。
+
+下图展示上述模块之间的调用与数据传递。子框标明主机、NPU 及项目边界；实线表示调用或数据传递，虚线表示按需使用的通信关系，箭头上的文字说明传递内容或调用目的。
+
+```mermaid
+flowchart TB
+    subgraph Host["主机侧"]
+        User["上层应用"]
+        subgraph HMC["HyperMulticore"]
+            HostImpl["megakernel 主机侧"]
+            Build["任务编译与组装"]
+            Bridge["PyTorch 接入与 CANN 算子入口"]
+            Resources["通信资源管理"]
+        end
+        Runtime["外部依赖：PyTorch / torch_npu / CANN"]
+    end
+    subgraph Device["NPU 侧：HyperMulticore"]
+        Worker["NPU 侧 runtime"]
+        Compute["计算核与适配"]
+        Comm["通信传输"]
+    end
+    Peer["其他 rank 的设备存储"]
+    User -->|调用上层接口| HostImpl
+    HostImpl -->|计算、依赖与 task 划分| Build
+    Build -->|执行配置| HostImpl
+    HostImpl -->|当前张量、配置及计算参数| Bridge
+    HostImpl -->|PyTorch 操作与自动微分| Runtime
+    Bridge -->|提交 CANN 算子| Runtime
+    Runtime -->|发射并传入配置与地址| Worker
+    Worker -->|分发计算 task| Compute
+    HostImpl -. 申请与使用通信资源 .-> Resources
+    Resources -. 提供存储与地址 .-> Comm
+    Worker -. 分发通信 task .-> Comm
+    Comm -. 远端读写与完成通知 .-> Peer
 ```
 
-每个算子是独立的 NPU kernel，算子之间存在大量 HBM 读写（激活值中间结果落盘再读回）。
-在 Expert Parallel（EP）场景下，AllToAll 通信与 GMM 计算通常串行执行，造成大量空闲等待。
+图中 NPU 部分展开的是 megakernel 执行路径。一次上层接口调用还可以组合 PyTorch 操作和普通 native 算子，后者指通过 CANN 入口提交、按自身计算流程执行的原生算子。需要自动微分时，前向实现将反向计算所需的状态保存到 autograd 上下文，反向实现再读取这些状态并提交相应计算；PyTorch 接入继续负责其中的设备提交。
 
-实测数据（Atlas A3 系列，DeepSeek-V3 规模 MoE 负载）：
+诊断模块在上述主机提交和设备 task 执行边界采集时间或数据，主机侧的诊断接入代码为采集结果提供阶段与张量含义。采集会增加时间和存储开销，因此结果需与无打点执行区分。
 
-| 指标 | 测量值 |
-|---|---|
-| Cube 核平均 MAC 利用率 | ~54%（离理论峰值差距显著） |
-| 关键路径 Vector 核执行时间 | ~18%（SwiGLU 等，此时 Cube 全闲） |
-| AllToAll 通信占端到端时间 | ~17%（其中 61% 被 GEMM 掩盖，39% 暴露） |
-| Cube/Vector 相互空闲 | 两类核轮流空转，任一时刻只有一类核工作 |
+## 任务与执行配置
 
-根因分析：GroupedGEMM 只使用 Cube 核，Vector 核在 GMM 执行期间全部空闲；SwiGLU 由 Vector 核执行时 Cube 全部空转；AllToAll 由 HOST 驱动，通信空窗期设备内 AIC 和 AIV 也无法计算。
+### 任务描述与编排
 
-### 1.2 融合方案
+算子描述要完成的逻辑计算，设备执行时还需要确定如何划分工作，以及各部分工作之间的依赖。HyperMulticore 用任务（task）表示 megakernel 内由 runtime 识别并分发执行的工作单元。例如，按数据块划分一个算子时，可以用多个 task 分别处理不同的数据块。这些 task 在同一次 megakernel 执行中完成，不分别启动独立 kernel。
 
-Multicore MoE-FFN 将上述五个算子**融合为一个 kernel**，由 AIC（AI Cube）和 AIV（AI Vector）核同时执行：
+主机侧在 task 描述中记录操作类型、数据位置、工作划分及计算参数的关联信息，NPU 侧 runtime 读取描述后调用对应的计算或通信实现。因此，task 描述与计算实现是分开的；需要等待其他任务结果时，描述中还会关联依赖事件。
 
-- **AIV 核**负责 AllToAll 通信（dispatch / combine）和 SwiGLU
-- **AIC 核**负责 GMM1、GMM2（矩阵乘）
-- 核间通过**共享内存 + 事件信号量**流水线协调，实现通信与计算的**细粒度重叠**
+主机侧还要安排这些 task 如何执行：将工作分配到执行队列，排列任务索引，并在需要时设置等待和发布的依赖事件及就绪阈值。这些安排称为任务编排，连同 task 描述一起构成执行配置。队列记录任务索引及其排列，依赖信息记录任务开始执行前需要满足的条件。NPU 侧 runtime 根据执行模式、队列范围和当前依赖状态选择 task，这一过程是运行时调度，实际执行顺序不一定与队列排列完全一致。
 
-关键收益：
+任务描述与编排信息可以通过两条路径生成。在图编译路径中，开发者用计算图描述逻辑算子及其张量关系，再由编译过程根据 task 划分和调度策略生成执行配置。对于工作划分与执行关系已经确定的流程，开发者也可以直接组装配置。两条路径生成的配置均由 NPU 侧 runtime 读取；图编译处理的是本项目的计算表示，当前不提供任意 PyTorch 计算图到 megakernel 的自动转换。
 
-- 通过单 kernel 调度减少 host launch 和同步边界，使通信、GMM 与 Vector 计算按 tile 重叠
-- 通信与计算深度重叠，提升硬件利用率
-- 正向、反向均适用，支持端到端训练
+### 参数绑定
 
-### 1.3 RATR：Rank-Aware Tile Reordering
+执行配置记录 task 描述、队列及依赖信息，每次调用则提供实际使用的输入、输出和工作存储。主机侧将可复用的配置与算子参数、tiling 参数保存为 plan。后续调用可以在 plan 的适用范围内复用它，通过参数绑定让这些描述用于本次调用的数据。
 
-在多卡 AllToAll 场景下，各 Rank 同时向同一目标 Rank 发送数据会造成网络拥塞，导致尾延迟暴露。RATR 通过调整 AllToAll Tile 的执行顺序，使发往不同 Rank 的通信流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标。RATR 不修改任何计算逻辑，仅对 `vector_task_indexs` 中 AllToAll Tile 重排，与静态调度配置一起在 RuntimeConfig 中离线生成，运行时零开销。
+对于通过张量描述定位数据的 task，描述中记录参数位置、偏移及形状等信息。这里的参数位置是参数列表中的索引，指定使用本次调用传入的哪块存储；该位置上的设备地址指向当前存储，偏移等描述信息再定位其中要处理的数据。调用路径按约定传入地址后，计算核适配器便能用同一份描述访问不同调用的数据。
 
-反向计算流程（同理融合）：
+直接读取 native 算子参数的实现则按该算子的参数布局取得地址。两种方式都要求参数顺序和偏移单位在主机与 NPU 两侧保持一致。
 
-```text
-AllToAll-Dispatch → ┌─ GMM1(act_grad) ──────────────────────┐
-                    └─ GMM4(w2_grad)                          │
-                                                              ▼
-                                               SwiGLU-grad → GMM2(gate_grad) → ┌─ AllToAll-Combine
-                                                                                └─ GMM3(w1_grad)
-```
+复用 plan 时，当前张量仍需绑定，依赖计数等可写状态仍需为本次执行准备；这些存储的使用期与复用条件见[状态与资源](#状态与资源)。
 
-GMM1 与 GMM4 并行，AllToAll-Combine 与 GMM3 并行，进一步减少空闲等待。
+### 任务划分与 tiling
 
----
+主机侧的 task 划分逻辑确定一个任务处理哪些行、块或逻辑工作；计算核适配器根据 tiling 参数确定内部的分块处理方式及局部存储使用；CANN 算子主机侧则准备发射核数、实现选择和 workspace 需求。这些信息分别描述工作范围、计算核内部的执行方式和整次 kernel 的启动条件，需要相互匹配，才能覆盖完整计算范围并满足资源需求。
 
-## 2. 目录结构
+### 配置布局与容量
 
-### 2.1 设计原则
+执行配置需要序列化后传到 NPU，由 NPU 侧读取配置头，并按布局约定解析队列和 task。两侧必须对同一段数据作出相同解释，因此 task 类型、字段含义、布局、单位及协议版本遵循同一约定。Python 和 C++ 可以分别声明表示，但不能各自扩展语义。
 
-本框架面向 Atlas A2/A3 系列及 Ascend950 系列 NPU 的 AIC/AIV 混合执行，按下表组织各层职责。
+分配的存储不仅要容纳实际引用的 task 描述，也要覆盖执行期间对依赖计数的原子访问和临时工作数据（scratch）的访问范围。因此容量不能仅根据逻辑 task 数量推断，主机侧分配和 native 算子的边界检查需要覆盖这些实际访问。
 
-| 层次 | Python 模块 | C++ 模块 | 职责 | 不包含 |
-|---|---|---|---|---|
-| **图层** | `scheduler/graph.py` | — | 算子拓扑、切分规则、形状推导 | 任何算子特定参数 |
-| **运行时层** | `scheduler/config.py` `scheduler/scheduler.py` | — | TaskDesc 生成、事件图、RATR 优化 | 框架 / 编译细节 |
-| **任务层** | `tasks/` | — | 每类算子的 FillConfig（填充策略） | 调度核心逻辑 |
-| **模块层** | `modules/<op>/` | — | 具体 DAG + CLI 数据生成 | C++ / 框架代码 |
-| **调度器层** | — | `ops/runtime/` | 通用 AIC/AIV 事件同步原语 | 计算核实现 |
-| **算子层** | — | `ops/<op_name>/` | 算子特有计算核 + KernelWorker 调度循环 | 跨算子共享逻辑 |
-| **Torch binding** | `torch/` | `torch/csrc/` | Torch 算子注册 | 图与调度逻辑 |
+阅读源码时，可以按下表定位本章介绍的概念；表中的结构和函数共同实现上述描述、编排与读取机制。
 
-### 核数规格来源
-
-`_core_spec.py` 定义不可变的 `CoreSpec(num_cube_cores, num_vector_cores)`。
-`DEFAULT_CORE_SPEC` 的默认值为 24 个 Cube 核、48 个 Vector 核，供离线 CLI、图、builder、
-任务填充及 GMM tiling 使用；调用方可以显式指定核数。
-
-`get_device_core_spec(device_index)` 每次调用 `torch.npu.get_device_limit()` 查询 Device 核数限制。
-`CoreSpec` 校验核数为正整数，算子的 1:2 混合执行约束由算子层校验。
-MoE 在资源绑定时查询核数；MHC 在每次计划选择前查询，并将核数纳入计划缓存 key。
-
-RuntimeConfig 的最小 Cube scratch 槽位、profile 槽位和 Gate 的 AIV 槽位上限各自定义容量；
-GMM/SwiGLU 模板中的 24/49 表示模板格式。
-
-### 2.2 核心运行时目录
-
-```text
-multicore/
-├── __init__.py
-├── _loader.py                      # 首次调用时定位 payload、校验 OPP 并加载框架 adapter
-├── _core_spec.py                   # 核数规格、默认值及 Device 查询
-│
-├── scheduler/                       # Python 编译器核心（无算子特化）
-│   ├── __init__.py
-│   ├── config.py                    # TaskSplitValue + init_task_split_value
-│   │                                # + 全部 ctypes structs（RuntimeConfigC 等）
-│   ├── graph.py                     # ComputeGraph / OperatorNode / TensorSpec
-│   │                                # SplitSpec / OpType / propagate_splits()
-│   ├── builder.py                   # build_runtime_config(graph, tsv, rank_id)
-│   ├── scheduler.py                 # revise_task_queue() / revise_gmm_task_queue_bwd()
-│   └── allocator.py                 # param_position 自动分配（预留）
-│
-├── tasks/                           # 任务类型注册与填充策略
-│   ├── __init__.py
-│   ├── task_base.py                 # FillConfig (ABC): fill(cfg, op, tsv) 接口
-│   ├── alltoall.py                  # AllToAllFillConfig（dispatch / combine）
-│   ├── gmm.py                       # GmmFillConfig（各变体）
-│   ├── swiglu.py                    # SwiGLUFillConfig + SwiGLUGradFillConfig
-│   ├── utils.py                     # advance_tsv_* / add_terminate / add_dynamic_data
-│   ├── tiling.py                    # 全局 tiling 字节注册表
-│   └── registry.py                  # FILL_CONFIG_REGISTRY 字典
-│
-├── modules/                         # 算子模块层（图定义 + CLI 数据生成）
-│   └── mega_moe/
-│       ├── forward/
-│       │   ├── graph.py             # build_forward_graph(tsv, ...) → ComputeGraph
-│       │   ├── gen_runtime_data.py  # CLI: --tp/--ep/... 生成 *.bin 文件
-│       │   └── tiling_tables.py     # GMM/SwiGLU tiling 参数表
-│       └── backward/
-│           ├── graph.py             # build_backward_graph(tsv, ...) → ComputeGraph
-│           ├── gen_runtime_data.py
-│           └── tiling_tables.py
-│
-├── ops/                             # C++ CANN AscendC 算子实现
-│   ├── runtime/                     # ⭐ 通用共享层（build 时拷入各 op_kernel/runtime/）
-│   │   ├── runtime_config.hpp       # 共享常量 + struct 定义（TaskDesc / EventDesc / TaskType 等）
-│   │   └── worker_kernel.h          # KernelWorkerBase<Derived> CRTP 基类
-│   │
-│   ├── hyper_mega_moe/              # MoE FFN 正向算子
-│   │   ├── op_host/                 # 主机侧：infershape / tiling / API
-│   │   └── op_kernel/               # 设备侧
-│   │       ├── hyper_mega_moe.cpp  # kernel 入口（include worker_kernel.cpp）
-│   │       ├── hyper_mega_moe_tiling_key.h
-│   │       ├── worker_kernel.cpp    # KernelWorker（fwd 特化：tiling@[23], event@[24]）
-│   │       │                        # #include "runtime/worker_kernel.h"
-│   │       ├── swi_glu/             # 仅隔离构建树：从 ops-nn 拷入
-│   │       ├── grouped_matmul/      # 仅隔离构建树：从 ops-transformer 拷入
-│   │       ├── put_mem_signal/
-│   │       │   └── put_mem_signal_kernel.cpp  # 自包含；DTYPE_DISPATCH_TARGET 实例化
-│   │       └── runtime/             # 构建时由源码组装器从 ops/runtime/ 拷入
-│   │           ├── runtime_config.hpp
-│   │           └── worker_kernel.h
-│   │
-│   └── hyper_mega_moe_grad/         # MoE FFN 反向算子（结构同上）
-│       ├── op_host/
-│       └── op_kernel/
-│           ├── hyper_mega_moe_grad.cpp
-│           ├── hyper_mega_moe_grad_tiling_key.h
-│           ├── worker_kernel.cpp    # KernelWorker（bwd 特化：tiling@[30], event@[31]）
-│           ├── swi_glu/
-│           ├── swi_glu_grad/
-│           ├── grouped_matmul/
-│           ├── put_mem_signal/
-│           │   └── put_mem_signal_kernel.cpp  # 自包含；DTYPE_DY 实例化
-│           └── runtime/             # build 时拷入
-│               ├── runtime_config.hpp
-│               └── worker_kernel.h
-│
-├── torch/                          # CMakeLists.txt + csrc/ + ops.py
-└── shmem/                          # 私有 Torch 单边通信与构建
-```
-
-### 2.3 核心模块说明
-
-#### scheduler/graph.py — 计算图层
-
-提供三个核心抽象：
-
-- **TensorSpec**：描述一个张量（shape、dtype、param_position、split_dim、is_dynamic、transpose）
-- **SplitSpec**：声明该算子如何切分（split_inputs、task_num_fn、split_output_dims）
-- **ComputeGraph**：DAG 管理器，`propagate_splits(tsv)` 按拓扑序自动计算每个节点的 task_num 和 split_dim
-
-#### scheduler/config.py — 配置与拓扑参数
-
-`TaskSplitValue` 封装拓扑超参数（tp、ep、seq_size、all_expert_num、top_k）和运行时计数器。
-
-`RuntimeConfigC` 定义 64 字节的公共 header；`scheduler/runtime.py` 为每个图创建子类，追加按实际容量分配的
-task、queue 和 event 数组。Host 与 Device 使用同一套 dense 布局，TaskDesc 为 576 字节。
-所有图均使用此结构，不区分大小图，不包含旧格式分支、magic 或 version 字段。
-
-#### tasks/ — 任务填充策略层
-
-每个文件对应一类算子任务类型，实现 `FillConfig.fill(cfg, op, tsv)` 接口，向 `RuntimeConfigC` 的
-`all_tasks[]`、task index 数组和 `all_event_num_triggers[]` 写入任务与事件关系。
-
-注册机制（`registry.py`）：
-
-```python
-FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
-    OpType.ALLTOALL:    AllToAllFillConfig,
-    OpType.GMM:         GmmFillConfig,
-    OpType.SWIGLU:      SwiGLUFillConfig,
-    OpType.SWIGLU_GRAD: SwiGLUFillConfig,
-}
-```
-
-新增算子只需在此字典中添加一行，无需修改核心调度逻辑。
-
-#### ops/runtime/ — C++ 通用共享层
-
-| 文件 | 职责 |
-|---|---|
-| `runtime_config.hpp` | 共享数据结构：`RuntimeHeader`、`TaskDesc`、`EventDesc`、`TaskType` 枚举、所有 accessor 函数 |
-| `worker_kernel.h` | `KernelWorkerBase<Derived>` CRTP 基类，含 `Process()`、`WaitForDependency()`、`TriggerEvent()` |
-
-**关键**：`ops/runtime/` 不会直接参与编译。[源码组装器](../hyper_multicore/_build/assemble_multicore_source.py)
-在隔离的临时源码树中，将整个 `runtime/` 目录分别拷贝到
-`hyper_mega_moe/op_kernel/runtime/` 和 `hyper_mega_moe_grad/op_kernel/runtime/`，使各算子
-`worker_kernel.cpp` 可以用 `#include "runtime/worker_kernel.h"` 访问共享定义。仓内业务源码和上游依赖源码
-均不会被原地修改。
-
-#### ops/<op_name>/op_kernel/worker_kernel.cpp — 算子调度循环
-
-每个算子保留自己的 `KernelWorker` 类，原因是 `input_list` 索引硬编码不同：
-
-| | mega_moe（正向）| mega_moe_grad（反向）|
-|---|---|---|
-| tiling 参数 | `input_list[23]` | `input_list[30]` |
-| event 计数器 | `input_list[24]` | `input_list[31]` |
-| GMM workspace | `input_list[11]` | `input_list[25]` |
-| SwiGLU grad workspace | — | `input_list[26]` |
-| 特有计算核 | `TASK_SWI_GLU` | `TASK_SWI_GLU_GRAD` |
-
-### 2.4 数据流总览
-
-```text
-用户 (Python)
-    ↓ build_forward_graph(tsv)
-ComputeGraph [modules/mega_moe/backends/bf16/forward/graph.py]
-    ↓ propagate_splits(tsv)
-各 OperatorNode 的 task_num / split_dim 被自动填充
-    ↓ build_runtime_config(graph, tsv, rank_id)
-    ↓  → 多态调用各 FillConfig.fill()
-    ↓  → RATR / GMM 交错优化
-RuntimeConfigC (ctypes) → 序列化为 runtime_config_rank_*.bin
-                                      ↓
-                          C++ worker_kernel 读取
-                                      ↓
-                    KernelWorker::Process() 主调度循环
-                    AIC（偶数 block）→ cube_task_indexs → GMM
-                    AIV（奇数 block）→ vector_task_indexs → SwiGLU/AllToAll
-                    事件同步：WaitForDependency / TriggerEvent
-```
-
----
-
-## 3. 正向算子
-
-### 3.1 计算流图
-
-```text
-dispatch ──► up_proj (GMM1) ──► swiglu ──► down_proj (GMM2) ──► combine
-```
-
-| 算子 | 类型 | 执行核 | 说明 |
-|---|---|---|---|
-| dispatch | AllToAll | AIV | 将 token 按 expert 路由分发到各 rank |
-| up_proj | GroupedMatmul | AIC | `[tokens, hidden] × [E, hidden, intermediate*2]` |
-| swiglu | SwiGLU | AIV | `silu(gate) * up`，输出 `[tokens, intermediate]` |
-| down_proj | GroupedMatmul | AIC | `[tokens, intermediate] × [E, intermediate, hidden]` |
-| combine | AllToAll | AIV | 将 expert 结果汇聚回原始 rank |
-
-### 3.2 Task 切分参数
-
-| 算子 | split_value | 执行核 | task_num 计算 |
-|---|---|---|---|
-| dispatch | 128 | AIV | `all_expert_num × (per_expert_seq_to_other // 128)` |
-| up_proj | 4096 | AIC | `num_cube_cores × single_rank_expert_num` |
-| swiglu | 128 | AIV | `(per_expert_seq // 128) × single_rank_expert_num` |
-| down_proj | 4096 | AIC | `num_cube_cores × single_rank_expert_num` |
-| combine | 128 | AIV | `all_expert_num × (per_expert_seq_to_other // 128)` |
-
-### 3.3 Tiling 文件（正向，各 rank 共用）
-
-| 文件 | 参数位置 | 说明 |
-|---|---|---|
-| `up_proj_tiling.bin` | pos 17 | GMM1 tiling，大小 = `num_cube_cores × tiling_entry_size` |
-| `swiglu_tiling.bin` | pos 18 | SwiGLU tiling，大小 = `(2×num_cube_cores+1) × entry_size` |
-| `down_proj_tiling.bin` | pos 19 | GMM2 tiling |
-
-生成方式见第 6.1 节。
-
----
-
-## 4. 反向算子
-
-### 4.1 计算流图
-
-```text
-dispatch ──► act_grad (GMM1) ──────────────────────────────────────────────────────────┐
-         └── w2_grad (GMM4)                                                             │
-                                                                                        ▼
-                                                    swiglu_grad ──► gate_grad (GMM2) ──► combine
-                                                                                     └── w1_grad (GMM3)
-```
-
-| 算子 | 映射 | 输入 | 输出 |
-|---|---|---|---|
-| dispatch | AllToAll | `dy`（输入梯度） | `dispatch_target`（分发后梯度） |
-| act_grad (GMM1) | `dispatch_target @ w2.T` | `dispatch_target`, `w2` | `act_grad_y`（激活梯度） |
-| w2_grad (GMM4) | `hidden.T @ dispatch_target` | `hidden`（正向 SwiGLU 输出）, `dispatch_target` | `hidden_dw`（W2 权重梯度） |
-| swiglu_grad | SwiGLU backward | `act_grad_y`, `gate`（正向 up_proj_y） | `grad_gate`（SwiGLU 梯度） |
-| gate_grad (GMM2) | `grad_gate @ w1.T` | `grad_gate`, `w1` | `gate_dx`（combine 前梯度） |
-| w1_grad (GMM3) | `permute_out.T @ grad_gate` | `permute_out`（正向 dispatch_target）, `grad_gate` | `gate_dw`（W1 权重梯度） |
-| combine | AllToAll | `gate_dx` | `grad_x`（汇聚后梯度） |
-
-### 4.2 并行执行说明
-
-- **act_grad（GMM1）与 w2_grad（GMM4）并行**：两者均依赖 dispatch 输出 `target`；GMM1 使用 `advance_mode="cube_only"`（只推进 task 计数，不推进 event），GMM4 使用 `advance_mode="cube_custom"` 统一推进 event，避免重复计数。
-
-- **combine 与 w1_grad（GMM3）并行**：两者均依赖 gate_grad（GMM2）输出；combine 使用 `advance_mode="vector_only"`，GMM3 使用 `cube_custom` 处理 event。
-
-### 4.3 Tiling 文件（反向，各 rank 共用）
-
-| 文件 | 参数名 | 说明 |
-|---|---|---|
-| `act_grad_tiling.bin` | `act_grad_tiling` | GMM1 反向 tiling（dispatch_target @ W2.T） |
-| `gate_grad_tiling.bin` | `gate_grad_tiling` | GMM2 反向 tiling（grad_gate @ W1.T） |
-| `w1_grad_tiling.bin` | `w1_grad_tiling` | GMM3（W1 权重梯度）tiling |
-| `w2_grad_tiling.bin` | `w2_grad_tiling` | GMM4（W2 权重梯度）tiling |
-| `swiglu_grad_tiling.bin` | `swiglu_grad_tiling` | SwiGLU 反向 tiling |
-
-生成方式见第 6.2 节。
-
----
-
-## 5. Task 切分设计
-
-### 5.1 TaskSplitValue
-
-`TaskSplitValue` 封装硬件拓扑参数和运行时计数器：
-
-```python
-from hyper_multicore.scheduler.config import TaskSplitValue
-
-tsv = TaskSplitValue(
-    tp=4,              # Tensor Parallel 度
-    ep=4,              # Expert Parallel 度（等于 NPU 卡数）
-    seq_size=8192,     # 全局序列长度
-    all_expert_num=32, # 总 expert 数
-    top_k=8,           # Top-K 路由数
-)
-```
-
-关键推导属性（只读 property）：
-
-| 属性 | 计算 | 含义 |
-|---|---|---|
-| `single_rank_expert_num` | `all_expert_num // ep` | 每个 rank 持有的 expert 数 |
-| `seq_all` | `seq_size × ep × top_k // tp` | TP 切分后、包含 Top-K 展开的总 token 数 |
-| `per_rank_seq` | `seq_all // ep` | 每个 rank 处理的 token 数 |
-| `per_expert_seq` | `seq_all // top_k` | Top-K 路由维度上的单份 token 数 |
-| `per_expert_seq_to_other` | `seq_all // (ep × top_k)` | 每个目标 rank、每个 Top-K 分片的 token 数 |
-| `all_event_num` | 自动计算 | 全局 event 总数 |
-
-### 5.2 propagate_splits 算法
-
-`ComputeGraph.propagate_splits(tsv)` 按拓扑顺序自动计算每个算子的 `task_num`：
-
-```text
-1. 重置所有 TensorSpec.split_dim = -1, split_num = 1
-
-2. 对每个算子（拓扑顺序）：
-   a. 若 split_inputs is None（源算子）→ task_num = task_num_fn(tsv)
-   b. 否则，若所有 (input_idx, dim) 均满足 op.inputs[input_idx].split_dim == dim
-      → task_num = task_num_fn(tsv)  [切分]
-      否则 task_num = 1              [不切分]
-   c. 标记输出张量：out.split_dim = split_output_dims[i]（task_num > 1 时）
-```
-
-**TensorSpec 共享机制**：同一个 `TensorSpec` 对象被生产者写入 `split_dim`，消费者直接读取，切分信息自动沿图传播，无需手工传递。
-
-正向传播示例：
-
-```text
-dispatch (源算子)  → target.split_dim = 0
-up_proj   [(0,0)]  → target.split_dim == 0 ✓ → gmm1_y.split_dim = 0
-swiglu    [(0,0)]  → gmm1_y.split_dim == 0 ✓ → swiglu_out.split_dim = 0
-down_proj [(0,0)]  → swiglu_out.split_dim == 0 ✓ → gmm2_y.split_dim = 0
-combine   [(1,0)]  → gmm2_y.split_dim == 0 ✓
-```
-
-### 5.3 split_inputs 选择原则
-
-`split_inputs` 中必须选择**图内有上游生产者的输入**（非外部叶子张量）。叶子张量的 `split_dim` 在每次 `propagate_splits` 时重置为 -1，以叶子为触发条件将导致 `task_num` 始终为 1。
-
-```python
-# ✅ 正确：inputs[1]=target 是 dispatch 的输出，图内连通
-w2_grad: split_inputs=[(1, 0)]   # inputs[1] = target
-
-# ❌ 错误：inputs[0]=hidden（外部叶子），split_dim 永远 -1
-w2_grad: split_inputs=[(0, 0)]   # task_num 始终 = 1
-```
-
-### 5.4 Event 驱动协调
-
-Multicore MoE-FFN 中各核通过事件信号量（event）同步：
-
-**AllToAll dispatch**：per-expert 触发
-
-```text
-trigger_event = pre_event_num + (task_index // expert_group_size) + 1
-```
-
-每个 expert group 的 dispatch task 完成后触发一个 event，GMM 以 expert 粒度消费，无需等待全部 token 发送完毕。
-
-**AllToAll combine**：global 触发
-
-```text
-trigger_event = all_event_num  （全局唯一 event）
-```
-
-**GMM 间 event 协调**（反向）：
-
-| 算子 | advance_mode | 说明 |
-|---|---|---|
-| act_grad (GMM1) | `cube_only` | 只推进 task 计数，不推进 event |
-| w2_grad (GMM4) | `cube_custom` | 统一推进 event（补偿 GMM1 未推进的部分） |
-| combine | `vector_only` | 只推进 task 计数 |
-| w1_grad (GMM3) | `cube_custom` | 统一推进 event |
-
-### 5.5 Task 切分参数设计原则
-
-| 算子类型 | 推荐 split_dim | task_num_fn | 注意事项 |
-|---|---|---|---|
-| GroupedMatMul（GMM）| 0（M 维，expert 并行）| `expert_num × (seq_per_expert // TILE_M)` | TILE_M 必须对齐 GMM block_size |
-| AllToAll（dispatch）| 0（token 维）| `total_tokens // token_tile` | event 范围：per-expert（dispatch）vs 全局（combine）|
-| AllToAll（combine）| 0 | `total_tokens // token_tile` | 依赖所有 down_proj tile 完成（N:1 扇入）|
-| SwiGLU / Add | 0 | = 上游 GMM task_num（1:1）| task_num 必须等于上游，否则事件错位 |
-
-### 5.6 Event 设计规范
-
-| 规则 | 说明 |
-|---|---|
-| **单调性** | event 计数器只增不减，保证无死锁 |
-| **1:1 依赖** | 每个生产者 tile 完成后触发对应消费者 tile |
-| **N:1 扇入** | 多个上游 tile 共同触发一个下游 tile，设置 `trigger_count = N` |
-| **1:N 扇出** | 一个上游触发多个下游，每个下游分配独立 event ID |
-| **ID 不重叠** | dispatch / combine / gmm 事件 ID 段需严格区分 |
-
----
-
-## 6. RuntimeConfig 生成
-
-`RuntimeConfig` 是 Multicore MoE-FFN 的调度配置二进制，包含每个 task 的依赖 event、触发 event、tensor 地址偏移等信息，**按 rank 独立生成**。
-
-header 的前五个 uint32 字段依次为 task_num、num_workers、task_capacity、event_capacity、ready_event；
-ready_event 为 0 表示无需跨 rank ready。接着三个 uint32 为 diagnostic_mode、
-aic_profile_record_capacity、aiv_profile_record_capacity；再两个为 completion_event、protocol_version，
-byte40 为 queue_layout，byte44 为 worker_queue_offset；最后16字节用于对齐。
-queue_layout=2 表示追加的24字节 WorkerQueue 描述表，0表示隐式队列。diagnostic_mode=0 表示普通执行，=1 表示 profiling，=2 表示 L1 dump。
-protocol_version=0 表示 push，=1 表示 pull；pull 的 completion_event
-用于等待所有参与 worker 完成，随后跨 rank 确认 source 可安全复用。
-task capacity 覆盖计算 task、terminate、队列长度和所有引用的最大 task ID，并按 16 对齐，没有固定 task 数上限。
-event capacity 至少为 1024，并覆盖无融合图、ready/completion 事件和 atomic-write 尾部。布局大小为
-`128 + 588 × task_capacity + 20 × event_capacity + group_list_bytes` 字节，必须能用 uint32 字节偏移寻址。
-在线 plan 与离线工具共用 `serialize_runtime_config()`；Device 检查协议版本以及存储与索引边界。
-普通事件区占 `event_capacity × 4` 字节；EP 大于 1 时，其后预留 `2 × (EP + 1) × 64` 字节持久 ready/completion 状态。
-每次调用只清零普通事件区，首次使用才初始化持久区并执行 Host barrier。
-
-grouped-matmul 的各 AIC scratch 按 128 字节对齐，每核步长为
-`max(128, ceil(local_experts × 8 / 128) × 128)` 字节。
-Cube 槽位容量为 `max(24, ceil(num_workers / 2))`，其中 `num_workers` 表示 Runtime AIV 容量。
-`group_list_bytes = max(4096, Cube槽位容量 × 每核步长 + 128)`，包含首地址对齐余量，
-完整 cache line 写回不会覆盖相邻核。Host 分配、序列化与 Device 偏移共同使用核数和每 rank 的专家数，
-scratch 大小受 uint32 偏移与实际内存限制。
-
-### 6.1 正向
-
-```bash
-# 必须从 hyper-multicore 仓库根目录（hyper_multicore/ 包所在目录）运行
-# 直接 python gen_runtime_data.py 会报 ImportError（相对导入）
-python -m hyper_multicore.modules.mega_moe.forward.gen_runtime_data \
-    --tp 4 --ep 4 \
-    --seq_size 8192 \
-    --all_expert_num 32 \
-    --top_k 8 \
-    --hidden_size 7168 \
-    --intermediate_size 2048 \
-    --num_cube_cores 24 \
-    --output_dir /path/to/fwd_data
-```
-
-输出文件：
-
-```text
-<output_dir>/
-├── up_proj_tiling.bin              # GMM1 tiling（各 rank 共用）
-├── swiglu_tiling.bin               # SwiGLU tiling（各 rank 共用）
-├── down_proj_tiling.bin            # GMM2 tiling（各 rank 共用）
-├── all_event_counters.bin          # 普通事件计数器及持久 ready 状态（需 symmetric memory）
-├── gmm_workspace.bin               # 256 MiB zeros（各 rank 共用）
-├── runtime_config_input_rank_0.bin # Rank 0 调度配置
-├── runtime_config_input_rank_1.bin
-└── ...
-```
-
-也可在 Python 代码中直接调用：
-
-```python
-from hyper_multicore.modules.mega_moe.forward.gen_runtime_data import build_config_for_rank
-from hyper_multicore.modules.mega_moe.forward.graph import build_forward_graph
-from hyper_multicore.scheduler.config import TaskSplitValue
-from hyper_multicore.scheduler.runtime import serialize_runtime_config
-
-tsv   = TaskSplitValue(tp=4, ep=4, seq_size=8192, all_expert_num=32, top_k=8)
-graph = build_forward_graph(tsv, dispatch_sv=128, up_proj_sv=4096,
-                            swiglu_sv=128, down_proj_sv=4096, combine_sv=128,
-                            hidden_size=7168, intermediate_size=2048)
-graph.propagate_splits(tsv)
-cfg = build_config_for_rank(graph, tsv, rank_id=0)   # 返回 RuntimeConfigC
-data = serialize_runtime_config(cfg)
-```
-
-### 6.2 反向
-
-```bash
-python -m hyper_multicore.modules.mega_moe.backward.gen_runtime_data \
-    --tp 4 --ep 4 \
-    --seq_size 8192 \
-    --all_expert_num 32 \
-    --top_k 8 \
-    --hidden_size 7168 \
-    --intermediate_size 2048 \
-    --num_cube_cores 24 \
-    --output_dir /path/to/bwd_data
-```
-
-输出文件：
-
-```text
-<output_dir>/
-├── act_grad_tiling.bin             # GMM1 反向 tiling（各 rank 共用）
-├── gate_grad_tiling.bin            # GMM2 反向 tiling
-├── w1_grad_tiling.bin              # GMM3（W1 梯度）tiling
-├── w2_grad_tiling.bin              # GMM4（W2 梯度）tiling
-├── swiglu_grad_tiling.bin          # SwiGLU 反向 tiling
-├── all_event_counters.bin          # 4096 uint8 zeros，4 KB（各 rank 共用）
-├── gmm_workspace.bin
-└── runtime_config_input_rank_<i>.bin
-```
-
----
-
-## 7. 构建与交付边界
-
-Multicore 组件入口负责依赖准备、私有 SHMEM、分 SoC vendor、vendor 合并和 Torch adapter；仓库根入口只调用
-组件脚本并将成功产物纳入完整 wheel。构建命令、环境要求、缓存和 payload 位置统一见
-[构建与交付](build.md)，源码态与 wheel 安装态的 CANN custom OPP 激活方式统一见
-[独立组件安装指南](../README.md)。
-
-每个 SoC 的 CANN 构建同时生成 `HyperMegaMoe` 和 `HyperMegaMoeGrad`。组件会校验新构建的 vendor，
-并在合并后再次校验四个 `aclnnHyperMegaMoe*` API、kernel object/metadata、SONAME 和运行时依赖。
-私有 SHMEM 库会校验专属 SONAME；所有随包 host 共享库均校验 ELF 架构、安全链接属性、无
-RPATH/RUNPATH 和依赖边界。`set_env.bash` 在启动 Python 前配置 vendor 搜索路径；SHMEM 私有库按后端绝对加载。
-
-MegaMoE、MegaGate 和 MegaMHC 通过 `torch/ops.py` 共用一个延迟加载入口，
-首次调用时按框架分支及 ABI 选择框架适配库，加载 `adapters/<variant-id>/libhyper_multicore_torch.so`。
-Torch adapter 是由 CMake 构建、通过 `torch.ops.load_library()` 加载的 dispatcher 共享库，不生成
-`PyInit_*` 入口，也不链接 `libpython` 或 `libtorch_python`。adapter 运行时按组件相对路径定位并绝对加载
-自带 vendor；`set_env.bash` 按 CANN custom OPP 契约设置 vendor 的 OPP 与动态库搜索路径。
-
-Atlas A2/A3 系列共用 `Ascend910B` SHMEM 后端，Ascend950 系列使用 `Ascend950` 后端，私有资源分别按 `arch22/arch35` 保存于
-`shmem/lib/<arch>/`。每个框架变体包含一份 Torch adapter，以及 `shmem/<arch>/` 中的各后端 binding。
-首次使用 SHMEM 时查询可见逻辑设备 0 的架构，仅加载匹配的一套 SDK、ops 和 binding；查询不创建 NPU 上下文。
-同一进程可见设备须属于同一架构，实际 Runtime 初始化仍校验调用方当前设备。
-
----
-
-## 8. Native ABI
-
-SHMEM 的 `_lifecycle.py` 管理native初始化、bootstrap、引用及调用方计划驱动的Runtime restart。
-MegaMoe 的 `heap_manager.py` 管理容量、workspace布局、heap预算和增长诊断，`spec.py`提供容量公式，
-`workspace.py`管理物理buffer与graph lease，`module.py`的执行资源对象负责绑定和关闭。
-SHMEM lifecycle不读取专家容量或workspace布局；配置和restart规则见
-[SHMEM 文档](shmem.md#runtime-restart)。
-
-用户使用方式、输入约束、容量和资源生命周期由组件 [README](../hyper_multicore/README.md) 统一说明。本节只记录
-`MegaMoeExperts` 内部调用的正反向 native ABI。
-
-### 8.1 `mega_moe` 正向 ABI
-
-```python
-multicore_ops.mega_moe(
-    # AllToAll dispatch
-    dispatch_target,      # [tokens, hidden]          bf16   AllToAll 目标缓冲区，output（in-place）
-    dispatch_target_off,  # [all_expert_num]           int64  每 expert 的远端写偏移（目标 PE）
-    dispatch_src,         # [tokens, hidden]           bf16   发送源数据
-    dispatch_src_off,     # [all_expert_num]           int64  每 expert 的本地读偏移
-    dispatch_size,        # [all_expert_num]           int32  每 expert 发送的元素数
-    # GMM1（up_proj）
-    up_proj_weight,       # [E, hidden, intermediate*2] bf16  W1 权重
-    up_proj_glist,        # [E]                        int64  每 expert token 累积和
-    up_proj_y,            # [tokens, intermediate*2]  bf16   GMM1 输出，output（in-place）
-    swiglu_out,           # [tokens, intermediate]    bf16   SwiGLU 输出，output（in-place）
-    # GMM2（down_proj）
-    down_proj_weight,     # [E, intermediate, hidden] bf16   W2 权重
-    down_proj_glist,      # [E]                       int64  每 expert token 累积和
-    down_proj_y,          # [tokens, hidden]          bf16   GMM2 输出，output（in-place）
-    # AllToAll combine
-    combine_target,       # [tokens, hidden]          bf16   AllToAll 汇聚目标缓冲区，output（in-place）
-    combine_target_off,   # [all_expert_num]          int64  每 expert 的远端写偏移
-    combine_src_off,      # [all_expert_num]          int64  每 expert 的本地读偏移
-    combine_size,         # [all_expert_num]          int32  每 expert 发送的元素数
-    # 配置张量
-    gmm_workspace,        # [256*1024*1024]           uint8  GMM 工作区（256 MiB）
-    up_proj_tiling,       # uint8                     GMM1 tiling，from gen_runtime_data.py
-    swiglu_tiling,        # uint8                     SwiGLU tiling
-    down_proj_tiling,     # uint8                     GMM2 tiling
-    runtime_config,       # uint8                     per-rank 调度配置，from gen_runtime_data.py
-    all_event_counters,   # uint8  事件同步计数器（symmetric memory）
-    # 标量
-    rank_id,              # int  当前 rank
-    ep,                   # int  Expert Parallel 度
-    expert_num,           # int  全局 expert 总数（all_expert_num）
-    hidden_size,          # int  隐藏层维度
-    seq_size,             # int  全局序列长度
-)
-```
-
-**返回值**：无；输出写入调用方提供的 Torch 张量
-
-### 8.2 `mega_moe_grad` 反向 ABI
-
-```python
-multicore_ops.mega_moe_grad(
-    # AllToAll dispatch（梯度分发）
-    dispatch_target,      # [tokens, hidden]           bf16   AllToAll 目标缓冲区，output（in-place）
-    dispatch_target_off,  # [all_expert_num]            int64  每 expert 的远端写偏移
-    dy,                   # [tokens, hidden]            bf16   输入梯度（AllToAll 发送源）
-    dispatch_src_off,     # [all_expert_num]            int64  每 expert 的本地读偏移
-    dispatch_size,        # [all_expert_num]            int32  每 expert 发送的元素数
-    # act_grad（GMM1 反向：dispatch_target @ W2.T）
-    hidden,               # [tokens, intermediate]      bf16   正向 SwiGLU 输出（缓存）
-    hidden_dw,            # [E, intermediate, hidden]   bf16   W2 权重梯度，output（in-place）
-    w2,                   # [E, intermediate, hidden]   bf16   W2 权重（= 正向 down_proj_weight）
-    act_grad_y,           # [tokens, intermediate]      bf16   GMM1 反向输出，output（in-place）
-    # swiglu_grad
-    gate,                 # [tokens, intermediate*2]   bf16   正向 up_proj_y（SwiGLU 输入缓存）
-    grad_gate,            # [tokens, intermediate*2]   bf16   SwiGLU 梯度输出，output（in-place）
-    # gate_grad（GMM2 反向：grad_gate @ W1.T）
-    w1,                   # [E, hidden, intermediate*2] bf16  W1 权重（= 正向 up_proj_weight）
-    gate_dx,              # [tokens, hidden]            bf16   GMM2 反向输出，output（in-place）
-    grad_x,               # [tokens, hidden]            bf16   AllToAll combine 输出，output（in-place）
-    # AllToAll combine（梯度汇聚）
-    combine_target_off,   # [all_expert_num]            int64  每 expert 的远端写偏移
-    combine_src_off,      # [all_expert_num]            int64  每 expert 的本地读偏移
-    combine_size,         # [all_expert_num]            int32  每 expert 发送的元素数
-    # w1_grad（GMM3）、w2_grad（GMM4）
-    permute_out,          # [tokens, hidden]            bf16   W1 梯度计算的 in-place 中间缓冲区
-    gate_dw,              # [E, hidden, intermediate*2] bf16  W1 权重梯度，output（in-place）
-    group_list,           # [E]                         int64  每 expert token 累积和
-    # 配置张量
-    act_grad_tiling,      # uint8                       GMM1 反向 tiling
-    gate_grad_tiling,     # uint8                       GMM2 反向 tiling
-    w1_grad_tiling,       # uint8                       GMM3（W1 梯度）tiling
-    w2_grad_tiling,       # uint8                       GMM4（W2 梯度）tiling
-    swiglu_grad_tiling,   # uint8                       SwiGLU 反向 tiling
-    gmm_workspace,        # [256*1024*1024]             uint8  GMM 工作区
-    swiglu_grad_workspace, # [64*1024*1024]             uint8  SwiGLU 反向工作区
-    runtime_config,       # uint8                       per-rank 调度配置
-    all_event_counters,   # uint8  事件同步计数器（symmetric memory）
-    # 标量
-    rank_id, ep, expert_num, hidden_size, seq_size,
-)
-```
-
----
-
-## 9. 扩展指南
-
-### 9.1 添加新算子任务类型（Python 侧）
-
-**Step 1** — 在 `scheduler/graph.py` 扩展 `OpType`：
-
-```python
-class OpType(Enum):
-    ALLTOALL    = "alltoall"
-    GMM         = "gmm"
-    SWIGLU      = "swiglu"
-    SWIGLU_GRAD = "swiglu_grad"
-    RMSNORM     = "rmsnorm"   # ← 新增
-```
-
-**Step 2** — 在 `scheduler/config.py` 和 C++ `runtime_config.hpp` 同步新增 `TaskType`，然后在
-`tasks/rmsnorm.py` 实现 `FillConfig`。以 [SwiGLUFillConfig](../hyper_multicore/tasks/swiglu.py) 为 Vector 任务参考：
-
-- 使用 `TaskDescC`、`TensorDescC` 构造任务和输入输出描述。
-- 将任务写入 `cfg.all_tasks`，并把索引写入对应的 `cube_task_indices`、`vector_task_indices` 或
-  `mix_task_indices`。
-- 设置 `dependent_event`、`trigger_event` 和 `all_event_num_triggers`，再更新 `cfg.task_index_num`。
-- 通过 `tasks/utils.py` 的 `advance_tsv_*` 辅助函数统一推进 task 和 event 计数。
-
-**Step 3** — 在 `tasks/registry.py` 注册：
-
-```python
-from .rmsnorm import RMSNormFillConfig
-FILL_CONFIG_REGISTRY[OpType.RMSNORM] = RMSNormFillConfig
-```
-
-**Step 4** — 在 C++ `ops/<op>/op_kernel/worker_kernel.cpp` 的 switch 中添加分支：
-
-```cpp
-case TaskType::TASK_RMSNORM:
-    ExecuteRMSNorm(task_desc);
-    break;
-```
-
-### 9.2 添加新模型（MoE FFN 以外的算子组合）
-
-**Step 1** — 建立目录：
-
-```text
-modules/
-└── attention/
-    ├── forward/
-    │   ├── graph.py
-    │   ├── gen_runtime_data.py
-    │   └── tiling_tables.py
-    └── backward/
-        └── ...
-```
-
-**Step 2** — 在 `graph.py` 构建 DAG：
-
-```python
-from hyper_multicore.scheduler.graph import (
-    ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType
-)
-from hyper_multicore.scheduler.config import TaskSplitValue
-
-def build_attention_fwd_graph(tsv: TaskSplitValue, ...) -> ComputeGraph:
-    g = ComputeGraph()
-    x       = TensorSpec("x",       shape=[tsv.seq_size, hidden], param_position=0)
-    qkv_out = TensorSpec("qkv_out", shape=[tsv.seq_size, 3*hidden], param_position=1,
-                         is_dynamic=True)
-    qkv_proj = OperatorNode("qkv_proj", op_type=OpType.GMM,
-                            inputs=[x], outputs=[qkv_out],
-                            split_spec=SplitSpec(
-                                split_inputs=None,
-                                task_num_fn=lambda tsv: tsv.seq_size // TILE_M,
-                                split_output_dims=[0]))
-    g.add_op(qkv_proj)
-    return g
-```
-
-**Step 3** — 实现 CLI（参考 `modules/mega_moe/backends/bf16/forward/gen_runtime_data.py`）：
-
-```python
-def main():
-    args = parse_args()
-    tsv = TaskSplitValue(tp=args.tp, ep=args.ep, ...)
-    graph = build_attention_fwd_graph(tsv)
-    graph.propagate_splits(tsv)
-    for rank_id in range(args.tp * args.ep):
-        cfg = build_config_for_rank(graph, tsv, rank_id)
-        write_bin(cfg, f"{args.output_dir}/runtime_config_rank_{rank_id}.bin")
-```
-
-### 9.3 添加新 C++ 计算核（AscendC 侧）
-
-**Step 1** — 建立算子目录：
-
-```text
-ops/
-└── attn_fwd/
-    ├── op_host/
-    │   ├── attn_fwd_def.cpp
-    │   ├── attn_fwd_infershape.cpp
-    │   └── attn_fwd_tiling.cpp/h
-    └── op_kernel/
-        ├── attn_fwd.cpp
-        ├── tiling_key.h
-        ├── worker_kernel.cpp
-        └── put_mem_signal/
-            └── put_mem_signal_kernel.cpp
-```
-
-**Step 2** — 在 `attn_fwd.cpp` 中引用共享 scheduler：
-
-```cpp
-#include "kernel_operator.h"
-#include "worker_kernel.cpp"
-#include "tiling_key.h"
-
-__global__ __aicore__ void multicore_attn_fwd(...) {
-    GM_ADDR input_list[] = { ..., runtime_config, ..., tiling, all_event_counters };
-    uint32_t idx = GetBlockIdx();
-    worker_kernel(idx, runtime_config, input_list);
-}
-```
-
-**Step 3** — 在 `worker_kernel.cpp` 中引用共享 runtime：
-
-```cpp
-#include "kernel_operator.h"
-#include "runtime/worker_kernel.h"  // build 脚本将 ops/runtime/ 拷入 op_kernel/runtime/
-
-class KernelWorker : public KernelWorkerBase<KernelWorker> {
- public:
-    // input_list 索引由本算子的参数布局决定
-    static constexpr uint32_t TILING_IDX = N;   // 替换为实际索引
-    static constexpr uint32_t EVENT_IDX  = M;
-
-    __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
-        switch (task_desc.task_type) {
-            // 添加本算子的 case
-        }
-    }
-};
-```
-
-**Step 4** — 在 `put_mem_signal/put_mem_signal_kernel.cpp` 中用本算子的数据类型实例化：
-
-```cpp
-#include "kernel_operator.h"
-#include "shmem.h"
-
-template <typename T>
-class PutMemSignalKernel { /* ... */ };  // 与现有实现相同
-
-extern "C" inline __aicore__ void put_mem_signal_kernel(...) {
-    PutMemSignalKernel<DTYPE_YOUR_TYPE> op;  // 替换为本算子的数据类型宏
-    op.Init(...);
-    op.Process();
-}
-```
-
-**Step 5** — 在[源码组装器](../hyper_multicore/_build/assemble_multicore_source.py)中登记新算子，使源码组装阶段复制共享的
-`runtime/`：
-
-```python
-_HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
-```
-
----
-
-## 10. 附录：常见错误与排查
-
-| 错误现象 | 可能原因 | 排查步骤 |
-|---|---|---|
-| `TaskDesc` event_id 越界 | all_event_num 计算错误 | 检查 `scheduler/config.py` 中 `all_event_num` 属性公式 |
-| 两 bin 文件 task_num 不一致 | SplitSpec 的 task_num_fn 写错 | 打印 `propagate_splits()` 后每个 op 的 task_num |
-| AIV hang（无限等待）| N:1 扇入 trigger_count 设置偏大 | 检查 FillConfig 的 trigger_count = 实际上游 tile 数 |
-| GMM workspace 越界 | TILE_M/N 设置过大 | 检查 `tiling_tables.py` 中 workspace 预算 |
-| `runtime/worker_kernel.h` 找不到 | 新算子未纳入隔离源码组装 | 检查 `assemble_multicore_source.py` 的算子列表和 `MULTICORE_SOURCE_ASSEMBLY_FAILED` 日志 |
-| Python `ImportError: scheduler` | 从非包根目录运行 | 从 `hyper-multicore/` 根目录用 `python -m` 方式运行 |
-
-## MegaMoE 概率数据流与 task 执行
-
-### 图声明与 workspace
-
-概率数据流在 forward/backward 逻辑图构建时声明，随后才执行粒度 lowering、task 填充与队列编排。
-`ProbabilityTaskBinding` 同时定义辅助 operand、类型化 activation/transport option 与 scalar effects；
-`ProbabilityFillConfig` 复用既有 token filler，并从该声明生成最后一个辅助 descriptor。
-诊断图直接读取同一 operand，使用与执行图一致的概率数据流声明。
-
-四个逻辑区域共用一块 FP32 对称内存：`source_p`、`received_p`、`received_dp`、`returned_dp`。
-这块内存由 MegaMoE workspace 分配和管理，物理布局由 `ProbabilityLayout` 描述。
-`TensorEffect` 标明本地和远端读写及 `token_and_scalar` 完成条件；Push 在 token signal 之前
-完成 scalar PUT，Pull 在本地 dispatch event 之前完成 scalar 和 token GET。反向消费者按
-DAG 依赖等待，token 与 scalar 共享同一个 task 的完成信号。空 task、待反向图、源 buffer 和 workspace lease
-由 MegaMoE 执行资源管理；通用 runtime 和 SHMEM 负责调度与传输，不解释概率数学。
-
-### Task descriptor 与校验
-
-`TaskDesc.extra_value_1` 是按 `TaskType` 解码的 32 位字段。模式、遍历方式、激活数学和传输内容
-分别由所属算子定义，通用 runtime 只保存字段，不解释这些语义：
-
-| 类型 | Python 定义位置 | 语义 |
+| 概念 | 对应实现 | 用途 |
 | --- | --- | --- |
-| `GroupedMatmulTaskMode` | `tasks/gmm.py` | GMM 覆盖范围，四个取值互斥 |
-| `SwiGluClampPosition` | `tasks/swiglu.py` | 在 SiLU 之前或之后裁剪 gate 分支 |
-| `SwiGluTaskIteration` | `tasks/swiglu.py` | 单 tile，或按 lane 跨步遍历运行时有效 tiles |
-| `ShmemTaskPartition` | `tasks/alltoall.py` | 固定行数分块，或按 PUT 的实际行数均分连续区间；GET 使用固定分块 |
-| `MegaMoeActivationWeighting` | `modules/mega_moe/task_options.py` | 激活是否在 FC2 前乘概率 |
-| `MegaMoeTransportPayload` | `modules/mega_moe/task_options.py` | 传输 token、token+p 或 token+dp，三个取值互斥 |
+| 计算图与逻辑算子 | 主机侧 `ComputeGraph`、`OperatorNode` | 表达算子及其张量关系，作为图编译的输入 |
+| task 描述 | 主机侧 `TaskDescC`；NPU 侧 `TaskDesc` | 记录操作类型、工作划分、参数关联及依赖事件 |
+| 张量描述 | 主机侧 `TensorDescC`；NPU 侧 `TensorDesc` | 记录参数位置、偏移、形状等数据定位信息 |
+| 执行配置 | 主机侧 `RuntimeConfigC` 及按容量生成的扩展类型；NPU 侧 `RuntimeHeader` 及配置读取函数 | 构造并序列化配置，在 NPU 侧读取配置头及各数据区域 |
+| worker 队列视图 | NPU 侧 `WorkerQueue` 及队列读取函数 | 描述 worker 的任务索引范围、步长及就绪窗口等读取与选择条件 |
 
-C++ 对应定义位于 `ops/common/*_task_options.h` 和 `ops/common/mega_moe/task_options.h`，
-使用独立的 `enum class`；组合只发生在对应 task 的编码、解码和校验处。
+准确的字段、宽度与偏移由[主机侧定义](../hyper_multicore/scheduler/config.py)、[分配与序列化](../hyper_multicore/scheduler/runtime.py)及[NPU 侧读取实现](../hyper_multicore/ops/runtime/runtime_config.hpp)维护。
 
-| TaskType | extra_value_1 | 概率 operand 合同 |
+## 运行时模型
+
+### 提交与执行
+
+一次上层接口调用可以提交一个或多个 kernel，其中一次 megakernel 执行又包含多个 task。主机侧先选取或生成执行配置，准备当前张量和可写状态，再通过 PyTorch 接入将 kernel 提交到执行流（stream）。stream 为提交到同一条流上的设备工作建立执行顺序，主机提交返回不代表 NPU 已经执行完毕。
+
+megakernel 开始执行后，NPU 侧 runtime 通过 worker（任务执行者）读取任务描述并调用对应的计算或通信实现。下图以运行在不同核上的两个 worker 为例：task P 生成数据，task C 等待并消费这些数据；同一 stream 上的后续 kernel 再使用本次 megakernel 的最终输出。
+
+```mermaid
+sequenceDiagram
+    box 主机侧：HyperMulticore
+        participant Call as 主机调用与 PyTorch 接入
+    end
+    box 主机侧：外部运行时
+        participant Runtime as torch_npu / CANN
+    end
+    box NPU 侧：同一次 megakernel 执行
+        participant P as 核 A 的 worker
+        participant C as 核 B 的 worker
+    end
+    box NPU 侧：后续 kernel
+        participant Next as 同一 stream 上的后续计算
+    end
+    Note over Call: 准备执行配置、张量与执行状态
+    Call->>Runtime: 向 stream 提交 megakernel
+    Runtime-)P: 异步发射一次 megakernel
+    Note over P,C: 同一次 megakernel 执行中的跨核任务协作
+    Runtime-->>Call: 主机提交路径返回
+    Note over Call: 返回不代表 NPU 执行完成
+
+    Note over C: task C 等待生产者结果
+    P->>P: 执行 task P，完成写入与必要同步
+    P-->>C: 通过共享依赖计数发布完成，task C 就绪
+    C->>C: 读取结果并执行 task C
+
+    Note over P,C: 所有 worker 的任务及所用协议完成后<br/>本次 megakernel 执行结束
+    Runtime-)Next: 按同一 stream 的顺序启动后续 kernel
+    Next->>Next: 使用 megakernel 的最终输出
+```
+
+### 执行模式
+
+worker 与 AIC（矩阵计算核）、AIV（向量计算核）执行实例的映射由执行模式确定。根据数据如何划分、任务之间是否需要跨 worker 协作，当前实现采用两种执行模式。
+
+**顺序阶段执行**适合数据可独立分区、分区内计算顺序固定的流程。多个 worker 可以读取同一份阶段描述，在各自负责的数据分区上执行同一阶段序列。每个 worker 完成当前阶段所需的计算和局部同步后，再执行下一阶段，遍历完整个序列后结束。这种方式依靠分区内的执行顺序维持依赖，减少了跨 worker 的协调。
+
+**依赖驱动执行**适合 task 间存在跨 worker 数据依赖的流程。主机侧将 task 安排到 AIC/AIV 执行队列，并描述需要等待的依赖。worker 在自己的队列范围内选择任务，确认依赖满足后执行，再按协议发布完成通知。worker 完成自己负责的全部任务后结束任务循环，当前实现不会从其他 worker 的队列取走任务。相比固定阶段顺序，这种方式允许更灵活的协作，同时需要维护依赖计数并承担任务选择的开销。
+
+### 依赖同步与队列调度
+
+在依赖驱动模式下，产生数据的 task 是生产者，使用这些数据的 task 是消费者。生产者完成相应工作后增加依赖事件的计数，消费者通过比较计数与阈值判断自己是否就绪。主机侧任务编排根据预期的生产者累计增量设置阈值，使就绪条件对应所需工作的完成。
+
+计数达到阈值时，消费者需要的数据也必须已经可见。对于普通计算，计算核适配器先完成所需写入和同步，再由 worker 更新依赖计数。
+
+对于带 signal 的传输，通信路径保证数据写入与通知的顺序，worker 不再重复增加计数。通信 signal 表示数据到达或远端读取完成等协议通知，也可以按约定直接更新任务依赖计数。通知的具体含义、计数存储及可见性要求由通信协议与 NPU 侧 runtime 共同约定，不能仅凭计数增加就推断所有数据访问已经完成。
+
+依赖设置正确，还需要让生产者有机会执行。worker 可以按队列顺序执行任务并等待所需依赖，也可以在配置允许的就绪窗口内扫描候选任务，选择已满足依赖的 task。就绪窗口允许执行排列在后面的任务，但会增加扫描开销，也只能考虑窗口范围内的候选任务。
+
+例如，生产者排在同一 worker 正在等待的消费者之后，严格顺序执行就会阻塞，即使计算图本身没有环。若生产者仍处于就绪窗口之外，扩大任务选择范围也不一定能解除阻塞。因此，主机侧编排必须同时考虑依赖关系、任务分配和队列顺序。具体执行入口见 [ops/runtime](../hyper_multicore/ops/runtime/)。
+
+### 完成语义
+
+一个 task 完成，只说明它承担的工作满足了后续消费条件，其他 worker 可能仍在执行。整次 kernel 结束后，远端使用者也可能继续访问共享数据。因此，结果消费和存储复用需要按相应的完成范围判断：
+
+| 完成范围 | 含义与责任 |
+| --- | --- |
+| task 执行完成 | task 要求的计算、写入及同步操作完成，对应数据可被下游 task 消费；计算核适配或通信路径保证这些条件，依赖驱动模式还据此发布依赖事件 |
+| kernel 执行完成 | 本次 kernel 的全部设备工作结束，并满足 kernel 所用协议的完成要求；NPU 侧 runtime 及协议实现协调参与的 worker，单个 worker 队列结束不足以代表全部完成 |
+| 远端消费完成 | 远端使用者不再访问相关源数据；通信协议提供相应完成依据，资源管理器据此判断存储能否复用 |
+
+本地后续计算如果提交到同一 stream，可以依靠流内顺序使用结果；跨 stream 使用时则需要建立显式依赖，例如在生产结果的 stream 上记录流事件（stream event），让消费结果的 stream 等待该事件。stream event 记录的是流上的执行进度，与 megakernel 内的任务依赖事件及通信 signal 具有不同的完成范围。
+
+一次上层接口调用涉及多个 kernel 时，需要考虑所有相关设备工作的完成情况；这些完成条件如何用于判断存储的覆盖与释放，见[状态与资源](#状态与资源)。
+
+## 状态与资源
+
+执行配置可以服务多次调用，但每次调用使用的张量、依赖计数和中间数据有各自的使用期。主机侧根据当前设备、形状和计算参数选择适用的 plan，再准备本次调用所需的状态。plan 能否复用取决于其中的描述是否仍然适用，可写存储能否再次使用则取决于先前的访问是否已经完成。
+
+计算过程还需要存放临时工作数据（scratch），例如计算核内部使用的中间结果。算子申请的 workspace 是执行所需的工作存储，可以容纳这些数据。本项目中，部分主机侧资源管理对象也以 workspace 命名，用于管理通信 buffer 和跨调用状态，因此其使用期可能长于一次 kernel 执行。
+
+下表按数据的用途列出持有者及复用条件。同一块存储可能同时用于本次计算和后续反向，覆盖或释放时需要满足所有使用者的条件。
+
+| 状态类别 | 所有权与有效期 | 复用或释放条件 |
 | --- | --- | --- |
-| SwiGLU / SwiGLUGrad | `1`：SiLU 后裁剪；`2`：按 lane 跨步遍历 tiles；`4`：FC2 前加权 | 1/2 个 token 输入、1 个 token 输出；FC2 前加权时附带 1 个概率 workspace 输出 descriptor，前向参数位置16、反向25 |
-| SHMEM PUT / GET | `2`：按实际行数划分 PUT 区间；`4`：token+p；`8`：token+dp | `4`/`8` 互斥；GET 不接受 `8`；4 个 token/metadata 输入、1 个 token 输出；传输概率或其梯度时附带 1 个概率 workspace 输出 descriptor |
-| GMM | 0/1/2/3 互斥 mode | 不按位组合 activation 或 transport options |
+| plan | 主机侧持有 plan，维护设备、形状、容量与数值配置的适用范围；调用保留所使用的 plan | 描述仍适用时可复用；淘汰缓存不撤销已有调用的引用，也不意味着设备已停止访问相关存储 |
+| 调用状态 | 主机侧调用路径准备输入、输出、依赖计数及中间数据，并在设备使用期间保留所需引用 | 可写区域在先前访问完成后才能覆盖；返回的输出由调用方按后续用途继续持有 |
+| 反向保存状态 | autograd 上下文持有前向为梯度计算保存的张量和配置 | 只要仍可能执行反向，所需数据就须保持有效；不再用于反向且没有其他使用者后才可回收 |
+| 共享资源 | 资源管理器安排跨调用的存储使用，通信层管理底层通信分配 | 下一次使用遵循资源使用协议；物理释放前须确认没有仍会使用该存储的调用或反向计算，并等待包括远端访问在内的在途操作完成 |
+| 算子 workspace | native 算子申报所需工作存储，torch_npu/CANN 调用桥接管理执行期分配与提交 | 按调用桥接和分配器的 stream 生命周期回收，主机提交返回不能使存储提前失效 |
 
-表中 SwiGLU 和 SHMEM 的数值为十进制掩码。`extra_value_0` 由 SwiGLU 持有，用 FP32 bit pattern 表达裁剪限值；
-`dependency_poll_interval_us` 由 runtime 持有，用于依赖轮询间隔。
-SHMEM engine 使用独立 typed option 的 bit16，不与轮询字段混用。`ProbabilityLayout` 固定四个 plane、FP32
-元素宽度和 scalar-row 单位；host 拒绝未知位、冲突 payload、缺失辅助 operand、错误单位和激活方向。
-MoE device adapter 在解码前重复校验。host validator 由 graph 绑定，normal/profile/dump 的 runtime
-副本保留相同的 validator。
+准备可写状态时，重置范围取决于数据的用途。任务依赖计数记录本次 kernel 的执行进度，需要在执行开始前初始化；跨调用握手状态则用于协调不同调用或 rank 的使用次序，需要保留协议仍然依赖的信息，只能在协议允许的初始化或重建时重置。即使两类状态位于同一块分配中，也不能一起按调用清零。
 
-### 调度与诊断
+前向结束也不意味着中间数据已经不再使用。autograd 上下文保存张量引用时不会自动复制其数据；如果张量指向共享工作区，后续调用覆盖该区域就会改变反向读取的内容。因此，前向实现必须确保这些值在反向仍需使用期间保持有效。模型参数仍由所属模型或模块持有，将其绑定到 megakernel 不会转移所有权。
 
-normal、profile 和支持 L1 dump 的路径使用同一个 `RunWorkerQueue` 扫描函数和相同静态 worker placement。
-`ProcessTasks` 和 `ExecuteTask` 使用运行时诊断模式参数，分别执行普通任务、采集时间戳或转储 L1，
-共用任务分发逻辑。动态就绪次序可能受记录开销影响，因此不同运行的实际 task 顺序可能不同。
-`MegaMoeSchedulePolicy` 分别表达 Vector/Cube 顺序、ready 选择、batching 和 polling。compact 粒度 lowering
-先于队列编排执行。`arch22` BF16 的 compact 使用跨步 Vector 队列与 256 槽默认窗口，
-覆盖全 AIV，专家批处理也使用这份队列表。`arch35` 使用固定通信 owner 与独立数学队列。
-WorkerQueue 的 begin/end/stride 表达 placement，ready_depth 只控制当前 worker 的有限就绪选择。
-无任务窃取；等待策略由同一描述表下发。stage 当前按组件内 operator.name 绑定。
+## 扩展边界
 
-MoE 跨 rank source-ready/read-complete 协议由 `ops/common/mega_moe/invocation_protocol.h` 持有；
-通用 runtime 只调用协议 hook，负责本地事件计数与队列完成。
+扩展一种计算能力时，主机侧需要描述计算操作及其依赖，NPU 侧需要提供对应的计算或通信实现。如果已有 task 类型能够表达所需操作，可以通过组合 task 和调整编排实现新的计算；新增操作类型时，则需要同时确定主机侧的参数描述和 NPU 侧的解释方式，队列选择与依赖等待仍可复用既有机制。
 
-### 辅助 kernel 与概率数学
+task 描述、参数绑定和完成条件连接了这些实现。替换计算核内部的算法或 tiling，只要仍满足原有的数据范围、数值和完成约定，就可以保持外部调用方式不变；如果改变 task 的划分、参数含义或完成通知，则需要同步调整依赖这些约定的生成方和使用方。下表列出不同变化的负责位置及需要共同保持的条件。
 
-| 功能 | 实现与执行边界 |
-| --- | --- |
-| 冷专家梯度清零 | `ZeroEmptyExpertGrad` 独立 kernel，以累计 counts 识别冷专家并选择性写零。 |
-| 路由 metadata | `Metadata` 独立 kernel，一次生成 row/element 描述符；同时提供基于标准 cumsum/reshape 的 fallback。 |
-| saved mapping 搬运 | `PermuteFromMapping` 独立 kernel，复用 forward mapping，在一次调用中展开 `[T,H]` token 并重排 p。 |
-| 概率数学 | `hyper_multicore/ops/common/mega_moe/routing_probabilities.h` 中的业务 helper 在 task 内执行 Cast/Mul/ReduceSum 循环，未复用标准算子源码片段。 |
-| BF16 SwiGLU 裁剪 | `arch22` 和 `arch35` 共用锁定的 ops-nn `39e54ece7ee5ff64c8015d3ba418f891e640f242` 源码、fusion patch 与 clamp patch。 |
+| 变化 | 负责的部分 | 需要共同保持的条件 |
+| --- | --- | --- |
+| 新增或替换 task 的计算实现 | 主机侧提供计算参数，计算核适配负责参数解释、tiling、局部存储与同步 | 参数生成方与计算实现对数据范围、参数含义和完成条件保持相同解释；计算结果满足 task 声明的数值约定 |
+| 调整 task 划分与编排 | 主机侧生成任务、队列和依赖，NPU 侧 runtime 负责选择与执行 | 覆盖完整计算范围；划分变化后，依赖阈值与实际生产者增量仍匹配，队列安排允许生产者执行 |
+| 扩展上层接口或前反向计算 | 上层接口实现定义计算组合及梯度逻辑，autograd 上下文保存反向状态；PyTorch 接入负责参数绑定和设备提交 | 接口实现、自动微分与参数绑定共同满足公开声明的输入输出和梯度语义，调用双方遵循相同的参数顺序与存储使用期约定 |
+| 调整通信实现或协议 | 通信实现负责传输及通知，NPU 侧 runtime 使用协议约定的依赖计数，资源管理器安排存储复用 | 通信发布方与等待方对通知对应的数据可见性、计数增量和远端访问完成范围保持相同解释，资源管理器据此判断复用条件 |
 
-FC2 前加权路径的概率数学为：`a0=BF16(a)`、`a1=BF16(FP32(a0)*p)`，反向
-`dp=sum(FP32(a0)*FP32(d_fc2_input))`、`d_a=BF16(FP32(d_fc2_input)*p)`。
-其中 `a` 是 SwiGLU 激活，`p` 是按专家行广播的路由概率，`dp` 沿激活的特征维规约。
-前向保留两处 BF16 舍入；反向使用未加权的 `a0` 计算 `dp`，不通过除以 `p` 恢复激活。
-这些计算在激活及其反向 task 内完成，使用 task 的 UB 和完成信号，不为每个 task 单独 launch 概率算子。
+当前图编译接口仍有适用范围限制：任务划分参数和部分容量计算包含专家数量、专家并行规模等信息。采用该路径的主机侧实现需要满足这些划分和容量约定，因而当前图编译接口还不能直接用于任意计算。
 
-上述三个独立辅助 kernel 通过 host launch bridge 由 Torch 调用，具有单独的构建入口，
-不属于 MegaKernel 内部的 task。辅助 kernel 按构建目标编译为 `dav-2201` 或 `dav-3510`。
-构建依赖与制品要求见[构建说明](build.md)，设备验证方式见[测试指南](../tests/README.md)。
+现有实现使用了不同的配置生成方式和执行模式。下表用于了解这些机制在具体计算中的组合方式，并提供源码入口。
 
-### BF16 与 MXFP8 执行能力
+| 实现 | 配置准备与执行模式 | 计算内容与状态 |
+| --- | --- | --- |
+| [MegaGate](../hyper_multicore/modules/mega_gate/) | 直接组装 AIV 顺序阶段 | PyTorch 投影配合 native 路由算子，另有适用条件下的 PyTorch 路径 |
+| [MegaMHC](../hyper_multicore/modules/mega_mhc/)及[反向](../hyper_multicore/modules/mega_mhc_grad/) | 前反向分别构图，依赖驱动执行 | 残差混合与归一化计算，依赖计数及前向保存状态 |
+| [MegaMoE](../hyper_multicore/modules/mega_moe/) | 精度后端构图与调度，依赖驱动执行 | 专家路由、跨 rank 传输及共享资源协议 |
 
-| 能力 | 共用实现 |
-| --- | --- |
-| 对外接口与模型持有权重 | 共用 `MegaMoeExperts`、EP 推导、输入检查、`numerics_options` 和 `tuning_options`。两种精度逐次接收当前权重，执行器管理资源而不持有模型参数。 |
-| 路由和动态容量 | 共用可选 `tokens_per_expert`、路由缓存及 metadata 生成、跨 rank 错误收敛、Push/Pull workspace 扩容及 Pull source lease。各后端分别管理计划缓存。 |
-| worker 队列和就绪扫描 | `WorkerQueue` 定义队列布局，`RunWorkerQueue` 执行队列。`arch22` BF16 compact 使用覆盖全 AIV 的跨步 Vector 队列和就绪扫描。`arch35` 的 BF16 与 MXFP8 共用显式核归属、窗口和等待机制。 |
-| 逐专家流水和通信 | `arch35` 共用 `two_expert_pipeline` 和 `builder_order`，两种精度将各自数学阶段映射给同一策略。两种策略及两种引擎共用通信 owner 和完成协议，通信保持 FIFO。`arch22` BF16 分别重排相邻专家的 Cube 和 Vector 任务。 |
-| 传输和依赖等待 | 引擎和轮询分别编码。Ascend950 的 SHMEM 默认启用 `mte_udma`，两种精度共用此配置。Push 使用 PUT 分发，Pull 使用 GET 分发，返回均用 PUT。 |
-| 概率梯度、partial dW 和观测 | 两种精度默认在 FC2 后加权，返回路由概率梯度，共用相关 unpermute/permute 辅助入口并支持 FP32 partial dW。两种精度均接入任务 profiler，并各自管理 native 启动参数和 saved tensors。 |
-
-下面的差异不涉及量化算子实现。调度参数的完整取值见
-[用户接口](../hyper_multicore/README.md#megamoe-scheduler-options)。
-
-| 能力 | BF16 | MXFP8 | 配置或提示 |
-| --- | --- | --- | --- |
-| 设备和 lowering | arch22 具备 compact、nominal 和 GMM 专家批处理。arch35 使用逐专家 dense。 | arch35 使用逐专家 dense。 | MXFP8 请求 compact、nominal 或 batching 在构造时报 `ValueError`。BF16 在构图时检查架构、策略名、compact 条件和非零窗口。MXFP8 在首次设备绑定时拒绝 arch22。 |
-| SwiGLU 裁剪和 FC2 前概率加权 | 支持 SiLU 前后两种裁剪位置。FC2 前加权使用概率 plane 传输 `p` 与 `dp`。 | 使用普通 SwiGLU 和 FC2 后加权。 | MXFP8 设置 `swiglu_limit` 或 `apply_probs_before_fc2=True` 在构造时报 `ValueError`。`clamp_after_silu` 只在提供 `swiglu_limit` 时生效。 |
-| 权重布局和当前存储 | EIO/EOI 首次绑定。EIO 可以整理成连续存储，EOI 要求连续。 | 使用 EIO 语义的原始 root，前后向分别获取当前阶段的物理存储。 | 两种后端均校验形状和设备。MXFP8 缺少阶段所需字段时报告缺失方向。 |
-| 冷专家梯度与反向暂存 | 按 group list 清零冷专家的 dW，已知全部专家活跃时跳过清零。dX 可复用已消费的 dispatch 暂存。 | 预先清零两个 partial dW 输出，并单独分配 dX 暂存。 | 两种精度共用公开梯度合同。 |
-| 无梯度执行与反向保存 | 使用独立 no-grad 路径，归并完成后释放 workspace。 | 无反向需求时直接归并共享返回区。训练时保存反向所需结果，在 backward 重新解析当前权重 root。 | BF16 测试覆盖 checkpoint 和 saved mapping。MXFP8 组件回放覆盖 no-grad、再次前向及待反向 ctx。 |
-| 执行计划复用 | token 向上取几何桶，计入 partial dW 精度。有活跃反向图时保留旧 plan。 | 按实际对齐 token 和接收容量缓存至多四个 plan。Pull 用固定容量上界归并 key。反向从 ctx 读原 plan。 | 缓存粒度为内部策略。 |
-| L1 Tensor dump | 支持专用 L1 view resolver 和 dump 参数。 | 提供任务 profiler。 | MXFP8 在启用 tensor dump 捕获的 launch 上报 `RuntimeError`。 |
-
-共享 ready ABI 保证同一设备执行器理解两类队列布局。它不保证不同精度或架构具有相同的任务序、
-缓存命中率或通信重排。arch35 两种精度的 `builder_order` / `two_expert_pipeline` 对照测试
-验证同一精度内的任务覆盖、通信队列和事件阈值保持一致。
+这些实现的公共接口见[使用指南](../hyper_multicore/README.md)，MegaMoE 的专家数学、配置和资源使用见[MegaMoE 特性指南](mega_moe.md)，后端协作、任务调度与资源实现见[MegaMoE 设计](design/mega_moe_design.md)。环境与制品见[构建指南](build.md)，通信分配与重建见 [SHMEM](shmem.md)，采集方法见[诊断指南](diagnostics.md)，验证范围见[测试指南](../tests/README.md)。

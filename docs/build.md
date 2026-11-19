@@ -10,7 +10,7 @@
 - [其他构建方式与参数](#其他构建方式与参数)
 - [日志与失败恢复](#日志与失败恢复)
 - [制品与构建参考](#制品与构建参考)
-- [Ascend950 MegaMoE 源码构建](#ascend950-megamoe-源码构建)
+- [ascend950 MegaMoE 源码构建](#ascend950-megamoe-源码构建)
 
 ## 源码构建
 
@@ -53,7 +53,7 @@ payload 位于 `build/native/payload/hyper_multicore/`。
 
 先激活目标运行环境，准备 Linux、匹配 wheel 的 Python ABI/CPU 架构、Torch/TorchNpu，以及兼容的 CANN/驱动。
 [运行依赖](../requirements.txt)也需提前安装；下面的 `--no-deps` 不会补装依赖。
-wheel 路径使用构建命令打印的实际路径，或已有制品的保存路径。
+在 Bash 中执行以下命令，wheel 路径使用构建命令打印的实际路径，或已有制品的保存路径。
 
 ```bash
 source /path/to/cann/set_env.sh
@@ -66,7 +66,7 @@ source "$(command -v hyper_multicore_set_env.bash)"
 
 ### 验证安装
 
-在源码目录外执行以下命令，并先从 `PYTHONPATH` 移除指向 checkout 的路径，避免源码遮蔽安装包：
+在源码目录外执行，并从 `PYTHONPATH` 移除会遮蔽目标安装的路径：
 
 ```bash
 hyper_multicore_build_info
@@ -76,7 +76,8 @@ python -c 'import hyper_multicore; print(hyper_multicore.__file__)'
 `hyper_multicore_build_info` 展示构建环境并校验包内清单和资源完整性，无需导入 Torch/TorchNpu。
 包来源应指向目标安装位置。需要查看完整构建记录和文件列表时，见[查询构建记录与源码包](#查询构建记录与源码包)。
 
-设备执行使用[双卡最小 NPU 示例](../README.md#快速开始)验证，示例完成前向、反向和设备通信。
+以上检查安装与加载来源；设备执行使用[双卡最小 NPU 示例](../examples/README.md#运行单层-moe-示例)验证，
+示例完成前向、反向和设备通信。
 完整用例及执行方法见[测试指南](../tests/README.md#npu-用例执行)。
 
 ### 激活本地 payload
@@ -123,17 +124,17 @@ bash build.sh --all --jobs 24
 
 默认包含所有支持的 SoC。使用 `--soc-list` 选择目标。
 
-| 产品系列 | 构建目标 | 内核架构 |
-| --- | --- | --- |
-| Atlas A2 系列 | `ascend910b` | `arch22` |
-| Atlas A3 系列 | `ascend910_93` | `arch22` |
-| Ascend950 系列 | `ascend950` | `arch35` |
+| 芯片型号 / 构建目标 | 内核架构 |
+| --- | --- |
+| `ascend910b` | `arch22` |
+| `ascend910_93` | `arch22` |
+| `ascend950` | `arch35` |
 
 ```bash
-# 构建 Atlas A2 和 Atlas A3 系列。
+# 构建 ascend910b 和 ascend910_93。
 bash build.sh --soc-list ascend910b,ascend910_93 --jobs 24
 
-# 选择 Ascend950。
+# 选择 ascend950。
 bash build.sh --soc-list ascend950 --jobs 24
 ```
 
@@ -298,8 +299,10 @@ CANN 版本不要求与构建时相等，仍需与框架和驱动兼容。
 内部文件集合、哈希及算子注册必须匹配；加载失败直接报告，不跨分支尝试其他框架适配库。
 
 vendor 位于 `lib/vendors/`，SHMEM 资源位于 `shmem/lib/<arch>/`。
+源码构建将正反向 kernel 放入同一个 `hyper_multicore_nn` vendor，连同匹配构建环境的框架适配库
+进入 wheel 或本地 native payload。Torch adapter 是通过 `torch.ops.load_library()` 加载的普通共享库。
 每个 `adapters/<ID>/` 包含一份 Torch 库和 `shmem/<arch>/` 下的 binding。
-vendor kernel 位于 `op_impl/ai_core/tbe/kernel/<arch>/`。Atlas A2/A3 系列共用 `arch22`，Ascend950 系列使用 `arch35`。
+vendor kernel 位于 `op_impl/ai_core/tbe/kernel/<arch>/`。`ascend910b`、`ascend910_93` 共用 `arch22`，`ascend950` 使用 `arch35`。
 CANN 注册和查找索引按所选 SoC 保存，并指向对应架构的 kernel。
 
 首次使用 SHMEM 时，查询可见逻辑设备 0 的 NPU 架构，按绝对路径加载一套后端，不创建 NPU 上下文。
@@ -385,7 +388,7 @@ flowchart TD
 锁定的第三方 Git 仓库位于 `build/native/deps/`，只 fetch 缺失提交，已缓存提交不访问远端。
 ops-transformer 的 GMM 和 MHC 共用仓库，按各自锁定提交导出片段，工作目录 HEAD 不决定版本。
 提交、tree、archive 和补丁按锁校验，补丁只应用于隔离源码副本。
-Ascend950 的 JSON 头文件同样从锁定提交导出，其记录参与 SDK 工具链身份。
+面向 `ascend950` 的 JSON 头文件同样从锁定提交导出，其记录参与 SDK 工具链身份。
 
 默认和全量构建共用 vendor 缓存，每个 CPU/设备架构组合保留一份。
 摘要覆盖锁定源码及补丁、vendor 构建脚本、SDK 头文件和链接库、CANN 实际路径及版本、
@@ -435,9 +438,9 @@ SDK/ops、vendor 和 binding 的子工作区按 `arch22/arch35` 隔离。
 | [prepare_dependencies.py](../hyper_multicore/_build/prepare_dependencies.py) | 锁定 native 源码获取与校验 |
 | [torch_compat.cmake](../hyper_multicore/cmake/torch_compat.cmake) | 从选定框架环境确定头文件、C++ 标准及 ABI |
 
-## Ascend950 MegaMoE 源码构建
+## ascend950 MegaMoE 源码构建
 
-Ascend950 使用 `arch35`。构建器按[依赖锁](../hyper_multicore/_build/dependencies.lock.json)
+`ascend950` 使用 `arch35`。构建器按[依赖锁](../hyper_multicore/_build/dependencies.lock.json)
 获取 ops-nn、ops-transformer、ops-tensor 和 SHMEM，在隔离目录应用适配补丁。
 在已准备好的 Python、Torch、TorchNpu 和 CANN 环境中执行：
 
@@ -449,9 +452,9 @@ python -c 'from hyper_multicore import MegaMoeExperts; print(MegaMoeExperts.__na
 
 在其他目录或节点使用同一制品时，见[激活本地 payload](#激活本地-payload)。
 有关 BF16/MXFP8 权重、数值和逐层调优入口，见
-[MegaMoeExperts](../hyper_multicore/README.md#megamoeexperts)。
+[MegaMoeExperts](mega_moe.md#基本用法)。
 
-Ascend950 的 SHMEM 默认启用 `mte_udma`。如需让专家通信使用 MTE，在各 rank 启动前设置
+`ascend950` 的 SHMEM 默认启用 `mte_udma`。如需让专家通信使用 MTE，在各 rank 启动前设置
 `HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte`。固定堆预算和日志均沿用
 [SHMEM 配置](shmem.md#6-配置与日志)，默认设置足以运行常规示例。
 
