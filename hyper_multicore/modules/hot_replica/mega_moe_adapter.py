@@ -189,9 +189,9 @@ class PlacementResources:
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
                                    host_rows=host_rows)
             if not shared_quotas:
-                # The host planner supplies the copy rows even when a fixed
-                # heap keeps the ordinary, unreserved placement policy.
-                return self.bind(hidden, planner.plan(request), fused=self.pipeline_enabled and not checkpointing)
+                # Keep the unreserved admission policy while reusing the
+                # agreed copies for the fused bank, including replay.
+                return self.bind(hidden, planner.plan(request), fused=self.pipeline_enabled)
 
             def _build_reserved(current, _target):
                 return self.bounded.select(
