@@ -722,15 +722,18 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 all_experts_active=ctx.all_experts_active,
                 owner_weights=owner_weights if acquired and binding.fused_gradients else None,
             )
-            runtime = None
-            if acquired and binding.fused:
-                gradients = execution.intermediates
-                runtime = binding.runtime(plan.bwd_runtime_config, (gradients.grad_weight1, gradients.grad_weight2))
+            grad_weight1 = execution.intermediates.grad_weight1
+            grad_weight2 = execution.intermediates.grad_weight2
             _launch_backward_kernel(
                 plan,
                 saved,
                 source,
-                execution, stream=workspace.lease_stream, runtime_override=runtime)
+                execution, stream=workspace.lease_stream,
+                runtime_override=(
+                    binding.runtime(plan.bwd_runtime_config, (grad_weight1, grad_weight2))
+                    if acquired and binding.fused else None
+                ),
+            )
             if plan.spec.apply_probs_before_fc2 and ctx.needs_input_grad[7]:
                 grad_topk_weights = (
                     workspace.probabilities(plan.spec).slice(ctx.source_rows, gradient=True).index_select(
@@ -739,8 +742,6 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                         saved_probabilities.shape, dtype=ctx.topk_dtype))
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
-            grad_weight1 = execution.intermediates.grad_weight1
-            grad_weight2 = execution.intermediates.grad_weight2
             if binding is not None:
                 grad_weight1, grad_weight2 = binding.gradients(
                     (grad_weight1, grad_weight2), owner_weights)
