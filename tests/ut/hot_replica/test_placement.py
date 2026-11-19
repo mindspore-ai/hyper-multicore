@@ -22,10 +22,23 @@ from unittest.mock import patch
 import torch
 
 from hyper_multicore.modules.hot_replica import placement
+from hyper_multicore.modules.hot_replica._planner.aligned import build_aligned_expert_plan
+from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 
 
 class TestHotReplicaPlacement(unittest.TestCase):
     """Reject invalid metadata before any optional device kernel is called."""
+
+    def test_mx_skips_whole_search_when_largest_expert_cannot_fit(self) -> None:
+        config = ExpertReplicaConfig(4, 4, 1)
+        matrix = ((16384, 0, 0, 0),) + ((0, 0, 0, 0),) * 3
+        with patch("hyper_multicore.modules.hot_replica._planner.whole._select_whole_targets") as whole:
+            plan = build_aligned_expert_plan(
+                matrix, config, capacity_limit=16384, minimum_replica_rows=64, minimum_load_reduction=.25,
+            )
+        whole.assert_not_called()
+        plan.validate()
+        self.assertEqual(max(plan.destination_loads), 8192)
 
     def test_receive_limit_matches_full_and_short_pr19_routes(self) -> None:
         limit = placement.placement_receive_limit

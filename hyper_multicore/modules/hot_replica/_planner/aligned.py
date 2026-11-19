@@ -201,9 +201,11 @@ def _select_aligned(totals, config, limit, minimum_rows, threshold, minimum_save
     # Whole-expert placement is a cheap competitor, not a split-K seed. Avoid
     # paying several full weight/dW transfers for less than the existing global
     # row allowance. This also preserves complete reductions when equally good.
-    if selected and original_peak <= limit:
+    allowed_whole_peak = max(loads) + credit
+    if selected and original_peak <= limit and max(totals) <= allowed_whole_peak:
         # Optional whole-expert competition must not veto mandatory fragments:
         # the latter can satisfy a bound that no complete expert can fit.
+        # An indivisible expert cannot fit below its own row count.
         from .whole import _select_whole_targets
         targets, whole_peak, _ = _select_whole_targets(
             totals, config, capacity_limit=limit, minimum_load_reduction=threshold / 10000,
@@ -211,7 +213,7 @@ def _select_aligned(totals, config, limit, minimum_rows, threshold, minimum_save
             transfer_row_credit=credit, nodes=nodes,
         )
         whole = {expert: (target, 0) for expert, target in enumerate(targets) if target != expert // home}
-        if whole_peak <= max(loads) + credit and len(whole) <= len(selected):
+        if whole_peak <= allowed_whole_peak and len(whole) <= len(selected):
             selected = whole
 
     slots, spans, loads = [], [], []
