@@ -278,18 +278,19 @@ class SharedExpertPool:
                 try:
                     # Invalidate old tickets before a write, including a failed copy.
                     self.generation += 1
-                    self._restore_suffix(snapshot)
+                    self.restore_snapshot(snapshot, self.local_experts)
                     self.statistics["early_restores"] += 1
                     return self.generation
                 finally:
                     self.release()
 
-    def _restore_suffix(self, snapshot: tuple[tuple[torch.Tensor, ...], Any]) -> None:
+    def restore_snapshot(self, snapshot: tuple[tuple[torch.Tensor, ...], Any], start: int) -> None:
+        """Copy saved guest operands into the selected prefix or suffix."""
         tails, ready = snapshot
         stream = torch.npu.current_stream(self.device)
         stream.wait_event(ready)
         for bank, tail in zip(self.leased_banks, tails):
-            bank[self.local_experts:self.local_experts + tail.shape[0]].copy_(tail)
+            bank[start:start + tail.shape[0]].copy_(tail)
             tail.record_stream(stream)
 
     def prefetch(
@@ -312,7 +313,7 @@ class SharedExpertPool:
                 if staged_generation is not None and staged_generation == self.generation:
                     self.statistics["early_restore_hits"] += 1
                 else:
-                    self._restore_suffix(snapshot)
+                    self.restore_snapshot(snapshot, self.local_experts)
                 self.statistics["checkpoint_restores"] += 1
         self.generation += 1
         self.statistics["prefetches"] += 1
@@ -401,7 +402,9 @@ class ExpertWeightBinding:
 
     def prepare_replay(self) -> None:
         """Restore the saved suffix while the framework replays attention and routing."""
-        if self.snapshot is not None:
+        # Only the agreed replay can overwrite the fused prefix. Early staging
+        # can run locally before EP agrees that parameter versions still match.
+        if self.snapshot is not None and not self.fused:
             self.staged_generation = self.pool.stage_snapshot(self.layout, self.snapshot)
 
     def acquire(
@@ -440,8 +443,8 @@ class ExpertWeightBinding:
         return self.pool.pipeline.runtime(ordinary, self, gradients) if self.fused else None
 
     def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
-        """Keep only the borrowed suffix from the original checkpoint forward."""
-        start = self.pool.local_experts
+        """Save the used guests from the completed origin of the checkpoint."""
+        start = 0 if self.fused else self.pool.local_experts
         used = self.placement.published_slots
         stop = start + (self.placement.borrowed_capacity if used is None else used)
         tails = tuple(weight[start:stop].detach().clone() for weight in weights)

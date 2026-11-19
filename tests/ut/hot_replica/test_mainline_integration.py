@@ -567,7 +567,7 @@ def test_a3_saved_route_uses_shared_quota_geometry(bound):
     assert before.counts_by_source is after.counts_by_source
     assert before.copies_by_rank == after.copies_by_rank
     assert before.published_slots == sum(expert >= 0 for expert in before.copies_by_rank[0])
-    assert all(not call.kwargs.get("fused") for call in bind.call_args_list)
+    assert all(call.kwargs.get("fused") for call in bind.call_args_list)
 
 
 def test_manifest_checks_custom_policy_settings():

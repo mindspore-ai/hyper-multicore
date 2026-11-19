@@ -917,7 +917,7 @@ def _execute_mega_moe_without_autograd(
         if weight_binding is not None:
             weight1, weight2 = weight_binding.acquire((weight1, weight2))
             acquired = True
-            if route.checkpoint_record is not None:
+            if route.checkpoint_record is not None and not weight_binding.fused:
                 weight_binding.save_snapshot((weight1, weight2))
         execution = _prepare_forward_execution(
             workspace, plan, route.routed_tokens, route.metadata.expert_capacity)
@@ -928,6 +928,10 @@ def _execute_mega_moe_without_autograd(
             _native_weight_operand(weight1, plan),
             _native_weight_operand(weight2, plan), execution, stream=workspace.lease_stream,
             runtime_override=weight_binding.runtime(plan.fwd_runtime_config) if acquired else None)
+        if acquired and route.checkpoint_record is not None and weight_binding.fused:
+            # This stream has consumed the guest operands, including both
+            # projection-ready events, so their prefix can now be captured.
+            weight_binding.save_snapshot((weight1, weight2))
         rows = route.routed_tokens.shape[0]
         if not rows:
             return route.routed_tokens.new_empty((0, plan.spec.hidden_size))

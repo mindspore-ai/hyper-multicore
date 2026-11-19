@@ -148,42 +148,19 @@ class ReplicaPipeline:
         # Projection weights and dW alias the generic bank, including a
         # checkpoint suffix staged between this binding's forward and backward.
         pool.generation += 1
-        _, received, owned = binding.edges
         rank_lines = pool.ranks * pool.local_experts * _LINE_WORDS
-        credit = self.storage[:rank_lines].view(pool.ranks, pool.local_experts, _LINE_WORDS)
         ready = self.storage[3 * rank_lines:3 * rank_lines + 2 * pool.local_experts * _LINE_WORDS]
         ready = ready.view(2, pool.local_experts, _LINE_WORDS)
         bank = pool.leased_banks
         if not backward or self.resident is not binding.token:
             self.resident = None
-            for slot, owner in enumerate(received):
-                if owner != _NO_OWNER:
-                    shmem.signal(credit[pool.rank, slot, :1], self.epoch, owner)
-            if owned:
-                for peer, slot, _ in owned:
-                    shmem.wait_signal(credit[peer, slot, :1], self.epoch, comparison="ge")
-                stream = torch.npu.current_stream(pool.device)
-                value = _words_tensor((self.epoch,), pool.device)[:4].view(torch.int32)
-                credit_ready = torch.npu.Event()
-                credit_ready.record(stream)
-                copies = {}
-                order = (1, 0) if backward else (0, 1)
-                try:
-                    for peer, slot, owner in owned:
-                        if peer not in copies:
-                            if peer not in self.streams:
-                                self.streams[peer] = torch.npu.Stream(device=pool.device)
-                            copies[peer] = self.streams[peer]
-                            copies[peer].wait_event(credit_ready)
-                        with torch.npu.stream(copies[peer]):
-                            value.record_stream(copies[peer])
-                            for matrix in order:
-                                source = weights[matrix][owner]
-                                source.record_stream(copies[peer])
-                                shmem._api._put_sdma(bank[matrix][slot], source, peer)
-                                shmem._api._put_sdma(ready[matrix, slot, :1], value, peer)
-                finally:
-                    binding.transfers = tuple(copies.values())
+            if binding.snapshot is None:
+                self._publish_weights(weights, binding, ready, rank_lines, backward)
+            else:
+                pool.restore_snapshot(binding.snapshot, 0)
+                ready.fill_(self.epoch)
+                stats = pool.statistics
+                stats["fused_snapshot_restores"] = stats.get("fused_snapshot_restores", 0) + 1
             binding.weight_epoch = self.epoch
             self.resident = binding.token
         binding.launch = (_LAUNCH_MAGIC, pool.local_experts, binding.weight_epoch,
@@ -193,6 +170,42 @@ class ReplicaPipeline:
         # GMM descriptors still use the padded expert count. Zero-row guests
         # have no weight reads or gradient producers.
         return tuple(w[:pool.local_experts + binding.placement.borrowed_capacity] for w in bank)
+
+    def _publish_weights(self, weights, binding, ready, rank_lines, backward):
+        """Transfer live owner projections after the guest credits arrive."""
+        pool = self.pool
+        _, received, owned = binding.edges
+        credit = self.storage[:rank_lines].view(pool.ranks, pool.local_experts, _LINE_WORDS)
+        for slot, owner in enumerate(received):
+            if owner != _NO_OWNER:
+                shmem.signal(credit[pool.rank, slot, :1], self.epoch, owner)
+        if not owned:
+            return
+        for peer, slot, _ in owned:
+            shmem.wait_signal(credit[peer, slot, :1], self.epoch, comparison="ge")
+        stream = torch.npu.current_stream(pool.device)
+        value = _words_tensor((self.epoch,), pool.device)[:4].view(torch.int32)
+        credit_ready = torch.npu.Event()
+        credit_ready.record(stream)
+        copies = {}
+        order = (1, 0) if backward else (0, 1)
+        bank = pool.leased_banks
+        try:
+            for peer, slot, owner in owned:
+                if peer not in copies:
+                    if peer not in self.streams:
+                        self.streams[peer] = torch.npu.Stream(device=pool.device)
+                    copies[peer] = self.streams[peer]
+                    copies[peer].wait_event(credit_ready)
+                with torch.npu.stream(copies[peer]):
+                    value.record_stream(copies[peer])
+                    for matrix in order:
+                        source = weights[matrix][owner]
+                        source.record_stream(copies[peer])
+                        shmem._api._put_sdma(bank[matrix][slot], source, peer)
+                        shmem._api._put_sdma(ready[matrix, slot, :1], value, peer)
+        finally:
+            binding.transfers = tuple(copies.values())
 
     def complete(self, binding):
         """Keep local parameter lifetimes and bank reuse ordered with the peer copies."""

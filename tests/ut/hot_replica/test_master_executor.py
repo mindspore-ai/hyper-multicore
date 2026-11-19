@@ -76,7 +76,8 @@ def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident
                            expert_weight_layout="EOI", leased_banks=bank, generation=0)
     pipeline = ReplicaPipeline(pool)
     pipeline.storage = torch.empty(pipeline.signal_words, dtype=torch.int32)
-    binding = SimpleNamespace(token=object(), edges=(0, (), ()), placement=SimpleNamespace(borrowed_capacity=1))
+    binding = SimpleNamespace(token=object(), edges=(0, (), ()), snapshot=None,
+                              placement=SimpleNamespace(borrowed_capacity=1))
     weights = pipeline.begin(bank, binding, backward=False)
     assert all(weight.shape[0] == 3 for weight in weights)
     assert pool.generation == 1
@@ -129,7 +130,8 @@ def test_inline_pipeline_fits_between_weight_gradient_and_checkpoint_views():
                            expert_weight_layout="EIO", leased_banks=(bank, bank), generation=0)
     pipeline = ReplicaPipeline(pool, inline=True)
     assert pipeline.slot_limit == 3
-    binding = SimpleNamespace(edges=(3, (), ()), token=object(), placement=SimpleNamespace(borrowed_capacity=4))
+    binding = SimpleNamespace(edges=(3, (), ()), token=object(), snapshot=None,
+                              placement=SimpleNamespace(borrowed_capacity=4))
     with patch("hyper_multicore.modules.hot_replica.pipeline.shmem.barrier") as barrier:
         pipeline.begin((bank, bank), binding, backward=False)
         storage = pipeline.storage
@@ -156,3 +158,22 @@ def test_inline_signal_capacity_cannot_admit_a_real_fourth_slot_for_six_home_exp
     assert fused_replica_slots(spec, placement, slot_limit=3) == 0
     placement.copies_by_rank = ((6, 7, 8, -1), (-1,)*4)
     assert fused_replica_slots(spec, placement, slot_limit=3) == 3
+
+
+def test_fused_checkpoint_restores_locally_only_after_the_binding_is_selected():
+    """An agreed replay publishes the restored prefix, without a peer wait."""
+    bank = (torch.empty((4, 4, 8)), torch.empty((4, 8, 2)))
+    pool = SimpleNamespace(local_experts=2, ranks=2, rank=0, hidden=8, intermediate=2, blocks=2,
+                           expert_weight_layout="EOI", leased_banks=bank, generation=0,
+                           restore_snapshot=Mock(), statistics={})
+    pipeline = ReplicaPipeline(pool)
+    pipeline.storage = torch.zeros(pipeline.signal_words, dtype=torch.int32)
+    binding = SimpleNamespace(token=object(), snapshot=object(), edges=(1, (1,), ()),
+                              placement=SimpleNamespace(borrowed_capacity=2))
+    with patch.object(pipeline, "_publish_weights") as publish:
+        pipeline.begin(bank, binding, backward=False)
+        pipeline.begin(bank, binding, backward=True)
+        assert not publish.called
+    pool.restore_snapshot.assert_called_once_with(binding.snapshot, 0)
+    assert binding.weight_epoch == 1 and binding.gradient_epoch == 2
+    assert pool.statistics["fused_snapshot_restores"] == 1
