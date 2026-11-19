@@ -1065,7 +1065,7 @@ def route_offsets(counts: torch.Tensor, rank: int, ub_bytes: int,
 
 
 def route_offsets_and_summary(payload: torch.Tensor, rank: int, ub_bytes: int,
-                              hidden_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build descriptors and the collective validation summary in the same device launch."""
+                              hidden_size: int) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Build descriptors and a validation summary when both fit this device launch."""
     _load_native()
     return torch.ops.hyper_multicore.route_offsets_and_summary(payload, rank, ub_bytes, hidden_size)

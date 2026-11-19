@@ -8,6 +8,7 @@
 #include <acl/acl.h>
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <tuple>
 
 #include "ATen/ATen.h"
@@ -131,9 +132,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> RouteMetadata(const at::Tensor& c
   TORCH_CHECK(hidden_size > 0 && hidden_size <= INT32_MAX, "invalid hidden size");
   const int64_t copies = hidden_size == 1 ? 1 : 2;
   c10::DeviceGuard guard(counts.device());
-  auto offsets = at::empty({copies * (4 * stride + local)}, counts.options().dtype(at::kLong));
-  auto sizes = at::empty({copies * 2 * stride}, counts.options());
-  at::Tensor summary;
   int64_t group = 1;
   while ((group * local) % 16 != 0) ++group;
   const auto programs = (p + group - 1) / group;
@@ -142,9 +140,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> RouteMetadata(const at::Tensor& c
     int64_t cores = 0;
     const auto status = aclrtGetDeviceInfo(counts.get_device(), ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
     TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
-    blocks += std::min(p, std::max<int64_t>(1, cores - blocks));
-    summary = at::empty({p, 8}, counts.options().dtype(at::kLong));
+    const auto summary_blocks = std::min(p, cores - blocks);
+    // Each offset block scans its group twice. Keep each summary block within
+    // two groups of rows and use a separate reduction when no such slots remain.
+    if (summary_blocks < (p + 2 * group - 1) / (2 * group)) {
+      return {};
+    }
+    blocks += summary_blocks;
   }
+  auto offsets = at::empty({copies * (4 * stride + local)}, counts.options().dtype(at::kLong));
+  auto sizes = at::empty({copies * 2 * stride}, counts.options());
+  auto summary = include_summary ? at::empty({p, 8}, counts.options().dtype(at::kLong)) : at::Tensor();
   const auto stream = c10_npu::getCurrentNPUStream().stream(false);
   auto run = [=]() -> int {
     auto launch = SelectUtility(counts.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRouteMetadata),
@@ -164,14 +170,21 @@ std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_
   return {std::get<0>(metadata), std::get<1>(metadata)};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> RouteOffsetsAndSummary(
+using OptionalTensor = std::optional<at::Tensor>;
+
+std::tuple<OptionalTensor, OptionalTensor, OptionalTensor> RouteOffsetsAndSummary(
     const at::Tensor& payload, int64_t rank, int64_t ub, int64_t hidden_size) {
-  return RouteMetadata(payload, rank, ub, hidden_size, true);
+  auto [offsets, sizes, summary] = RouteMetadata(payload, rank, ub, hidden_size, true);
+  if (!summary.defined()) {
+    return {};
+  }
+  return {offsets, sizes, summary};
 }
 }  // namespace
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
   m.def("route_offsets(Tensor counts, int rank, int ub, int hidden_size=1) -> (Tensor, Tensor)");
-  m.def("route_offsets_and_summary(Tensor payload, int rank, int ub, int hidden_size) -> (Tensor, Tensor, Tensor)");
+  m.def("route_offsets_and_summary(Tensor payload, int rank, int ub, int hidden_size) -> "
+        "(Tensor?, Tensor?, Tensor?)");
 }
 TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
   m.impl("route_offsets", RouteOffsets);

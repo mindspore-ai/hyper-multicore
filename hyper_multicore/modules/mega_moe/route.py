@@ -671,6 +671,8 @@ def _read_packed_dynamic_route(
     if ub is None:
         return None
     offsets, sizes, summary = multicore_ops.route_offsets_and_summary(payload, spec.rank_id, ub, spec.hidden_size)
+    if summary is None:
+        return None
     rows = summary.tolist()
     result = _summarize_dynamic_rows(rows, spec, all_experts_active=rows[spec.rank_id][7] > 0)
     metadata = _unpack_route_offsets(offsets, sizes, spec, result.capacity)
