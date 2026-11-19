@@ -164,6 +164,34 @@ def _place_aligned(matrix, config, limit, minimum_rows, threshold, minimum_saved
     return _materialize_aligned(matrix, config, geometry.slots, geometry.intervals)
 
 
+def _prune_aligned_transfers(totals, home, loads, selected, allowed):
+    """Remove avoidable guest edges in the original peak, square, expert order."""
+    while selected:
+        leader = max(range(len(loads)), key=loads.__getitem__)
+        next_peak = max(load for rank, load in enumerate(loads) if rank != leader)
+        best = (allowed + 1, 0, -1)
+        for expert, (target, cut) in selected.items():
+            owner = expert // home
+            moved = totals[expert] - cut
+            owner_after = loads[owner] + moved
+            if owner_after > allowed:
+                continue
+            # The owner's original load is covered by owner_after. Only the
+            # target, whose load decreases, can remove the previous peak.
+            unchanged_peak = next_peak if target == leader else loads[leader]
+            peak = max(owner_after, loads[target] - moved, unchanged_peak)
+            if peak <= allowed:
+                square_delta = moved * (owner_after - loads[target])
+                best = min(best, (peak, square_delta, expert))
+        expert = best[2]
+        if expert < 0:
+            return
+        target, cut = selected.pop(expert)
+        moved = totals[expert] - cut
+        loads[expert // home] += moved
+        loads[target] -= moved
+
+
 @lru_cache(maxsize=64)
 def _select_aligned(totals, config, limit, minimum_rows, threshold, minimum_saved, credit, nodes):
     """Minimize the receive peak, then discard avoidable full-matrix transfers."""
@@ -186,18 +214,7 @@ def _select_aligned(totals, config, limit, minimum_rows, threshold, minimum_save
         if original_peak <= limit:
             allowed = min(allowed, original_peak - minimum_saved,
                           original_peak * (10000 - threshold) // 10000)
-        while True:
-            deletions = []
-            for expert, (target, cut) in selected.items():
-                after = loads.copy()
-                after[expert // home] += totals[expert] - cut
-                after[target] -= totals[expert] - cut
-                if max(after) <= allowed:
-                    deletions.append(((max(after), sum(n * n for n in after), expert), after))
-            if not deletions:
-                break
-            (_, _, expert), loads = min(deletions)
-            del selected[expert]
+        _prune_aligned_transfers(totals, home, loads, selected, allowed)
     # Whole-expert placement is a cheap competitor, not a split-K seed. Avoid
     # paying several full weight/dW transfers for less than the existing global
     # row allowance. This also preserves complete reductions when equally good.
