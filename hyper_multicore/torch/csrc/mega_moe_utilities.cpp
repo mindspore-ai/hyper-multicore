@@ -192,7 +192,33 @@ TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
 }
 
 #if HMC_UTILITY_ARCH3510
+extern "C" void HmcLaunchMxRouteSummary_arch3510(
+    unsigned workers, void* stream, const int32_t* payload, int64_t* output, uint32_t peers, uint32_t experts);
+
 namespace {
+at::Tensor MxRouteSummary(const at::Tensor& payload) {
+  TORCH_CHECK(payload.dim() == 2 && payload.scalar_type() == at::kInt && payload.is_contiguous() &&
+                  payload.device().type() == c10::DeviceType::PrivateUse1,
+              "MX route summary requires a contiguous INT32 NPU wire table");
+  const auto peers = payload.size(0), experts = payload.size(1) - 3;
+  TORCH_CHECK(peers > 0 && peers <= 128 && experts > 0 && experts <= 4096 && experts % peers == 0,
+              "MX route summary wire table exceeds supported geometry");
+  const c10::DeviceGuard guard(payload.device());
+  const auto device = payload.get_device();
+  int64_t cores = 0;
+  const auto status = aclrtGetDeviceInfo(device, ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
+  TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
+  auto result = at::empty({peers, 8}, payload.options().dtype(at::kLong));
+  const auto stream = c10_npu::getCurrentNPUStream(device).stream(false);
+  auto run = [=]() -> int {
+    HmcLaunchMxRouteSummary_arch3510(std::min(cores, peers), stream, payload.data_ptr<int32_t>(),
+                                    result.data_ptr<int64_t>(), peers, experts);
+    return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+  };
+  at_npu::native::OpCommand::RunOpApi("HmcMxRouteSummary", run);
+  return result;
+}
+
 void PublishMxProjectionReady(const at::Tensor& flag, const at::Tensor& epoch) {
   TORCH_CHECK(flag.scalar_type() == at::kInt && epoch.scalar_type() == at::kInt &&
               flag.numel() == 1 && epoch.numel() == 1 && flag.is_contiguous() && epoch.is_contiguous() &&
@@ -209,9 +235,11 @@ void PublishMxProjectionReady(const at::Tensor& flag, const at::Tensor& epoch) {
 }
 }  // namespace
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
+  m.def("mx_route_summary(Tensor payload) -> Tensor");
   m.def("hot_replica_publish_mx_projection_ready_(Tensor(a!) flag, Tensor epoch) -> ()");
 }
 TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
+  m.impl("mx_route_summary", &MxRouteSummary);
   m.impl("hot_replica_publish_mx_projection_ready_", &PublishMxProjectionReady);
 }
 #endif

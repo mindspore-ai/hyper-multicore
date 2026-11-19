@@ -59,7 +59,8 @@ foreach(utility_arch IN LISTS HP_MULTICORE_NPU_ARCHS)
     set(utility_object "${CMAKE_CURRENT_BINARY_DIR}/mega_moe_utilities_${utility_arch}.o")
     add_custom_command(OUTPUT "${utility_object}"
         COMMAND "${ASCEND_BISHENG}" -x asc "--npu-arch=dav-${utility_arch}" --cce-auto-sync=off
-            "-DHMC_UTILITY_SUFFIX=_arch${utility_arch}" -std=c++17 -O2 -fPIC -c "${UTILITY_SOURCE}"
+            "-DHMC_UTILITY_SUFFIX=_arch${utility_arch}" "-DHMC_UTILITY_ARCH=${utility_arch}"
+            -std=c++17 -O2 -fPIC -c "${UTILITY_SOURCE}"
             -o "${utility_object}"
             "-I${CANN_ROOT}/asc" "-I${CANN_ROOT}/asc/include"
             "-I${CANN_ROOT}/asc/include/interface" "-I${CANN_ROOT}/asc/include/utils"

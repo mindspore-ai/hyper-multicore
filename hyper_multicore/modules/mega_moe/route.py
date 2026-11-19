@@ -21,6 +21,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from itertools import accumulate
+import os
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -615,12 +616,18 @@ def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 
 def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec, source_rows: list | None = None) -> _RouteSummary:
     """Use one Host summary for shape, participation, receive limits, and schedule."""
-    counts = payload[:, 3:]
-    # Each column belongs to one expert. Reduce over every source before checking for empty experts.
-    expert_loads = counts.sum(0).reshape(spec.ep_size, spec.local_experts)
-    summary = torch.cat((payload[:, :3], counts.sum(1, keepdim=True),
-                         counts.amin(1, keepdim=True), counts.amax(1, keepdim=True),
-                         expert_loads.sum(1, keepdim=True), expert_loads.amin(1, keepdim=True)), dim=1)
+    if (spec.architecture == 3510 and spec.precision == 'mxfp8' and payload.device.type == 'npu'
+            and payload.dtype == torch.int32 and payload.is_contiguous()
+            and spec.ep_size <= 128 and spec.num_experts <= 4096
+            and os.environ.get('HYPER_MULTICORE_MX_ROUTE_SUMMARY') == 'warp'):
+        summary = multicore_ops.mx_route_summary(payload)
+    else:
+        counts = payload[:, 3:]
+        # Each column belongs to one expert. Reduce over every source before checking for empty experts.
+        expert_loads = counts.sum(0).reshape(spec.ep_size, spec.local_experts)
+        summary = torch.cat((payload[:, :3], counts.sum(1, keepdim=True),
+                             counts.amin(1, keepdim=True), counts.amax(1, keepdim=True),
+                             expert_loads.sum(1, keepdim=True), expert_loads.amin(1, keepdim=True)), dim=1)
     rows = summary.tolist()
     result = _summarize_dynamic_rows(rows, spec, all_experts_active=rows[spec.rank_id][7] > 0)
     if source_rows is not None:
