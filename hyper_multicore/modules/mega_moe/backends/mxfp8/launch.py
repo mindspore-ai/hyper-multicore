@@ -51,10 +51,10 @@ def launch_mxfp8_experts(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
                            events: torch.Tensor, diagnostic: torch.Tensor, launch: torch.Tensor,
                            *, direction: str = 'forward') -> None:
     """Run the native fused MoE with alias-preserving physical arguments."""
-    aliases = _byte_aliases(buffers)
     _load_mxfp8_native()
-    if direction not in ('forward', 'backward'):
+    if direction == 'forward':
+        torch.ops.hyper_multicore.mega_moe_mxfp8.typed_forward(buffers, runtime, events, diagnostic, launch)
+    elif direction == 'backward':
+        torch.ops.hyper_multicore.mega_moe_mxfp8_grad(_byte_aliases(buffers), runtime, events, diagnostic, launch)
+    else:
         raise ValueError('MX native direction must be forward or backward')
-    primary = (torch.ops.hyper_multicore.mega_moe_mxfp8_grad if direction == 'backward'
-               else torch.ops.hyper_multicore.mega_moe_mxfp8)
-    primary(aliases, runtime, events, diagnostic, launch)
