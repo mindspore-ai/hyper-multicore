@@ -243,4 +243,5 @@ def test_weight_only_pipeline_drains_projection_copies_before_ordered_gradient_r
     assert binding.gradients(gradients, weights) == pool.return_generated_gradients.return_value
     assert [call[0] for call in pool.method_calls] == ["pipeline.complete", "return_generated_gradients"]
     pool.return_generated_gradients.assert_called_once_with(
-        gradients, placement.copies, output_dtypes=(torch.bfloat16, torch.bfloat16), published_slots=5)
+        gradients, placement.copies, output_dtypes=(torch.bfloat16, torch.bfloat16), published_slots=5,
+        prefer_buffered=True)

@@ -229,6 +229,29 @@ def test_fp32_owner_gradient_reaches_native_reduction_without_rounding():
     torch.testing.assert_close(bridge.reduce.call_args.args[0], gradient, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(("partial_dtype", "new_bridge", "native"), [
+    (torch.bfloat16, True, True), (torch.bfloat16, False, False), (torch.float32, True, True),
+])
+def test_native_home_gradient_keeps_fp32_guest_payload_and_legacy_fallback(partial_dtype, new_bridge, native):
+    """Keep original local precision and the ordered FP32 wire in the buffered reducer."""
+    gradient = torch.arange(12, dtype=partial_dtype).view(3, 2, 2)
+    bank = torch.empty(4, 2, 2, dtype=torch.bfloat16)
+    copies = torch.tensor([[2], [0]], dtype=torch.int32)
+    bridge = SimpleNamespace(reduce=Mock())
+    if new_bridge:
+        bridge.reduce_buffered = Mock()
+        bridge.buffered_plan_fits = Mock(return_value=True)
+    with patch("hyper_multicore.modules.hot_replica.bank_ops.load_bridge", return_value=bridge):
+        result, = reduce_banks((gradient,), (bank,), copies, 0, 1, (torch.bfloat16,), prefer_buffered=True)
+    called = bridge.reduce_buffered if native else bridge.reduce
+    called.assert_called_once()
+    source, output, slots, *_ = called.call_args.args
+    assert source.dtype == (partial_dtype if native else torch.float32)
+    assert output is result and result.dtype == torch.bfloat16
+    assert result.untyped_storage().data_ptr() != gradient.untyped_storage().data_ptr()
+    torch.testing.assert_close(slots, gradient[2:].float(), rtol=0, atol=0)
+
+
 def test_placement_reuses_validated_source_totals_and_autograd_mask():
     """Reuse existing source counts and gradient participation without rereading."""
     hidden = torch.empty(2, 8)

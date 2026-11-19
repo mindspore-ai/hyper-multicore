@@ -17,7 +17,10 @@ namespace {
 constexpr int32_t kElements = 8192;
 constexpr int32_t kScratch = 64;
 constexpr int32_t kReservedUb = 188 * 1024;
-constexpr int32_t kIndexOffset = kScratch + kElements * 8;
+constexpr int32_t kFirstContribution = kScratch + kElements * sizeof(float);
+constexpr int32_t kIndexOffset = kFirstContribution + kElements * sizeof(float);
+constexpr int32_t kNativeHomeOffset = kIndexOffset + kElements * sizeof(float);
+constexpr int32_t kBufferedIndexOffset = kNativeHomeOffset + kElements * sizeof(bfloat16_t);
 
 template <typename T>
 __aicore__ inline LocalTensor<T> LocalAt(int32_t offset, TPosition position) {
@@ -28,21 +31,21 @@ __aicore__ inline LocalTensor<T> LocalAt(int32_t offset, TPosition position) {
     return local;
 }
 
-__aicore__ inline void LoadOwner(LocalTensor<float> local,
-                               __gm__ float* source, int32_t elements) {
-    GlobalTensor<float> global;
+template <typename T>
+__aicore__ inline void LoadOwner(LocalTensor<T> local, __gm__ T* source, int32_t elements) {
+    GlobalTensor<T> global;
     global.SetGlobalBuffer(source);
-    DataCopyExtParams copy{1, static_cast<uint32_t>(elements * sizeof(float)), 0, 0, 0};
-    DataCopyPadExtParams<float> padding{false, 0, 0, 0};
+    DataCopyExtParams copy{1, static_cast<uint32_t>(elements * sizeof(T)), 0, 0, 0};
+    DataCopyPadExtParams<T> padding{false, 0, 0, 0};
     DataCopyPad(local, global, copy, padding);
     PipeBarrier<PIPE_ALL>();
 }
 
-__aicore__ inline void StoreOwner(__gm__ float* destination,
-                                LocalTensor<float> local, int32_t elements) {
-    GlobalTensor<float> global;
+template <typename T>
+__aicore__ inline void StoreOwner(__gm__ T* destination, LocalTensor<T> local, int32_t elements) {
+    GlobalTensor<T> global;
     global.SetGlobalBuffer(destination);
-    DataCopyExtParams copy{1, static_cast<uint32_t>(elements * sizeof(float)), 0, 0, 0};
+    DataCopyExtParams copy{1, static_cast<uint32_t>(elements * sizeof(T)), 0, 0, 0};
     PipeBarrier<PIPE_ALL>();
     DataCopyPad(global, local, copy);
     PipeBarrier<PIPE_ALL>();
@@ -63,10 +66,18 @@ __aicore__ inline void BuildOwnerLists(__gm__ int32_t* plan, __ubuf__ int32_t* h
         }
     }
 }
-}  // namespace
+__aicore__ inline void ReadContribution(__gm__ float* remote, int64_t matrix, int32_t slots,
+                                        int32_t entry, int64_t begin, int32_t elements, int32_t buffer) {
+    const int32_t offset = buffer == 0 ? kFirstContribution : kIndexOffset;
+    const TEventID ready = buffer == 0 ? EVENT_ID0 : EVENT_ID1;
+    const int64_t peer_offset = static_cast<int64_t>(entry % slots) * matrix + begin;
+    aclshmemx_mte_get_nbi(reinterpret_cast<__ubuf__ float*>(offset), remote + peer_offset,
+                          elements, entry / slots, ready);
+    SetFlag<HardEvent::MTE2_V>(ready);
+}
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__
-void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
+template <bool NativeHome, bool Buffered>
+__aicore__ inline void ReturnOwnerGradients(uint64_t ffts, GM_ADDR source_address,
                              GM_ADDR output_address, GM_ADDR slots_address,
                              GM_ADDR plan_address, int32_t experts,
                              int64_t matrix, int32_t ranks, int32_t slots,
@@ -80,7 +91,7 @@ void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
     auto* output = reinterpret_cast<__gm__ float*>(output_address);
     auto* remote = reinterpret_cast<__gm__ float*>(slots_address);
     auto* plan = reinterpret_cast<__gm__ int32_t*>(plan_address);
-    auto* heads = reinterpret_cast<__ubuf__ int32_t*>(kIndexOffset);
+    auto* heads = reinterpret_cast<__ubuf__ int32_t*>(Buffered ? kBufferedIndexOffset : kIndexOffset);
     auto* next = heads + (experts + 7) / 8 * 8;
     BuildOwnerLists(plan, heads, next, experts, ranks, slots, rank);
     const int32_t sub_blocks = static_cast<int32_t>(GetSubBlockNum());
@@ -88,7 +99,7 @@ void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
     const int32_t workers = GetBlockNum();
     const int64_t tiles = (matrix + kElements - 1) / kElements;
     auto accumulator = LocalAt<float>(kScratch, TPosition::VECIN);
-    auto contribution = LocalAt<float>(kScratch + 4*kElements, TPosition::VECIN);
+
     for (int32_t expert = 0; expert < experts; ++expert) {
         // Owned native gradients can remain in place when no peer contributes.
         // Every worker still participates in both root barriers.
@@ -99,18 +110,48 @@ void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
             const int64_t begin = tile * kElements;
             const int32_t elements = matrix - begin < kElements ? matrix - begin : kElements;
             const int64_t offset = static_cast<int64_t>(expert) * matrix + begin;
-            LoadOwner(accumulator, source + offset, elements);
-            if (heads[expert] >= 0) {
-                for (int32_t rb = heads[expert]; rb >= 0; rb = next[rb]) {
-                    const int32_t peer = rb / slots;
-                    const int32_t slot = rb % slots;
-                    const int64_t peer_offset = static_cast<int64_t>(slot) * matrix + begin;
-                    aclshmemx_mte_get_nbi(
-                        reinterpret_cast<__ubuf__ float*>(kScratch + 4*kElements),
-                        remote + peer_offset, elements, peer, EVENT_ID0);
-                    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-                    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-                    Add(accumulator, accumulator, contribution, elements);
+            const int32_t head = heads[expert];
+            if constexpr (NativeHome) {
+                auto native = LocalAt<bfloat16_t>(kNativeHomeOffset, TPosition::VECIN);
+                auto* native_source = reinterpret_cast<__gm__ bfloat16_t*>(source_address);
+                LoadOwner(native, native_source + offset, elements);
+                if (head < 0) {
+                    StoreOwner(reinterpret_cast<__gm__ bfloat16_t*>(output_address) + offset, native, elements);
+                    continue;
+                }
+                ReadContribution(remote, matrix, slots, head, begin, elements, 0);
+                Cast(accumulator, native, RoundMode::CAST_NONE, elements);
+                PipeBarrier<PIPE_V>();
+            } else {
+                LoadOwner(accumulator, source + offset, elements);
+                if constexpr (Buffered) {
+                    if (head >= 0) ReadContribution(remote, matrix, slots, head, begin, elements, 0);
+                }
+            }
+            int32_t buffer = 0;
+            for (int32_t entry = head; entry >= 0; entry = next[entry]) {
+                const TEventID ready = buffer == 0 ? EVENT_ID0 : EVENT_ID1;
+                const int32_t following = next[entry];
+                if constexpr (!Buffered) {
+                    ReadContribution(remote, matrix, slots, entry, begin, elements, 0);
+                }
+                WaitFlag<HardEvent::MTE2_V>(ready);
+                if constexpr (Buffered) {
+                    if (following >= 0) {
+                        const TEventID other = buffer == 0 ? EVENT_ID1 : EVENT_ID0;
+                        // Before a slot is reused, wait for its preceding vector Add.
+                        if (entry != head) WaitFlag<HardEvent::V_MTE2>(other);
+                        ReadContribution(remote, matrix, slots, following, begin, elements, 1 - buffer);
+                    }
+                }
+                const int32_t contribution_offset = buffer == 0 ? kFirstContribution : kIndexOffset;
+                auto contribution = LocalAt<float>(contribution_offset, TPosition::VECIN);
+                Add(accumulator, accumulator, contribution, elements);
+                if constexpr (Buffered) {
+                    if (following >= 0 && next[following] >= 0) SetFlag<HardEvent::V_MTE2>(ready);
+                    PipeBarrier<PIPE_V>();
+                    buffer = 1 - buffer;
+                } else {
                     PipeBarrier<PIPE_ALL>();
                 }
             }
@@ -131,24 +172,83 @@ void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
     // All readers must complete before a later backward overwrites the slots.
     if (finish) aclshmemx_barrier_all_vec();
 }
+}  // namespace
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__
+void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source, GM_ADDR output, GM_ADDR slots,
+                                  GM_ADDR plan, int32_t experts, int64_t matrix, int32_t ranks,
+                                  int32_t borrowed, int32_t rank, bool bf16, bool publish, bool finish) {
+    ReturnOwnerGradients<false, false>(ffts, source, output, slots, plan, experts, matrix,
+                               ranks, borrowed, rank, bf16, publish, finish);
+}
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__
+void HotReplicaSharedGradReturnBuffered(uint64_t ffts, GM_ADDR source, GM_ADDR output, GM_ADDR slots,
+                                       GM_ADDR plan, int32_t experts, int64_t matrix, int32_t ranks,
+                                       int32_t borrowed, int32_t rank, bool native_home, bool bf16,
+                                       bool publish, bool finish) {
+    if (native_home) {
+        ReturnOwnerGradients<true, true>(ffts, source, output, slots, plan, experts, matrix,
+                                         ranks, borrowed, rank, true, publish, finish);
+    } else {
+        ReturnOwnerGradients<false, true>(ffts, source, output, slots, plan, experts, matrix,
+                                          ranks, borrowed, rank, bf16, publish, finish);
+    }
+}
+
+extern "C" ASCEND_HOT_REPLICA_EXPORT bool hmc_hot_replica_buffered_plan_fits(
+    int32_t experts, int32_t ranks, int32_t borrowed) {
+    const int64_t entries = (static_cast<int64_t>(experts) + 7) / 8 * 8 +
+                            static_cast<int64_t>(ranks) * borrowed;
+    return experts > 0 && ranks > 0 && borrowed > 0 &&
+           kBufferedIndexOffset + entries * sizeof(int32_t) <= kReservedUb;
+}
+
+template <bool Buffered>
+static int LaunchGradientReturn(
+    void* stream, const void* source, void* output, void* slots,
+    const int32_t* plan, int32_t experts, int32_t hidden, int32_t projection,
+    int32_t ranks, int32_t rank, int32_t blocks, int32_t borrowed, bool native_home, bool bf16,
+    bool publish, bool finish) {
+    const int64_t index_entries = (experts + 7) / 8 * 8 + ranks * borrowed;
+    if (stream == nullptr || source == nullptr || output == nullptr ||
+        slots == nullptr || plan == nullptr || experts <= 0 || hidden <= 0 ||
+        projection <= 0 || ranks != aclshmem_n_pes() || rank < 0 ||
+        rank >= ranks || blocks <= 0 ||
+        (Buffered ? !hmc_hot_replica_buffered_plan_fits(experts, ranks, borrowed) :
+                    kIndexOffset + index_entries * sizeof(int32_t) > kReservedUb)) {
+        return ACL_ERROR_INVALID_PARAM;
+    }
+    auto* source_bytes = reinterpret_cast<uint8_t*>(const_cast<void*>(source));
+    auto* output_bytes = reinterpret_cast<uint8_t*>(output);
+    auto* slot_bytes = reinterpret_cast<uint8_t*>(slots);
+    auto* plan_bytes = reinterpret_cast<uint8_t*>(const_cast<int32_t*>(plan));
+    const int64_t matrix = static_cast<int64_t>(hidden) * projection;
+    if constexpr (Buffered) {
+        HotReplicaSharedGradReturnBuffered<<<blocks, nullptr, stream>>>(
+            shmemx_get_ffts_config(), source_bytes, output_bytes, slot_bytes, plan_bytes,
+            experts, matrix, ranks, borrowed, rank, native_home, bf16, publish, finish);
+    } else {
+        HotReplicaSharedGradReturnFp32<<<blocks, nullptr, stream>>>(
+            shmemx_get_ffts_config(), source_bytes, output_bytes, slot_bytes, plan_bytes,
+            experts, matrix, ranks, borrowed, rank, bf16, publish, finish);
+    }
+    return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+}
 
 extern "C" ASCEND_HOT_REPLICA_EXPORT int hmc_hot_replica_grad_return_fp32(
     void* stream, const void* source, void* output, void* slots,
     const int32_t* plan, int32_t experts, int32_t hidden, int32_t projection,
     int32_t ranks, int32_t rank, int32_t blocks, int32_t borrowed, bool bf16, bool publish, bool finish) {
-    const int32_t index_entries = (experts + 7) / 8 * 8 + ranks * borrowed;
-    if (stream == nullptr || source == nullptr || output == nullptr ||
-        slots == nullptr || plan == nullptr || experts <= 0 || hidden <= 0 ||
-        projection <= 0 || ranks != aclshmem_n_pes() || rank < 0 ||
-        rank >= ranks || blocks <= 0 ||
-        kIndexOffset + index_entries * sizeof(int32_t) > kReservedUb) {
-        return ACL_ERROR_INVALID_PARAM;
-    }
-    HotReplicaSharedGradReturnFp32<<<blocks, nullptr, stream>>>(
-        shmemx_get_ffts_config(),
-        reinterpret_cast<uint8_t*>(const_cast<void*>(source)),
-        reinterpret_cast<uint8_t*>(output), reinterpret_cast<uint8_t*>(slots),
-        reinterpret_cast<uint8_t*>(const_cast<int32_t*>(plan)), experts,
-        static_cast<int64_t>(hidden) * projection, ranks, borrowed, rank, bf16, publish, finish);
-    return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+    return LaunchGradientReturn<false>(stream, source, output, slots, plan, experts, hidden, projection,
+                                       ranks, rank, blocks, borrowed, false, bf16, publish, finish);
+}
+
+extern "C" ASCEND_HOT_REPLICA_EXPORT int hmc_hot_replica_grad_return_buffered(
+    void* stream, const void* source, void* output, void* slots,
+    const int32_t* plan, int32_t experts, int32_t hidden, int32_t projection,
+    int32_t ranks, int32_t rank, int32_t blocks, int32_t borrowed, bool native_home, bool bf16,
+    bool publish, bool finish) {
+    return LaunchGradientReturn<true>(stream, source, output, slots, plan, experts, hidden, projection,
+                                      ranks, rank, blocks, borrowed, native_home, bf16, publish, finish);
 }

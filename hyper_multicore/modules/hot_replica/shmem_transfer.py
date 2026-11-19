@@ -331,6 +331,7 @@ class SharedExpertPool:
         *,
         output_dtypes: tuple[torch.dtype, ...] | None = None,
         published_slots: int | None = None,
+        prefer_buffered: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Sum borrowed gradients into the expert producer's home gradients."""
         if self.pipeline is not None:
@@ -344,6 +345,7 @@ class SharedExpertPool:
                 self.blocks,
                 output_dtypes,
                 published_slots=published_slots,
+                prefer_buffered=prefer_buffered,
             )
         self.generation += 1
         self.statistics["gradient_returns"] += 1
@@ -476,6 +478,7 @@ class ExpertWeightBinding:
         return self.pool.return_generated_gradients(
             gradients, self.placement.copies, output_dtypes=tuple(w.dtype for w in weights),
             published_slots=self.placement.published_slots,
+            prefer_buffered=self.fused,
         )
 
     def release(self) -> None:

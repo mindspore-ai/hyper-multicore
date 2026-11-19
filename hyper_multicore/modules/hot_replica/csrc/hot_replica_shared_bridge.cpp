@@ -12,6 +12,12 @@ extern "C" int hmc_hot_replica_grad_return_fp32(
     void* stream, const void* source, void* output, void* slots,
     const int32_t* plan, int32_t experts, int32_t hidden, int32_t projection,
     int32_t ranks, int32_t rank, int32_t blocks, int32_t borrowed, bool bf16, bool publish, bool finish);
+extern "C" int hmc_hot_replica_grad_return_buffered(
+    void* stream, const void* source, void* output, void* slots,
+    const int32_t* plan, int32_t experts, int32_t hidden, int32_t projection,
+    int32_t ranks, int32_t rank, int32_t blocks, int32_t borrowed, bool native_home, bool bf16,
+    bool publish, bool finish);
+extern "C" bool hmc_hot_replica_buffered_plan_fits(int32_t experts, int32_t ranks, int32_t borrowed);
 
 static void check_runtime(int64_t rank, int64_t ranks) {
     TORCH_CHECK(rank == aclshmem_my_pe(), "expert-transfer rank differs from active MegaMoE SHMEM PE");
@@ -64,16 +70,23 @@ static void prefetch(torch::Tensor home, torch::Tensor slots, torch::Tensor copi
     at_npu::native::OpCommand::RunOpApi("HyperMulticoreHotReplicaPrefetch", run);
 }
 
+template <bool Buffered>
 static void reduce(torch::Tensor source, torch::Tensor home, torch::Tensor slots,
                    torch::Tensor copies, int64_t rank, int64_t blocks, bool publish, bool finish) {
     check_runtime(rank, copies.size(0));
     TORCH_CHECK(source.is_contiguous() && home.is_contiguous() && slots.is_contiguous()
                     && copies.is_contiguous(),
                 "gradient transfer requires contiguous tensors");
-    TORCH_CHECK(source.scalar_type() == at::kFloat
-                    && (home.scalar_type() == at::kFloat || home.scalar_type() == at::kBFloat16)
-                    && slots.scalar_type() == at::kFloat,
-                "expert partial gradients and owner reduction must remain FP32");
+    const bool native_home = source.scalar_type() == at::kBFloat16;
+    if (Buffered && native_home) {
+        TORCH_CHECK(home.scalar_type() == at::kBFloat16,
+                    "native BF16 local weight gradients require BF16 output");
+    } else {
+        TORCH_CHECK(source.scalar_type() == at::kFloat
+                        && (home.scalar_type() == at::kFloat || home.scalar_type() == at::kBFloat16),
+                    "FP32 owner reduction requires FP32 inputs and FP32 or BF16 outputs");
+    }
+    TORCH_CHECK(slots.scalar_type() == at::kFloat, "replica weight gradients must remain FP32");
     TORCH_CHECK(copies.scalar_type() == at::kInt && copies.dim() == 2,
                 "gradient copy plan must be INT32 [root, slots]");
     TORCH_CHECK(home.sizes() == source.sizes() && home.dim() == 3 && slots.dim() == 3
@@ -82,6 +95,12 @@ static void reduce(torch::Tensor source, torch::Tensor home, torch::Tensor slots
                 "gradient transfer shape changed");
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
     auto run = [=]() -> int {
+        if constexpr (Buffered) {
+            return hmc_hot_replica_grad_return_buffered(stream, source.data_ptr(), home.data_ptr(), slots.data_ptr(),
+                copies.data_ptr<int32_t>(), home.size(0), home.size(1), home.size(2),
+                copies.size(0), rank, blocks, copies.size(1), native_home, home.scalar_type() == at::kBFloat16,
+                publish, finish);
+        }
         return hmc_hot_replica_grad_return_fp32(stream, source.data_ptr(), home.data_ptr(), slots.data_ptr(),
             copies.data_ptr<int32_t>(), home.size(0), home.size(1), home.size(2),
             copies.size(0), rank, blocks, copies.size(1), home.scalar_type() == at::kBFloat16, publish, finish);
@@ -94,7 +113,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                pybind11::arg("copies"), pybind11::arg("rank"), pybind11::arg("ranks"),
                pybind11::arg("blocks"),
                pybind11::arg("publish") = true, pybind11::arg("finish") = true);
-    module.def("reduce", &reduce, pybind11::arg("source"), pybind11::arg("home"),
+    module.def("reduce", &reduce<false>, pybind11::arg("source"), pybind11::arg("home"),
+               pybind11::arg("slots"), pybind11::arg("copies"), pybind11::arg("rank"),
+               pybind11::arg("blocks"),
+               pybind11::arg("publish") = true, pybind11::arg("finish") = true);
+    module.def("buffered_plan_fits", &hmc_hot_replica_buffered_plan_fits);
+    module.def("reduce_buffered", &reduce<true>, pybind11::arg("source"), pybind11::arg("home"),
                pybind11::arg("slots"), pybind11::arg("copies"), pybind11::arg("rank"),
                pybind11::arg("blocks"),
                pybind11::arg("publish") = true, pybind11::arg("finish") = true);
