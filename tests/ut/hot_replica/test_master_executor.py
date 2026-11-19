@@ -28,7 +28,7 @@ from hyper_multicore.modules.hot_replica.bounded_placement import _render_geomet
 from hyper_multicore.modules.hot_replica.pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
 from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, SharedExpertPool
 from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16
-from hyper_multicore.modules.mega_moe.heap_manager import _HeapEntry, _HeapManager, _workspace_layout
+from hyper_multicore.modules.mega_moe.heap_manager import _HeapEntry, _HeapManager, _round_heap_bytes, _workspace_layout
 
 
 @pytest.mark.parametrize(("budget_mib", "peak", "fallback"), [
@@ -101,6 +101,44 @@ def test_fixed_heap_checkpoint_preflights_the_regular_admission_result():
                             planner=policy, checkpointing=True) is budget.return_value
     policy.plan.assert_called_once_with(request)
     budget.assert_called_once_with(request, policy.plan.return_value, 4096, None)
+
+
+@pytest.mark.parametrize(("ep", "home", "matching_events"), [(32, 4, True), (32, 6, True), (32, 8, True), (64, 8, False)])
+@pytest.mark.parametrize("tight", [False, True])
+def test_bound_parent_workspace_reuse_requires_budget_pressure_and_matching_events(ep, home, matching_events, tight):
+    """Preserve the existing allocation when it fits and respect the event stride."""
+    planner = mega_moe_adapter.HotReplicaPlanner
+    spec = SimpleNamespace(
+        ep_size=ep, local_experts=home, num_experts=ep * home, top_k=8, local_num_tokens=4096,
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        hidden_size=5120, intermediate_size=1792, initial_capacity_factor=1.25, num_cube_cores=24,
+        expert_weight_layout="EIO", auto_tokens=True,
+    )
+    specification = dict(vars(spec), source_token_bound=4096, hot_replica=True,
+                         planner_key=(planner.__module__, planner.__qualname__))
+    hidden = torch.empty(0, 5120, dtype=torch.bfloat16)
+    entries, headroom, _ = mega_moe_adapter.workspace_reservations((specification,), hidden.dtype, 24)
+    _, layout = entries[0]
+    bank = mega_moe_adapter._expert_bank_bytes(home, spec.hidden_size, spec.intermediate_size, hidden.dtype)
+    manager = _HeapManager(None, hidden)
+    manager.heap_limit = _round_heap_bytes(layout.required_bytes + (bank if tight else headroom))
+    workspace = SimpleNamespace(capacity_floor=layout.receive_capacity)
+    manager.entries.append(_HeapEntry(specification, layout, workspace, spec))
+    owner = mega_moe_adapter.PlacementResources(SimpleNamespace(spec=spec, workspace=workspace, heap_manager=manager),
+                                               specification, shared=True)
+    assert not owner.reuses_parent_workspace
+    assert owner.can_share_fixed_workspace == matching_events
+    request = SimpleNamespace(hidden=hidden, maximum_received=32768)
+    placement = SimpleNamespace(borrowed_capacity=1, receive_capacity=32768)
+    with patch.object(owner, "bind") as bind:
+        result = owner._bind_fixed(request, placement, 4096, None)
+        if tight and not matching_events:
+            assert result is None
+            bind.assert_not_called()
+        else:
+            assert result is bind.return_value
+            bind.assert_called_once_with(hidden, placement, tokens=4096, fused=True)
+    assert owner.reuses_parent_workspace == (tight and matching_events)
 
 
 def test_serial_replica_widths_share_one_reservation_with_the_bank():

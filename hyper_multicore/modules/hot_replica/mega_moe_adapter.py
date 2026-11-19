@@ -193,11 +193,13 @@ class PlacementResources:
         else:
             self.bounded = None
         spec = parent.spec
-        self.reuses_parent_workspace = (
-            self.bounded is not None and self.source_bound is None
+        matching_events = (
+            self.bounded is not None
             and mega_moe_event_capacity(spec.num_experts, spec.ep_size)
             == mega_moe_event_capacity(2 * spec.num_experts, spec.ep_size)
         )
+        self.reuses_parent_workspace = matching_events and self.source_bound is None
+        self.can_share_fixed_workspace = matching_events and self.fixed_heap
         self.pipeline_enabled = built_in and supports_pipeline(parent.spec, 1)
         self.statistics = {
             "invocations": 0, "placements": 0,
@@ -269,6 +271,16 @@ class PlacementResources:
                 width = spec.local_experts if self.source_bound is not None else placement.borrowed_capacity
                 if self._virtual_fits(hidden.dtype, tokens, placement.receive_capacity, width):
                     return self.bind(hidden, placement, tokens=tokens, fused=self.pipeline_enabled)
+                if (self.can_share_fixed_workspace and not self.reuses_parent_workspace and not self.geometries
+                        and self._virtual_fits(hidden.dtype, tokens, placement.receive_capacity, width,
+                                               share_home=True)):
+                    self.reuses_parent_workspace = True
+                    try:
+                        return self.bind(hidden, placement, tokens=tokens, fused=self.pipeline_enabled)
+                    except Exception:
+                        if self.pool is None:
+                            self.reuses_parent_workspace = False
+                        raise
             if manager.fits_fixed_heap(
                     workspace_growth=(self.parent.workspace, tokens, request.maximum_received)):
                 return None
@@ -310,20 +322,25 @@ class PlacementResources:
                 hi = middle - 1
         return limit
 
-    def _virtual_fits(self, dtype, tokens, rows, width):
+    def _virtual_fits(self, dtype, tokens, rows, width, *, share_home=False):
         """Count the actual virtual workspace and any still-unallocated shared bank."""
         spec = self.parent.spec
         manager = self.parent.heap_manager
+        growth = None
+        layouts = []
         resources = self.geometries.get(width)
-        if resources is not None:
+        if self.reuses_parent_workspace or share_home:
+            growth = (self.parent.workspace, tokens, rows)
+        elif resources is not None:
             return manager.fits_fixed_heap(workspace_growth=(resources.workspace, tokens, rows))
-        _, layout = self._virtual_reservation(dtype, tokens, rows, width)
+        else:
+            _, layout = self._virtual_reservation(dtype, tokens, rows, width)
+            layouts.append(layout)
         pool = _SHARED_BANKS.get(manager, {}).get(_bank_key(spec, dtype, None))
-        layouts = (layout,)
         if pool is None or pool.closed:
             bank_bytes = _expert_bank_bytes(spec.local_experts, spec.hidden_size, spec.intermediate_size, dtype)
-            layouts = (layout, _WorkspaceLayout(bank_bytes, (), 0))
-        return manager.fits_fixed_heap(layouts)
+            layouts.append(_WorkspaceLayout(bank_bytes, (), 0))
+        return manager.fits_fixed_heap(tuple(layouts), workspace_growth=growth)
 
     def request(
         self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: _RouteSummary,
@@ -390,7 +407,7 @@ class PlacementResources:
             if self.pool is None:
                 source = max(_COMMUNICATION_SPLIT, _align_capacity(tokens))
                 receive = _align_capacity(placement.receive_capacity)
-                if self.shared:
+                if self.shared and manager.heap_limit is None:
                     receive = max(receive, _resolve_receive_capacity(
                         spec.initial_capacity_factor, source * spec.top_k, spec.ep_size,
                     ))
