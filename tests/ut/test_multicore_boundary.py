@@ -53,25 +53,29 @@ assert 'torch_npu' not in sys.modules
 """
         result = subprocess.run(
             [sys.executable, "-c", code], check=False, capture_output=True, text=True,
+            cwd=Path(__file__).resolve().parents[2],
             env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
         )
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_business_symbols_are_exported_by_standalone_package(self):
+    def test_business_symbols_are_exported_by_standalone_package(self) -> None:
         """Verify the Multicore public export boundary.
 
         Feature: Multicore public exports.
         Description: Inspect the HyperMulticore public package symbols.
-        Expectation: The package exports its business modules and diagnostic helpers.
+        Expectation: The package exports its business modules, placement contracts and diagnostic helpers.
         """
         self.assertCountEqual(multicore.__all__, [
-            "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaKernelDiagnostics",
+            "BasePlanner", "ExpertPlacement", "PlacementRequest",
+            "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaMoePlacementOptions",
+            "MegaKernelDiagnostics",
             "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
         ])
         self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))
-        for name in ("MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions"):
+        for name in ("MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaMoePlacementOptions",
+                     "BasePlanner", "ExpertPlacement", "PlacementRequest"):
             self.assertTrue(callable(getattr(multicore, name)))
         for name in ("MhcState", "MegaMhcOutput", "GateOutput", "GateBackend"):
             self.assertFalse(hasattr(multicore, name))
