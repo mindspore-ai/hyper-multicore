@@ -197,7 +197,9 @@ class PlacementResources:
                     reserved=current.ordinary_receive_capacity,
                 )
 
-            selected = HotReplicaPlanner._plan_reserved(request, _build_reserved, HotReplicaPlanner._build)
+            # At the full home-slot budget the quota search can attain the
+            # group average; a reservation below that bound requires growth.
+            selected = HotReplicaPlanner._plan_reserved(request, _build_reserved)
             return self.bind(hidden, selected, fused=self.pipeline_enabled and not checkpointing)
         self.statistics["invocations"] += 1
         peak = summary.maximum

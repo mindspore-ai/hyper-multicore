@@ -75,7 +75,7 @@ class HotReplicaPlanner(BasePlanner):
         return None
 
     @staticmethod
-    def _plan_reserved(request, build, capacity_fallback=None):
+    def _plan_reserved(request, build):
         """Maintain the reservation admission policy across quota implementations."""
         maximum, floor = request.maximum_received, request.ordinary_receive_capacity
         ranks, experts = request.counts_by_source.shape
@@ -97,14 +97,6 @@ class HotReplicaPlanner(BasePlanner):
         if not must_balance and (maximum <= receive_limit or not _worth_moving(target)):
             return None
         placement = build(request, target)
-        if must_balance and capacity_fallback is not None and (
-            placement is None or placement.receive_capacity > floor
-        ):
-            # A different quota search can miss a feasible placement. Try the
-            # established allocator before requiring a workspace resize.
-            fallback = capacity_fallback(request, target)
-            if fallback is not None and (placement is None or fallback.receive_capacity < placement.receive_capacity):
-                placement = fallback
         if placement is not None and (
             (must_balance and placement.receive_capacity <= floor) or _worth_moving(placement.receive_capacity)
         ):
