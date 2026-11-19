@@ -1009,7 +1009,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         payload = self._payload(experts, torch.int32)
         workspace = SimpleNamespace(route_cache=None, route_cache_probe_after=0)
 
-        def prepare(wire):
+        def _prepare(wire):
             count = wire[spec.rank_id, 3:]
             summary, raw, metadata = _read_cached_route(wire, spec, workspace, "cpu")
             permuted = torch.empty(0, 16), torch.empty(0, dtype=torch.int32)
@@ -1017,10 +1017,10 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                 permuted, count, summary, raw, metadata, None, wire, spec, workspace, "cpu", int(wire[1, 1]),
             ).metadata
 
-        prepare(payload)
+        _prepare(payload)
         payload[1, 3 + 3] -= 1
         payload[1, 3 + 5] += 1
-        metadata = prepare(payload)
+        metadata = _prepare(payload)
         self.assertEqual(workspace.route_cache_probe_after, _ROUTE_CACHE_REPROBE_STEPS)
         empty = payload.clone()
         expert = spec.rank_id * spec.local_experts
@@ -1031,12 +1031,12 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                 wire = empty if remaining % 2 else payload
                 with patch.object(wire, "tolist", side_effect=AssertionError("unexpected full Host table read")):
                     # A changing route must not inherit the previous route's activity.
-                    observed = prepare(wire)
+                    observed = _prepare(wire)
                 self.assertEqual(observed.all_experts_active, wire is payload)
                 self.assertEqual(observed.for_kernel(spec.hidden_size).all_experts_active, wire is payload)
                 self.assertEqual(workspace.route_cache_probe_after, remaining)
             self.assertEqual(device_summary.call_count, _ROUTE_CACHE_REPROBE_STEPS)
-        self.assertIs(prepare(payload), metadata)
+        self.assertIs(_prepare(payload), metadata)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

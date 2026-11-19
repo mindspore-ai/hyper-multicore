@@ -145,7 +145,7 @@ def test_supported_device_requires_selected_adapter_artifacts():
         capability._require_a3(tensor)  # pylint: disable=protected-access
 
 
-def test_mx_capability_checks_cube_geometry_before_loading_replica_artifacts():
+def test_mx_capability_checks_cube_geometry_before_loading_replica_artifacts() -> None:
     """Converge a device limitation during binding, before a hotspot can allocate guest resources."""
     tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=3), dtype=torch.bfloat16)
     with (
