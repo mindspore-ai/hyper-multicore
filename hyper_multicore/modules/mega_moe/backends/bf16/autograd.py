@@ -396,6 +396,15 @@ def _diagnostic_parameters(
     return (*parameters, *tilings, planes)
 
 
+def _diagnostic_runtime(runtime, ordinary, extended):
+    """Keep the current replica suffix after the profiler's scheduler header."""
+    if extended is None:
+        return runtime
+    if runtime.numel() != ordinary.numel():
+        raise RuntimeError("MegaMoE profiler changed the replica runtime extension offset")
+    return torch.cat((runtime, extended[ordinary.numel():]))
+
+
 def _launch_forward_kernel(
     plan: MegaMoePlan,
     metadata: RouteMetadata,
@@ -449,14 +458,15 @@ def _launch_forward_kernel(
         direction="forward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
+        runtime = _diagnostic_runtime(diagnostic_call.runtime_config, plan.fwd_runtime_config, runtime_override)
+        record_plan_stream(plan, runtime, stream=stream)
         multicore_ops.mega_moe_with_diagnostic_buffer(
             *kernel_parameters,
             execution.gmm_workspace,
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            diagnostic_call.runtime_config,
+            runtime,
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,
@@ -528,7 +538,8 @@ def _launch_backward_kernel(
         direction="backward",
         fallback_event_counters=execution.event_counters,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
+        runtime = _diagnostic_runtime(diagnostic_call.runtime_config, plan.bwd_runtime_config, runtime_override)
+        record_plan_stream(plan, runtime, stream=stream)
         multicore_ops.mega_moe_grad_with_diagnostic_buffer(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -538,7 +549,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            diagnostic_call.runtime_config,
+            runtime,
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,

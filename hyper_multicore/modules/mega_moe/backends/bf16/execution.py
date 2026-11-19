@@ -57,7 +57,7 @@ def forward(
             route_experts=ordinary_options.get("route_experts"),
             replica_pipeline=True, reserve_merge_workers=binding.owns_returns,
         )
-        if plan.fwd_diagnostics.is_active or plan.bwd_diagnostics.is_active:
+        if plan.fwd_diagnostics.is_tensor_dump_active:
             binding.fused = False
     if binding is None or not binding.fused:
         plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **ordinary_options)
