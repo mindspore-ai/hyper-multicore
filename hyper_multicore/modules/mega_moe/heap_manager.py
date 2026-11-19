@@ -170,6 +170,7 @@ class _HeapManager:
         *,
         allow_resize: bool,
         initial_headroom: int = 0,
+        fixed_heap_headroom: int = 0,
         workspace_growth: tuple[MegaMoeWorkspace, int, int] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         """Add lazy reservations and resize an attached Runtime when required."""
@@ -189,10 +190,11 @@ class _HeapManager:
                         _, layouts = growth
                 configured = os.getenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
                 if not self._configured:
+                    headroom = initial_headroom if configured is None else fixed_heap_headroom
                     self._run_and_check_consistency(
-                        lambda: self._configure(configured, initial_headroom),
+                        lambda: self._configure(configured, headroom),
                         stage="Configuration",
-                        value=(configured, str(self.dtype), tuple(layouts), initial_headroom),
+                        value=(configured, str(self.dtype), tuple(layouts), headroom),
                     )
                     self._configured = True
                 else:

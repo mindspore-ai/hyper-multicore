@@ -42,6 +42,12 @@ if TYPE_CHECKING:
     from hyper_multicore.modules.mega_moe.route import _RouteSummary
 
 
+def _uses_builtin_planner(specification: Mapping[str, Any]) -> bool:
+    """Identify the planner whose capacity checks the adapter owns."""
+    planner_key = specification.get("planner_key")
+    return planner_key is not None and planner_key[:2] == (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__)
+
+
 def _bounded_receive(
     specification: Mapping[str, Any], source: int, dtype: torch.dtype, cube_cores: int,
 ) -> tuple[int, int]:
@@ -70,11 +76,13 @@ def _bounded_receive(
 
 def workspace_reservations(
     specifications: tuple[Mapping[str, Any], ...], dtype: torch.dtype, cube_cores: int,
-) -> tuple[tuple[tuple[Mapping[str, Any], _WorkspaceLayout], ...], int]:
-    """Describe each ordinary layout and budget the later virtual binds once."""
+) -> tuple[tuple[tuple[Mapping[str, Any], _WorkspaceLayout], ...], int, int]:
+    """Describe A3 ordinary layouts and headroom for automatic and fixed heaps."""
     reservations = []
     banks = set()
+    fixed_banks = set()
     headroom = 0
+    fixed_headroom = 0
     for specification in specifications:
         bound = specification.get("source_token_bound")
         if bound is None:
@@ -85,13 +93,26 @@ def workspace_reservations(
         reservations.append((specification, _workspace_layout(specification, dtype, native, source)))
         virtual_spec = {**specification, "num_experts": 2 * specification["num_experts"],
                         "hot_replica": False, "source_token_bound": None, "planner_key": None}
-        headroom += _workspace_layout(virtual_spec, dtype, virtual, source).required_bytes
+        virtual_bytes = _workspace_layout(virtual_spec, dtype, virtual, source).required_bytes
+        headroom += virtual_bytes
         local = specification["num_experts"] // specification["ep_size"]
         bank = local, specification["hidden_size"], specification["intermediate_size"]
         if bank not in banks:
             banks.add(bank)
             headroom += _expert_bank_bytes(*bank, dtype)
-    return tuple(reservations), headroom
+        # BF16 placement capability has checked the A3 device. Its built-in
+        # per-expert path budgets actual child layouts against the fixed heap.
+        deferred = (
+            _uses_builtin_planner(specification) and not specification.get("batch_experts", False)
+            and specification.get("dispatch_mode", "push") == "push"
+            and specification.get("transport_engine") in (None, "mte")
+        )
+        if not deferred:
+            fixed_headroom += virtual_bytes
+            if bank not in fixed_banks:
+                fixed_banks.add(bank)
+                fixed_headroom += _expert_bank_bytes(*bank, dtype)
+    return tuple(reservations), headroom, fixed_headroom
 
 
 _SHARED_BANKS = weakref.WeakKeyDictionary()
@@ -161,8 +182,7 @@ class PlacementResources:
         self.geometries = {}
         self.source_bound = specification.get("source_token_bound")
         self.initial_receive_floor = parent.workspace.capacity_floor if self.source_bound is not None else None
-        planner_key = specification.get("planner_key")
-        built_in = planner_key and planner_key[:2] == (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__)
+        built_in = _uses_builtin_planner(specification)
         self.fixed_heap = False
         self.rank_nodes = None
         if built_in and supports_bounded_placement(parent.spec):
@@ -178,7 +198,7 @@ class PlacementResources:
             and mega_moe_event_capacity(spec.num_experts, spec.ep_size)
             == mega_moe_event_capacity(2 * spec.num_experts, spec.ep_size)
         )
-        self.pipeline_enabled = bool(built_in) and supports_pipeline(parent.spec, 1)
+        self.pipeline_enabled = built_in and supports_pipeline(parent.spec, 1)
         self.statistics = {
             "invocations": 0, "placements": 0,
             "route_replays": 0, "route_replay_misses": 0, "skipped_recomputes": 0,

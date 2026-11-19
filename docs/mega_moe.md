@@ -163,6 +163,7 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   Reentrant checkpoint 重算沿用已保存的放置，融合路径恢复已保存的借用权重。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
   固定 SHMEM 堆下，A3 内置策略在建 bank 或增长前检查整个 root 的剩余容量。
+  带显式 bound 时，初始固定堆预算须容纳普通布局，副本空间在实际准入时校验和申请。
   普通路由和副本路由各自核算，普通路由溢出时可尝试在固定堆内完成的副本配额。
 - `ascend950` 支持 MXFP8 EIO，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
   并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置

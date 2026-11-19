@@ -54,12 +54,13 @@ class _MegaMoeExecutionResources:
             require_capability(tensor, specification["ep_group"],
                                mx_cube_cores=self.spec.num_cube_cores if mx_placement else None)
         initial_headroom = 0
+        fixed_heap_headroom = 0
         if workspace_layout is not None:
             reservations = ((specification, workspace_layout),)
         elif placement and not mx_placement:
             from hyper_multicore.modules.hot_replica.mega_moe_adapter import workspace_reservations  # pylint: disable=import-outside-toplevel
 
-            reservations, initial_headroom = workspace_reservations(
+            reservations, initial_headroom, fixed_heap_headroom = workspace_reservations(
                 active_specifications, tensor.dtype, self.spec.num_cube_cores
             )
         else:
@@ -70,6 +71,7 @@ class _MegaMoeExecutionResources:
             allow_resize=any(item.get("dispatch_mode", "push") == "push" or item.get("auto_tokens", False)
                              for item in active_specifications),
             initial_headroom=initial_headroom,
+            fixed_heap_headroom=fixed_heap_headroom,
         )
         attached = False
         self.plan = None
