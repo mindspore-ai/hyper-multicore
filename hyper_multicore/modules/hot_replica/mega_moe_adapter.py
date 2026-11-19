@@ -212,7 +212,7 @@ class PlacementResources:
                 # Keep the unreserved admission policy while reusing the
                 # agreed copies for the fused bank, including replay.
                 placement = planner.plan(request)
-                if self.fixed_heap and not checkpointing:
+                if self.fixed_heap:
                     return self._bind_fixed(request, placement, summary.plan_tokens, host_rows)
                 return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
 

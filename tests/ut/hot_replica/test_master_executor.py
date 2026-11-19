@@ -83,6 +83,26 @@ def test_fixed_heap_check_includes_lazy_workspace_entries():
     assert not manager.workspaces
 
 
+def test_fixed_heap_checkpoint_preflights_the_regular_admission_result():
+    """A checkpoint that must plan again applies the same physical budget."""
+    planner = mega_moe_adapter.HotReplicaPlanner
+    spec = SimpleNamespace(architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+                           local_experts=4, hidden_size=5120, intermediate_size=1792, expert_weight_layout="EOI")
+    owner = mega_moe_adapter.PlacementResources(
+        SimpleNamespace(spec=spec, heap_manager=SimpleNamespace(heap_limit=1024**3)),
+        {"planner_key": (planner.__module__, planner.__qualname__)},
+        shared=True,
+    )
+    policy = Mock(spec=planner)
+    request = object()
+    with (patch.object(owner, "request", return_value=request),
+          patch.object(owner, "_bind_fixed") as budget):
+        assert owner.select(None, None, None, SimpleNamespace(plan_tokens=4096), [], None, 0,
+                            planner=policy, checkpointing=True) is budget.return_value
+    policy.plan.assert_called_once_with(request)
+    budget.assert_called_once_with(request, policy.plan.return_value, 4096, None)
+
+
 def test_serial_replica_widths_share_one_reservation_with_the_bank():
     """Keep one virtual reservation when the home counters cannot cover all widths."""
     spec = SimpleNamespace(local_experts=6, ep_size=32, top_k=8, initial_capacity_factor=1.25,
