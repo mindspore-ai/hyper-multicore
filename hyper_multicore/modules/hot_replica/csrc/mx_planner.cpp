@@ -240,22 +240,33 @@ PyObject *SearchAligned(PyObject *, PyObject *args) {
       const LoadScore score(loads);
       const auto original = std::make_pair(score.leaders[0].first, score.square);
       Move best = {original.first, original.second, 0, experts, ranks, 0};
-      for (int expert = 0; expert < experts; ++expert) {
-        const auto weight = weights[expert];
-        if (selected[expert] || weight < minimum) continue;
-        const int owner = expert / home;
-        for (int target = 0; target < ranks; ++target) {
-          const auto gap = loads[owner] - loads[target];
-          if (target == owner || gap <= 0 || guests[target] >= budget) continue;
-          const auto lower = std::clamp(weight - gap / 2, int64_t{0}, weight) / 64 * 64;
-          for (int64_t cut : {int64_t{0}, lower, lower + 64}) {
-            const auto moved = weight - cut;
-            if (cut >= weight || moved < minimum || (cut > 0 && cut < minimum)) continue;
-            const auto peak = std::max({loads[owner] - moved, loads[target] + moved, score.Outside(owner, target)});
-            const auto square = score.square + 2 * moved * (moved - gap);
-            const auto key = Move(peak, square, nodes[owner] != nodes[target], expert, target, cut);
-            if (std::make_pair(peak, square) < original && key < best) best = key;
+      const auto consider_owner = [&](int owner) {
+        // The target only gains rows, so its old load can stay in this bound.
+        const auto outside = score.Outside(owner, -1);
+        for (int expert = owner * home; expert < (owner + 1) * home; ++expert) {
+          const auto weight = weights[expert];
+          if (selected[expert] || weight < minimum) continue;
+          for (int target = 0; target < ranks; ++target) {
+            const auto gap = loads[owner] - loads[target];
+            if (gap <= minimum || guests[target] >= budget) continue;
+            const auto lower = std::clamp(weight - gap / 2, int64_t{0}, weight) / 64 * 64;
+            for (int64_t cut : {int64_t{0}, lower, lower + 64}) {
+              const auto moved = weight - cut;
+              if (moved < minimum || moved >= gap || (cut > 0 && cut < minimum)) continue;
+              const auto peak = std::max({loads[owner] - moved, loads[target] + moved, outside});
+              const auto square = score.square + 2 * moved * (moved - gap);
+              const auto key = Move(peak, square, nodes[owner] != nodes[target], expert, target, cut);
+              if (key < best) best = key;
+            }
           }
+        }
+      };
+      // A move from a different owner cannot reduce the heaviest rank's load.
+      const int heaviest = score.leaders[0].second;
+      consider_owner(heaviest);
+      if (std::get<0>(best) == original.first) {
+        for (int owner = 0; owner < ranks; ++owner) {
+          if (owner != heaviest) consider_owner(owner);
         }
       }
       const auto &[peak, square, remote, expert, target, cut] = best;
