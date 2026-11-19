@@ -23,7 +23,7 @@ from typing import Any
 
 import torch
 
-from hyper_multicore.diagnostics.dump.layout import _SAFE_FILE_NAME, _stage_names
+from hyper_multicore.diagnostics.dumper._layout import _SAFE_FILE_NAME, _stage_names
 
 
 @dataclass(frozen=True)
@@ -39,7 +39,7 @@ class _TensorPort:
 
 @dataclass(frozen=True)
 class _GraphTensor:
-    """One logical graph Tensor and its L0 capture relationship."""
+    """One logical graph Tensor and its Kernel capture relationship."""
 
     name: str
     param_position: int
@@ -51,7 +51,7 @@ class _GraphTensor:
 
 
 @dataclass
-class _TensorSnapshot:
+class _KernelDumpTensorSnapshot:
     """One Host-owned Tensor value plus export metadata."""
 
     graph_tensor: _GraphTensor
@@ -134,7 +134,7 @@ def _dtype_name(dtype: Any) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def _snapshot_tensor(tensor: Any, graph_tensor: _GraphTensor, phase: str) -> _TensorSnapshot:
+def _snapshot_tensor(tensor: Any, graph_tensor: _GraphTensor, phase: str) -> _KernelDumpTensorSnapshot:
     if not torch.is_tensor(tensor):
         raise TypeError(
             f"dump Tensor {graph_tensor.name!r} at param_position={graph_tensor.param_position} "
@@ -142,7 +142,7 @@ def _snapshot_tensor(tensor: Any, graph_tensor: _GraphTensor, phase: str) -> _Te
         )
     host_tensor = tensor.detach().contiguous().cpu().clone()
     dtype_name = _dtype_name(host_tensor.dtype)
-    return _TensorSnapshot(
+    return _KernelDumpTensorSnapshot(
         graph_tensor=graph_tensor,
         phase=phase,
         original_dtype=dtype_name,
@@ -152,13 +152,13 @@ def _snapshot_tensor(tensor: Any, graph_tensor: _GraphTensor, phase: str) -> _Te
     )
 
 
-def _write_l0_stage_files(
-    snapshot: _TensorSnapshot,
+def _write_kernel_stage_files(
+    snapshot: _KernelDumpTensorSnapshot,
     invocation_dir: Path,
     window_dir: Path,
     safe_name: str,
 ) -> tuple[Path, list[dict[str, Any]]]:
-    """Save one L0 Tensor under stages and hard-link its remaining ports."""
+    """Save one Kernel dump Tensor snapshot under stages and hard-link its remaining ports."""
     metadata = []
     primary_path = None
     for port in snapshot.graph_tensor.ports:

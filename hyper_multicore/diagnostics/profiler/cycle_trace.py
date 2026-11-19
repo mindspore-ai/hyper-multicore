@@ -34,7 +34,7 @@ from hyper_multicore.scheduler.config import (
     TaskType,
 )
 from hyper_multicore.diagnostics.common.graph import _scheduled_task_ids
-from hyper_multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
+from hyper_multicore.diagnostics.common.runtime import DeviceDiagnosticMode, PreparedDiagnosticRuntime
 from hyper_multicore.scheduler.runtime import runtime_cube_worker_capacity
 
 
@@ -377,31 +377,31 @@ class _PreparedProfileRuntime:
 
     def __init__(self, runtime: PreparedDiagnosticRuntime) -> None:
         """Build only profiling-owned metadata, layout and Device configuration."""
-        runtime_config = runtime.copy_host_config()
-        self._metadata = _configure_trace_metadata(runtime_config, runtime.metadata)
+        profile_runtime_config = runtime.copy_diagnostic_runtime_config()
+        self._metadata = _configure_trace_metadata(profile_runtime_config, runtime.metadata)
         self._metadata = _ProfileMetadata(
             self._metadata.kernel_name, self._metadata.owner_label, self._metadata.stage_names,
             self._metadata.task_stage_names, _TaskExecutionMode(runtime.spec.execution_mode),
-            1 if runtime_config.queue_layout == 2 else runtime.spec.vector_worker_stride,
+            1 if profile_runtime_config.queue_layout == 2 else runtime.spec.vector_worker_stride,
         )
-        self._layout = _configure_profile_layout(runtime_config, self._metadata)
+        self._layout = _configure_profile_layout(profile_runtime_config, self._metadata)
         self._rank = runtime.rank
         self._device_id = runtime.device_id
-        self._host_config = runtime_config
-        self._normal_tensor = runtime.normal_tensor
-        self._device = getattr(runtime.normal_tensor, "device", None)
-        runtime_config.diagnostic_mode = DiagnosticMode.PROFILE
-        self._profile_tensor = runtime.tensor_from_config(runtime_config)
+        self._profile_runtime_config = profile_runtime_config
+        self._runtime_config_tensor = runtime.runtime_config_tensor
+        self._device = getattr(runtime.runtime_config_tensor, "device", None)
+        profile_runtime_config.diagnostic_mode = DeviceDiagnosticMode.CYCLE_PROFILE
+        self._profile_runtime_config_tensor = runtime.tensor_from_config(profile_runtime_config)
 
     @property
-    def normal_tensor(self) -> Any:
-        """Return the original normal image without modifying it."""
-        return self._normal_tensor
+    def runtime_config_tensor(self) -> Any:
+        """Return the original standard execution configuration Tensor."""
+        return self._runtime_config_tensor
 
     @property
-    def profile_tensor(self) -> Any:
-        """Return the independent profiling configuration."""
-        return self._profile_tensor
+    def profile_runtime_config_tensor(self) -> Any:
+        """Return the independent profiling configuration Tensor."""
+        return self._profile_runtime_config_tensor
 
     @property
     def buffer_size(self) -> int:
@@ -429,9 +429,9 @@ class _PreparedProfileRuntime:
         return self._metadata.kernel_name
 
     @property
-    def host_config(self) -> RuntimeConfigC:
-        """Return an immutable Host copy retaining the graph-sized runtime arrays."""
-        return self._host_config
+    def profile_runtime_config(self) -> RuntimeConfigC:
+        """Return the structured profiling configuration with graph-sized arrays."""
+        return self._profile_runtime_config
 
     @property
     def task_stage_names(self) -> Mapping[int, str]:
@@ -468,7 +468,7 @@ class _PreparedProfileRuntime:
             aic_record_capacity=self._layout.aic_record_capacity,
             aiv_record_capacity=self._layout.aiv_record_capacity,
         )
-        workers = int(self._host_config.num_workers)
+        workers = int(self._profile_runtime_config.num_workers)
         pipeline = self._metadata.execution_mode is _TaskExecutionMode.AIV_PIPELINE
         trace["megaKernelCycleTrace"]["workerCapacities"] = {
             "cubeSlots": self._layout.cube_slot_count,

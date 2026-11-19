@@ -111,8 +111,8 @@ class OperatorNode:
     tiling_position: int
     fill_config:     Any                       # FillConfig subclass instance
     kernel_spec:     Any = None                # reserved for @MultiCore decorator path
-    diagnostic_name: Optional[str] = None      # optional Host-side diagnostic display name
-    diagnostic_view_resolver: Optional[Callable[..., Any]] = None
+    diagnostic_stage_name: Optional[str] = None      # optional Host-side diagnostic display name
+    task_dump_tensor_view_resolver: Optional[Callable[..., Any]] = None
     diagnostic_host_ports: bool = False  # Native hard-coded ABI operands, not TaskDesc TensorDesc arrays.
     tensor_effects: tuple[TensorEffect, ...] = ()
 

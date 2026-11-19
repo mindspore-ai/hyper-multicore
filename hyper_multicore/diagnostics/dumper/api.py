@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
+from enum import Enum
 import json
 from pathlib import Path
 from typing import Any
@@ -30,21 +31,22 @@ from hyper_multicore.diagnostics.common.session import (
 )
 from hyper_multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments, LaunchContext
 from hyper_multicore.diagnostics.common.schedule import DiagnosticAction
-from hyper_multicore.diagnostics.dump.layout import _SAFE_FILE_NAME, _stage_names
-from hyper_multicore.diagnostics.dump.l0 import (
-    _GraphTensor, _TensorSnapshot, _describe_graph_tensors, _snapshot_tensor, _write_l0_stage_files,
+from hyper_multicore.diagnostics.dumper._layout import _SAFE_FILE_NAME, _stage_names
+from hyper_multicore.diagnostics.dumper._kernel import (
+    _GraphTensor, _KernelDumpTensorSnapshot, _describe_graph_tensors, _snapshot_tensor, _write_kernel_stage_files,
 )
-from hyper_multicore.diagnostics.dump.l1 import (
-    _L1Snapshot,
-    _PreparedL1Dump,
-    _decode_l1_dump,
-    _prepare_l1_dump,
+from hyper_multicore.diagnostics.dumper._task import (
+    _TaskDumpTensorSnapshot,
+    _PreparedTaskDump,
+    _decode_task_dump,
+    _prepare_task_dump,
 )
 
 
 __all__ = [
+    "TensorDumpLevel",
     "TensorDumpConfig",
-    "TorchMegaKernelTensorDumper",
+    "TensorDumpSession",
     "tensor_dump",
 ]
 
@@ -98,35 +100,45 @@ def _normalize_ranks(value: int | Collection[int] | None) -> tuple[int, ...] | N
     return _normalize_non_negative_int_filter(value, name="ranks")
 
 
+class TensorDumpLevel(str, Enum):
+    """Execution scope at whose before/after points Tensor values are dumped."""
+
+    KERNEL = "kernel"
+    TASK = "task"
+
+
 @dataclass(frozen=True)
 class TensorDumpConfig:
     """Configuration for MegaKernel Tensor value collection.
 
     Args:
         output_dir: Root directory for per-rank dump windows.
-        level: Dump level. Supported values are ``"L0"`` and ``"L1"``.
+        level: Kernel or Task dump level. Accepts TensorDumpLevel or a
+            case-insensitive ``"kernel"`` / ``"task"`` string. Defaults to Kernel.
         kernel_names: Optional exact MegaKernel names whose invocations should
             be retained.
         tensor_names: Optional exact logical Tensor names selected from the
             MegaKernel compute graph.
-        roles: Optional L0 Tensor roles to retain. Supported roles are
+        roles: Optional Tensor roles for Kernel dump. Supported roles are
             ``external_input``, ``stage_output`` and ``final_output``.
         directions: Forward and/or backward invocations to retain.
         ranks: Optional non-negative distributed ranks to retain.
-        stages: Optional exact L1 stage names.
-        task_ids: Optional stable global RuntimeConfig task IDs.
+        stages: Optional exact Task stage names.
+        task_ids: Optional task IDs in this invocation's diagnostic RuntimeConfig.
+            Diagnostic adaptation may renumber them relative to standard execution.
         stage_task_indices: Optional task indices local to a stage.
         owner_ids: Optional business diagnostic owner IDs.
-        core_types: Optional L1 Device worker types, ``AIC`` and/or ``AIV``.
+        core_types: Optional Task Device worker types, ``AIC`` and/or ``AIV``.
         core_ids: Optional core-local worker IDs.
-        io: L1 operator ports to capture: ``input``, ``output``, or both.
-        device_memory_budget_mb: Maximum Device memory used by one L1 launch.
+        io: Task operator ports to capture: ``input``, ``output``, or both.
+        device_memory_budget_mb: Maximum Device dump-buffer memory per Kernel
+            invocation when using Task dump.
         max_bytes_per_tensor: Optional per-record byte cap. A capped Tensor is
             exported as a flattened prefix and marked as truncated.
     """
 
     output_dir: str | Path
-    level: str = "L0"
+    level: TensorDumpLevel | str = TensorDumpLevel.KERNEL
     tensor_names: str | Collection[str] | None = None
     roles: str | Collection[str] | None = None
     directions: str | Collection[str] | None = None
@@ -146,9 +158,12 @@ class TensorDumpConfig:
         """Validate and normalize user-facing collection filters."""
         if not isinstance(self.output_dir, (str, Path)):
             raise TypeError(f"output_dir must be str or Path, got {type(self.output_dir).__name__}")
-        level = self.level.upper() if isinstance(self.level, str) else self.level
-        if level not in ("L0", "L1"):
-            raise ValueError(f"unsupported Tensor dump level {self.level!r}; expected 'L0' or 'L1'")
+        try:
+            level = TensorDumpLevel(self.level.lower() if isinstance(self.level, str) else self.level)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"unsupported Tensor dump level {self.level!r}; expected 'kernel' or 'task'"
+            ) from error
         output_dir = Path(self.output_dir).expanduser()
         kernel_names = _normalize_string_filter(self.kernel_names, name="kernel_names")
         tensor_names = _normalize_string_filter(self.tensor_names, name="tensor_names")
@@ -187,11 +202,11 @@ class TensorDumpConfig:
                 raise TypeError("max_bytes_per_tensor must be a positive integer or None")
             if self.max_bytes_per_tensor <= 0:
                 raise ValueError("max_bytes_per_tensor must be positive")
-        if level == "L1" and all(
+        if level is TensorDumpLevel.TASK and all(
             value is None
             for value in (stages, task_ids, stage_task_indices, owner_ids, tensor_names)
         ):
-            raise ValueError("L1 Tensor dump requires at least one stage, task, owner, or Tensor filter")
+            raise ValueError("Task Tensor dump requires at least one stage, task, owner, or Tensor filter")
 
         object.__setattr__(self, "output_dir", output_dir)
         object.__setattr__(self, "level", level)
@@ -223,7 +238,7 @@ class TensorDumpConfig:
         return self.ranks is None or rank in self.ranks
 
     def selects_tensor(self, tensor_name: str, role: str) -> bool:
-        """Return whether one logical Tensor passes L0 name and role filters.
+        """Return whether one logical Tensor passes Kernel name and role filters.
 
         Args:
             tensor_name: Logical tensor name recorded by the graph.
@@ -244,9 +259,9 @@ class _DumpInvocation:
     direction: str
     rank: int
     device: str
-    level: str
-    snapshots: list[_TensorSnapshot]
-    l1_snapshots: list[_L1Snapshot]
+    level: TensorDumpLevel
+    snapshots: list[_KernelDumpTensorSnapshot]
+    task_snapshots: list[_TaskDumpTensorSnapshot]
     device_buffer_bytes: int = 0
 
 
@@ -259,17 +274,17 @@ class _TensorDumpCall(DiagnosticCall):
         invocation: _DumpInvocation | None = None,
         graph_tensors: tuple[_GraphTensor, ...] = (),
         parameters: Sequence[Any] = (),
-        prepared_l1: _PreparedL1Dump | None = None,
+        prepared_task_dump: _PreparedTaskDump | None = None,
         *,
         arguments: LaunchArguments,
     ) -> None:
-        """Store complete launch arguments and L0 or L1 capture state."""
+        """Store complete launch arguments and Kernel or Task capture state."""
         super().__init__(arguments)
         self._on_complete = on_complete
         self._invocation = invocation
         self._graph_tensors = graph_tensors
         self._parameters = parameters
-        self._prepared_l1 = prepared_l1
+        self._prepared_task = prepared_task_dump
         self.finished = False
 
     def complete(self) -> None:
@@ -277,8 +292,8 @@ class _TensorDumpCall(DiagnosticCall):
         if self.finished:
             return
         if self._on_complete is not None and self._invocation is not None:
-            if self._prepared_l1 is not None:
-                self._invocation.l1_snapshots.extend(_decode_l1_dump(self._prepared_l1))
+            if self._prepared_task is not None:
+                self._invocation.task_snapshots.extend(_decode_task_dump(self._prepared_task))
             else:
                 for graph_tensor in self._graph_tensors:
                     if graph_tensor.role != "external_input":
@@ -294,13 +309,13 @@ class _TensorDumpCall(DiagnosticCall):
             return
         if self._invocation is not None:
             self._invocation.snapshots.clear()
-            self._invocation.l1_snapshots.clear()
-        self._prepared_l1 = None
+            self._invocation.task_snapshots.clear()
+        self._prepared_task = None
         self.finished = True
 
 
-class TorchMegaKernelTensorDumper:
-    """Standalone schedule-driven L0/L1 Tensor dumper for Torch MegaKernels."""
+class TensorDumpSession:
+    """Standalone schedule-driven Kernel/Task Tensor dumper for Torch MegaKernels."""
 
     def __init__(
         self,
@@ -343,7 +358,7 @@ class TorchMegaKernelTensorDumper:
         """Return manifest paths from the most recently finalized window."""
         return self._last_manifest_paths
 
-    def __enter__(self) -> TorchMegaKernelTensorDumper:
+    def __enter__(self) -> TensorDumpSession:
         """Activate this dumper as the process-local diagnostic session."""
         _activate_session("tensor_dump", self)
         self._entered = True
@@ -383,8 +398,8 @@ class TorchMegaKernelTensorDumper:
             raise TypeError(f"MegaKernel schedule must return DiagnosticAction, got {type(action).__name__}")
         return action
 
-    def is_capture_enabled(self) -> bool:
-        """Return whether this step collects Tensor values."""
+    def should_prepare_call(self) -> bool:
+        """Return whether this step prepares Tensor collection; warmup is excluded."""
         return self._action in (DiagnosticAction.RECORD, DiagnosticAction.RECORD_AND_SAVE)
 
     def prepare_call(self, context: LaunchContext) -> DiagnosticCall:
@@ -394,7 +409,7 @@ class TorchMegaKernelTensorDumper:
             context: Selected invocation or operand context supplied by the diagnostic framework.
         """
         runtime = context.runtime
-        if not self.is_capture_enabled() or not self.config.selects_invocation(
+        if not self.should_prepare_call() or not self.config.selects_invocation(
             context.direction, runtime.rank, runtime.kernel_name,
         ):
             return DiagnosticCall(context.ordinary_arguments())
@@ -403,8 +418,8 @@ class TorchMegaKernelTensorDumper:
         _stage_names(runtime.graph.topological_sort())
         return self._acquire_call(
             runtime.graph, context.parameters, direction=context.direction, rank=runtime.rank,
-            kernel_name=runtime.kernel_name, device=runtime.normal_tensor.device,
-            runtime=runtime, event_counters=context.fallback_event_counters,
+            kernel_name=runtime.kernel_name, device=runtime.runtime_config_tensor.device,
+            runtime=runtime, event_counters=context.event_counters,
         )
 
     def _acquire_call(
@@ -421,11 +436,11 @@ class TorchMegaKernelTensorDumper:
     ) -> DiagnosticCall:
         """Plan a selected invocation and retain independent input snapshots before launch."""
         arguments = LaunchArguments(
-            runtime.normal_tensor, event_counters,
-            runtime.normal_tensor if event_counters is None else event_counters, event_counters,
+            runtime.runtime_config_tensor, event_counters,
+            runtime.runtime_config_tensor if event_counters is None else event_counters, event_counters,
         )
-        if self.config.level == "L1":
-            prepared_l1 = _prepare_l1_dump(
+        if self.config.level is TensorDumpLevel.TASK:
+            prepared_task_dump = _prepare_task_dump(
                 runtime,
                 graph,
                 parameters,
@@ -442,13 +457,15 @@ class TorchMegaKernelTensorDumper:
                 device=str(device),
                 level=self.config.level,
                 snapshots=[],
-                l1_snapshots=[],
-                device_buffer_bytes=prepared_l1.total_bytes,
+                task_snapshots=[],
+                device_buffer_bytes=prepared_task_dump.total_bytes,
             )
             self._next_invocation_id += 1
-            arguments.runtime_config = prepared_l1.runtime_config
-            arguments.diagnostic_buffer = prepared_l1.buffer
-            return _TensorDumpCall(self._invocations.append, invocation, prepared_l1=prepared_l1, arguments=arguments)
+            arguments.runtime_config_tensor = prepared_task_dump.runtime_config_tensor
+            arguments.diagnostic_buffer = prepared_task_dump.buffer
+            return _TensorDumpCall(
+                self._invocations.append, invocation, prepared_task_dump=prepared_task_dump, arguments=arguments,
+            )
 
         graph_tensors = tuple(
             tensor
@@ -471,7 +488,7 @@ class TorchMegaKernelTensorDumper:
             device=str(device),
             level=self.config.level,
             snapshots=[],
-            l1_snapshots=[],
+            task_snapshots=[],
         )
         self._next_invocation_id += 1
         for graph_tensor in graph_tensors:
@@ -498,7 +515,7 @@ class TorchMegaKernelTensorDumper:
         if self._on_dump_ready is not None:
             self._on_dump_ready(self)
 
-    def _write_l0_invocation(
+    def _write_kernel_invocation(
         self,
         invocation: _DumpInvocation,
         invocation_dir: Path,
@@ -508,7 +525,7 @@ class TorchMegaKernelTensorDumper:
         tensor_metadata = []
         for snapshot in invocation.snapshots:
             safe_name = _SAFE_FILE_NAME.sub("_", snapshot.graph_tensor.name)
-            output_path, port_metadata = _write_l0_stage_files(
+            output_path, port_metadata = _write_kernel_stage_files(
                 snapshot,
                 invocation_dir,
                 window_dir,
@@ -540,15 +557,15 @@ class TorchMegaKernelTensorDumper:
             "tensors": tensor_metadata,
         }
 
-    def _write_l1_invocation(
+    def _write_task_invocation(
         self,
         invocation: _DumpInvocation,
         invocation_dir: Path,
         window_dir: Path,
     ) -> dict[str, Any]:
         """Write task-local tensor snapshots with their native copy metadata."""
-        snapshots_by_task: dict[tuple[int, str, int], list[_L1Snapshot]] = {}
-        for snapshot in invocation.l1_snapshots:
+        snapshots_by_task: dict[tuple[int, str, int], list[_TaskDumpTensorSnapshot]] = {}
+        for snapshot in invocation.task_snapshots:
             record = snapshot.record
             snapshots_by_task.setdefault((record.task_id, record.core_type, record.core_id), []).append(snapshot)
 
@@ -625,20 +642,20 @@ class TorchMegaKernelTensorDumper:
         invocation_metadata = []
         for invocation in invocations:
             invocation_dir = window_dir / f"invocation_{invocation.invocation_id:06d}_{invocation.direction}"
-            if invocation.level == "L1":
-                metadata = self._write_l1_invocation(invocation, invocation_dir, window_dir)
+            if invocation.level is TensorDumpLevel.TASK:
+                metadata = self._write_task_invocation(invocation, invocation_dir, window_dir)
             else:
-                metadata = self._write_l0_invocation(invocation, invocation_dir, window_dir)
+                metadata = self._write_kernel_invocation(invocation, invocation_dir, window_dir)
             invocation_metadata.append(metadata)
-        is_l1 = self.config.level == "L1"
+        is_task_dump = self.config.level is TensorDumpLevel.TASK
         manifest = {
-            "schemaVersion": 4,
-            "level": self.config.level,
+            "schemaVersion": 5,
+            "level": self.config.level.value,
             "tensorSerialization": "torch.save",
             "tensorFileLayout": "stage_only",
             "windowIndex": self._window_index,
-            "capturePhaseSemantics": "task_boundary" if is_l1 else "mega_kernel_boundary",
-            "stageViewStorage": "per_task_files" if is_l1 else "primary_file_with_hard_links",
+            "capturePhaseSemantics": "task_boundary" if is_task_dump else "mega_kernel_boundary",
+            "stageViewStorage": "per_task_files" if is_task_dump else "primary_file_with_hard_links",
             "rank": rank,
             "invocationCount": len(invocation_metadata),
             "invocations": invocation_metadata,
@@ -653,14 +670,14 @@ def tensor_dump(
     *,
     schedule: Callable[[int], DiagnosticAction] | None = None,
     on_dump_ready: Callable[[Any], None] | None = None,
-) -> TorchMegaKernelTensorDumper:
+) -> TensorDumpSession:
     # pylint: disable=redefined-outer-name
     """Create the standalone tensor MegaKernel Tensor dumper.
 
     Args:
         config: Output and logical Tensor selection configuration.
         schedule: Optional shared diagnostic step schedule. Warmup actions do
-            not copy Tensor values because L0 collection needs no warmup.
+            not copy Tensor values because Kernel collection needs no warmup.
         on_dump_ready: Optional callback invoked after a window is exported.
 
     Returns:
@@ -670,7 +687,7 @@ def tensor_dump(
         Tensor dumping synchronizes Device-to-Host copies and changes execution
         timing. It is mutually exclusive with MegaKernel cycle profiling.
     """
-    return TorchMegaKernelTensorDumper(
+    return TensorDumpSession(
         config,
         schedule=schedule,
         on_dump_ready=on_dump_ready,

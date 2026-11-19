@@ -44,6 +44,12 @@ namespace Runtime = MulticoreRuntime;
 static_assert(sizeof(Runtime::TensorDesc) == 64);
 static_assert(sizeof(Runtime::TaskDesc) == 576);
 
+extern "C" void read_device_diagnostic_modes(uint32_t *result) {
+  result[0] = static_cast<uint32_t>(Runtime::DeviceDiagnosticMode::DISABLED);
+  result[1] = static_cast<uint32_t>(Runtime::DeviceDiagnosticMode::CYCLE_PROFILE);
+  result[2] = static_cast<uint32_t>(Runtime::DeviceDiagnosticMode::TASK_TENSOR_DUMP);
+}
+
 extern "C" void read_probability_layout(uint32_t *result) {
   using Layout = Runtime::ProbabilityLayout;
   const uint32_t values[] = {Layout::PLANES, Layout::ELEMENT_BYTES, Layout::FORWARD_POSITION,

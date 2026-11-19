@@ -23,7 +23,7 @@ import unittest
 from unittest.mock import patch
 
 from hyper_multicore.diagnostics.common.graph import DiagnosticSpec, build_graph_metadata
-from hyper_multicore.diagnostics.common.runtime import PreparedDiagnosticRuntime
+from hyper_multicore.diagnostics.common.runtime import DeviceDiagnosticMode, PreparedDiagnosticRuntime
 from hyper_multicore.diagnostics.profiler.cycle_trace import (
     GRAPH_STAGE_DESC_BASE, MAX_PROFILE_BUFFER_BYTES, _PreparedProfileRuntime,
     _calculate_profile_layout, _configure_trace_metadata, _resolve_cycle_frequency_mhz,
@@ -96,7 +96,7 @@ class TestDiagnosticMetadata(unittest.TestCase):
         """
         graph = _graph()
         for operator in graph.topological_sort():
-            operator.diagnostic_name = "Repeated"
+            operator.diagnostic_stage_name = "Repeated"
         metadata = build_graph_metadata(graph, _runtime_config(), DiagnosticSpec("Custom"))
         self.assertEqual(metadata.stage_names, {0: "Repeated", 1: "Repeated"})
 
@@ -176,8 +176,13 @@ class TestDiagnosticMetadata(unittest.TestCase):
         profile = _PreparedProfileRuntime(runtime)
         self.assertEqual(len(created), 2)
         offset = RuntimeConfigC.diagnostic_mode.offset
-        self.assertEqual(struct.unpack_from("<I", runtime.normal_tensor, offset)[0], 0)
-        self.assertEqual(struct.unpack_from("<I", profile.profile_tensor, offset)[0], 1)
+        self.assertIsInstance(runtime.diagnostic_runtime_config, RuntimeConfigC)
+        self.assertIsInstance(profile.profile_runtime_config, RuntimeConfigC)
+        self.assertEqual(runtime.diagnostic_runtime_config.diagnostic_mode, DeviceDiagnosticMode.DISABLED)
+        self.assertEqual(profile.profile_runtime_config.diagnostic_mode, DeviceDiagnosticMode.CYCLE_PROFILE)
+        self.assertIs(profile.runtime_config_tensor, runtime.runtime_config_tensor)
+        self.assertEqual(struct.unpack_from("<I", runtime.runtime_config_tensor, offset)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", profile.profile_runtime_config_tensor, offset)[0], 1)
         self.assertEqual(bytes(config), original)
         self.assertEqual((profile.rank, profile.device_id), (3, 7))
 

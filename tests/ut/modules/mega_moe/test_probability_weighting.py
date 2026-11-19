@@ -27,18 +27,22 @@ from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import (
     _execute_mega_moe_without_autograd, _kernel_workspace, _stage_backward_source, _stage_probabilities,
 )
-from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts, _prepare_diagnostics
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.workspace import MegaMoeWorkspace, _workspace_allocation_specs
 
 
 from hyper_multicore.diagnostics.common.graph import validate_mega_kernel_diagnostic_contract
-from hyper_multicore.diagnostics.dump.l1 import L1TensorViewContext, L1TensorView
+from hyper_multicore.diagnostics.dumper import (
+    TensorDumpConfig, TaskDumpTensorViewContext, TaskDumpTensorView,
+)
+from hyper_multicore.diagnostics.dumper._task import _prepare_task_dump
 from hyper_multicore.modules.mega_moe.diagnostics import _adapt_mega_moe_diagnostic_graph
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _diagnostic_parameters
-from hyper_multicore.modules.mega_moe.tensor_dump import resolve_mega_moe_l1_tensor_view
-from hyper_multicore.scheduler.config import TaskType
+from hyper_multicore.modules.mega_moe.task_dump import resolve_mega_moe_task_dump_tensor_view
+from hyper_multicore.scheduler.config import RuntimeConfigC, TaskType
 from hyper_multicore.scheduler.graph import TensorSpec
+from hyper_multicore.scheduler.runtime import allocate_runtime_config
 
 
 class TestProbabilityWeighting(unittest.TestCase):
@@ -224,6 +228,58 @@ class TestProbabilityWeighting(unittest.TestCase):
                                 [bytes(copied.all_tasks[i]) for i in after[:length]],
                             )
 
+    def test_task_dump_uploads_the_diagnostic_task_identity(self) -> None:
+        """Forward and backward batched dumps execute the tasks selected by their records."""
+        for batched in (False, True):
+            spec = MegaMoeSpec(256, 1024, 512, 12, 2, 1.25, 640, 4, None, 0, 20, batch_experts=batched)
+            artifacts = _build_runtime_artifacts(spec)
+            diagnostics = _prepare_diagnostics(spec, *artifacts, "cpu")
+            for handle, original, operator_name in zip(diagnostics, artifacts[1::2], ("up_proj", "act_grad")):
+                with self.subTest(batched=batched, operator=operator_name):
+                    before = bytes(original)
+                    standard = handle.runtime_config_tensor.clone()
+                    runtime = handle._runtime
+                    graph = runtime.graph
+                    weight = graph.get_op(operator_name).inputs[1]
+                    parameters = [None] * runtime.parameter_count
+                    parameters[weight.param_position] = torch.ones(weight.shape, dtype=torch.bfloat16)
+                    data = runtime.diagnostic_runtime_config.dynamic_data
+                    parameters[data.dynamic_input_position] = torch.arange(1, data.dynamic_group_size + 1) * 128
+                    diagnostic_config = bytes(runtime.diagnostic_runtime_config)
+                    selection = TensorDumpConfig(
+                        "dump", level="task", tensor_names=weight.name, io="input", max_bytes_per_tensor=16,
+                    )
+                    prepared = _prepare_task_dump(runtime, graph, parameters, selection, rank=0, device="cpu")
+                    raw = prepared.runtime_config_tensor.numpy().tobytes()
+                    header = RuntimeConfigC.from_buffer_copy(raw)
+                    layout = allocate_runtime_config(
+                        header.task_capacity, event_capacity=header.event_capacity,
+                        local_experts=data.dynamic_group_size, num_workers=header.num_workers,
+                    )
+                    uploaded = type(layout).from_buffer_copy(raw)
+                    for field, count in zip(("cube_task_indices", "vector_task_indices", "mix_task_indices"),
+                                            original.task_index_num[:3]):
+                        before_ids = getattr(original, field)[:count]
+                        after_ids = getattr(uploaded, field)[:count]
+                        self.assertEqual(
+                            [bytes(original.all_tasks[i]) for i in before_ids],
+                            [bytes(uploaded.all_tasks[i]) for i in after_ids],
+                        )
+                    expected = runtime.diagnostic_runtime_config
+                    self.assertEqual(list(uploaded.task_index_num), list(original.task_index_num))
+                    self.assertEqual(list(uploaded.all_event_num_triggers), list(original.all_event_num_triggers))
+                    self.assertEqual(bytes(uploaded.all_events), bytes(original.all_events))
+                    self.assertEqual(uploaded.ready_event, original.ready_event)
+                    self.assertEqual(uploaded.completion_event, original.completion_event)
+                    self.assertEqual(uploaded.num_workers, original.num_workers)
+                    for record in prepared.records:
+                        self.assertEqual(bytes(uploaded.all_tasks[record.task_id]),
+                                         bytes(expected.all_tasks[record.task_id]))
+                        self.assertEqual(uploaded.all_tasks[record.task_id].task_index, record.task_index)
+                    self.assertEqual(bytes(original), before)
+                    self.assertEqual(bytes(expected), diagnostic_config)
+                    torch.testing.assert_close(handle.runtime_config_tensor, standard)
+
     def test_scratch_bindings_preserve_logical_plan_strides(self) -> None:
         """Retained plans expose logical scratch bounds after physical heap growth."""
         spec = SimpleNamespace(apply_probs_before_fc2=True, ep_size=4, plan_tokens=128, top_k=2)
@@ -240,7 +296,7 @@ class TestProbabilityWeighting(unittest.TestCase):
         self.assertIs(_diagnostic_parameters(plan, parameters, buffer), parameters)
 
     def test_probability_snapshots_use_local_scalar_slices(self) -> None:
-        """L1 dumps snapshot initialized local rows, never unused remote scratch."""
+        """Task dumps snapshot initialized local rows, never unused remote scratch."""
         cases = (
             (TaskType.TASK_SWI_GLU, 4, 1), (TaskType.TASK_SWI_GLU_GRAD, 4, 2),
             (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, 4, 0),
@@ -267,13 +323,13 @@ class TestProbabilityWeighting(unittest.TestCase):
                 task_type=kind, task_split_num=4, task_split_value=128, task_index=3, extra_value_1=flag,
             )
             config = SimpleNamespace(dynamic_data=SimpleNamespace(dynamic_group_size=2, dynamic_input_position=6))
-            context = L1TensorViewContext(
+            context = TaskDumpTensorViewContext(
                 operator, 0, 1, task, SimpleNamespace(data_type=4),
                 TensorSpec("probability_workspace", [4, 512], 16, dtype_size=4),
-                "output", 1, parameters, config, 0, "scalar", L1TensorView(0, (4, 512)), {},
+                "output", 1, parameters, config, 0, "scalar", TaskDumpTensorView(0, (4, 512)), {},
                 owner_context=SimpleNamespace(topology=SimpleNamespace(rank_id=0)),
             )
-            view = resolve_mega_moe_l1_tensor_view(context)
+            view = resolve_mega_moe_task_dump_tensor_view(context)
             self.assertEqual(view.shape, (3,))
             self.assertEqual(view.source_offset_bytes, (plane * 512 + 257) * 4)
             self.assertLessEqual(view.source_offset_bytes + 3 * 4, parameters[16].numel() * 4)

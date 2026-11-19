@@ -206,7 +206,10 @@ class TestMegaMhcInvocationState(unittest.TestCase):
         package = "mega_mhc_grad" if backward else "mega_mhc"
         function = importlib.import_module(f"hyper_multicore.modules.{package}.function")
         inputs, cache, buffers = _make_inputs(), _make_cache(), []
-        plan = SimpleNamespace(runtime=SimpleNamespace(runtime_config=object(), is_active=False), event_capacity=1024)
+        plan = SimpleNamespace(
+            diagnostics=SimpleNamespace(requires_diagnostic_launch=False),
+            runtime_config_tensor=object(), event_capacity=1024,
+        )
 
         def _launch(*native_args, **options):
             """Retain and mutate counters as an in-flight native invocation would."""

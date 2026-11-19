@@ -58,13 +58,13 @@ from hyper_multicore.diagnostics import MegaKernelDiagnostics
 
 
 def _launch_diagnostic_out(
-    operator, inputs, outputs, runtime_config, event_counters, diagnostic_buffer,
+    operator, inputs, outputs, runtime_config_tensor, event_counters, diagnostic_buffer,
     diagnostics, direction, attributes,
 ):
     """Bind preallocated native out operands before the selected tool prepares."""
-    parameters = (*inputs, runtime_config, event_counters, diagnostic_buffer, *outputs)
-    with diagnostics.launch(parameters, direction=direction, fallback_event_counters=event_counters) as call:
-        return operator(*inputs, call.runtime_config, call.event_counters, call.diagnostic_buffer,
+    parameters = (*inputs, runtime_config_tensor, event_counters, diagnostic_buffer, *outputs)
+    with diagnostics.launch(parameters, direction=direction, event_counters=event_counters) as call:
+        return operator(*inputs, call.runtime_config_tensor, call.event_counters, call.diagnostic_buffer,
                         *outputs, *attributes)
 
 
@@ -801,8 +801,9 @@ def mega_moe_with_diagnostic_buffer(
     all_event_counters :
         Event synchronization counter tensor.
     diagnostic_buffer :
-        Ordinary NPU memory receiving either profiling records or L1 dump
-        snapshots, selected by runtime_config. Unused in ordinary/L0 mode.
+        Ordinary NPU memory receiving either profiling records or Task dump
+        snapshots, selected by runtime_config. Unused in standard execution
+        and Kernel dump.
     rank_id, ep, expert_num, hidden_size, seq_size :
         Topology / shape attributes.
     """
@@ -880,9 +881,9 @@ def mega_moe_grad_with_diagnostic_buffer(
 
     The argument contract matches :func:`mega_moe_grad` with one additional
     ordinary-NPU-memory ``diagnostic_buffer``. Device workers write profiling
-    records or L1 dump snapshots according to runtime_config; ordinary/L0 mode
-    does not access the buffer. All output and workspace tensors remain
-    caller-owned and are written in place.
+    records or Task dump snapshots according to runtime_config; standard
+    execution and Kernel dump do not access the buffer. All output and workspace
+    tensors remain caller-owned and are written in place.
 
     Args:
         dispatch_target: First tensor in the fixed diagnostic-backward ABI; remaining tensor and topology arguments
@@ -996,7 +997,7 @@ def _mega_gate_route(
         parameters = (logits, text_bias, vision_bias, image_mask, runtime_config, diagnostic_buffer, *outputs)
         with diagnostics.launch(parameters, direction="forward") as call:
             return torch.ops.hyper_multicore.mega_gate_route_out(
-                logits, text_bias, vision_bias, image_mask, call.runtime_config, call.diagnostic_buffer,
+                logits, text_bias, vision_bias, image_mask, call.runtime_config_tensor, call.diagnostic_buffer,
                 *outputs, top_k, routed_scaling_factor, use_vision_bias,
             )
     return torch.ops.hyper_multicore.mega_gate_route(

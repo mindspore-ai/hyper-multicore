@@ -18,7 +18,7 @@ from typing import Any
 
 from hyper_multicore._core_spec import get_device_core_spec
 from hyper_multicore.diagnostics.common.graph import bind_graph_tensor_ports
-from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
+from hyper_multicore.diagnostics.dumper import TaskDumpTensorView, TaskDumpTensorViewContext
 from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
 
 
@@ -62,7 +62,7 @@ def _port(name: str, position: int, dtype_size: int = 4) -> TensorSpec:
     return TensorSpec(name, [], position, dtype_size=dtype_size, is_dynamic=True)
 
 
-def _row_view(context: L1TensorViewContext) -> L1TensorView:
+def _row_view(context: TaskDumpTensorViewContext) -> TaskDumpTensorView:
     """Mirror Route/RouteGrad tiling without running a Device-side resolver."""
     tensor = context.parameters[context.tensor_spec.param_position]
     shape = tuple(tensor.shape)
@@ -73,7 +73,7 @@ def _row_view(context: L1TensorViewContext) -> L1TensorView:
         return context.make_view(shape, source_offset_bytes=0)
     cache_key = -1
     if cache_key not in context.parameter_cache:
-        cores = int(context.runtime_config.num_workers)
+        cores = int(context.diagnostic_runtime_config.num_workers)
         if tensor.device.type == "npu":
             cores = min(cores, get_device_core_spec(tensor.device.index).num_vector_cores)
         workers = min(tokens, cores)
@@ -92,7 +92,7 @@ def bind_pipeline_graph(graph: Any, config: Any, *, backward: bool = False) -> C
     """Build diagnostic ports only; native stages still use their original ABI.
 
     RouteGrad's scatter/sqrt/softplus tail is launched by ACLNN after the MegaKernel.
-    A zero-task boundary node describes its L0 result, not an L1 Device capture.
+    A zero-task node describes its Kernel dump result, without a Device Task capture.
     Internal CANN workspace arrays are deliberately not advertised as ABI Tensors.
 
     Args:
@@ -128,7 +128,7 @@ def bind_pipeline_graph(graph: Any, config: Any, *, backward: bool = False) -> C
     previous = None
     for index, name in enumerate(names):
         node = OperatorNode(name, OpType.AIV_PIPELINE, [], [], [], 0, SplitSpec(None, lambda _: 1), 0, None,
-                            diagnostic_name=name)
+                            diagnostic_stage_name=name)
         node.task_num = 1 if index < config.task_num else 0
         graph.add_op(node)
         if previous is not None:

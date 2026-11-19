@@ -70,8 +70,8 @@ def test_mega_moe_large_runtime() -> None:
         # Inspect private plan ownership only to prove which uploaded queues ran.
         resources = mega._resource_group.resources  # pylint: disable=protected-access
         plan = resources.plan_for_tokens(shape.local_num_tokens, baseline.DEVICE)
-        result = {"forward": _runtime_metadata(plan.fwd_runtime_config),
-                  "backward": _runtime_metadata(plan.bwd_runtime_config),
+        result = {"forward": _runtime_metadata(plan.fwd_runtime_config_tensor),
+                  "backward": _runtime_metadata(plan.bwd_runtime_config_tensor),
                   "all_outputs_gradients_updates_match": True, "memory": memory_sample()}
     finally:
         mega.close()

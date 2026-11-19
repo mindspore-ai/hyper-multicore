@@ -70,7 +70,7 @@ def mx_profile_bindings(buffers: Sequence[Any], runtime: Any, events: Any) -> li
 def mx_profile_capture_enabled() -> bool:
     """Select profiling and reject unsupported diagnostic modes."""
     session = _get_active_session()
-    if session is None or not session.is_capture_enabled():
+    if session is None or not session.should_prepare_call():
         return False
     if _get_active_session('profiler') is not session:
         raise RuntimeError('MX tensor dumps are unsupported; only the task profiler has a physical ABI contract.')
@@ -92,7 +92,7 @@ def profile_mx_launch(buffers: Sequence[Any], runtime: Any, events: Any, spec: A
     """Submit the graph through the shared diagnostic lifecycle."""
     parameters = mx_profile_bindings(buffers, runtime.runtime, events)
     with runtime.diagnostics.launch(
-            parameters, direction=direction, fallback_event_counters=events, tags=scope) as call:
+            parameters, direction=direction, event_counters=events, tags=scope) as call:
         # Use master's diagnostic lifecycle; normal launches bypass it entirely.
-        descriptor = prepare(buffers, call.runtime_config, call.event_counters, spec)
-        launch(buffers, call.runtime_config, call.event_counters, call.diagnostic_buffer, descriptor)
+        descriptor = prepare(buffers, call.runtime_config_tensor, call.event_counters, spec)
+        launch(buffers, call.runtime_config_tensor, call.event_counters, call.diagnostic_buffer, descriptor)

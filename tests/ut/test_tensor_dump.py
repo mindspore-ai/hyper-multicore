@@ -30,8 +30,9 @@ from torch.testing import assert_close
 
 from hyper_multicore.diagnostics import prepare_mega_kernel_diagnostics, schedule
 from hyper_multicore.diagnostics import profiler as torch_profiler
+from hyper_multicore.diagnostics.dumper import TensorDumpLevel, TensorDumpSession
 from hyper_multicore.scheduler.runtime import allocate_runtime_config
-from hyper_multicore.diagnostics.dump import api as tensor_dump
+from hyper_multicore.diagnostics.dumper import api as tensor_dump
 from hyper_multicore.diagnostics.common.session import _reset_active_session_for_test
 from hyper_multicore.scheduler.graph import (
     ComputeGraph,
@@ -44,23 +45,23 @@ from tests.common.mark_utils import arg_mark
 
 
 def _make_test_graph() -> ComputeGraph:
-    """Build a two-stage graph with all three L0 Tensor roles."""
+    """Build a two-stage graph with all three Tensor roles for Kernel dump."""
     graph_input = TensorSpec("input", [2], param_position=0)
     intermediate = TensorSpec("intermediate", [2], param_position=1)
     graph_output = TensorSpec("output", [2], param_position=2)
     first = OperatorNode(
         "up_proj", OpType.GMM, [graph_input], [intermediate], [0, 1], 1,
-        SplitSpec(None, lambda _: 1, [0]), -1, None, diagnostic_name="GMM1",
+        SplitSpec(None, lambda _: 1, [0]), -1, None, diagnostic_stage_name="GMM1",
     )
     second = OperatorNode(
         "down_proj", OpType.GMM, [intermediate], [graph_output], [1, 2], 1,
-        SplitSpec([(0, 0)], lambda _: 1, [0]), -1, None, diagnostic_name="GMM2",
+        SplitSpec([(0, 0)], lambda _: 1, [0]), -1, None, diagnostic_stage_name="GMM2",
     )
     return ComputeGraph().add_op(first).add_op(second).add_edge(first, second)
 
 
 class TestTensorDumpConfig(unittest.TestCase):
-    """Validate L0 configuration normalization and filtering."""
+    """Validate Kernel configuration normalization and filtering."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -74,6 +75,7 @@ class TestTensorDumpConfig(unittest.TestCase):
             directions="forward", ranks=2,
         )
 
+        self.assertIs(config.level, TensorDumpLevel.KERNEL)
         self.assertEqual(config.tensor_names, ("output",))
         self.assertEqual(config.kernel_names, ("mega_moe",))
         self.assertEqual(config.roles, ("final_output",))
@@ -85,14 +87,14 @@ class TestTensorDumpConfig(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_normalizes_l1_filters(self):
+    def test_normalizes_task_filters(self):
         """Feature: MegaKernel diagnostics.
-        Description: Normalizes l1 filters.
-        Expectation: Normalizes l1 filters.
+        Description: Normalizes Task dump filters.
+        Expectation: Normalizes Task dump filters.
         """
         config = tensor_dump.TensorDumpConfig(
             "dump",
-            level="l1",
+            level="TaSk",
             stages="SwiGLU",
             task_ids=3,
             stage_task_indices=1,
@@ -102,7 +104,7 @@ class TestTensorDumpConfig(unittest.TestCase):
             io="output",
         )
 
-        self.assertEqual(config.level, "L1")
+        self.assertIs(config.level, TensorDumpLevel.TASK)
         self.assertEqual(config.stages, ("SwiGLU",))
         self.assertEqual(config.task_ids, (3,))
         self.assertEqual(config.core_types, ("AIV",))
@@ -115,12 +117,26 @@ class TestTensorDumpConfig(unittest.TestCase):
         Description: Rejects unsupported level and invalid rank.
         Expectation: Rejects unsupported level and invalid rank.
         """
-        with self.assertRaisesRegex(ValueError, "unsupported Tensor dump level"):
-            tensor_dump.TensorDumpConfig("dump", level="L2")
+        for level in ("L0", "L1", "L2", "", None, 0, True):
+            with self.subTest(level=level), self.assertRaisesRegex(ValueError, "unsupported Tensor dump level"):
+                tensor_dump.TensorDumpConfig("dump", level=level)
         with self.assertRaisesRegex(ValueError, "requires at least one"):
-            tensor_dump.TensorDumpConfig("dump", level="L1")
+            tensor_dump.TensorDumpConfig("dump", level="task")
         with self.assertRaisesRegex(ValueError, "non-negative integers"):
             tensor_dump.TensorDumpConfig("dump", ranks=True)
+
+    def test_levels_and_session_public_interface(self):
+        """Both public levels normalize to enums and create the same session type."""
+        for level, expected in (
+            (TensorDumpLevel.KERNEL, TensorDumpLevel.KERNEL),
+            ("KeRnEl", TensorDumpLevel.KERNEL),
+            (TensorDumpLevel.TASK, TensorDumpLevel.TASK),
+            ("TASK", TensorDumpLevel.TASK),
+        ):
+            with self.subTest(level=level):
+                config = tensor_dump.TensorDumpConfig("dump", level=level, tensor_names="output")
+                self.assertIs(config.level, expected)
+                self.assertIsInstance(tensor_dump.tensor_dump(config), TensorDumpSession)
 
 
 class TestGraphDiagnosticMetadata(unittest.TestCase):
@@ -135,7 +151,7 @@ class TestGraphDiagnosticMetadata(unittest.TestCase):
         """
         operators = _make_test_graph().topological_sort()
         for operator in operators:
-            operator.diagnostic_name = None
+            operator.diagnostic_stage_name = None
 
         self.assertEqual(
             tensor_dump._stage_names(operators),
@@ -150,13 +166,13 @@ class TestGraphDiagnosticMetadata(unittest.TestCase):
         Expectation: Rejects duplicate explicit stage names.
         """
         operators = _make_test_graph().topological_sort()
-        operators[1].diagnostic_name = "GMM1"
+        operators[1].diagnostic_stage_name = "GMM1"
 
         with self.assertRaisesRegex(ValueError, "stage directory"):
             tensor_dump._stage_names(operators)
 
 
-class TestTorchMegaKernelTensorDumper(unittest.TestCase):
+class TestTensorDumpSession(unittest.TestCase):
     """Validate capture boundaries, metadata, filters and diagnostic isolation."""
 
     def tearDown(self) -> None:
@@ -181,7 +197,7 @@ class TestTorchMegaKernelTensorDumper(unittest.TestCase):
                 adapter = prepare_mega_kernel_diagnostics(
                     graph, allocate_runtime_config(0), kernel_name="test_kernel", parameter_count=3, device="cpu",
                 )
-                call = adapter.launch(parameters, direction="forward", fallback_event_counters=torch_zeros(16))
+                call = adapter.launch(parameters, direction="forward", event_counters=torch_zeros(16))
                 parameters[1].copy_(parameters[0] + 1)
                 parameters[2].copy_(parameters[1] * 2)
                 call.complete()
@@ -191,14 +207,17 @@ class TestTorchMegaKernelTensorDumper(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             invocation = manifest["invocations"][0]
             tensors = {item["name"]: item for item in invocation["tensors"]}
-            self.assertEqual(manifest["schemaVersion"], 4)
+            self.assertEqual(manifest["schemaVersion"], 5)
+            self.assertEqual(manifest["level"], "kernel")
             self.assertEqual(manifest["tensorSerialization"], "torch.save")
             self.assertEqual(manifest["tensorFileLayout"], "stage_only")
             self.assertEqual(manifest["capturePhaseSemantics"], "mega_kernel_boundary")
+            self.assertNotIn("dumpPhaseSemantics", manifest)
             self.assertEqual(manifest["stageViewStorage"], "primary_file_with_hard_links")
             self.assertEqual(invocation["direction"], "forward")
             self.assertEqual(invocation["kernelName"], "test_kernel")
             self.assertEqual(tensors["input"]["capturePhase"], "before")
+            self.assertNotIn("dumpPhase", tensors["input"])
             self.assertEqual(tensors["intermediate"]["role"], "stage_output")
             self.assertEqual(tensors["output"]["role"], "final_output")
             self.assertEqual(
@@ -241,7 +260,7 @@ class TestTorchMegaKernelTensorDumper(unittest.TestCase):
                 adapter = prepare_mega_kernel_diagnostics(
                     graph, allocate_runtime_config(0), kernel_name="test_kernel", parameter_count=3, device="cpu",
                 )
-                call = adapter.launch(parameters, direction="forward", fallback_event_counters=torch_zeros(16))
+                call = adapter.launch(parameters, direction="forward", event_counters=torch_zeros(16))
                 call.complete()
 
             manifest_path = dumper.last_manifest_paths[0]
@@ -279,7 +298,7 @@ class TestTorchMegaKernelTensorDumper(unittest.TestCase):
             window_dir = Path(output_dir)
             invocation_dir = window_dir / "invocation_000000_forward"
 
-            output_path, ports = tensor_dump._write_l0_stage_files(
+            output_path, ports = tensor_dump._write_kernel_stage_files(
                 snapshot,
                 invocation_dir,
                 window_dir,

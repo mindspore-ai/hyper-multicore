@@ -78,9 +78,9 @@ MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES = (
 class MegaGatePlan:
     """Capacity-bounded RuntimeConfig shared by all input shapes on one NPU."""
 
-    route_runtime: MegaKernelDiagnostics
-    route_grad_runtime: MegaKernelDiagnostics
-    route_grad_k1_runtime: MegaKernelDiagnostics
+    route_diagnostics: MegaKernelDiagnostics
+    route_grad_diagnostics: MegaKernelDiagnostics
+    route_grad_k1_diagnostics: MegaKernelDiagnostics
     vision_mask_placeholder: torch.Tensor
 
 
@@ -142,17 +142,17 @@ def build_mega_gate_plan(device: torch.device) -> MegaGatePlan:
         )
 
     return MegaGatePlan(
-        route_runtime=prepare(_build_pipeline_runtime_config(
+        route_diagnostics=prepare(_build_pipeline_runtime_config(
             MEGA_GATE_ROUTE_TASK_TYPES,
             MEGA_GATE_ROUTE_STAGE_NAMES,
             kernel_name="HyperMegaGateRoute",
         )),
-        route_grad_runtime=prepare(_build_pipeline_runtime_config(
+        route_grad_diagnostics=prepare(_build_pipeline_runtime_config(
             MEGA_GATE_ROUTE_GRAD_TASK_TYPES,
             MEGA_GATE_ROUTE_GRAD_STAGE_NAMES,
             kernel_name="HyperMegaGateRouteGrad",
         ), backward=True),
-        route_grad_k1_runtime=prepare(_build_pipeline_runtime_config(
+        route_grad_k1_diagnostics=prepare(_build_pipeline_runtime_config(
             MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES,
             MEGA_GATE_ROUTE_GRAD_K1_STAGE_NAMES,
             kernel_name="HyperMegaGateRouteGrad",

@@ -42,7 +42,7 @@ class TestDiagnosticCall(unittest.TestCase):
         """
         arguments = LaunchArguments(object(), object(), object(), object())
         call = DiagnosticCall(arguments)
-        self.assertIs(call.runtime_config, arguments.runtime_config)
+        self.assertIs(call.runtime_config_tensor, arguments.runtime_config_tensor)
         self.assertIs(call.event_counters, arguments.event_counters)
         self.assertIs(call.diagnostic_buffer, arguments.diagnostic_buffer)
         self.assertFalse(hasattr(call, "profile_buffer"))
@@ -87,15 +87,15 @@ class TestDiagnosticCall(unittest.TestCase):
         Description: A new tool can implement the interface without modifying this adapter.
         Expectation: Dispatch calls only the active session.
         """
-        runtime = SimpleNamespace(normal_tensor=object(), parameter_count=1)
+        runtime = SimpleNamespace(runtime_config_tensor=object(), parameter_count=1)
         adapter = MegaKernelDiagnostics(runtime)
         session = mock.Mock()
         selected = DiagnosticCall(LaunchArguments(object(), object(), object(), object()))
         session.prepare_call.return_value = selected
         _activate_session("custom_tool", session)
         try:
-            self.assertTrue(adapter.is_active)
-            call = adapter.launch((object(),), direction="forward", fallback_event_counters=object())
+            self.assertTrue(adapter.requires_diagnostic_launch)
+            call = adapter.launch((object(),), direction="forward", event_counters=object())
             self.assertIs(call, selected)
             session.prepare_call.assert_called_once()
             self.assertIs(session.prepare_call.call_args.args[0].runtime, runtime)
@@ -109,11 +109,11 @@ class TestDiagnosticCall(unittest.TestCase):
         Description: Even malformed diagnostic-only metadata cannot affect ordinary execution.
         Expectation: No session never inspects diagnostic metadata.
         """
-        runtime = SimpleNamespace(normal_tensor=object())
+        runtime = SimpleNamespace(runtime_config_tensor=object())
         adapter = MegaKernelDiagnostics(runtime)
         events = object()
-        self.assertFalse(adapter.is_active)
-        with adapter.launch((), direction="forward", fallback_event_counters=events) as call:
-            self.assertIs(call.runtime_config, runtime.normal_tensor)
+        self.assertFalse(adapter.requires_diagnostic_launch)
+        with adapter.launch((), direction="forward", event_counters=events) as call:
+            self.assertIs(call.runtime_config_tensor, runtime.runtime_config_tensor)
             self.assertIs(call.diagnostic_buffer, events)
         self.assertTrue(call.finished)

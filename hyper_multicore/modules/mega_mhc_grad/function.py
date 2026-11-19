@@ -195,9 +195,9 @@ def hyper_mega_mhc_grad(
         previous_residual_mix.reshape(1, token_count, 4, 4).contiguous(),
     )
     options = {"hc_eps": hc_eps}
-    if plan.runtime.is_active:
-        options["diagnostics"] = plan.runtime
+    if plan.diagnostics.requires_diagnostic_launch:
+        options["diagnostics"] = plan.diagnostics
     outputs = multicore_ops.hyper_mega_mhc_grad(
-        *kernel_inputs, plan.runtime.runtime_config, events, events, **options,
+        *kernel_inputs, plan.runtime_config_tensor, events, events, **options,
     )
     return _restore_output_shapes(outputs, leading_shape, hidden_size)

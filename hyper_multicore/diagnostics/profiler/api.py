@@ -119,7 +119,7 @@ class _ProfileCall(DiagnosticCall):
     def __init__(
         self,
         *,
-        runtime_config: Any,
+        runtime_config_tensor: Any,
         event_counters: Any,
         diagnostic_buffer: Any,
         clear_event_counters: Any | None = None,
@@ -132,7 +132,7 @@ class _ProfileCall(DiagnosticCall):
     ) -> None:
         """Store launch arguments and optional active-session bookkeeping."""
         super().__init__(LaunchArguments(
-            runtime_config, event_counters, diagnostic_buffer,
+            runtime_config_tensor, event_counters, diagnostic_buffer,
             event_counters if clear_event_counters is None else clear_event_counters,
         ))
         self._profiler = profiler
@@ -276,8 +276,8 @@ class TorchMegaKernelProfiler:
             raise TypeError("MegaKernel schedule must return DiagnosticAction, " f"got {type(action).__name__}")
         return action
 
-    def is_capture_enabled(self) -> bool:
-        """Return whether the current schedule action records Device cycles."""
+    def should_prepare_call(self) -> bool:
+        """Return whether this step prepares profiling, including discarded warmup."""
         return self._action is not DiagnosticAction.NONE
 
     def prepare_call(self, context: LaunchContext) -> DiagnosticCall:
@@ -286,13 +286,13 @@ class TorchMegaKernelProfiler:
         Args:
             context: Selected invocation or operand context supplied by the diagnostic framework.
         """
-        if not self.is_capture_enabled():
+        if not self.should_prepare_call():
             return DiagnosticCall(context.ordinary_arguments())
         runtime = self._profile_runtimes.get(context.runtime)
         if runtime is None:
             runtime = _PreparedProfileRuntime(context.runtime)
             self._profile_runtimes[context.runtime] = runtime
-        call = self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        call = self.acquire_call(runtime, context.event_counters, context.direction)
         tags = getattr(context, "tags", None)
         if tags is not None:
             if not all(isinstance(k, str) and isinstance(v, str) for k, v in tags.items()):
@@ -320,7 +320,7 @@ class TorchMegaKernelProfiler:
         profile_buffer, profile_buffer_key = self._take_profile_buffer(runtime)
         self._next_invocation_id += 1
         call = _ProfileCall(
-            runtime_config=runtime.profile_tensor,
+            runtime_config_tensor=runtime.profile_runtime_config_tensor,
             event_counters=event_counters,
             clear_event_counters=event_counters,
             profiler=self,

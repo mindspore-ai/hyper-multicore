@@ -242,10 +242,10 @@ class TestMegaMoeFunction(unittest.TestCase):
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
-        runtime = SimpleNamespace(normal_tensor=None, kernel_name="mega_moe", rank=0)
+        runtime = SimpleNamespace(runtime_config_tensor=None, kernel_name="mega_moe", rank=0)
         plan.fwd_diagnostics = MegaKernelDiagnostics(runtime)
         plan.bwd_diagnostics = MegaKernelDiagnostics(runtime)
-        plan.fwd_runtime_config = plan.bwd_runtime_config = None
+        plan.fwd_runtime_config_tensor = plan.bwd_runtime_config_tensor = None
         workspace = Mock(
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),

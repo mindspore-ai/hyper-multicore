@@ -18,7 +18,7 @@ from math import prod
 from typing import Any
 
 from hyper_multicore.diagnostics.common.graph import bind_graph_tensor_ports
-from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
+from hyper_multicore.diagnostics.dumper import TaskDumpTensorView, TaskDumpTensorViewContext
 from hyper_multicore.scheduler.graph import TensorSpec
 
 
@@ -33,7 +33,7 @@ def tensor_port(name: str, position: int, dtype_size: int = 4) -> TensorSpec:
     return TensorSpec(name, [], position, dtype_size=dtype_size, is_dynamic=True)
 
 
-def resolve_token_view(context: L1TensorViewContext) -> L1TensorView:
+def resolve_token_view(context: TaskDumpTensorViewContext) -> TaskDumpTensorView:
     """Resolve a contiguous token tile, not a native CANN workspace alias.
 
     Args:
@@ -62,7 +62,7 @@ def bind_forward_graph(graph: Any, config: Any) -> Any:
 
     The ring X-cast workspace is CANN-owned, not hc_before_norm. It is deliberately
     not exposed as a Tensor. Iteration-major Sinkhorn caches are also omitted:
-    a token tile there is strided, whereas L1 currently copies contiguous ranges.
+    a token tile there is strided, whereas Task currently copies contiguous ranges.
 
     Args:
         graph: Business compute graph whose scheduling storage remains unchanged.
