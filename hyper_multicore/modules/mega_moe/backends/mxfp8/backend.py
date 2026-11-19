@@ -57,10 +57,11 @@ class _MXFP8Plan:
 
 class Resources(_MegaMoeExecutionResources):
     """Own MX execution plans for the bound workspace."""
-    def __init__(self, specification, tensor, *, expert_weight_layout, shared, active_specifications):
+    def __init__(self, specification, tensor, *, expert_weight_layout, shared, active_specifications,
+                 routed_buffer_owner=None):
         super().__init__(
             specification, tensor, expert_weight_layout=expert_weight_layout, shared=shared,
-            active_specifications=active_specifications,
+            active_specifications=active_specifications, routed_buffer_owner=routed_buffer_owner,
         )
         self._plans = OrderedDict()
 

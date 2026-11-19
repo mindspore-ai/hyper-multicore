@@ -90,7 +90,6 @@ class MXFP8Execution:
             dispatch_buffer = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
             source_buffer = workspace.source_buffer
         else:
-            dispatch_buffer = workspace.expert_buffer
             source_buffer = route.routed_tokens
         row_only = not retain_backward
         forward = plan.forward_without_grad if row_only else plan.forward
@@ -103,11 +102,14 @@ class MXFP8Execution:
         if not pull:
             workspace.claim()
         try:
+            if not pull:
+                dispatch_buffer = workspace.expert_buffer
+            routed_buffer = workspace.lease_owner.routed_buffer
             buffers = [
                 dispatch_buffer, transport.dispatch_target_off, source_buffer,
                 transport.dispatch_src_off, transport.dispatch_size,
                 weight1.col_data, metadata.group_list, up, a_row, weight2.col_data, metadata.group_list, down,
-                workspace.routed_buffer, transport.combine_target_off,
+                routed_buffer, transport.combine_target_off,
                 transport.combine_src_off, transport.combine_size,
                 x_row, x_scale, x_col, x_col_scale, a_scale, a_col, a_col_scale,
                 weight1.col_scale, weight2.col_scale, forward.gmm, forward.quant,
@@ -119,13 +121,13 @@ class MXFP8Execution:
                 with self.weight_prefetch.lease((weight1, weight2), self.placement,
                                                 backward=False) as (guests, ready):
                     self._launch([*buffers, *guests, ready], forward, events, plan)
-            expert_output = workspace.routed_buffer[:route.routed_tokens.shape[0]]
+            expert_output = routed_buffer[:route.routed_tokens.shape[0]]
             if retain_backward or not self.nograd_no_clone:
                 expert_output = expert_output.clone()
             probabilities = probs.float().contiguous()
             output = torch_npu.npu_moe_token_unpermute(expert_output, route.unpermute_mapping, probs=probabilities)
             if (self.nograd_no_clone and not retain_backward
-                    and output.untyped_storage().data_ptr() == workspace.routed_buffer.untyped_storage().data_ptr()):
+                    and output.untyped_storage().data_ptr() == routed_buffer.untyped_storage().data_ptr()):
                 raise RuntimeError('No-grad MX unpermute output must not alias shared routed storage.')
             saved = ((x_col, x_col_scale, a_col, a_col_scale, up, expert_output, probabilities,
                       route.unpermute_mapping, metadata.group_list, transport.dispatch_target_off,
@@ -168,8 +170,7 @@ class MXFP8Execution:
         pull = spec.dispatch_mode == 'pull'
         source = (workspace.source_buffer[:metadata.source_rows] if pull else
                   torch.empty((metadata.source_rows, spec.hidden_size), dtype=torch.bfloat16, device=device))
-        dispatch = (torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
-                    if pull else workspace.expert_buffer)
+        dispatch = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device) if pull else None
         grad_probs = torch.empty_like(probs)
         da = torch.empty((capacity, spec.intermediate_size), dtype=torch.bfloat16, device=device)
         dx = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
@@ -178,6 +179,9 @@ class MXFP8Execution:
                                                    metadata.all_experts_active)
         workspace.claim()
         try:
+            if not pull:
+                dispatch = workspace.expert_buffer
+            routed_buffer = workspace.lease_owner.routed_buffer
             multicore_ops.mega_moe_unpermute_grad_out(
                 expert_output, gradient.reshape(-1, spec.hidden_size).contiguous(), mapping, probs, source, grad_probs,
             )
@@ -185,7 +189,7 @@ class MXFP8Execution:
                 dispatch, dispatch_target, workspace.source_buffer if pull else source,
                 dispatch_source, dispatch_size,
                 a_col, dw2, weight2.row_data, da, up, du_row, weight1.row_data, dx,
-                workspace.routed_buffer, combine_target, combine_source,
+                routed_buffer, combine_target, combine_source,
                 combine_size, x_col, dw1, group_list, dy_row, dy_scale, dy_col, dy_col_scale,
                 a_col_scale, weight2.row_scale, du_scale, du_col, du_col_scale, weight1.row_scale, x_col_scale,
                 plan.backward.gmm, plan.backward.quant,
@@ -199,7 +203,7 @@ class MXFP8Execution:
                         self.gradient_pool.native_return(self.placement, plan.backward, (dw1, dw2)) as returns:
                     self._launch([*buffers, *guests, ready, *returns], plan.backward, events, plan, direction="backward")
             grad_hidden = multicore_ops.moe_token_permute_grad(
-                workspace.routed_buffer[:metadata.source_rows], mapping,
+                routed_buffer[:metadata.source_rows], mapping,
                 gradient.numel() // spec.hidden_size, spec.top_k,
             )
             return grad_hidden.reshape(metadata.hidden_shape), grad_probs.to(metadata.probs_dtype), dw1, dw2

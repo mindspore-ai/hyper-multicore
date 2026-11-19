@@ -436,13 +436,10 @@ class _HeapManager:
         # backward reads these two serial transport buffers from the workspace
         # at launch. Event storage and the expert bank keep their identities.
         old_layout = entry.layout
-        data_fields = (
-            ("expert_buffer", old_layout.receive_capacity, layout.receive_capacity),
-            ("routed_buffer", spec.routed_slots, new_spec.routed_slots),
-        )
-        changed = tuple((name, item, old_rows) for (name, old_rows, new_rows), item in zip(data_fields, replacements)
-                        if old_rows != new_rows)
-        temporary_bytes = sum(old_rows * spec.hidden_size * self.element_size for _, _, old_rows in changed)
+        data_fields = {id(workspace.expert_buffer): "expert_buffer", id(workspace.routed_buffer): "routed_buffer"}
+        changed = tuple((data_fields[id(item.current)], item) for item in replacements
+                        if id(item.current) in data_fields and tuple(item.current.shape) != item.target.shape)
+        temporary_bytes = sum(item.current.numel() * self.element_size for _, item in changed)
         if required + temporary_bytes > self.heap_bytes:
             return False
 
@@ -450,11 +447,12 @@ class _HeapManager:
 
         def prepare() -> None:
             workspace.validate_restart_allocations(spec, self.dtype, old_layout.receive_capacity, replacements)
-            if workspace.used:
-                workspace.completion_event.synchronize()
+            owner = workspace.lease_owner
+            if changed and owner.used:
+                owner.completion_event.synchronize()
 
         owner_index = next(index for index, candidate in enumerate(self.entries) if candidate is entry)
-        signature = tuple((name, item.target) for name, item, _ in changed)
+        signature = tuple((name, item.target) for name, item in changed)
         self._run_and_check_consistency(
             prepare, stage="MX Push growth preflight", value=(owner_index, old_layout, layout, signature),
         )
@@ -479,7 +477,7 @@ class _HeapManager:
             "receive": layout.receive_capacity,
             "old_source": spec.local_num_tokens,
             "source": new_spec.local_num_tokens,
-            "replaced": [name for name, _, _ in changed],
+            "replaced": [name for name, _ in changed],
             "total_ms": (time.perf_counter() - started) * 1000,
             "stages_ms": stages_ms,
             "capacities": [item.layout.receive_capacity for item in self.entries],
@@ -488,13 +486,13 @@ class _HeapManager:
 
     @staticmethod
     def _replace_mx_push_buffers(
-        workspace: MegaMoeWorkspace, changed: tuple[tuple[str, _lifecycle._AllocationReplacement, int], ...],
+        workspace: MegaMoeWorkspace, changed: tuple[tuple[str, _lifecycle._AllocationReplacement], ...],
     ) -> dict[str, float]:
         """Allocate replacements before releasing quiescent scratch tensors."""
         started = time.perf_counter()
         staged = []
         try:
-            for name, item, _ in changed:
+            for name, item in changed:
                 target = item.target
                 tensor = shmem.empty(target.shape, dtype=target.dtype, alignment=target.alignment_bytes)
                 staged.append((name, tensor))
@@ -507,7 +505,7 @@ class _HeapManager:
         # the new Allocation outside its sole workspace owner.
         for name, tensor in staged:
             setattr(workspace, name, tensor)
-        for _, item, _ in changed:
+        for _, item in changed:
             shmem.free(item.current)
         return {"allocate_ms": (bound - started) * 1000, "release_ms": (time.perf_counter() - bound) * 1000}
 

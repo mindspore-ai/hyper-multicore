@@ -38,6 +38,7 @@ class _MegaMoeExecutionResources:
         shared: bool,
         active_specifications: tuple[Mapping[str, Any], ...],
         workspace_layout: _WorkspaceLayout | None = None,
+        routed_buffer_owner: MegaMoeWorkspace | None = None,
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         bound_specification = {**specification, "expert_weight_layout": expert_weight_layout}
@@ -95,7 +96,7 @@ class _MegaMoeExecutionResources:
                 if transport == "udma":
                     moe_transport.require_queue_backend()
                 self.plan = self._initial_plan(tensor)
-                self.workspace = MegaMoeWorkspace(shared=shared)
+                self.workspace = MegaMoeWorkspace(shared=shared, routed_buffer_owner=routed_buffer_owner)
                 self.workspace.transport_engine = self.spec.transport_engine
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager

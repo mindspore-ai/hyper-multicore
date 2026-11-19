@@ -178,6 +178,11 @@ class MXPlacementResources(PlacementResources):
         placement = ExpertPlacement(virtual_ids, geometry.counts, geometry.copies, self.config.replica_slots_per_rank,
                                     peak, local_receive_capacity=local, copies_by_rank=geometry.owners,
                                     owner_rows=geometry.rows)
+        parent = self.parent
+        workspace = parent.workspace
+        if workspace.routed_buffer is None or tokens * spec.top_k > workspace.routed_slots:
+            physical = parent.heap_manager.ensure_token_capacity(workspace, tokens, 0)
+            workspace.ensure_routed_buffer(physical, hidden.dtype, hidden.device)
         resources = self._virtual_resources(hidden, tokens, peak)
         resources.prepare_auto_workspace(tokens, peak, hidden)
         permuted = route._permute_topk_input(hidden, virtual_ids)
@@ -196,7 +201,7 @@ class MXPlacementResources(PlacementResources):
             return self.geometries[width]
         spec = self.parent.spec
         specification = {**self.specification, "hot_replica": False, "planner_key": None,
-                         "num_experts": self.config.physical_experts}
+                         "num_experts": self.config.physical_experts, "_borrows_routed_buffer": True}
         layout = _workspace_layout(specification, hidden.dtype, _align_capacity(received), tokens)
         manager = self.parent.heap_manager
         pool = _get_mega_bank(hidden, self.parent, self, pool_type=MXGradientPool,
@@ -209,7 +214,8 @@ class MXPlacementResources(PlacementResources):
 
         try:
             resources = Resources(specification, hidden, expert_weight_layout="EIO",
-                                  shared=self.shared, active_specifications=(specification,))
+                                  shared=self.shared, active_specifications=(specification,),
+                                  routed_buffer_owner=self.parent.workspace)
             _collective.collective_call(allocate_prefetch, stage="MXFP8 HotReplica weight buffers", group=spec.ep_group)
         except Exception:
             if resources is not None:

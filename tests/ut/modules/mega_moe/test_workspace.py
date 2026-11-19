@@ -184,6 +184,57 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         self.assertEqual(workspace.gmm_workspace.numel(), 512)
         self.assertEqual(workspace.swiglu_grad_workspace.numel(), 512)
 
+    def test_mx_routed_owner_survives_virtual_first_and_late_home_materialization(self) -> None:
+        """A retained placed route has distinct counters and borrows the current routed buffer."""
+        home_spec = SimpleNamespace(
+            apply_probs_before_fc2=False, receive_capacity=128, routed_slots=256, hidden_size=16,
+            ep_size=4, num_experts=24, dispatch_mode="push", precision="mxfp8",
+        )
+        placed_spec = SimpleNamespace(**(vars(home_spec) | {"num_experts": 32}))
+        home = MegaMoeWorkspace(shared=True)
+        placed = MegaMoeWorkspace(shared=True, routed_buffer_owner=home)
+        device, dtype = torch.device("cpu"), torch.bfloat16
+        with (
+            patch.object(workspace_module.shmem, "empty",
+                         side_effect=lambda shape, **kw: torch.empty(shape, dtype=kw["dtype"])) as allocate,
+            patch.object(workspace_module.torch, "npu", create=True),
+        ):
+            home.ensure_routed_buffer(home_spec, dtype, device)
+            original = home.routed_buffer
+            self.assertIsNone(home.expert_buffer)
+            self.assertEqual(allocate.call_count, 1)
+            placed.ensure(placed_spec, dtype, device)
+            self.assertIsNone(placed.routed_buffer)
+            self.assertEqual(allocate.call_count, 4)
+            home.ensure(home_spec, dtype, device)
+        self.assertEqual(allocate.call_count, 7)
+        self.assertIs(home.routed_buffer, original)
+        self.assertIs(placed.lease_owner, home)
+        self.assertIsNot(home.forward_event_counters, placed.forward_event_counters)
+        self.assertNotIn(original.data_ptr(), {
+            item.current.data_ptr() for item in placed.describe_restart_allocations(placed_spec, dtype, 128)
+        })
+
+    def test_mx_routed_owner_orders_virtual_and_home_across_streams(self) -> None:
+        """After a placed stream writes routed scratch, a home invocation waits on its completion."""
+        event, placed_stream, home_stream = Mock(), Mock(), Mock()
+        device = SimpleNamespace(type="npu")
+        home = MegaMoeWorkspace(shared=True, device=device, completion_event=event)
+        placed = MegaMoeWorkspace(shared=True, device=device, routed_buffer_owner=home)
+        with patch.object(workspace_module.torch, "npu", create=True) as npu:
+            npu.current_stream.return_value = placed_stream
+            placed.claim()
+            with self.assertRaisesRegex(RuntimeError, "do not support concurrent calls"):
+                home.claim()
+            placed.release()
+            event.record.assert_called_once_with(placed_stream)
+            npu.current_stream.return_value = home_stream
+            home.claim()
+            home_stream.wait_event.assert_called_once_with(event)
+            home.release()
+        self.assertFalse(home.in_use)
+        self.assertFalse(placed.in_use)
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_reuse_waits_with_event_without_host_synchronize(self) -> None:
