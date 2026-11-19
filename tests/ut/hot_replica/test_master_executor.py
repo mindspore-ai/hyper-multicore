@@ -21,11 +21,37 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from hyper_multicore.modules.hot_replica import mega_moe_adapter
 from hyper_multicore.modules.hot_replica._planner._dispatch import _materialize
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica.bounded_placement import _render_geometry, supports_bounded_placement
 from hyper_multicore.modules.hot_replica.pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
+from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16
+
+
+def test_serial_replica_widths_share_one_reservation_with_the_bank():
+    """Reserve real token rows and reuse the physical workspace across route widths."""
+    spec = SimpleNamespace(local_experts=6, ep_size=32, top_k=8, initial_capacity_factor=1.25,
+                           expert_weight_layout="EIO")
+    owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
+    owner.parent = SimpleNamespace(spec=spec, heap_manager=SimpleNamespace(heap_limit=None))
+    owner.pool, owner.geometries = None, {}
+    owner.source_bound, owner.shared, owner.bounded, owner.specification = None, True, object(), {}
+    owner.pipeline_enabled = True
+    hidden = torch.empty(0, dtype=torch.bfloat16)
+    layout = Mock()
+    with (patch.object(mega_moe_adapter, "_workspace_layout", return_value=layout) as sizing,
+          patch.object(mega_moe_adapter, "_get_mega_bank") as bank,
+          patch.object(bf16, "BF16Resources") as resource):
+        first = owner._geometry(hidden, SimpleNamespace(borrowed_capacity=1, receive_capacity=33280), 4096)
+        second = owner._geometry(hidden, SimpleNamespace(borrowed_capacity=2, receive_capacity=34176), 4096)
+    assert first is second
+    specification, dtype, receive, source = sizing.call_args.args
+    assert (specification["num_experts"], dtype, receive, source) == (384, torch.bfloat16, 40960, 4096)
+    bank.assert_called_once_with(hidden, owner.parent, owner, pipeline=True, reservations=((specification, layout),))
+    resource.assert_called_once()
+    assert resource.call_args.kwargs["workspace_layout"] is layout
 
 
 @pytest.mark.parametrize(("first", "second"), [("EIO", "EOI"), ("EOI", "EIO")])

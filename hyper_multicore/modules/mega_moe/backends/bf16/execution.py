@@ -35,12 +35,16 @@ def forward(
     resources = route.execution_resources or resources
     binding = route.weight_binding
     ordinary_options = {}
+    if binding is not None:
+        route_experts = binding.placement.counts_by_source.shape[1]
+        if route_experts != resources.spec.num_experts:
+            ordinary_options["route_experts"] = route_experts
     if binding is not None and module_resources.placement.source_bound is not None:
         home = module_resources.spec.local_experts
         nominal = (home >= 2 * resources.spec.num_cube_cores and resources.spec.intermediate_size < 2048
                    and resources.spec.lowering != "dense" and resources.spec.ready_depth is None)
-        ordinary_options = dict(
-            weight_grad_dtype=torch.float32, route_experts=binding.placement.counts_by_source.shape[1],
+        ordinary_options.update(
+            weight_grad_dtype=torch.float32,
             nominal_schedule=nominal,
             batch_experts=nominal and route.metadata.plan_tokens * resources.spec.top_k <= 128 * home,
         )

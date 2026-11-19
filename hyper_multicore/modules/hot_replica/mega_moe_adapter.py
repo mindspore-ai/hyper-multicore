@@ -24,7 +24,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from hyper_multicore.modules.mega_moe.heap_manager import _WorkspaceLayout, _workspace_layout
-from hyper_multicore.modules.mega_moe.spec import _align_capacity
+from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_capacity, _resolve_receive_capacity
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
 from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
@@ -191,7 +191,8 @@ class PlacementResources:
             if not shared_quotas:
                 # Keep the unreserved admission policy while reusing the
                 # agreed copies for the fused bank, including replay.
-                return self.bind(hidden, planner.plan(request), fused=self.pipeline_enabled)
+                return self.bind(hidden, planner.plan(request), tokens=summary.plan_tokens,
+                                 fused=self.pipeline_enabled)
 
             def _build_reserved(current, _target):
                 return self.bounded.select(
@@ -202,7 +203,7 @@ class PlacementResources:
             # At the full home-slot budget the quota search can attain the
             # group average; a reservation below that bound requires growth.
             selected = HotReplicaPlanner._plan_reserved(request, _build_reserved)
-            return self.bind(hidden, selected, fused=self.pipeline_enabled)
+            return self.bind(hidden, selected, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
         self.statistics["invocations"] += 1
         peak = summary.maximum
         spec = self.parent.spec
@@ -212,7 +213,7 @@ class PlacementResources:
         if not saved or (4 * saved < peak if projections == 3 else 5 * saved < 2 * peak):
             return None
         placement = self.bounded.select(hidden, ids, gathered[:, 3:], source_rows, inverse, projections, snapshot)
-        return self.bind(hidden, placement, fused=self.pipeline_enabled)
+        return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
 
     def request(
         self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: _RouteSummary,
@@ -240,13 +241,13 @@ class PlacementResources:
         )
 
     def bind(
-        self, hidden: torch.Tensor, placement: ExpertPlacement | None, *, fused: bool = False,
+        self, hidden: torch.Tensor, placement: ExpertPlacement | None, *, tokens: int, fused: bool = False,
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Use a prepared placement to bind the existing BF16 runtime."""
         if placement is None:
             return None
         self.statistics["placements"] += 1
-        resources = self._geometry(hidden, placement)
+        resources = self._geometry(hidden, placement, tokens)
         spec = self.parent.spec
         pipeline = self.pool.pipeline
         slots = 0
@@ -257,38 +258,51 @@ class PlacementResources:
         )
         return resources, placement, binding
 
-    def _geometry(self, hidden, placement):
+    def _geometry(self, hidden, placement, tokens):
         """Cache only static BF16 geometry; retain mainline scheduling choices."""
         # Imported lazily to avoid the BF16 resource / placement ownership cycle.
         from hyper_multicore.modules.mega_moe.backends.bf16.resources import (  # pylint: disable=import-outside-toplevel
             BF16Resources,
         )  # pylint: disable=import-outside-toplevel
 
-        width = self.parent.spec.local_experts if self.source_bound is not None else placement.borrowed_capacity
+        spec = self.parent.spec
+        manager = self.parent.heap_manager
+        shared_geometry = self.shared and self.bounded is not None
+        width = spec.local_experts if self.source_bound is not None or shared_geometry else placement.borrowed_capacity
         if width in self.geometries:
             return self.geometries[width]
-        if self.pool is None:
-            self.pool = _get_mega_bank(hidden, self.parent, self, pipeline=self.pipeline_enabled)
         specification = {
             **self.specification,
             "hot_replica": False, "source_token_bound": None, "planner_key": None,
-            "num_experts": self.parent.spec.ep_size * (self.parent.spec.local_experts + width),
+            "num_experts": spec.ep_size * (spec.local_experts + width),
         }
-        layout = None
+        source = max(_COMMUNICATION_SPLIT, _align_capacity(tokens))
+        receive = _align_capacity(placement.receive_capacity)
         if self.source_bound is not None:
-            source = _align_capacity(self.source_bound)
-            _, virtual = _bounded_receive(self.specification, source, hidden.dtype, self.parent.spec.num_cube_cores)
-            layout = _workspace_layout(
-                specification, hidden.dtype, max(virtual, _align_capacity(placement.receive_capacity)), source
+            bound = _align_capacity(self.source_bound)
+            _, virtual = _bounded_receive(self.specification, bound, hidden.dtype, spec.num_cube_cores)
+            source, receive = max(bound, source), max(virtual, receive)
+        elif shared_geometry and manager.heap_limit is None:
+            receive = max(receive, _resolve_receive_capacity(
+                spec.initial_capacity_factor, source * spec.top_k, spec.ep_size,
+            ))
+        layout = _workspace_layout(specification, hidden.dtype, receive, source)
+        if self.pool is None:
+            self.pool = _get_mega_bank(
+                hidden, self.parent, self, reservations=((specification, layout),), pipeline=self.pipeline_enabled,
             )
-        resources = BF16Resources(
-            specification,
-            hidden,
-            expert_weight_layout=self.parent.spec.expert_weight_layout,
-            shared=self.shared,
-            active_specifications=(specification,),
-            workspace_layout=layout,
-        )
+        try:
+            resources = BF16Resources(
+                specification,
+                hidden,
+                expert_weight_layout=spec.expert_weight_layout,
+                shared=self.shared,
+                active_specifications=(specification,),
+                workspace_layout=layout,
+            )
+        except Exception:
+            manager.rollback_reservations((specification,), None)
+            raise
         self.geometries[width] = resources
         return resources
 
