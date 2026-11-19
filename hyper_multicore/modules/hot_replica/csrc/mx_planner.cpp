@@ -189,6 +189,19 @@ PyObject *PackDispatch(const std::vector<Rows> &dispatch) {
   return result;
 }
 
+int LightestWholeGuest(const std::vector<int> &available, const Rows &loads, const Rows &nodes,
+                       int source, int owner, int64_t weight) {
+  int guest = -1;
+  for (int target : available) {
+    if (loads[source] - loads[target] < weight) break;
+    if (target == source || target == owner) continue;
+    if (guest != -1 && loads[target] != loads[guest]) break;
+    if (nodes[target] == nodes[owner]) return target;
+    if (guest == -1) guest = target;
+  }
+  return guest;
+}
+
 }  // namespace
 
 PyObject *AlignedDispatch(PyObject *, PyObject *args) {
@@ -274,19 +287,33 @@ PyObject *SearchWhole(PyObject *, PyObject *args) {
     const int home = experts / ranks;
     auto loads = HomeLoads(weights, home, ranks);
     std::vector<int> targets(experts), guests(ranks);
+    std::vector<int> available;
+    available.reserve(ranks);
     for (int expert = 0; expert < experts; ++expert) targets[expert] = expert / home;
     int cross = 0, guest_total = 0;
     for (int step = 0; step < experts * 2 + ranks * budget; ++step) {
       const LoadScore score(loads);
       auto best = std::make_tuple(score.leaders[0].first, score.square, cross, guest_total);
       int picked = -1, destination = -1;
+      available.clear();
+      for (int rank = 0; rank < ranks; ++rank) {
+        if (guests[rank] < budget) available.push_back(rank);
+      }
+      std::sort(available.begin(), available.end(), [&loads](int left, int right) {
+        return std::tie(loads[left], left) < std::tie(loads[right], right);
+      });
       for (int expert = 0; expert < experts; ++expert) {
         const auto weight = weights[expert];
         if (weight == 0) continue;
         const int source = targets[expert], owner = expert / home;
-        for (int target = 0; target < ranks; ++target) {
-          if (target == source || (target != owner && (guests[target] >= budget ||
-              (weight < minimum && !capacity_required)))) continue;
+        // A move heavier than the load gap increases the square score without
+        // reducing the peak. Among the remaining guests, both scores are
+        // minimized at the smallest target load; locality breaks equal loads.
+        const int guest = (weight >= minimum || capacity_required)
+                              ? LightestWholeGuest(available, loads, nodes, source, owner, weight)
+                              : -1;
+        for (int target : {std::min(owner, guest), std::max(owner, guest)}) {
+          if (target < 0 || target == source || loads[source] - loads[target] < weight) continue;
           const auto peak = std::max({loads[source] - weight, loads[target] + weight, score.Outside(source, target)});
           const auto square = score.square + 2 * weight * (weight - (loads[source] - loads[target]));
           const auto key = std::make_tuple(peak, square,
