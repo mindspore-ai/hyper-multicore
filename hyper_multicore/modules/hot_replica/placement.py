@@ -218,9 +218,9 @@ def build_placement(
     if counts_by_source.dtype not in (torch.int32, torch.int64):
         raise TypeError("HotReplica counts must use INT32 or INT64")
     plan = build_capacity_plan(counts_by_source.cpu().numpy(), capacity)
-    used = max(plan.replica_slots_used)
-    if not used:
+    if plan is None:
         return None
+    used = max(plan.replica_slots_used)
     borrowed = min(plan.config.home_experts, 1 << (used - 1).bit_length())
     device = counts_by_source.device
     ordered, table, owners = render_plan(plan, rank, borrowed)
@@ -238,4 +238,5 @@ def build_placement(
     transfers = max(used, max(outgoing))
     loads = plan.destination_loads
     return ExpertPlacement(ids, table, copies, borrowed, max(loads), loads[rank],
-                           transfers, plan.replica_slots_used[rank])
+                           transfers, plan.replica_slots_used[rank], copies_by_rank=owners,
+                           owner_rows=plan.destination_counts[rank][:plan.config.home_experts])

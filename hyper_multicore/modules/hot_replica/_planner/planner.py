@@ -103,20 +103,22 @@ def _traffic_work_is_useful(copies, loads, config, resident, row_credit, minimum
 
 def build_capacity_plan(
     counts_by_source: np.ndarray, target_load: int,
-) -> ExpertExecutionPlan:
+) -> ExpertExecutionPlan | None:
     """Keep capacity-based admission stable for the generic and Native EP executors."""
+    limit = 2**31 - 1
     if counts_by_source.min() < 0:
         raise ValueError("HotReplica routed row counts must be nonnegative")
-    if counts_by_source.sum(dtype=np.int64) > 2**31 - 1:
+    if counts_by_source.max() > limit or counts_by_source.sum(dtype=np.int64) > limit:
         raise ValueError("HotReplica routed row count exceeds the INT32 planner limit")
     ranks, experts = counts_by_source.shape
     home = experts // ranks
     config = ExpertReplicaConfig(experts, ranks, home)
-    counts = tuple(map(tuple, counts_by_source.tolist()))
-    _, loads, baseline = _home_layout(counts, config)
+    _, loads, baseline = _home_layout(counts_by_source, config)
     target = max(1, target_load)
+    if max(loads) <= target or min(loads) >= target:
+        return None
     copies = _capacity_copies(loads, baseline, home, target)
-    return _materialize(counts, copies, config, source_locality=False)
+    return _materialize(counts_by_source, copies, config, source_locality=False)
 
 
 def build_expert_replica_plan(

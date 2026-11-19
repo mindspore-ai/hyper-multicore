@@ -27,8 +27,8 @@ def render_plan(
     home, ranks, full = config.home_experts, config.ep_size, config.slots_per_rank
     width = home + borrowed
     owners = tuple(row[home:width] for row in plan.slot_to_logical)
-    table = np.asarray(plan.dispatch_counts, dtype=np.int32).reshape(ranks, ranks, full)
-    table = np.ascontiguousarray(table[:, :, :width]).reshape(ranks, -1)
+    table = np.frombuffer(plan._dispatch_counts_bytes, dtype=np.int32).reshape(ranks, ranks, full)
+    table = table[:, :, :width].copy().reshape(ranks, -1)
     logical = np.asarray(plan.slot_to_logical, dtype=np.int32)[:, :width].reshape(-1)
     slots = np.argsort(logical, kind="stable").astype(np.int32, copy=False)
     return np.repeat(slots, table[rank, slots]), table, owners
