@@ -20,7 +20,8 @@ constexpr int32_t kReservedUb = 188 * 1024;
 constexpr int32_t kFirstContribution = kScratch + kElements * sizeof(float);
 constexpr int32_t kIndexOffset = kFirstContribution + kElements * sizeof(float);
 constexpr int32_t kNativeHomeOffset = kIndexOffset + kElements * sizeof(float);
-constexpr int32_t kBufferedIndexOffset = kNativeHomeOffset + kElements * sizeof(bfloat16_t);
+constexpr int32_t kTilePairStride = kElements * (2 * sizeof(float) + sizeof(bfloat16_t));
+constexpr int32_t kBufferedIndexOffset = kScratch + 2 * kTilePairStride;
 
 template <typename T>
 __aicore__ inline LocalTensor<T> LocalAt(int32_t offset, TPosition position) {
@@ -32,13 +33,25 @@ __aicore__ inline LocalTensor<T> LocalAt(int32_t offset, TPosition position) {
 }
 
 template <typename T>
-__aicore__ inline void LoadOwner(LocalTensor<T> local, __gm__ T* source, int32_t elements) {
+__aicore__ inline void LoadOwnerAsync(LocalTensor<T> local, __gm__ T* source, int32_t elements) {
     GlobalTensor<T> global;
     global.SetGlobalBuffer(source);
     DataCopyExtParams copy{1, static_cast<uint32_t>(elements * sizeof(T)), 0, 0, 0};
     DataCopyPadExtParams<T> padding{false, 0, 0, 0};
     DataCopyPad(local, global, copy, padding);
+}
+
+template <typename T>
+__aicore__ inline void LoadOwner(LocalTensor<T> local, __gm__ T* source, int32_t elements) {
+    LoadOwnerAsync(local, source, elements);
     PipeBarrier<PIPE_ALL>();
+}
+
+template <typename T>
+__aicore__ inline void StoreOwnerAsync(__gm__ T* destination, LocalTensor<T> local, int32_t elements) {
+    GlobalTensor<T> global;
+    global.SetGlobalBuffer(destination);
+    DataCopyPad(global, local, DataCopyExtParams(1, elements * sizeof(T), 0, 0, 0));
 }
 
 template <typename T>
@@ -76,6 +89,76 @@ __aicore__ inline void ReadContribution(__gm__ float* remote, int64_t matrix, in
     SetFlag<HardEvent::MTE2_V>(ready);
 }
 
+template <bool NativeHome>
+__aicore__ inline void LoadSinglePeerTile(GM_ADDR source, __gm__ float* remote, int64_t expert_offset,
+                                         int64_t remote_offset, int64_t matrix, int64_t tile,
+                                         int32_t peer, int32_t buffer) {
+    const int64_t begin = tile * kElements;
+    const int32_t elements = matrix - begin < kElements ? matrix - begin : kElements;
+    const int32_t offset = kScratch + buffer * kTilePairStride;
+    const TEventID event = buffer == 0 ? EVENT_ID0 : EVENT_ID1;
+    if constexpr (NativeHome) {
+        auto native = LocalAt<bfloat16_t>(offset + 8 * kElements, TPosition::VECIN);
+        LoadOwnerAsync(native, reinterpret_cast<__gm__ bfloat16_t*>(source) + expert_offset + begin, elements);
+    } else {
+        auto accum = LocalAt<float>(offset, TPosition::VECIN);
+        LoadOwnerAsync(accum, reinterpret_cast<__gm__ float*>(source) + expert_offset + begin, elements);
+    }
+    aclshmemx_mte_get_nbi(reinterpret_cast<__ubuf__ float*>(offset + 4 * kElements),
+                          remote + remote_offset + begin, elements, peer, event);
+    SetFlag<HardEvent::MTE2_V>(event);
+}
+
+template <bool NativeHome>
+__aicore__ inline void ReturnSinglePeer(GM_ADDR source, GM_ADDR output, __gm__ float* remote,
+                                        int32_t expert, int32_t entry, int64_t matrix, int32_t slots,
+                                        int32_t worker, int32_t workers, int64_t tiles, bool bf16) {
+    if (worker >= tiles) return;
+    const int64_t expert_offset = static_cast<int64_t>(expert) * matrix;
+    const int64_t remote_offset = static_cast<int64_t>(entry % slots) * matrix;
+    const int32_t peer = entry / slots;
+    int32_t buffer = 0;
+    LoadSinglePeerTile<NativeHome>(source, remote, expert_offset, remote_offset, matrix, worker, peer, buffer);
+    for (int64_t tile = worker; tile < tiles; tile += workers) {
+        const TEventID event = buffer == 0 ? EVENT_ID0 : EVENT_ID1;
+        const int64_t following = tile + workers;
+        WaitFlag<HardEvent::MTE2_V>(event);
+        if (following < tiles) {
+            const TEventID other = buffer == 0 ? EVENT_ID1 : EVENT_ID0;
+            // A prior output must leave this UB slot before the next MTE2.
+            if (tile != worker) WaitFlag<HardEvent::MTE3_MTE2>(other);
+            LoadSinglePeerTile<NativeHome>(source, remote, expert_offset, remote_offset, matrix,
+                                           following, peer, 1 - buffer);
+        }
+        const int64_t begin = tile * kElements;
+        const int32_t elements = matrix - begin < kElements ? matrix - begin : kElements;
+        const int32_t offset = kScratch + buffer * kTilePairStride;
+        auto accum = LocalAt<float>(offset, TPosition::VECIN);
+        auto contribution = LocalAt<float>(offset + 4 * kElements, TPosition::VECIN);
+        if constexpr (NativeHome) {
+            auto native = LocalAt<bfloat16_t>(offset + 8 * kElements, TPosition::VECIN);
+            Cast(accum, native, RoundMode::CAST_NONE, elements);
+            PipeBarrier<PIPE_V>();
+        }
+        Add(accum, accum, contribution, elements);
+        if (bf16) {
+            auto native = LocalAt<bfloat16_t>(offset + 8 * kElements, TPosition::VECOUT);
+            PipeBarrier<PIPE_V>();
+            Cast(native, accum, RoundMode::CAST_RINT, elements);
+            SetFlag<HardEvent::V_MTE3>(event);
+            WaitFlag<HardEvent::V_MTE3>(event);
+            StoreOwnerAsync(reinterpret_cast<__gm__ bfloat16_t*>(output) + expert_offset + begin, native, elements);
+        } else {
+            SetFlag<HardEvent::V_MTE3>(event);
+            WaitFlag<HardEvent::V_MTE3>(event);
+            StoreOwnerAsync(reinterpret_cast<__gm__ float*>(output) + expert_offset + begin, accum, elements);
+        }
+        if (following + workers < tiles) SetFlag<HardEvent::MTE3_MTE2>(event);
+        buffer = 1 - buffer;
+    }
+    PipeBarrier<PIPE_ALL>();
+}
+
 template <bool NativeHome, bool Buffered>
 __aicore__ inline void ReturnOwnerGradients(uint64_t ffts, GM_ADDR source_address,
                              GM_ADDR output_address, GM_ADDR slots_address,
@@ -105,6 +188,14 @@ __aicore__ inline void ReturnOwnerGradients(uint64_t ffts, GM_ADDR source_addres
         // Every worker still participates in both root barriers.
         if (source_address == output_address && heads[expert] < 0) {
             continue;
+        }
+        if constexpr (Buffered) {
+            const int32_t head = heads[expert];
+            if (head >= 0 && next[head] < 0) {
+                ReturnSinglePeer<NativeHome>(source_address, output_address, remote, expert, head, matrix,
+                                              slots, worker, workers, tiles, bf16);
+                continue;
+            }
         }
         for (int64_t tile = worker; tile < tiles; tile += workers) {
             const int64_t begin = tile * kElements;
