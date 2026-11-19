@@ -68,7 +68,7 @@ def build_kernels(output: Path, sdk: Path) -> None:
         "-Wl,-z,relro,-z,now,-z,noexecstack",
         *[
             str(source / name)
-            for name in ("a3_allocator.asc", "hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp",
+            for name in ("hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp",
                          "replica_counts.cpp")
         ],
         "-o",
@@ -127,22 +127,18 @@ def build_adapters(output: Path, sdk: Path, device_root: Path, standard: int) ->
         "-lruntime",
         "-ldl",
     ]
-    for name, filename in (
-        ("_a3_allocator", "allocator_bridge.cpp"),
-        ("_hot_replica_shared_bridge", "hot_replica_shared_bridge.cpp"),
-    ):
-        subprocess.run(
-            [
-                *common,
-                f"-DTORCH_EXTENSION_NAME={name}",
-                str(source / filename),
-                "-o",
-                str(output / (name + ".so")),
-                *includes,
-                *libraries,
-            ],
-            check=True,
-        )
+    subprocess.run(
+        [
+            *common,
+            "-DTORCH_EXTENSION_NAME=_hot_replica_shared_bridge",
+            str(source / "hot_replica_shared_bridge.cpp"),
+            "-o",
+            str(output / "_hot_replica_shared_bridge.so"),
+            *includes,
+            *libraries,
+        ],
+        check=True,
+    )
 
 
 def build_mx_host(output: Path) -> None:

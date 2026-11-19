@@ -14,8 +14,6 @@
 # ============================================================================
 """CPU contracts for planner count formats and optional execution dependencies."""
 
-import sys
-from types import ModuleType
 import unittest
 from unittest.mock import patch
 
@@ -89,42 +87,27 @@ class TestHotReplicaPlacement(unittest.TestCase):
         self.assertTrue(placement.placement_is_profitable(*geometry, projection_flops=6))
         self.assertFalse(placement.placement_is_profitable(*geometry, projection_flops=4))
 
-    def test_native_and_legacy_counts_share_the_int32_planner(self) -> None:
-        """Normalize equivalent wire types without changing the ownership decision."""
+    def test_capacity_placement_preserves_source_intervals(self) -> None:
+        """Split the same logical expert in source-rank order for both wire dtypes."""
         for dtype in (torch.int32, torch.int64):
             with self.subTest(dtype=dtype):
-                counts = torch.tensor([[512, 0], [0, 0]], dtype=dtype)
-                copies = torch.full((2, 1), -1, dtype=torch.int32)
-                with (
-                    patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}),
-                    patch(
-                        "hyper_multicore.modules.hot_replica.placement.allocate_experts",
-                        return_value=(torch.zeros(2, 2, dtype=torch.int32), None, None, copies),
-                    ) as allocate,
-                ):
-                    result = placement.build_placement(
-                        torch.empty(512, 4),
-                        torch.zeros(512, 1, dtype=torch.int32),
-                        counts,
-                        256,
-                        0,
-                    )
-                self.assertIsNone(result)
-                actual_counts, actual_capacity = allocate.call_args.args
-                self.assertEqual(actual_capacity, 256)
-                self.assertEqual(actual_counts.dtype, torch.int32)
-                torch.testing.assert_close(actual_counts, counts.to(torch.int32))
+                counts = torch.tensor([[4, 0], [2, 0]], dtype=dtype)
+                result = placement.build_placement(
+                    torch.empty(4, 4), torch.zeros(4, 1, dtype=torch.int32),
+                    counts, 3, 0, source_inverse=torch.arange(4, dtype=torch.int32),
+                )
+                self.assertIsNotNone(result)
+                torch.testing.assert_close(result.virtual_ids, torch.tensor([[0], [0], [0], [3]], dtype=torch.int32))
+                torch.testing.assert_close(result.counts_by_source,
+                                           torch.tensor([[3, 0, 0, 1], [0, 0, 0, 2]], dtype=torch.int32))
+                torch.testing.assert_close(result.copies, torch.tensor([[-1], [0]], dtype=torch.int32))
+                self.assertEqual((result.receive_capacity, result.published_slots), (3, 0))
 
     def test_wide_counts_reject_overflow_before_allocator(self) -> None:
         """A large INT64 wire count must never wrap to a negative planner value."""
         counts = torch.tensor([[2**31, 0], [0, 0]], dtype=torch.int64)
-        with (
-            patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}),
-            patch("hyper_multicore.modules.hot_replica.placement.allocate_experts") as allocate,
-            self.assertRaisesRegex(ValueError, "INT32 planner limit"),
-        ):
+        with self.assertRaisesRegex(ValueError, "INT32 planner limit"):
             placement.build_placement(torch.empty(0, 4), torch.empty(0, 1, dtype=torch.int32), counts, 1, 0)
-        allocate.assert_not_called()
 
     def test_invalid_topologies_fail_before_allocator(self) -> None:
         """An invalid rank or expert extent cannot launch an asymmetric plan."""
@@ -135,8 +118,7 @@ class TestHotReplicaPlacement(unittest.TestCase):
         ):
             with self.subTest(shape=counts.shape, rank=rank):
                 with (
-                    patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}),
-                    patch("hyper_multicore.modules.hot_replica.placement.allocate_experts") as allocate,
+                    patch("hyper_multicore.modules.hot_replica.placement.build_capacity_plan") as allocate,
                     self.assertRaises(ValueError),
                 ):
                     placement.build_placement(

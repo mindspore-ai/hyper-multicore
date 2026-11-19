@@ -19,7 +19,7 @@ from types import ModuleType
 
 import torch
 
-from .allocator import load_native_extension
+from .native import load_native_extension
 
 
 @lru_cache(maxsize=1)

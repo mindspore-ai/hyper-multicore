@@ -16,13 +16,12 @@
 
 from __future__ import annotations
 
-import numpy as np
-
 import torch
 
 from ..base_planner import ExpertPlacement
-from .allocator import allocate_experts
-from .render import render_expert_major
+from ..mega_moe.route import _upload_route_tensor
+from ._planner.planner import build_capacity_plan
+from .render import render_plan
 
 # Effective A3 planner estimates from the original prefetch/return cost model.
 # Profiled compute saved by placement at H=5120/I=1792 exceeded the old
@@ -211,8 +210,6 @@ def build_placement(
     Returns:
         A per-invocation placement, or None when no expert needs to be borrowed.
     """
-    # The primitive is optional and is loaded only when placement is actually used.
-
     if counts_by_source.ndim != 2:
         raise ValueError("HotReplica counts must be a source-by-expert matrix")
     ranks, experts = counts_by_source.shape
@@ -220,37 +217,25 @@ def build_placement(
         raise ValueError("HotReplica counts must describe a valid ordered EP topology")
     if counts_by_source.dtype not in (torch.int32, torch.int64):
         raise TypeError("HotReplica counts must use INT32 or INT64")
-    gathered = counts_by_source.contiguous()
-    if gathered.dtype == torch.int64:
-        # The legacy route wire uses INT64; the planner's arithmetic is INT32.
-        total = int(gathered.sum(dtype=torch.int64).item())
-        if not 0 <= total <= 2**31 - 1:
-            raise ValueError("HotReplica routed row count exceeds the native INT32 planner limit")
-        gathered = gathered.to(torch.int32)
-    local = experts // ranks
-    cumulative, _, _, copies = allocate_experts(gathered, max(1, capacity))
-    if tuple(cumulative.shape) != (experts, ranks):
-        raise ValueError("HotReplica allocator returned an invalid cumulative extent")
-    # One readback supplies occupied slot width and post-placement receive bounds.
-    # Keep the tables as arrays rather than allocating Python objects per expert.
-    summary = torch.cat((copies.flatten(), cumulative.sum(0, dtype=torch.int64))).cpu().numpy()
-    slots = summary[:experts].reshape(ranks, local)
-    used = np.flatnonzero((slots >= 0).any(axis=0))
-    if not used.size:
+    plan = build_capacity_plan(counts_by_source.cpu().numpy(), capacity)
+    used = max(plan.replica_slots_used)
+    if not used:
         return None
-    needed = int(used[-1]) + 1
-    borrowed = min(local, 1 << (needed - 1).bit_length())
-    rank_loads = np.diff(summary[experts:], prepend=0)
-    bound, local_bound = int(rank_loads.max()), int(rank_loads[rank])
-    sorted_ids, table = render_expert_major(gathered, cumulative, copies, rank, borrowed, topk_ids.numel())
-    copies = copies[:, :borrowed].contiguous()
+    borrowed = min(plan.config.home_experts, 1 << (used - 1).bit_length())
+    device = counts_by_source.device
+    ordered, table, owners = render_plan(plan, rank, borrowed)
+    if ordered.size != topk_ids.numel():
+        raise ValueError("HotReplica counts must describe the local Top-K routes")
+    sorted_ids = _upload_route_tensor(torch.from_numpy(ordered), device)
     ids = sorted_ids.index_select(
-        0, _token_order(hidden, topk_ids, counts_by_source.shape[1], source_inverse)
+        0, _token_order(hidden, topk_ids, experts, source_inverse)
     ).reshape_as(topk_ids)
-    valid = slots[slots >= 0]
-    outgoing = np.bincount(valid // local, minlength=ranks)
-    incoming = (slots >= 0).sum(axis=1)
-    transfers = max(int(outgoing.max()), int(incoming.max()))
-    published = np.flatnonzero(slots[rank] >= 0)
-    last_slot = int(published[-1]) + 1 if published.size else 0
-    return ExpertPlacement(ids, table, copies, borrowed, bound, local_bound, transfers, last_slot)
+    copies = _upload_route_tensor(torch.tensor(owners, dtype=torch.int32), device)
+    table = _upload_route_tensor(torch.from_numpy(table), device)
+    outgoing = [0] * ranks
+    for transfer in plan.transfers:
+        outgoing[transfer.owner_rank] += 1
+    transfers = max(used, max(outgoing))
+    loads = plan.destination_loads
+    return ExpertPlacement(ids, table, copies, borrowed, max(loads), loads[rank],
+                           transfers, plan.replica_slots_used[rank])

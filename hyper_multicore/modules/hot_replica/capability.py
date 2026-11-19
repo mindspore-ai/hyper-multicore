@@ -37,7 +37,7 @@ def _require_a3(tensor):
     artifacts = selected["variant"].get("hot_replica")
     if not artifacts or artifacts.get("soc") != "ascend910_93":
         raise RuntimeError("The selected Torch/PTA adapter has no Atlas A3 HotReplica artifacts")
-    for key in ("allocator", "bridge", "kernels"):
+    for key in ("bridge", "kernels"):
         if not (selected["root"] / artifacts[key]).is_file():
             raise RuntimeError(f"Selected HotReplica artifact is missing: {key}")
 

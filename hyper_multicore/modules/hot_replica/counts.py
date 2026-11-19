@@ -8,7 +8,7 @@ import torch
 
 from hyper_multicore.torch.ops import _load_native
 
-from .allocator import native_library_path
+from .native import native_library_path
 
 
 @lru_cache(maxsize=1)

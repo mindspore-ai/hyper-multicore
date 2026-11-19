@@ -81,12 +81,16 @@ def _pad_owner_rows(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaCo
     return output
 
 
-def _slot_quotas(copies: list[dict[int, int]], config: ExpertReplicaConfig) -> tuple:
+def _slot_quotas(copies: list[dict[int, int]], config: ExpertReplicaConfig, source_locality: bool) -> tuple:
     """Freeze the physical slot order and collect positive guest quotas."""
     slot_map, by_expert = [], {}
     home, width = config.home_experts, config.slots_per_rank
     for rank, row in enumerate(copies):
-        guests = sorted(expert for expert, count in row.items() if expert // home != rank and count)
+        guests = [expert for expert, count in row.items() if expert // home != rank and count]
+        if source_locality:
+            guests.sort()
+        else:
+            guests.sort(key=lambda expert: (row[expert], expert), reverse=True)
         if len(guests) > config.replica_slots_per_rank:
             raise ValueError("replica layout exceeds the physical guest slot cap")
         slots = list(range(rank * home, (rank + 1) * home)) + guests
@@ -145,6 +149,7 @@ def _materialize(
     capacity_limit: int | None = None,
     *,
     rank_nodes: tuple[int, ...] = (),
+    source_locality: bool = True,
 ) -> ExpertExecutionPlan:
     """Materialize only the selected layout, preserving exact source locality."""
     home, width = config.home_experts, config.slots_per_rank
@@ -163,7 +168,7 @@ def _materialize(
     if 1 < len(set(rank_nodes)) < config.ep_size:
         for rank, node in enumerate(rank_nodes):
             node_sources.setdefault(node, []).append(rank)
-    slots, by_expert = _slot_quotas(copies, config)
+    slots, by_expert = _slot_quotas(copies, config, source_locality)
     dispatch = _pad_owner_rows(counts, config)
     for expert, quotas in by_expert.items():
         owner, local_expert = divmod(expert, home)
@@ -173,7 +178,10 @@ def _materialize(
             quotas.sort(key=lambda quota: quota[0])
         for row in dispatch:
             row[owner_physical] = 0
-        _assign_expert(counts, expert, quotas, dispatch, width, rank_nodes, node_sources)
+        if source_locality:
+            _assign_expert(counts, expert, quotas, dispatch, width, rank_nodes, node_sources)
+        else:
+            _fill_remaining(quotas, [row[expert] for row in counts], dispatch)
     plan = ExpertExecutionPlan(config, counts, slots, tuple(map(tuple, dispatch)))
     return _capacity_checked_plan(plan, capacity_limit, copies=copies)
 

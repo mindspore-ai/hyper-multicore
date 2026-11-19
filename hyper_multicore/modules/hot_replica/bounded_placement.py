@@ -19,6 +19,7 @@ from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from ._planner.planner import build_expert_replica_plan
 from .counts import route_summary
 from .placement import ExpertPlacement
+from .render import render_plan
 
 
 _PINNED_WIRE_MAX_BYTES = 32 * 1024
@@ -136,23 +137,16 @@ def _render_geometry(plan, spec, device, maximum):
     """Pack count rows and only active guest columns in the common route format."""
     config = plan.config
     rank = spec.rank_id
-    home, ranks, full = config.home_experts, config.ep_size, config.slots_per_rank
     used = max(plan.replica_slots_used)
     borrowed = min(config.replica_slots_per_rank, 1 << (used - 1).bit_length())
-    width = home + borrowed
-    owners = tuple(row[home:width] for row in plan.slot_to_logical)
-    table = np.asarray(plan.dispatch_counts, dtype=np.int32).reshape(ranks, ranks, full)
-    table = np.ascontiguousarray(table[:, :, :width]).reshape(ranks, -1)
-    runs = plan.source_runs_for(rank)
-    slots = np.fromiter(((slot // full) * width + slot % full for slot, _ in runs), dtype=np.int32)
-    lengths = np.fromiter((rows for _, rows in runs), dtype=np.int64)
-    items = [np.repeat(slots, lengths), table, np.asarray(owners, dtype=np.int32)]
+    sorted_ids, table, owners = render_plan(plan, rank, borrowed)
+    items = (sorted_ids, table, np.asarray(owners, dtype=np.int32))
     ids, counts, copies = (_upload_route_tensor(torch.from_numpy(item), device) for item in items)
     receive = plan.destination_loads
     metadata = _push_metadata(table, rank, spec.hidden_size, max(1, receive[rank]),
                               max(128, ((maximum + 127) // 128) * 128), len(items[0]) // spec.top_k, device)
     return _Geometry(ids, counts, copies, owners, borrowed, max(receive), receive[rank], metadata,
-                     plan.destination_counts[rank][:home], plan.replica_slots_used[rank])
+                     plan.destination_counts[rank][:config.home_experts], plan.replica_slots_used[rank])
 
 
 class BoundedPlacement:

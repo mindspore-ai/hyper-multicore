@@ -18,6 +18,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import numpy as np
+
+from ._balance import _capacity_copies
 from ._dispatch import _home_layout, _materialize
 from ._placement import _consolidate_copies, _locality_copies
 from ._retained import _rebalance_retained_copies
@@ -96,6 +99,24 @@ def _traffic_work_is_useful(copies, loads, config, resident, row_credit, minimum
         for row, sent, received in zip(copies, outgoing, incoming)
     )
     return max(loads) >= bound + minimum_rows
+
+
+def build_capacity_plan(
+    counts_by_source: np.ndarray, target_load: int,
+) -> ExpertExecutionPlan:
+    """Keep capacity-based admission stable for the generic and Native EP executors."""
+    if counts_by_source.min() < 0:
+        raise ValueError("HotReplica routed row counts must be nonnegative")
+    if counts_by_source.sum(dtype=np.int64) > 2**31 - 1:
+        raise ValueError("HotReplica routed row count exceeds the INT32 planner limit")
+    ranks, experts = counts_by_source.shape
+    home = experts // ranks
+    config = ExpertReplicaConfig(experts, ranks, home)
+    counts = tuple(map(tuple, counts_by_source.tolist()))
+    _, loads, baseline = _home_layout(counts, config)
+    target = max(1, target_load)
+    copies = _capacity_copies(loads, baseline, home, target)
+    return _materialize(counts, copies, config, source_locality=False)
 
 
 def build_expert_replica_plan(

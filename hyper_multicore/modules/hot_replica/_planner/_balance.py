@@ -21,23 +21,33 @@ from heapq import heapify, heappop, heappush
 from .capacity import ExpertReplicaConfig
 
 
-def _balanced_edges(loads: list[int], expert_counts: list[int],
-                    home: int) -> list[tuple[int, int, list[tuple[int, int]]]]:
-    """Fill each receiver once, always sourcing original home experts."""
-    rank_count = len(loads)
-    quotient, remainder = divmod(sum(loads), rank_count)
-    targets = [quotient + int(rank < remainder) for rank in range(rank_count)]
-    remaining = list(expert_counts)
-    excess = [load - target for load, target in zip(loads, targets)]
+def _rank_transfers(excess):
+    """Fill the largest deficit from the largest surplus in EP rank order."""
     donors = [(-rows, rank) for rank, rows in enumerate(excess) if rows > 0]
     receivers = [(rows, rank) for rank, rows in enumerate(excess) if rows < 0]
     heapify(donors)
     heapify(receivers)
-    edges = []
-    while receivers:
+    while donors and receivers:
         donor_rows, donor = heappop(donors)
         receiver_rows, receiver = heappop(receivers)
         amount = -receiver_rows
+        yield donor, receiver, amount
+        donor_excess = -donor_rows - amount
+        if donor_excess > 0:
+            heappush(donors, (-donor_excess, donor))
+        elif donor_excess < 0:
+            # Filling a receiver can turn the donor into the next receiver.
+            heappush(receivers, (donor_excess, donor))
+
+
+def _balanced_edges(loads: list[int], expert_counts: list[int],
+                    home: int) -> list[tuple[int, int, list[tuple[int, int]]]]:
+    """Assign the rank transfers to home experts in receiver order."""
+    quotient, remainder = divmod(sum(loads), len(loads))
+    excess = [load - quotient - int(rank < remainder) for rank, load in enumerate(loads)]
+    remaining = list(expert_counts)
+    edges = []
+    for donor, receiver, amount in _rank_transfers(excess):
         pending = amount
         segments = []
         experts = sorted(range(donor * home, (donor + 1) * home), key=lambda expert: (-remaining[expert], expert))
@@ -50,13 +60,31 @@ def _balanced_edges(loads: list[int], expert_counts: list[int],
         if pending:
             raise RuntimeError("balanced transfer exceeds remaining home work")
         edges.append((donor, receiver, segments))
-        donor_excess = -donor_rows - amount
-        if donor_excess > 0:
-            heappush(donors, (-donor_excess, donor))
-        elif donor_excess < 0:
-            # Filling a receiver can turn the donor into the next receiver.
-            heappush(receivers, (donor_excess, donor))
     return edges
+
+
+def _capacity_copies(loads, copies, home, target):
+    """Assign capacity transfers with the established rank and expert tie breaks."""
+    quotas = [[] for _ in loads]
+    for donor, receiver, amount in _rank_transfers([load - target for load in loads]):
+        quotas[donor].append((-amount, receiver))
+    for donor, pending in enumerate(quotas):
+        if not pending:
+            continue
+        experts = [(-copies[donor][expert], expert) for expert in range(donor * home, (donor + 1) * home)]
+        heapify(pending)
+        heapify(experts)
+        while pending:
+            quota, receiver = heappop(pending)
+            remaining, expert = heappop(experts)
+            rows = min(-remaining, -quota)
+            copies[donor][expert] -= rows
+            copies[receiver][expert] = copies[receiver].get(expert, 0) + rows
+            if remaining + rows < 0:
+                heappush(experts, (remaining + rows, expert))
+            if quota + rows < 0:
+                heappush(pending, (quota + rows, receiver))
+    return copies
 
 
 def _bounded_copies(loads: list[int], expert_counts: list[int], config: ExpertReplicaConfig,

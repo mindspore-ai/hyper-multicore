@@ -125,12 +125,14 @@ def validate_adapter_paths(root: Path, variant: dict, backends: dict) -> None:
     if replica is not None:
         expected = {
             "soc": "ascend910_93", "kernels": "shmem/lib/arch22/hot_replica/libhmc_hot_replica_kernels.so",
-            "allocator": f"adapters/{variant['id']}/shmem/arch22/hot_replica/_a3_allocator.so",
             "bridge": f"adapters/{variant['id']}/shmem/arch22/hot_replica/_hot_replica_shared_bridge.so",
         }
+        # Accept manifests from wheels that still package the A3 allocator.
+        if isinstance(replica, dict) and "allocator" in replica:
+            expected["allocator"] = f"adapters/{variant['id']}/shmem/arch22/hot_replica/_a3_allocator.so"
         if replica != expected or "ascend910_93" not in backends.get("arch22", {}).get("soc_list", []):
             raise ValueError("Invalid HotReplica adapter capability or artifact paths")
-        for key in ("allocator", "bridge", "kernels"):
+        for key in (key for key in expected if key != "soc"):
             path = resource_path(root, replica[key])
             if not path.is_file() or not path.stat().st_size:
                 raise ValueError(f"Missing HotReplica artifact: {key}")

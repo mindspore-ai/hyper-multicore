@@ -128,8 +128,8 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
                 link_env = {**selected_env, "LD_LIBRARY_PATH": os.pathsep.join(
                     [str(replica_output), str(common / "shmem/lib/arch22/hot_replica"),
                      selected_env.get("LD_LIBRARY_PATH", "")])}
-                for name in ("_a3_allocator.so", "_hot_replica_shared_bridge.so"):
-                    validate_elf(replica_output / name, identity["host_arch"], run.commands, link_env)
+                validate_elf(replica_output / "_hot_replica_shared_bridge.so", identity["host_arch"],
+                             run.commands, link_env)
         if backend == "arch35":
             with run.commands.scope("HotReplica"):
                 replica_output = output / "hot_replica"
@@ -144,7 +144,6 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
     if "ascend910_93" in args.soc_list.split(","):
         paths["hot_replica"] = {
             "soc": "ascend910_93", "kernels": "shmem/lib/arch22/hot_replica/libhmc_hot_replica_kernels.so",
-            "allocator": f"adapters/{identifier}/shmem/arch22/hot_replica/_a3_allocator.so",
             "bridge": f"adapters/{identifier}/shmem/arch22/hot_replica/_hot_replica_shared_bridge.so",
         }
     record = {**identity, **paths, "id": identifier,
