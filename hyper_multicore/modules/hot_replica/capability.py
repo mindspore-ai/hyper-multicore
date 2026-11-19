@@ -42,7 +42,7 @@ def _require_a3(tensor):
             raise RuntimeError(f"Selected HotReplica artifact is missing: {key}")
 
 
-def _require_mx(tensor):
+def _require_mx(tensor, cube_cores: int):
     """Validate the A5 transport contract before starting SHMEM."""
     if tensor.device.type != "npu" or tensor.dtype != torch.bfloat16:
         raise ValueError("MXFP8 HotReplica requires BF16 input on Ascend950")
@@ -52,6 +52,10 @@ def _require_mx(tensor):
         index = torch.npu.current_device()
     if query_npu_arch(index) != 3510:
         raise ValueError("MXFP8 HotReplica requires Ascend950")
+    from ..mega_moe.schedule import MX_GRADIENT_CUBE_CORES  # pylint: disable=import-outside-toplevel
+
+    if cube_cores != MX_GRADIENT_CUBE_CORES:
+        raise ValueError(f"MXFP8 HotReplica requires {MX_GRADIENT_CUBE_CORES} Cube cores, got {cube_cores}")
     if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AICPU_CacheDisable":
         raise ValueError("MXFP8 HotReplica prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable")
     selected = validate_native_compatibility()
@@ -64,7 +68,14 @@ def _require_mx(tensor):
     load_mx_planner(planner)
 
 
-def require_capability(tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *, mx=False) -> None:
+def require_capability(
+    tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *, mx_cube_cores: int | None = None,
+) -> None:
     """Converge capability failures before any rank allocates a bank or enters transfer."""
-    check = _require_mx if mx else _require_a3
-    _collective.collective_call(lambda: check(tensor), stage="HotReplica capability", group=group)
+    def check() -> None:
+        if mx_cube_cores is None:
+            _require_a3(tensor)
+        else:
+            _require_mx(tensor, mx_cube_cores)
+
+    _collective.collective_call(check, stage="HotReplica capability", group=group)

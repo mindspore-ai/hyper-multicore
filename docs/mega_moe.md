@@ -83,6 +83,7 @@ MegaMoE 不接受 TP 大小参数。
 | --- | --- | --- |
 | `MegaMoeExperts` | 配置模型尺寸和 EP 组，执行专家前反向并管理执行资源 | 公开稳定 API；专家参数由调用方持有，每次 forward 传入。 |
 | `MegaMoeNumericsOptions` | 配置 SwiGLU 裁剪、路由概率的应用位置及 partial dW 精度 | 公开稳定 API；通过 `numerics_options=` 传入，按来源模型选择数值语义。 |
+| `MegaMoePlacementOptions` | 配置专家放置策略 | 通过 `expert_placement=` 传入，默认使用原属 rank。 |
 | `MegaMoeTuningOptions` | 配置通信模式、容量、分片和可选调度 | 公开实验 API；通过 `tuning_options=` 传入。字段、可选值及默认执行策略不保证跨版本兼容，升级时须重新验证。 |
 | `MegaMoeSchedulerOptions` | 配置数学任务顺序、就绪扫描和 lowering | 公开实验 API；作为 `MegaMoeTuningOptions(scheduler=...)` 传入。 |
 
@@ -100,6 +101,7 @@ MegaMoE 不接受 TP 大小参数。
 | `ep_group` | `None` | 独立单 rank 可省略；分布式作业显式指定 EP 组 |
 | `precision` | `"bf16"` | 可选 `"bf16"` 或 `"mxfp8"`，硬件与权重要求见精度支持 |
 | `numerics_options` | `None` | 默认不裁剪、FC2 后加权，完整字段见数值配置 |
+| `expert_placement` | `None` | 默认使用原属 rank，可选[自适应专家放置](#自适应专家放置) |
 | `tuning_options` | `None` | 使用默认执行策略，公开实验配置见执行调优 |
 
 本地专家数为 E/EP，专家归属按组内 rank 顺序确定。同一进程的 SHMEM 同时只能绑定一组有序的 EP 成员。
@@ -144,6 +146,28 @@ output = experts(
     tokens_per_expert=tokens_per_expert,
 )
 ```
+
+### 自适应专家放置
+
+为多 rank EP 的 Push 执行启用热点专家副本时，将下列配置传给 `MegaMoeExperts` 的 `expert_placement`。
+
+```python
+from hyper_multicore import MegaMoePlacementOptions
+from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
+
+placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner())
+```
+
+- `ascend910_93` 支持 BF16 EIO 和 EOI。EIO 在资源满足条件时可使用融合的副本传输。
+- `ascend950` 支持 MXFP8 EIO，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
+  并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
+  `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，
+  `HYPER_MULTICORE_SHMEM_UDMA_QP_NUM` 设置为 8、16 或 32。
+  每 rank 可借用的槽位上限为两个，且不超过本地专家数。
+
+每次正向按实际路由决定是否启用副本。模型继续持有原属专家参数、优化器状态和 checkpoint，
+反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
+测量稳态性能前应覆盖代表性的路由和容量。
 
 ## 精度支持
 

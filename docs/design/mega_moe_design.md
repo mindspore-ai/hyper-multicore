@@ -73,7 +73,7 @@ BF16 的 plan 将实际 H/I 传给 GMM 与 SwiGLU tiling 准备逻辑。
 
 | 内部状态 | BF16 | MXFP8 |
 | --- | --- | --- |
-| 梯度存储 | 按 counts 处理冷专家 dW；已消费的 dispatch 暂存可以用于 dX | 预先清零 partial dW，dX 单独分配 |
+| 梯度存储 | 按 counts 处理冷专家 dW；已消费的 dispatch 暂存可以用于 dX | 根据接收计数为可能为空的专家初始化 partial dW，dX 单独分配 |
 | 反向保存 | 保存对应调用的激活、映射和 plan | 保存反向所需结果及原始权重 root，反向重新解析物理存储 |
 
 BF16 前向的任务图由组件生成。FC2 前概率加权的反向需要恢复未加权激活，数值关系见
@@ -92,6 +92,12 @@ MXFP8 在分发后的专家输入及中间激活上准备量化数据，GMM 使�
 [execution](../../hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py)及
 [权重绑定](../../hyper_multicore/modules/mega_moe/backends/mxfp8/weights.py)解释，
 不能直接套用 BF16 的 task 数、tiling 或 native 算子参数表。
+
+对启用 MXFP8 副本的路由，执行器按投影传输本次调用的量化权重和 scale，再发布各槽位的
+weight-ready 信号。反向在完整 FP32 TN 生产完成后归并副本 dW，两组投影归并共享一轮 ACK。
+使用 UDMA 的 peer 上，token 传输保持 QP0 归属，四个梯度 helper 使用独占 QP。
+大计数表及路由缓存冷却时只回读压缩摘要，其中包含各目标 rank 本地专家的最小接收量。
+执行器仅在该值大于零时省去整块原属专家 dW 的初始化，空专家仍产生零梯度。
 
 ### 辅助计算与诊断
 

@@ -14,6 +14,7 @@ from .transport import TRANSPORT_TASKS, transport_queues
 
 TWO_EXPERT_PIPELINE = 'two_expert_pipeline'
 BUILDER_ORDER = 'builder_order'
+MX_GRADIENT_CUBE_CORES = 32
 
 
 def validate_schedule_options(options):
@@ -126,8 +127,8 @@ def _reserve_mx_gradient_workers(vectors):
     """Free four even AIVs while keeping projection producers in window order."""
     lanes = vectors[::2]
     reserved = 4
-    if len(lanes) != 32 or len({len(queue) for queue in lanes}) != 1:
-        raise ValueError("MX gradient helpers require 32 equal logical math queues")
+    if len(lanes) != MX_GRADIENT_CUBE_CORES or len({len(queue) for queue in lanes}) != 1:
+        raise ValueError(f"MX gradient helpers require {MX_GRADIENT_CUBE_CORES} equal logical math queues")
     # Merge by window position before distributing. Appending displaced
     # producers to the tail of existing queues can introduce a wait cycle.
     work = [task for position in zip(*lanes) for task in position]

@@ -51,7 +51,8 @@ class _MegaMoeExecutionResources:
         mx_placement = placement and self.spec.precision == "mxfp8"
         if placement:
             from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
-            require_capability(tensor, specification["ep_group"], mx=mx_placement)
+            require_capability(tensor, specification["ep_group"],
+                               mx_cube_cores=self.spec.num_cube_cores if mx_placement else None)
         initial_headroom = 0
         if workspace_layout is not None:
             reservations = ((specification, workspace_layout),)

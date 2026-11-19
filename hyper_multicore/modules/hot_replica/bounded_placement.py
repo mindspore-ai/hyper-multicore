@@ -1,6 +1,6 @@
 # Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Format PR2's bounded quotas for the shared BF16 executor."""
+"""Prepare bounded replica quotas for the shared BF16 executor."""
 
 from dataclasses import dataclass, replace
 from pathlib import Path

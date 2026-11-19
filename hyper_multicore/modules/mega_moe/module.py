@@ -191,8 +191,9 @@ class MegaMoeExperts(MulticoreModule):
                 weighting. Options specify the clamp limit and its position relative
                 to SiLU, plus the probability position relative to FC2. The before-FC2
                 path rounds activations to BF16 both before and after FP32 weighting.
-            expert_placement: Placement strategy and planner. Adaptive placement
-                requires A3 BF16 push execution and a multi-rank EP group.
+            expert_placement: Placement strategy and planner for multi-rank Push execution.
+                Adaptive placement supports BF16 on Ascend910_93 and MXFP8 on Ascend950.
+                MXFP8 requires the built-in planner and FP32 partial weight gradients.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.
                 Options are validated and copied into the instance configuration;

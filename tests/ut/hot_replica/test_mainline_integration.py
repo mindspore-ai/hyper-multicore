@@ -145,6 +145,19 @@ def test_supported_device_requires_selected_adapter_artifacts():
         capability._require_a3(tensor)  # pylint: disable=protected-access
 
 
+def test_mx_capability_checks_cube_geometry_before_loading_replica_artifacts():
+    """Converge a device limitation during binding, before a hotspot can allocate guest resources."""
+    tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=3), dtype=torch.bfloat16)
+    with (
+        patch.object(capability, "load_torch_npu"),
+        patch.object(capability, "query_npu_arch", return_value=3510),
+        patch.object(capability, "validate_native_compatibility") as manifest,
+        pytest.raises(RuntimeError, match="HotReplica capability failed.*requires 32 Cube cores, got 24"),
+    ):
+        capability.require_capability(tensor, None, mx_cube_cores=24)
+    manifest.assert_not_called()
+
+
 def test_no_move_preserves_original_prepared_route_and_capacity():
     """Preserve validated routing and capacity when placement is declined."""
     hidden = torch.empty(2, 8)
@@ -155,8 +168,9 @@ def test_no_move_preserves_original_prepared_route_and_capacity():
     permutation = (hidden, torch.tensor([0, 1]))
     original = object()
     prepare, select, work = Mock(), Mock(return_value=None), Mock()
+    summary = route._RouteSummary(2, 128, 2)
     with (
-        patch.object(route, "_read_cached_route", return_value=((2, 128, 2), [], metadata)) as read,
+        patch.object(route, "_read_cached_route", return_value=(summary, [], metadata)) as read,
         patch.object(route, "_finalize_dynamic_route", return_value=original) as finish,
     ):
         result = route._prepare_placed_route(  # pylint: disable=protected-access
@@ -234,7 +248,7 @@ def test_placement_reuses_validated_source_totals_and_autograd_mask():
         """Expose source totals from the existing validation readback."""
         del payload, spec, workspace, device, kwargs
         source_rows.extend((2, 6))
-        return (2, 128, 6), None, None
+        return route._RouteSummary(2, 128, 6), None, None
 
     with patch.object(route, "_read_cached_route", side_effect=read), patch.object(route, "_finalize_dynamic_route"):
         route._prepare_placed_route(  # pylint: disable=protected-access
@@ -283,7 +297,7 @@ def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
         patch(module + ".placement_is_profitable", side_effect=[True, False, True, False]) as cost,
         patch(module + ".build_placement", return_value=candidate) as build,
     ):
-        arguments = (hidden, ids, gathered, (8, 128, 8), [4, 4], torch.zeros(4), 1)
+        arguments = (hidden, ids, gathered, route._RouteSummary(8, 128, 8), [4, 4], torch.zeros(4), 1)
         assert owner.select(*arguments, planner=planner, host_rows=[[1, 2, 1, 4]]) is None
         assert owner.select(*arguments, planner=planner, host_rows=[[1, 2, 1, 4]]) is None
         assert build.call_count == 1 and cost.call_count == 2
@@ -434,6 +448,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
             kwargs["prepare_workspace"], kwargs["select_placement"], kwargs["autograd_mask"],
         )
 
+    summary = route._RouteSummary(2, 128, 2)
     try:
         with (
             patch.object(expert, "_prepare_forward_inputs", return_value=(hidden, False)),
@@ -441,7 +456,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
             patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
             patch.object(replay, "route_record", return_value=(None, False)),
             patch.object(invocation, "prepare_topk_route", side_effect=exchanged) as exchange,
-            patch.object(route, "_read_cached_route", return_value=((2, 128, 2), None, None)) as read,
+            patch.object(route, "_read_cached_route", return_value=(summary, None, None)) as read,
             patch.object(route, "_finalize_dynamic_route", return_value=ordinary),
             patch.object(expert._backend, "forward", return_value=hidden) as forward,
         ):
@@ -505,7 +520,7 @@ def test_checkpoint_request_is_training_independently_of_reservation(bound):
     resources = PlacementResources(owner, {"source_token_bound": bound}, False)
     ids = torch.tensor([[0]])
     with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True):
-        request = resources.request(torch.zeros(1, 4), ids, torch.zeros(2, 5), (1, 128, 1),
+        request = resources.request(torch.zeros(1, 4), ids, torch.zeros(2, 5), route._RouteSummary(1, 128, 1),
                                     [1, 1], ids, 0, host_rows=None)
     assert request.training and request.checkpointing
     assert request.ordinary_receive_capacity == (128 if bound else None)

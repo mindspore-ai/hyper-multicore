@@ -458,12 +458,7 @@ python -c 'from hyper_multicore import MegaMoeExperts; print(MegaMoeExperts.__na
 `HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte`。固定堆预算和日志均沿用
 [SHMEM 配置](shmem.md#6-配置与日志)，默认设置足以运行常规示例。
 
-Ascend950 上的 MXFP8 专家副本通过 `MegaMoeExperts` 的 `expert_placement` 参数启用，
-传入 `MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner())`。
-该配置要求 EIO 权重、Push、`MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`
-和多 rank EP。每 rank 最多借用两个专家槽位。设置 `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`
-和 `HYPER_MULTICORE_SHMEM_UDMA_QP_NUM`（8、16 或 32）。普通 MXFP8 的 UDMA QP 数默认仍为 1。
-首轮路由可能扩容 SHMEM，性能计量应在代表性路由均已预热后开始。
+启用 MXFP8 专家副本时，按[自适应专家放置](mega_moe.md#自适应专家放置)配置设备和 SHMEM。
 
 ### 独立回放与队列诊断
 
