@@ -158,7 +158,7 @@ from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner())
 ```
 
-- `ascend910_93` 支持 BF16 EIO 和 EOI。EIO 在资源满足条件时可使用融合的副本传输。
+- `ascend910_93` 支持 BF16 EIO 和 EOI。A3 MTE Push 的内置规划器在槽位与资源满足条件时可使用分投影权重预取和融合梯度回传。
 - `ascend950` 支持 MXFP8 EIO，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
   并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
   `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，

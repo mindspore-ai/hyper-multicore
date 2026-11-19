@@ -34,7 +34,7 @@ from hyper_multicore.shmem import _lifecycle
 
 from .bank_ops import prefetch_banks, reduce_banks
 from .placement import ExpertPlacement
-from .pipeline import ReplicaPipeline
+from .pipeline import ReplicaPipeline, projection_shapes
 
 @contextmanager
 def _ordered_transfers(pool: Any):
@@ -133,14 +133,9 @@ class SharedExpertPool:
         self.completion_stream = None
 
     def _bank_shapes(self, layout=None):
-        if (layout or self.expert_weight_layout) == "EOI":
-            return (
-                (2 * self.local_experts, 2 * self.intermediate, self.hidden),
-                (2 * self.local_experts, self.hidden, self.intermediate),
-            )
-        return (
-            (2 * self.local_experts, self.hidden, 2 * self.intermediate),
-            (2 * self.local_experts, self.intermediate, self.hidden),
+        return tuple(
+            (2 * self.local_experts, *shape)
+            for shape in projection_shapes(self.hidden, self.intermediate, layout or self.expert_weight_layout)
         )
 
     def _allocations(self, dtype):

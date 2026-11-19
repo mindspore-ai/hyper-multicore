@@ -11,12 +11,21 @@ import torch
 from hyper_multicore import shmem
 from hyper_multicore.modules.mega_moe.route import _upload_route_tensor
 
+from .bounded_placement import supports_bounded_placement
+
 _LINE_WORDS = 16
 _LAUNCH_MAGIC = 0x4D4F4F4E45505752
 _BAND_BYTES = 4 * 1024**2
 _MAX_BANDS = 64
 _MAX_EPOCH = (1 << 31) - 1
 _NO_OWNER = (1 << 64) - 1
+
+
+def projection_shapes(hidden, intermediate, layout):
+    """Return the physical matrix shapes of W13 and W2."""
+    if layout == "EOI":
+        return (2 * intermediate, hidden), (hidden, intermediate)
+    return (hidden, 2 * intermediate), (intermediate, hidden)
 
 
 def _band_layout(shape):
@@ -30,11 +39,11 @@ def supports_pipeline(spec, borrowed):
     home = spec.local_experts
     h, i = spec.hidden_size, spec.intermediate_size
     return (
-        spec.architecture == 2201 and spec.expert_weight_layout == "EIO" and not spec.batch_experts
-        and spec.dispatch_mode == "push" and spec.transport_engine == "mte"
+        supports_bounded_placement(spec)
         and 0 < 3 * borrowed <= 2 * home
         and h * i % 16 == 0
-        and max(_band_layout((h, 2 * i))[1], _band_layout((i, h))[1]) <= _MAX_BANDS
+        and all(_band_layout(shape)[1] <= _MAX_BANDS
+                for shape in projection_shapes(h, i, spec.expert_weight_layout))
     )
 
 
@@ -57,8 +66,8 @@ class ReplicaPipeline:
     def signal_words(self):
         """Return the same reserved extent on every member of a bank."""
         pool = self.pool
-        shapes = ((pool.hidden, 2 * pool.intermediate), (pool.intermediate, pool.hidden))
-        band_count = sum(min(_MAX_BANDS, _band_layout(shape)[1]) for shape in shapes)
+        band_count = sum(_band_layout(shape)[1]
+                         for shape in projection_shapes(pool.hidden, pool.intermediate, pool.expert_weight_layout))
         return (3 * pool.ranks + 2 + band_count * pool.blocks) * pool.local_experts * _LINE_WORDS
 
     def allocate(self):

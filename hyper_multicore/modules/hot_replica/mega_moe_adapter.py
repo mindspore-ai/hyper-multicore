@@ -27,7 +27,7 @@ from hyper_multicore.modules.mega_moe.heap_manager import _WorkspaceLayout, _wor
 from hyper_multicore.modules.mega_moe.spec import _align_capacity
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from .bounded_placement import BoundedPlacement
+from .bounded_placement import BoundedPlacement, supports_bounded_placement
 from .checkpoint import is_checkpointing
 from .placement import placement_receive_limit
 from .pipeline import supports_pipeline
@@ -99,7 +99,7 @@ def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reserva
     spec = parent.spec
     manager = parent.heap_manager
     # Fused peer epochs and MX returns belong to one execution owner.
-    pipeline = owner.bounded is not None
+    pipeline = owner.bounded is not None and supports_pipeline(spec, 1)
     owner_id = id(owner) if pipeline or pool_type is not SharedExpertPool else None
     key = (spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id)
     with manager.access():
@@ -151,7 +151,8 @@ class PlacementResources:
         planner_key = specification.get("planner_key")
         built_in = planner_key and planner_key[:2] == (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__)
         self.bounded = (BoundedPlacement(parent.spec) if built_in and self.source_bound is None
-                        and supports_pipeline(parent.spec, 1) and parent.heap_manager.heap_limit is None else None)
+                        and supports_bounded_placement(parent.spec)
+                        and parent.heap_manager.heap_limit is None else None)
         self.statistics = {
             "invocations": 0, "placements": 0,
             "route_replays": 0, "route_replay_misses": 0, "skipped_recomputes": 0,
@@ -219,7 +220,7 @@ class PlacementResources:
         spec = self.parent.spec
         fused = (
             fused and bool(placement.copies_by_rank)
-            and 3 * placement.borrowed_capacity <= 2 * spec.local_experts
+            and supports_pipeline(spec, placement.borrowed_capacity)
         )
         binding = ExpertWeightBinding(self.pool, placement, spec.expert_weight_layout, fused=fused)
         return resources, placement, binding

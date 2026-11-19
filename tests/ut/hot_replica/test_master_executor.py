@@ -16,10 +16,13 @@
 
 from contextlib import nullcontext
 from threading import RLock
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from hyper_multicore.modules.hot_replica.bounded_placement import supports_bounded_placement
+from hyper_multicore.modules.hot_replica.pipeline import ReplicaPipeline, supports_pipeline
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 
 
@@ -46,3 +49,19 @@ def test_bank_layout_views_follow_the_lease(first, second):
             assert all(view.data_ptr() == owner.data_ptr() for view, owner in zip(pool.leased_banks, pool.weights))
             pool.release()
             assert not pool.leased_banks
+
+
+@pytest.mark.parametrize(("layout", "bands"), [("EIO", 41), ("EOI", 42)])
+def test_replica_signal_extent_follows_the_physical_gradient_rows(layout, bands):
+    """Budget each projection's actual row bands and keep over-width placement valid."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        expert_weight_layout=layout, hidden_size=5248, intermediate_size=2688, local_experts=6,
+    )
+    pool = SimpleNamespace(hidden=spec.hidden_size, intermediate=spec.intermediate_size,
+                           expert_weight_layout=layout, ranks=32, blocks=24, local_experts=6)
+    assert supports_bounded_placement(spec)
+    assert supports_pipeline(spec, 4)
+    assert not supports_pipeline(spec, 5)
+    expected_words = (3 * pool.ranks + 2 + bands * pool.blocks) * pool.local_experts * 16
+    assert ReplicaPipeline(pool).signal_words == expected_words
