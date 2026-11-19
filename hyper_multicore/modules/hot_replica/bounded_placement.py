@@ -11,7 +11,8 @@ import torch
 import torch.distributed as dist
 
 from hyper_multicore.modules.mega_moe.route import (
-    RouteMetadata, _pack_host_route, _permute_topk_input, _summarize_dynamic_rows, _upload_route_tensor,
+    RouteMetadata, _RouteSummary, _pack_host_route, _permute_topk_input, _summarize_dynamic_rows,
+    _upload_route_tensor,
 )
 
 from ._planner.planner import build_expert_replica_plan
@@ -27,7 +28,7 @@ class PlacementWire:
     """Validated count agreement and ordinary descriptors for one exact wire."""
 
     wire: np.ndarray
-    summary: tuple[int, int, int]
+    summary: _RouteSummary
     source_rows: list[int]
     stream: object
     device_wire: torch.Tensor
@@ -37,7 +38,8 @@ class PlacementWire:
         """Build the home descriptor only when the planner keeps the home layout."""
         if self.metadata is None:
             self.metadata = _push_metadata(self.wire[:, 3:], spec.rank_id, spec.hidden_size,
-                                           self.summary[0], self.summary[1], hidden.shape[0], hidden.device)
+                                           self.summary.capacity, self.summary.plan_tokens,
+                                           hidden.shape[0], hidden.device)
         return self.metadata
 
 

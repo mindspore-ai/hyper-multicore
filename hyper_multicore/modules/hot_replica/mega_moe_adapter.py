@@ -36,6 +36,7 @@ from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
 
 if TYPE_CHECKING:
     from hyper_multicore.modules.mega_moe.backends.bf16.resources import BF16Resources
+    from hyper_multicore.modules.mega_moe.route import _RouteSummary
 
 
 def _bounded_receive(
@@ -161,7 +162,7 @@ class PlacementResources:
         hidden: torch.Tensor,
         ids: torch.Tensor,
         gathered: torch.Tensor,
-        summary: tuple[int, ...],
+        summary: _RouteSummary,
         source_rows: list[int],
         inverse: torch.Tensor,
         autograd_mask: int,
@@ -177,7 +178,7 @@ class PlacementResources:
         del host_rows
         self.statistics["invocations"] += 1
         spec = self.parent.spec
-        peak = summary[2]
+        peak = summary.maximum
         average = (sum(source_rows) + spec.ep_size - 1) // spec.ep_size
         projections = 2 * bool(autograd_mask & 4) + bool(autograd_mask & 8) if autograd_mask & 1 else 0
         saved = peak - average
@@ -187,7 +188,7 @@ class PlacementResources:
         return self.bind(hidden, placement, fused=True)
 
     def request(
-        self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: tuple[int, ...],
+        self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: _RouteSummary,
         source_rows: list[int], inverse: torch.Tensor, autograd_mask: int, *,
         host_rows: list[list[int]] | None,
     ) -> PlacementRequest:
@@ -201,7 +202,7 @@ class PlacementResources:
             if host_rows is not None and not bounded else None
         )
         return PlacementRequest(
-            hidden, ids, gathered[:, 3:], inverse, summary[2], sum(source_rows), spec.rank_id,
+            hidden, ids, gathered[:, 3:], inverse, summary.maximum, sum(source_rows), spec.rank_id,
             spec.intermediate_size, spec.num_cube_cores, replay or bool(autograd_mask & 1),
             checkpointing=replay, ordinary_receive_capacity=self.parent.workspace.capacity_floor if bounded else None,
             apply_probs_before_fc2=spec.apply_probs_before_fc2, count_key=key,

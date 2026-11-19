@@ -125,17 +125,17 @@ class MXPlacementResources(PlacementResources):
         geometry = self._select(hidden, gathered, summary, raw, source_rows, mask, stream)
         self._previous_active = geometry is not None
         if geometry is None:
-            parent.prepare_auto_workspace(summary[1], summary[2], hidden)
+            parent.prepare_auto_workspace(summary.plan_tokens, summary.maximum, hidden)
             permuted = route._permute_topk_input(hidden, ids)
             return route._finalize_dynamic_route(
                 permuted, counts, summary, raw, metadata, None, gathered, spec, workspace,
                 hidden.device, hidden.shape[0])
         self.statistics["placements"] += 1
-        return self._prepare_virtual(hidden, ids, gathered, geometry, summary[1], inverse)
+        return self._prepare_virtual(hidden, ids, gathered, geometry, summary.plan_tokens, inverse)
 
     def _select(self, hidden, gathered, summary, raw, source_rows, mask, stream):
         spec = self.parent.spec
-        _, tokens, peak = summary
+        tokens, peak = summary.plan_tokens, summary.maximum
         average = (sum(source_rows) + spec.ep_size - 1) // spec.ep_size
         if not optional_peak_gain_is_sufficient(peak, average, reduction_basis_points(_MINIMUM_REDUCTION), 0):
             return None
@@ -182,7 +182,7 @@ class MXPlacementResources(PlacementResources):
         resources.prepare_auto_workspace(tokens, peak, hidden)
         permuted = route._permute_topk_input(hidden, virtual_ids)
         prepared = route._finalize_dynamic_route(
-            permuted, geometry.counts[spec.rank_id], (max(1, local), tokens, peak), None,
+            permuted, geometry.counts[spec.rank_id], route._RouteSummary(max(1, local), tokens, peak), None,
             geometry.metadata, None, gathered, resources.spec, resources.workspace, hidden.device, hidden.shape[0])
         return replace(prepared, execution_resources=resources,
                        weight_binding=MXBindings(placement, self.prefetch, self.pool))
