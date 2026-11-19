@@ -77,6 +77,7 @@ def _workspace_allocation_specs(
 
 def _spec_workspace_bytes(
     specification: Mapping[str, Any], dtype: torch.dtype, *, receive_capacity: int | None = None,
+    borrows_receive_buffer: bool = False,
 ) -> int:
     """Return planned symmetric bytes for one execution-resource group."""
     local_tokens = specification["local_num_tokens"]
@@ -106,6 +107,7 @@ def _spec_workspace_bytes(
         + spec.alignment_bytes - 1
         for name, spec in allocations
         if name != "routed_buffer" or not specification.get("_borrows_routed_buffer", False)
+        if name != "expert_buffer" or not borrows_receive_buffer
     )
 
 
@@ -175,12 +177,18 @@ class MegaMoeWorkspace:
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
     routed_buffer_owner: MegaMoeWorkspace | None = field(default=None, repr=False)
+    borrows_receive_buffer: bool = False
     _routed_only: bool = field(default=False, init=False, repr=False)
 
     @property
     def lease_owner(self) -> MegaMoeWorkspace:
         """Order every user of the same routed scratch on one stream event."""
         return self if self.routed_buffer_owner is None else self.routed_buffer_owner
+
+    @property
+    def receive_buffer(self):
+        """Resolve the latest receive allocation while holding the workspace lease."""
+        return self.lease_owner.expert_buffer if self.borrows_receive_buffer else self.expert_buffer
 
     def _allocation_specs(self, spec, dtype, capacity, *, routed_only):
         allocations = _workspace_allocation_specs(
@@ -196,9 +204,9 @@ class MegaMoeWorkspace:
         )
         if routed_only:
             return tuple(item for item in allocations if item[0] == "routed_buffer")
-        if self.routed_buffer_owner is not None:
-            return tuple(item for item in allocations if item[0] != "routed_buffer")
-        return allocations
+        return tuple(item for item in allocations
+                     if item[0] != "routed_buffer" or self.routed_buffer_owner is None
+                     if item[0] != "expert_buffer" or not self.borrows_receive_buffer)
 
     def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:
         """Rebind aliases when heap storage or a retained plan's stride changes."""

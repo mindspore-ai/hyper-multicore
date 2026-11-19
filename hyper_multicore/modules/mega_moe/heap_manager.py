@@ -57,6 +57,7 @@ class _WorkspaceLayout:
     collective_signature: tuple[Any, ...]
     receive_capacity: int
     token_capacity: int | None = None
+    borrows_receive_buffer: bool = False
 
 
 @dataclass
@@ -100,6 +101,8 @@ def _workspace_layout(
     dtype: torch.dtype,
     capacity: int | None = None,
     token_capacity: int | None = None,
+    *,
+    borrows_receive_buffer: bool = False,
 ) -> _WorkspaceLayout:
     """Describe one MegaMoe symmetric workspace reservation."""
     physical = dict(specification)
@@ -113,10 +116,12 @@ def _workspace_layout(
         )
     signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
     return _WorkspaceLayout(
-        required_bytes=_spec_workspace_bytes(physical, dtype, receive_capacity=capacity),
+        required_bytes=_spec_workspace_bytes(physical, dtype, receive_capacity=capacity,
+                                             borrows_receive_buffer=borrows_receive_buffer),
         collective_signature=signature,
         receive_capacity=capacity,
         token_capacity=physical["local_num_tokens"] if specification.get("auto_tokens", False) else None,
+        borrows_receive_buffer=borrows_receive_buffer,
     )
 
 
@@ -373,6 +378,43 @@ class _HeapManager:
                 self._restart(layouts, heap_bytes)
             return entry.bound_spec
 
+    def borrow_mx_receive_buffer(self, workspace: MegaMoeWorkspace) -> None:
+        """Retire the virtual receive allocation after home has materialized its larger buffer."""
+        with self.access():
+            entry = self._entry_for_workspace(workspace)
+            owner = workspace.lease_owner
+            layout = _workspace_layout(
+                entry.specification, self.dtype, entry.layout.receive_capacity, entry.layout.token_capacity,
+                borrows_receive_buffer=True,
+            )
+            started = time.perf_counter()
+
+            def prepare() -> None:
+                if (owner is workspace or owner.in_use or workspace.expert_buffer is None
+                        or owner.expert_buffer is None or owner.expert_capacity < layout.receive_capacity):
+                    raise RuntimeError("MX Push receive sharing requires a quiescent, sufficiently large home buffer")
+                if owner.used:
+                    owner.completion_event.synchronize()
+
+            owner_index = next(index for index, candidate in enumerate(self.entries) if candidate is entry)
+            self._run_and_check_consistency(
+                prepare, stage="MX Push receive sharing", value=(owner_index, entry.layout, layout),
+            )
+            try:
+                shmem.free(workspace.expert_buffer)
+            except Exception:
+                self.state = "failed"
+                raise
+            workspace.expert_buffer = None
+            workspace.borrows_receive_buffer = True
+            entry.layout = layout
+            self.epoch += 1
+            self.growth_records.append({
+                "epoch": self.epoch, "mode": "mx_push_shared_receive", "heap_bytes": self.heap_bytes,
+                "old_heap_bytes": self.heap_bytes, "total_ms": (time.perf_counter() - started) * 1000,
+                "capacities": [item.layout.receive_capacity for item in self.entries],
+            })
+
     def fits_fixed_heap(
         self,
         new_layouts: tuple[_WorkspaceLayout, ...] = (),
@@ -411,12 +453,14 @@ class _HeapManager:
         receive_capacity = entry.layout.receive_capacity
         if grow_receive:
             receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
-        layout = _workspace_layout(entry.specification, self.dtype, receive_capacity, token_capacity)
+        layout = _workspace_layout(entry.specification, self.dtype, receive_capacity, token_capacity,
+                                   borrows_receive_buffer=entry.layout.borrows_receive_buffer)
         layouts = [layout if item is entry else item.layout for item in self.entries]
         if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
             layout = _workspace_layout(entry.specification, self.dtype,
                                        max(entry.layout.receive_capacity, _align_capacity(received)),
-                                       max(spec.local_num_tokens, tokens))
+                                       max(spec.local_num_tokens, tokens),
+                                       borrows_receive_buffer=entry.layout.borrows_receive_buffer)
             layouts = [layout if item is entry else item.layout for item in self.entries]
         return layout, layouts
 

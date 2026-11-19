@@ -125,7 +125,13 @@ class MXPlacementResources(PlacementResources):
         geometry = self._select(hidden, gathered, summary, raw, source_rows, mask, stream)
         self._previous_active = geometry is not None
         if geometry is None:
-            parent.prepare_auto_workspace(summary.plan_tokens, summary.maximum, hidden)
+            child = self.geometries.get(self.config.replica_slots_per_rank)
+            received = summary.maximum
+            if child is not None:
+                received = max(received, child.workspace.expert_capacity)
+            parent.prepare_auto_workspace(summary.plan_tokens, received, hidden)
+            if child is not None and not child.workspace.borrows_receive_buffer:
+                parent.heap_manager.borrow_mx_receive_buffer(child.workspace)
             permuted = route._permute_topk_input(hidden, ids)
             return route._finalize_dynamic_route(
                 permuted, counts, summary, raw, metadata, None, gathered, spec, workspace,
@@ -185,6 +191,8 @@ class MXPlacementResources(PlacementResources):
             workspace.ensure_routed_buffer(physical, hidden.dtype, hidden.device)
         resources = self._virtual_resources(hidden, tokens, peak)
         resources.prepare_auto_workspace(tokens, peak, hidden)
+        if resources.workspace.borrows_receive_buffer and resources.workspace.expert_capacity > workspace.expert_capacity:
+            parent.prepare_auto_workspace(tokens, resources.workspace.expert_capacity, hidden)
         permuted = route._permute_topk_input(hidden, virtual_ids)
         prepared = route._finalize_dynamic_route(
             permuted, geometry.counts[spec.rank_id], route._RouteSummary(max(1, local), tokens, peak), None,
@@ -199,12 +207,17 @@ class MXPlacementResources(PlacementResources):
         width = self.config.replica_slots_per_rank
         if width in self.geometries:
             return self.geometries[width]
-        spec = self.parent.spec
+        parent = self.parent
+        spec = parent.spec
         specification = {**self.specification, "hot_replica": False, "planner_key": None,
                          "num_experts": self.config.physical_experts, "_borrows_routed_buffer": True}
-        layout = _workspace_layout(specification, hidden.dtype, _align_capacity(received), tokens)
-        manager = self.parent.heap_manager
-        pool = _get_mega_bank(hidden, self.parent, self, pool_type=MXGradientPool,
+        borrows_receive = parent.workspace.expert_buffer is not None
+        if borrows_receive and received > parent.workspace.expert_capacity:
+            parent.prepare_auto_workspace(tokens, _align_capacity(received), hidden)
+        layout = _workspace_layout(specification, hidden.dtype, _align_capacity(received), tokens,
+                                   borrows_receive_buffer=borrows_receive)
+        manager = parent.heap_manager
+        pool = _get_mega_bank(hidden, parent, self, pool_type=MXGradientPool,
                               reservations=((specification, layout),))
         resources = prefetch = None
 
@@ -215,7 +228,7 @@ class MXPlacementResources(PlacementResources):
         try:
             resources = Resources(specification, hidden, expert_weight_layout="EIO",
                                   shared=self.shared, active_specifications=(specification,),
-                                  routed_buffer_owner=self.parent.workspace)
+                                  workspace_layout=layout, routed_buffer_owner=parent.workspace)
             _collective.collective_call(allocate_prefetch, stage="MXFP8 HotReplica weight buffers", group=spec.ep_group)
         except Exception:
             if resources is not None:

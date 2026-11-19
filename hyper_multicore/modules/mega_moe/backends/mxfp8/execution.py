@@ -103,7 +103,7 @@ class MXFP8Execution:
             workspace.claim()
         try:
             if not pull:
-                dispatch_buffer = workspace.expert_buffer
+                dispatch_buffer = workspace.receive_buffer
             routed_buffer = workspace.lease_owner.routed_buffer
             buffers = [
                 dispatch_buffer, transport.dispatch_target_off, source_buffer,
@@ -180,7 +180,7 @@ class MXFP8Execution:
         workspace.claim()
         try:
             if not pull:
-                dispatch = workspace.expert_buffer
+                dispatch = workspace.receive_buffer
             routed_buffer = workspace.lease_owner.routed_buffer
             multicore_ops.mega_moe_unpermute_grad_out(
                 expert_output, gradient.reshape(-1, spec.hidden_size).contiguous(), mapping, probs, source, grad_probs,

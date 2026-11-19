@@ -101,6 +101,34 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                     self.assertEqual(restart.call_count, 1)
                 self.assertEqual(manager.epoch, 1)
 
+    def test_mx_shared_receive_retires_one_allocation_after_the_last_consumer(self) -> None:
+        """Keep the home receive allocation and the virtual route's independent events."""
+        manager, home, spec = self._automatic_workspace("push")
+        home.expert_capacity = spec.receive_capacity
+        home.completion_event = Mock()
+        home.used = True
+        specification = {**manager.entries[0].specification, "_borrows_routed_buffer": True}
+        layout = _workspace_layout(specification, torch.bfloat16)
+        manager.reserve(((specification, layout),), allow_resize=True)
+        child = MegaMoeWorkspace(shared=True, routed_buffer_owner=home)
+        child.capacity_floor = manager.bind(child, spec, specification)
+        contested = torch.empty_like(home.expert_buffer)
+        child.expert_buffer = contested
+        child.completion_event = Mock()
+        child.forward_event_counters = home.forward_event_counters.clone()
+        child.backward_event_counters = home.backward_event_counters.clone()
+
+        with patch.object(shmem, "free") as free:
+            manager.borrow_mx_receive_buffer(child)
+            free.assert_called_once_with(contested)
+        home.completion_event.synchronize.assert_called_once()
+        self.assertIs(child.receive_buffer, home.expert_buffer)
+        self.assertIsNone(child.expert_buffer)
+        self.assertTrue(manager.entries[1].layout.borrows_receive_buffer)
+        self.assertEqual(layout.required_bytes - manager.entries[1].layout.required_bytes,
+                         contested.nbytes + 511)
+        self.assertEqual(len(child.describe_restart_allocations(spec, torch.bfloat16, spec.receive_capacity)), 2)
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_automatic_budget_failure_preserves_committed_source_and_receive_capacity(self) -> None:

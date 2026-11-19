@@ -96,7 +96,10 @@ class _MegaMoeExecutionResources:
                 if transport == "udma":
                     moe_transport.require_queue_backend()
                 self.plan = self._initial_plan(tensor)
-                self.workspace = MegaMoeWorkspace(shared=shared, routed_buffer_owner=routed_buffer_owner)
+                self.workspace = MegaMoeWorkspace(
+                    shared=shared, routed_buffer_owner=routed_buffer_owner,
+                    borrows_receive_buffer=workspace_layout is not None and workspace_layout.borrows_receive_buffer,
+                )
                 self.workspace.transport_engine = self.spec.transport_engine
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
