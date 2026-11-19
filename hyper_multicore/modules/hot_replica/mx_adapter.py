@@ -15,7 +15,9 @@ from ..mega_moe.spec import _align_capacity
 from ._planner.admission import optional_peak_gain_is_sufficient, reduction_basis_points
 from ._planner.aligned import build_aligned_expert_plan
 from ._planner.capacity import ExpertReplicaConfig
-from ._planner.mx_peak_planner import build_mx_peak_plan, localize_mx_guests
+from ._planner.mx_peak_planner import (
+    build_mx_local_peak_plan, build_mx_peak_plan, localize_mx_guests, mx_guest_transfer_rows,
+)
 from .bounded_placement import _rank_nodes
 from .mega_moe_adapter import PlacementResources, _get_mega_bank
 from .mx_gradient import MAX_MX_GUEST_SLOTS, MXGradientPool
@@ -162,10 +164,13 @@ class MXPlacementResources(PlacementResources):
                                           minimum_reduction=_MINIMUM_REDUCTION, row_credit=credit, nodes=self.nodes,
                                           drain_peak_plateau=True, admit_small_transfer_plan=training)
                 if training:
-                    # Three 1-byte weight axes with one scale per 32 values, then FP32 dW.
-                    # Every relocated row changes at most six BF16 token messages.
-                    weight_rows = 3 * spec.intermediate_size * (3 * 33 + 4 * 32) // (12 * 32)
-                    plan = localize_mx_guests(plan, self.nodes, weight_rows)
+                    plan = localize_mx_guests(plan, self.nodes, mx_guest_transfer_rows(spec.intermediate_size))
+            elif training:
+                plan = build_mx_local_peak_plan(
+                    counts, self.config, capacity=capacity, minimum_rows=_MINIMUM_ROWS,
+                    minimum_reduction=_MINIMUM_REDUCTION, row_credit=credit, nodes=self.nodes,
+                    transfer_rows=mx_guest_transfer_rows(spec.intermediate_size),
+                )
             else:
                 plan = build_aligned_expert_plan(
                     counts, self.config, capacity_limit=capacity, minimum_replica_rows=_MINIMUM_ROWS,

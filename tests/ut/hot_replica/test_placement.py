@@ -22,6 +22,7 @@ import torch
 from hyper_multicore.modules.hot_replica import placement
 from hyper_multicore.modules.hot_replica._planner.aligned import build_aligned_expert_plan
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica._planner.mx_peak_planner import build_mx_local_peak_plan
 
 
 class TestHotReplicaPlacement(unittest.TestCase):
@@ -37,6 +38,35 @@ class TestHotReplicaPlacement(unittest.TestCase):
         whole.assert_not_called()
         plan.validate()
         self.assertEqual(max(plan.destination_loads), 8192)
+
+    def test_mx_local_peak_refines_tied_ranks_without_changing_node_traffic(self) -> None:
+        config = ExpertReplicaConfig(8, 8, 1)
+        nodes = (0, 0, 0, 0, 1, 1, 1, 1)
+        matrix = ((8192, 0, 0, 0, 8192, 0, 0, 0),) * 8
+        baseline = build_aligned_expert_plan(
+            matrix, config, capacity_limit=131072, minimum_replica_rows=8192, minimum_load_reduction=.25,
+            rank_nodes=nodes,
+        )
+        options = dict(capacity=131072, minimum_rows=8192, minimum_reduction=.25, row_credit=0, nodes=nodes)
+        plan = build_mx_local_peak_plan(matrix, config, transfer_rows=3178, **options)
+        plan.validate()
+        self.assertEqual(max(baseline.destination_loads), 32768)
+        self.assertEqual(max(plan.destination_loads), 16384)
+        self.assertTrue(all(nodes[edge.owner_rank] == nodes[edge.target_rank] for edge in plan.transfers))
+        for before, after in zip(baseline.dispatch_counts, plan.dispatch_counts):
+            # The total is conserved for each source rank and destination node.
+            self.assertEqual(sum(before[:8]), sum(after[:8]))
+        self.assertEqual(build_mx_local_peak_plan(matrix, config, transfer_rows=32768, **options), baseline)
+
+    def test_mx_local_peak_does_not_admit_an_inactive_short_route(self) -> None:
+        config = ExpertReplicaConfig(4, 4, 1)
+        matrix = ((1024, 0, 0, 0),) * 4
+        plan = build_mx_local_peak_plan(
+            matrix, config, capacity=4096, minimum_rows=8192, minimum_reduction=.25,
+            row_credit=896, nodes=(0, 0, 1, 1), transfer_rows=3178,
+        )
+        plan.validate()
+        self.assertFalse(plan.transfers)
 
     def test_receive_limit_matches_full_and_short_pr19_routes(self) -> None:
         limit = placement.placement_receive_limit
