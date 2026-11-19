@@ -169,7 +169,7 @@ class PlacementResources:
             heap_limited = parent.heap_manager.heap_limit is not None
             has_reservation = self.source_bound is not None
             self.bounded = BoundedPlacement(parent.spec) if has_reservation or not heap_limited else None
-            self.fixed_heap = heap_limited and not has_reservation
+            self.fixed_heap = heap_limited
         else:
             self.bounded = None
         spec = parent.spec
@@ -225,6 +225,8 @@ class PlacementResources:
             # At the full home-slot budget the quota search can attain the
             # group average; a reservation below that bound requires growth.
             selected = HotReplicaPlanner._plan_reserved(request, _build_reserved)
+            if self.fixed_heap:
+                return self._bind_fixed(request, selected, summary.plan_tokens, host_rows)
             return self.bind(hidden, selected, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
         self.statistics["invocations"] += 1
         peak = summary.maximum
@@ -240,18 +242,20 @@ class PlacementResources:
     def _bind_fixed(self, request, placement, tokens, host_rows):
         """Fit the selected plan before reserving storage; try a new plan if home spills."""
         manager = self.parent.heap_manager
+        spec = self.parent.spec
         hidden = request.hidden
         with manager.access():
-            if placement is not None and self._virtual_fits(
-                    hidden.dtype, tokens, placement.receive_capacity, placement.borrowed_capacity):
-                return self.bind(hidden, placement, tokens=tokens, fused=self.pipeline_enabled)
+            if placement is not None:
+                width = spec.local_experts if self.source_bound is not None else placement.borrowed_capacity
+                if self._virtual_fits(hidden.dtype, tokens, placement.receive_capacity, width):
+                    return self.bind(hidden, placement, tokens=tokens, fused=self.pipeline_enabled)
             if manager.fits_fixed_heap(
                     workspace_growth=(self.parent.workspace, tokens, request.maximum_received)):
                 return None
 
-            spec = self.parent.spec
             if self.rank_nodes is None:
-                self.rank_nodes = _rank_nodes(spec.ep_group, spec.ep_size)
+                nodes = self.bounded.nodes if self.bounded is not None else None
+                self.rank_nodes = nodes if nodes is not None else _rank_nodes(spec.ep_group, spec.ep_size)
             counts = ([row[3:] for row in host_rows] if host_rows is not None else
                       request.counts_by_source.tolist())
             lower = (request.total_rows + spec.ep_size - 1) // spec.ep_size
