@@ -251,10 +251,17 @@ class PlacementResources:
         spec = self.parent.spec
         pipeline = self.pool.pipeline
         slots = 0
+        return_in_kernel = False
         if fused and pipeline is not None and placement.copies_by_rank and self.pool.blocks == spec.num_cube_cores:
             slots = fused_replica_slots(spec, placement, slot_limit=pipeline.slot_limit)
+            return_in_kernel = bool(slots)
+            if not slots and not pipeline.inline:
+                # A wide live prefix may overlap FP32 dW. It can still feed
+                # the projection kernels when the flags have their own storage.
+                slots = placement.borrowed_capacity
         binding = ExpertWeightBinding(
             self.pool, placement, spec.expert_weight_layout, fused=bool(slots), fused_slots=slots,
+            return_in_kernel=return_in_kernel,
         )
         return resources, placement, binding
 

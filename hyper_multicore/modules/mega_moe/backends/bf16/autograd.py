@@ -720,7 +720,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved,
                 grad_output,
                 all_experts_active=ctx.all_experts_active,
-                owner_weights=owner_weights if acquired and binding.fused else None,
+                owner_weights=owner_weights if acquired and binding.fused_gradients else None,
             )
             runtime = None
             if acquired and binding.fused:

@@ -388,6 +388,7 @@ class ExpertWeightBinding:
     generation: int | None = None
     staged_generation: int | None = None
     fused: bool = False
+    return_in_kernel: bool = True
     token: object = field(default_factory=object)
     transfers: tuple = ()
     gradient_storage: tuple = ()
@@ -397,8 +398,12 @@ class ExpertWeightBinding:
         self.edges = self.pool.pipeline.plan(self.placement, fused_slots) if self.fused else None
 
     @property
+    def fused_gradients(self):
+        return self.fused and self.return_in_kernel
+
+    @property
     def owns_returns(self):
-        return self.fused and bool(self.edges[2])
+        return self.fused_gradients and bool(self.edges[2])
 
     def prepare_replay(self) -> None:
         """Restore the saved suffix while the framework replays attention and routing."""
@@ -440,7 +445,9 @@ class ExpertWeightBinding:
 
     def runtime(self, ordinary, gradients=None):
         """Select split weights and optional in-kernel dW for this launch."""
-        return self.pool.pipeline.runtime(ordinary, self, gradients) if self.fused else None
+        if not self.fused:
+            return None
+        return self.pool.pipeline.runtime(ordinary, self, gradients if self.fused_gradients else None)
 
     def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
         """Save the used guests from the completed origin of the checkpoint."""
@@ -457,10 +464,15 @@ class ExpertWeightBinding:
         self, gradients: tuple[torch.Tensor, ...], weights: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
         """Return partial expert gradients to owners before casting parameter gradients."""
-        if self.fused:
+        if self.fused_gradients:
             stats = self.pool.statistics
             stats["fused_gradient_returns"] = stats.get("fused_gradient_returns", 0) + 1
             return gradients
+        if self.fused:
+            # Both dX projections for every populated guest have waited for
+            # their incoming weights. Drain outgoing copies on the same
+            # stream before the ordered reducer reuses the bank for FP32 dW.
+            self.pool.pipeline.complete(self)
         return self.pool.return_generated_gradients(
             gradients, self.placement.copies, output_dtypes=tuple(w.dtype for w in weights),
             published_slots=self.placement.published_slots,
