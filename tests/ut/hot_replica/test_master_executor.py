@@ -28,6 +28,59 @@ from hyper_multicore.modules.hot_replica.bounded_placement import _render_geomet
 from hyper_multicore.modules.hot_replica.pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
 from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, SharedExpertPool
 from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16
+from hyper_multicore.modules.mega_moe.heap_manager import _HeapEntry, _HeapManager, _workspace_layout
+
+
+@pytest.mark.parametrize(("budget_mib", "peak", "fallback"), [
+    (1536, 95_000, None),
+    (1536, 139_025, None),
+    (1984, 786_432, 32_768),
+])
+def test_fixed_heap_placement_accounts_for_home_and_virtual_reservations(budget_mib, peak, fallback):
+    """Check current root bytes before choosing B0 or a capacity-required replica."""
+    from hyper_multicore.modules.base_planner import PlacementRequest
+
+    ep, home, tokens = 32, 6, 4096
+    hidden = torch.empty((0, 5120), dtype=torch.bfloat16)
+    spec = SimpleNamespace(local_experts=home, ep_size=ep, top_k=8, initial_capacity_factor=1.0,
+                           architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+                           hidden_size=5120, intermediate_size=1792, expert_weight_layout="EIO",
+                           auto_tokens=True, local_num_tokens=tokens, capacity_growth_factor=None)
+    specification = {**vars(spec), "num_experts": ep * home, "apply_probs_before_fc2": True}
+    manager = _HeapManager(None, hidden)
+    manager.heap_limit = budget_mib * 1024**2
+    workspace = object()
+    layout = _workspace_layout(specification, hidden.dtype)
+    manager.entries.append(_HeapEntry(specification, layout, workspace, spec))
+    owner = mega_moe_adapter.PlacementResources(
+        SimpleNamespace(spec=spec, workspace=workspace, heap_manager=manager),
+        {**specification, "planner_key": (mega_moe_adapter.HotReplicaPlanner.__module__,
+                                         mega_moe_adapter.HotReplicaPlanner.__qualname__)}, shared=True,
+    )
+    owner.rank_nodes = (0,) * 16 + (1,) * 16
+    counts = torch.zeros((ep, ep * home), dtype=torch.int32)
+    counts[:, :8] = tokens
+    ids = torch.empty((0, 8), dtype=torch.int32)
+    request = PlacementRequest(hidden, ids, counts, None, peak, ep * tokens * 8,
+                               0, spec.intermediate_size, 24, True)
+    selected = SimpleNamespace(receive_capacity=42624, borrowed_capacity=2)
+    with (patch.object(owner, "bind", side_effect=lambda _, placement, **_kwargs: placement) as bind,
+          patch.object(mega_moe_adapter, "render_placement",
+                       side_effect=lambda _, __, plan, *_args, **_kwargs: max(plan.destination_loads))):
+        assert owner._bind_fixed(request, selected, tokens, None) == fallback
+    assert bind.call_count == (fallback is not None)
+    assert [entry.layout for entry in manager.entries] == [layout]
+
+
+def test_fixed_heap_check_includes_lazy_workspace_entries():
+    """An unbound layer still consumes its entry in the Root budget."""
+    manager = _HeapManager(None, torch.empty(0, dtype=torch.bfloat16))
+    manager.heap_limit = 2 * 1024**2
+    layout = mega_moe_adapter._WorkspaceLayout(manager.heap_limit // 2 + 1, (), 128)
+    assert manager.fits_fixed_heap((layout,))
+    manager.entries.append(_HeapEntry({}, layout))
+    assert not manager.fits_fixed_heap((layout,))
+    assert not manager.workspaces
 
 
 def test_serial_replica_widths_share_one_reservation_with_the_bank():

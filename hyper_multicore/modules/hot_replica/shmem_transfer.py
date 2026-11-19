@@ -56,6 +56,11 @@ def _ordered_transfers(pool: Any):
 _ROOT_TRANSFER_EVENTS = weakref.WeakKeyDictionary()
 
 
+def _expert_bank_bytes(local_experts, hidden, intermediate, dtype):
+    """Size a combined expert bank before allocating independent signals."""
+    return 6 * local_experts * hidden * intermediate * dtype.itemsize + 1024
+
+
 class SharedExpertPool:
     """Lease expert storage under an active SHMEM lifecycle."""
 
@@ -98,7 +103,7 @@ class SharedExpertPool:
     @property
     def allocation_bytes(self) -> int:
         """Report the aligned combined bank and optional peer-event requirement."""
-        weights = 6 * self.local_experts * self.hidden * self.intermediate * self.dtype.itemsize + 1024
+        weights = _expert_bank_bytes(self.local_experts, self.hidden, self.intermediate, self.dtype)
         signal_bytes = 0 if self.pipeline is None or self.pipeline.inline else 4 * self.pipeline.signal_words + 512
         return weights + signal_bytes
 

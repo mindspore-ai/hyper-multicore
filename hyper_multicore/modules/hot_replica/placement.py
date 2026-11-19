@@ -21,6 +21,7 @@ import torch
 from ..base_planner import ExpertPlacement
 from ..mega_moe.route import _upload_route_tensor
 from ._planner.planner import build_capacity_plan
+from ._planner.plan import ExpertExecutionPlan
 from .render import render_plan
 
 # Effective A3 planner estimates from the original prefetch/return cost model.
@@ -220,9 +221,22 @@ def build_placement(
     plan = build_capacity_plan(counts_by_source.cpu().numpy(), capacity)
     if plan is None:
         return None
+    return render_placement(hidden, topk_ids, plan, rank, source_inverse=source_inverse)
+
+
+def render_placement(
+    hidden: torch.Tensor,
+    topk_ids: torch.Tensor,
+    plan: ExpertExecutionPlan,
+    rank: int,
+    *,
+    source_inverse: torch.Tensor | None = None,
+) -> ExpertPlacement:
+    """Render the admitted source quotas using the existing device permutation."""
+    ranks, experts = plan.config.ep_size, plan.config.num_experts
     used = max(plan.replica_slots_used)
-    borrowed = min(plan.config.home_experts, 1 << (used - 1).bit_length())
-    device = counts_by_source.device
+    borrowed = min(plan.config.replica_slots_per_rank, 1 << (used - 1).bit_length())
+    device = topk_ids.device
     ordered, table, owners = render_plan(plan, rank, borrowed)
     if ordered.size != topk_ids.numel():
         raise ValueError("HotReplica counts must describe the local Top-K routes")

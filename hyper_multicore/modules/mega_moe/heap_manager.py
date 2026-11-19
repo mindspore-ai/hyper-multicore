@@ -371,6 +371,26 @@ class _HeapManager:
                 self._restart(layouts, heap_bytes)
             return entry.bound_spec
 
+    def fits_fixed_heap(
+        self,
+        new_layouts: tuple[_WorkspaceLayout, ...] = (),
+        *,
+        workspace_growth: tuple[MegaMoeWorkspace, int, int] | None = None,
+    ) -> bool:
+        """Check pending allocations or one workspace's growth under the current Root lock."""
+        with self.access():
+            if self.heap_limit is None:
+                return True
+            growth = None
+            if workspace_growth is not None:
+                workspace, tokens, received = workspace_growth
+                growth = self._token_growth_layouts(self._entry_for_workspace(workspace), tokens, received)
+            if growth is None and not new_layouts:
+                return True
+            layouts = [entry.layout for entry in self.entries] if growth is None else growth[1]
+            layouts.extend(new_layouts)
+            return self._required_bytes(layouts) <= self.heap_limit
+
     def _token_growth_layouts(
         self, entry: _HeapEntry, tokens: int, received: int,
     ) -> tuple[_WorkspaceLayout, list[_WorkspaceLayout]] | None:

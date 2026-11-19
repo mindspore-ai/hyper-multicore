@@ -22,6 +22,10 @@ from .capacity import ExpertReplicaConfig
 from .plan import ExpertExecutionPlan
 
 
+class ReplicaCapacityError(ValueError):
+    """A valid routing table produced no placement within its receive limit."""
+
+
 def _fill_node_quotas(
     quotas: list[list[int]],
     pending: list[int],
@@ -65,7 +69,7 @@ def _capacity_checked_plan(
     )
     object.__setattr__(plan, "destination_counts", destination)
     if capacity_limit is not None and max(plan.destination_loads) > capacity_limit:
-        raise ValueError("replica plan exceeds capacity_limit; use a feasible receive bound")
+        raise ReplicaCapacityError("replica plan exceeds capacity_limit; use a feasible receive bound")
     return plan
 
 

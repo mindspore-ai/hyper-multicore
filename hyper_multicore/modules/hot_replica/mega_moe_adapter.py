@@ -28,12 +28,14 @@ from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_c
 from hyper_multicore.scheduler.config import mega_moe_event_capacity
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
+from ._planner._dispatch import ReplicaCapacityError
+from ._planner.planner import build_expert_replica_plan
+from .bounded_placement import BoundedPlacement, PlacementWire, _rank_nodes, supports_bounded_placement
 from .checkpoint import is_checkpointing
-from .placement import placement_receive_limit
+from .placement import placement_receive_limit, render_placement
 from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
 from .planner import HotReplicaPlanner
-from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
+from .shmem_transfer import ExpertWeightBinding, SharedExpertPool, _expert_bank_bytes
 
 if TYPE_CHECKING:
     from hyper_multicore.modules.mega_moe.backends.bf16.resources import BF16Resources
@@ -88,11 +90,16 @@ def workspace_reservations(
         bank = local, specification["hidden_size"], specification["intermediate_size"]
         if bank not in banks:
             banks.add(bank)
-            headroom += 6 * math.prod(bank) * dtype.itemsize + 1024
+            headroom += _expert_bank_bytes(*bank, dtype)
     return tuple(reservations), headroom
 
 
 _SHARED_BANKS = weakref.WeakKeyDictionary()
+
+
+def _bank_key(spec, dtype, owner_id):
+    """Identify an existing BF16 bank by its physical allocation shape."""
+    return (spec.local_experts, spec.hidden_size, spec.intermediate_size, dtype, owner_id)
 
 
 def _get_mega_bank(
@@ -103,7 +110,7 @@ def _get_mega_bank(
     manager = parent.heap_manager
     dedicated = pipeline and owner.source_bound is None and manager.heap_limit is None
     owner_id = id(owner) if dedicated or pool_type is not SharedExpertPool else None
-    key = (spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id)
+    key = _bank_key(spec, hidden.dtype, owner_id)
     with manager.access():
         banks = _SHARED_BANKS.setdefault(manager, weakref.WeakValueDictionary())
         pool = banks.get(key)
@@ -156,10 +163,13 @@ class PlacementResources:
         self.initial_receive_floor = parent.workspace.capacity_floor if self.source_bound is not None else None
         planner_key = specification.get("planner_key")
         built_in = planner_key and planner_key[:2] == (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__)
+        self.fixed_heap = False
+        self.rank_nodes = None
         if built_in and supports_bounded_placement(parent.spec):
             heap_limited = parent.heap_manager.heap_limit is not None
             has_reservation = self.source_bound is not None
             self.bounded = BoundedPlacement(parent.spec) if has_reservation or not heap_limited else None
+            self.fixed_heap = heap_limited and not has_reservation
         else:
             self.bounded = None
         spec = parent.spec
@@ -201,8 +211,10 @@ class PlacementResources:
             if not shared_quotas:
                 # Keep the unreserved admission policy while reusing the
                 # agreed copies for the fused bank, including replay.
-                return self.bind(hidden, planner.plan(request), tokens=summary.plan_tokens,
-                                 fused=self.pipeline_enabled)
+                placement = planner.plan(request)
+                if self.fixed_heap and not checkpointing:
+                    return self._bind_fixed(request, placement, summary.plan_tokens, host_rows)
+                return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
 
             def _build_reserved(current, _target):
                 return self.bounded.select(
@@ -224,6 +236,70 @@ class PlacementResources:
             return None
         placement = self.bounded.select(hidden, ids, gathered[:, 3:], source_rows, inverse, projections, snapshot)
         return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
+
+    def _bind_fixed(self, request, placement, tokens, host_rows):
+        """Fit the selected plan before reserving storage; try a new plan if home spills."""
+        manager = self.parent.heap_manager
+        hidden = request.hidden
+        with manager.access():
+            if placement is not None and self._virtual_fits(
+                    hidden.dtype, tokens, placement.receive_capacity, placement.borrowed_capacity):
+                return self.bind(hidden, placement, tokens=tokens, fused=self.pipeline_enabled)
+            if manager.fits_fixed_heap(
+                    workspace_growth=(self.parent.workspace, tokens, request.maximum_received)):
+                return None
+
+            spec = self.parent.spec
+            if self.rank_nodes is None:
+                self.rank_nodes = _rank_nodes(spec.ep_group, spec.ep_size)
+            counts = ([row[3:] for row in host_rows] if host_rows is not None else
+                      request.counts_by_source.tolist())
+            lower = (request.total_rows + spec.ep_size - 1) // spec.ep_size
+            for width in dict.fromkeys((*sorted(self.geometries, reverse=True), spec.local_experts)):
+                limit = self._fixed_receive_limit(hidden.dtype, tokens, lower, request.maximum_received, width)
+                if limit < lower:
+                    continue
+                try:
+                    plan = build_expert_replica_plan(
+                        counts, width, capacity_limit=limit, receive_capacity=limit, rank_nodes=self.rank_nodes,
+                    )
+                except ReplicaCapacityError:
+                    continue
+                if plan.transfers:
+                    placement = render_placement(hidden, request.ids, plan, request.rank,
+                                                 source_inverse=request.source_inverse)
+                    return self.bind(hidden, placement, tokens=tokens, fused=self.pipeline_enabled,
+                                     workspace_width=width)
+        return None
+
+    def _fixed_receive_limit(self, dtype, tokens, lower, upper, width):
+        """Find the largest feasible receive tile for the prospective virtual workspace."""
+        tile = _COMMUNICATION_SPLIT
+        lo, hi = _align_capacity(lower) // tile, _align_capacity(upper) // tile
+        limit = 0
+        while lo <= hi:
+            middle = (lo + hi) // 2
+            if self._virtual_fits(dtype, tokens, middle * tile, width):
+                limit = middle * tile
+                lo = middle + 1
+            else:
+                hi = middle - 1
+        return limit
+
+    def _virtual_fits(self, dtype, tokens, rows, width):
+        """Count the actual virtual workspace and any still-unallocated shared bank."""
+        spec = self.parent.spec
+        manager = self.parent.heap_manager
+        resources = self.geometries.get(width)
+        if resources is not None:
+            return manager.fits_fixed_heap(workspace_growth=(resources.workspace, tokens, rows))
+        _, layout = self._virtual_reservation(dtype, tokens, rows, width)
+        pool = _SHARED_BANKS.get(manager, {}).get(_bank_key(spec, dtype, None))
+        layouts = (layout,)
+        if pool is None or pool.closed:
+            bank_bytes = _expert_bank_bytes(spec.local_experts, spec.hidden_size, spec.intermediate_size, dtype)
+            layouts = (layout, _WorkspaceLayout(bank_bytes, (), 0))
+        return manager.fits_fixed_heap(layouts)
 
     def request(
         self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: _RouteSummary,
@@ -252,12 +328,14 @@ class PlacementResources:
 
     def bind(
         self, hidden: torch.Tensor, placement: ExpertPlacement | None, *, tokens: int, fused: bool = False,
+        workspace_width: int | None = None,
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Use a prepared placement to bind the existing BF16 runtime."""
         if placement is None:
             return None
         self.statistics["placements"] += 1
-        resources = self._geometry(hidden, placement, tokens)
+        resources = (self._geometry(hidden, placement, tokens) if workspace_width is None else
+                     self._geometry(hidden, placement, tokens, width=workspace_width))
         spec = self.parent.spec
         pipeline = self.pool.pipeline
         slots = 0
@@ -275,7 +353,7 @@ class PlacementResources:
         )
         return resources, placement, binding
 
-    def _geometry(self, hidden, placement, tokens):
+    def _geometry(self, hidden, placement, tokens, *, width=None):
         """Cache only static BF16 geometry; retain mainline scheduling choices."""
         # Imported lazily to avoid the BF16 resource / placement ownership cycle.
         from hyper_multicore.modules.mega_moe.backends.bf16.resources import (  # pylint: disable=import-outside-toplevel
@@ -284,10 +362,10 @@ class PlacementResources:
 
         spec = self.parent.spec
         manager = self.parent.heap_manager
-        source = max(_COMMUNICATION_SPLIT, _align_capacity(tokens))
-        receive = _align_capacity(placement.receive_capacity)
         if self.reuses_parent_workspace:
             if self.pool is None:
+                source = max(_COMMUNICATION_SPLIT, _align_capacity(tokens))
+                receive = _align_capacity(placement.receive_capacity)
                 if self.shared:
                     receive = max(receive, _resolve_receive_capacity(
                         spec.initial_capacity_factor, source * spec.top_k, spec.ep_size,
@@ -298,23 +376,12 @@ class PlacementResources:
                 )
             return self.parent
         shared_geometry = self.shared and self.bounded is not None
-        width = spec.local_experts if self.source_bound is not None or shared_geometry else placement.borrowed_capacity
+        if width is None:
+            width = (spec.local_experts if self.source_bound is not None or shared_geometry else
+                     placement.borrowed_capacity)
         if width in self.geometries:
             return self.geometries[width]
-        specification = {
-            **self.specification,
-            "hot_replica": False, "source_token_bound": None, "planner_key": None,
-            "num_experts": spec.ep_size * (spec.local_experts + width),
-        }
-        if self.source_bound is not None:
-            bound = _align_capacity(self.source_bound)
-            _, virtual = _bounded_receive(self.specification, bound, hidden.dtype, spec.num_cube_cores)
-            source, receive = max(bound, source), max(virtual, receive)
-        elif shared_geometry and manager.heap_limit is None:
-            receive = max(receive, _resolve_receive_capacity(
-                spec.initial_capacity_factor, source * spec.top_k, spec.ep_size,
-            ))
-        layout = _workspace_layout(specification, hidden.dtype, receive, source)
+        specification, layout = self._virtual_reservation(hidden.dtype, tokens, placement.receive_capacity, width)
         if self.pool is None:
             self.pool = _get_mega_bank(
                 hidden, self.parent, self, reservations=((specification, layout),), pipeline=self.pipeline_enabled,
@@ -333,6 +400,26 @@ class PlacementResources:
             raise
         self.geometries[width] = resources
         return resources
+
+    def _virtual_reservation(self, dtype, tokens, received, width):
+        """Size a new virtual workspace with the same floors as resource binding."""
+        spec = self.parent.spec
+        source = max(_COMMUNICATION_SPLIT, _align_capacity(tokens))
+        receive = _align_capacity(received)
+        specification = {
+            **self.specification,
+            "hot_replica": False, "source_token_bound": None, "planner_key": None,
+            "num_experts": spec.ep_size * (spec.local_experts + width),
+        }
+        if self.source_bound is not None:
+            bound = _align_capacity(self.source_bound)
+            _, virtual = _bounded_receive(self.specification, bound, dtype, spec.num_cube_cores)
+            source, receive = max(bound, source), max(virtual, receive)
+        elif self.shared and self.bounded is not None and self.parent.heap_manager.heap_limit is None:
+            receive = max(receive, _resolve_receive_capacity(
+                spec.initial_capacity_factor, source * spec.top_k, spec.ep_size,
+            ))
+        return specification, _workspace_layout(specification, dtype, receive, source)
 
     def can_close(self) -> bool:
         """Include every owned child workspace and retained bank consumer."""
