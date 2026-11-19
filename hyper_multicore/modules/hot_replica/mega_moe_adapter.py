@@ -158,7 +158,7 @@ class PlacementResources:
             self.bounded = BoundedPlacement(parent.spec) if has_reservation or not heap_limited else None
         else:
             self.bounded = None
-        self.pipeline_enabled = self.bounded is not None and supports_pipeline(parent.spec, 1)
+        self.pipeline_enabled = bool(built_in) and supports_pipeline(parent.spec, 1)
         self.statistics = {
             "invocations": 0, "placements": 0,
             "route_replays": 0, "route_replay_misses": 0, "skipped_recomputes": 0,
@@ -189,7 +189,9 @@ class PlacementResources:
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
                                    host_rows=host_rows)
             if not shared_quotas:
-                return self.bind(hidden, planner.plan(request))
+                # The host planner supplies the copy rows even when a fixed
+                # heap keeps the ordinary, unreserved placement policy.
+                return self.bind(hidden, planner.plan(request), fused=self.pipeline_enabled and not checkpointing)
 
             def _build_reserved(current, _target):
                 return self.bounded.select(
