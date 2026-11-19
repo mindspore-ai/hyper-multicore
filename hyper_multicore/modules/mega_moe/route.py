@@ -315,6 +315,44 @@ def _permute_topk_input_out(
     return output, mapping
 
 
+def _packed_route_ub(wire: torch.Tensor, spec: MegaMoeSpec, *, header: int = 0) -> int | None:
+    """Return the available UB when this count table fits the native descriptor kernel."""
+    if wire.device.type != "npu" or wire.dtype != torch.int32 or wire.stride(1) != 1:
+        return None
+    from hyper_multicore._device import device_ub_bytes  # pylint: disable=import-outside-toplevel
+
+    ub = device_ub_bytes(wire.device.index)
+    experts, peers, local = spec.num_experts, spec.ep_size, spec.local_experts
+    stride = (experts + 31) // 32 * 32
+    span = (peers - 1) * wire.stride(0) + experts + header
+    scratch = ((span + 7) // 8 * 8 + 3 * stride + 2 * ((local + 7) // 8 * 8)) * 4
+    return ub if wire.stride(0) >= experts + header and scratch <= ub // 4 * 3 else None
+
+
+def _unpack_route_offsets(
+    off: torch.Tensor, sz: torch.Tensor, spec: MegaMoeSpec, expert_capacity: int,
+) -> RouteMetadata:
+    """Describe row and element offsets as views of this invocation's native output."""
+    experts, local = spec.num_experts, spec.local_experts
+    stride = (experts + 31) // 32 * 32
+    units = 1 if off.numel() == 4 * stride + local else 2
+    offsets = off.split(((experts, stride - experts) * 4 + (local,)) * units)
+    sizes = sz.split((experts, stride - experts) * (2 * units))
+    pull = spec.dispatch_mode == "pull"
+
+    def describe(unit: int) -> RouteMetadata:
+        offset_index, size_index = 9 * unit, 4 * unit
+        src, target, length = offsets[offset_index + 4], offsets[offset_index + 6], sizes[size_index + 2]
+        return RouteMetadata(
+            target if pull else offsets[offset_index], src if pull else offsets[offset_index + 2],
+            length if pull else sizes[size_index], src, target, length,
+            offsets[offset_index + 8], expert_capacity,
+        )
+
+    rows = describe(0)
+    return rows if spec.hidden_size == 1 else replace(rows, _elements=(spec.hidden_size, describe(1)))
+
+
 def _compute_route_metadata(
     counts: torch.Tensor,
     counts_by_source: torch.Tensor,
@@ -323,39 +361,10 @@ def _compute_route_metadata(
     expert_capacity: int,
 ) -> RouteMetadata:
     """Build exact element offsets without padding or route truncation."""
-    if counts_by_source.device.type == "npu" and counts_by_source.dtype == torch.int32:
-        from hyper_multicore._device import device_ub_bytes  # pylint: disable=import-outside-toplevel
-        ub = device_ub_bytes(counts_by_source.device.index)
-        e,p,local = spec.num_experts,spec.ep_size,spec.local_experts
-        stride=(e+31)//32*32
-        span = (p - 1) * counts_by_source.stride(0) + e
-        if (counts_by_source.stride(1) == 1 and counts_by_source.stride(0) >= e
-                and ((span+7)//8*8+3*stride+2*((local+7)//8*8))*4 <= ub//4*3):
-            off,sz=multicore_ops.route_offsets(counts_by_source, spec.rank_id, ub, spec.hidden_size)
-            pull = spec.dispatch_mode == "pull"
-            offset_count = 4 * stride + local
-            # Split once in ATen instead of dispatching a Python slice for
-            # every field. Both row and element descriptors remain public views
-            # of this invocation's storage; no cache can outlive its contents.
-            units = 1 if off.numel() == offset_count else 2
-            offsets = off.split((e, stride - e) * 4 + (local,) if units == 1
-                                else ((e, stride - e) * 4 + (local,)) * 2)
-            sizes = sz.split((e, stride - e) * (2 * units))
-
-            def describe(unit: int) -> RouteMetadata:
-                """Describe row or element offsets from the packed native output."""
-                offset_index, size_index = 9 * unit, 4 * unit
-                src, target, length = offsets[offset_index + 4], offsets[offset_index + 6], sizes[size_index + 2]
-                return RouteMetadata(
-                    target if pull else offsets[offset_index], src if pull else offsets[offset_index + 2],
-                    length if pull else sizes[size_index], src, target, length,
-                    offsets[offset_index + 8], expert_capacity,
-                )
-
-            rows = describe(0)
-            if spec.hidden_size == 1:
-                return rows
-            return replace(rows, _elements=(spec.hidden_size, describe(1)))
+    ub = _packed_route_ub(counts_by_source, spec)
+    if ub is not None:
+        offsets, sizes = multicore_ops.route_offsets(counts_by_source, spec.rank_id, ub, spec.hidden_size)
+        return _unpack_route_offsets(offsets, sizes, spec, expert_capacity)
 
     if received_counts is None:
         start = spec.rank_id * spec.local_experts
@@ -652,6 +661,22 @@ def _read_dynamic_route(
     return summary, raw
 
 
+def _read_packed_dynamic_route(
+    payload: torch.Tensor, spec: MegaMoeSpec, tokens: int,
+) -> tuple[_RouteSummary, RouteMetadata] | None:
+    """Submit invocation-owned offsets before reading the one collective summary."""
+    if spec.ep_size * spec.num_experts <= _HOST_ROUTE_MAX_COUNTS:
+        return None
+    ub = _packed_route_ub(payload, spec, header=3)
+    if ub is None:
+        return None
+    offsets, sizes, summary = multicore_ops.route_offsets_and_summary(payload, spec.rank_id, ub, spec.hidden_size)
+    rows = summary.tolist()
+    result = _summarize_dynamic_rows(rows, spec, all_experts_active=rows[spec.rank_id][7] > 0)
+    metadata = _unpack_route_offsets(offsets, sizes, spec, result.capacity)
+    return result, metadata.with_active_experts(result.all_experts_active, tokens, result.plan_tokens)
+
+
 def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> _RouteSummary:
     """Validate a bounded Host table before allocating or publishing source rows."""
     counts = [row[3:] for row in raw]
@@ -907,8 +932,12 @@ def _resolve_dynamic_permutation(
         if work is not None:
             work.wait()
             work = None
-        summary, host_rows, metadata = _read_cached_route(
-            gathered, spec, workspace, hidden_states.device, stream=route_stream)
+        packed = _read_packed_dynamic_route(gathered, spec, hidden_states.shape[0])
+        if packed is None:
+            summary, host_rows, metadata = _read_cached_route(
+                gathered, spec, workspace, hidden_states.device, stream=route_stream)
+        else:
+            summary, metadata = packed
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
         prepare_workspace(summary.plan_tokens, summary.maximum)

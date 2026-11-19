@@ -6,6 +6,7 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <acl/acl.h>
+#include <algorithm>
 #include <cstdint>
 #include <tuple>
 
@@ -104,24 +105,24 @@ TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) { m.impl("zero_empty_expert_
 TORCH_LIBRARY_IMPL(hyper_multicore, Meta, m) { m.impl("zero_empty_expert_grad_", &ZeroEmptyMeta); }
 
 extern "C" void HmcLaunchRouteMetadata_arch2201(unsigned blocks, void* stream, uint8_t* counts, uint8_t* offsets,
-                                       uint8_t* sizes, int32_t ep, int32_t experts,
+                                       uint8_t* sizes, uint8_t* summary, int32_t ep, int32_t experts,
                                        int32_t rank, int32_t stride, int32_t group,
                                        int32_t programs, int32_t bytes, int32_t row_stride, int32_t hidden_size);
 extern "C" void HmcLaunchRouteMetadata_arch3510(unsigned blocks, void* stream, uint8_t* counts, uint8_t* offsets,
-                                       uint8_t* sizes, int32_t ep, int32_t experts,
+                                       uint8_t* sizes, uint8_t* summary, int32_t ep, int32_t experts,
                                        int32_t rank, int32_t stride, int32_t group,
                                        int32_t programs, int32_t bytes, int32_t row_stride, int32_t hidden_size);
 namespace {
-std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_t rank, int64_t ub,
-                                                int64_t hidden_size) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor> RouteMetadata(const at::Tensor& counts, int64_t rank, int64_t ub,
+                                                          int64_t hidden_size, bool include_summary) {
   TORCH_CHECK(counts.dim() == 2 && counts.scalar_type() == at::kInt && counts.stride(1) == 1,
               "expected row-contiguous int32 [source,expert]");
-  const int64_t p = counts.size(0), e = counts.size(1);
+  const int64_t p = counts.size(0), e = counts.size(1) - (include_summary ? 3 : 0);
   TORCH_CHECK(p > 0 && e > 0 && e % p == 0 && rank >= 0 && rank < p && p <= INT32_MAX && e <= INT32_MAX / p,
               "invalid geometry");
   const auto row_stride = counts.stride(0);
-  TORCH_CHECK(row_stride >= e && row_stride <= INT32_MAX, "invalid count row stride");
-  const auto span = (p - 1) * row_stride + e;
+  TORCH_CHECK(row_stride >= counts.size(1) && row_stride <= INT32_MAX, "invalid count row stride");
+  const auto span = (p - 1) * row_stride + counts.size(1);
   TORCH_CHECK(span <= INT32_MAX, "count matrix span exceeds the native bound");
   const auto local = e / p, stride = (e + 31) / 32 * 32;
   auto aligned = [](int64_t x) { return (x + 7) / 8 * 8; };
@@ -132,26 +133,50 @@ std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_
   c10::DeviceGuard guard(counts.device());
   auto offsets = at::empty({copies * (4 * stride + local)}, counts.options().dtype(at::kLong));
   auto sizes = at::empty({copies * 2 * stride}, counts.options());
+  at::Tensor summary;
   int64_t group = 1;
   while ((group * local) % 16 != 0) ++group;
   const auto programs = (p + group - 1) / group;
+  int64_t blocks = 2 * programs;
+  if (include_summary) {
+    int64_t cores = 0;
+    const auto status = aclrtGetDeviceInfo(counts.get_device(), ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
+    TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
+    blocks += std::min(p, std::max<int64_t>(1, cores - blocks));
+    summary = at::empty({p, 8}, counts.options().dtype(at::kLong));
+  }
   const auto stream = c10_npu::getCurrentNPUStream().stream(false);
   auto run = [=]() -> int {
     auto launch = SelectUtility(counts.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRouteMetadata),
                                 HMC_UTILITY_ARCH35(HmcLaunchRouteMetadata));
-    launch(2 * programs, stream, static_cast<uint8_t*>(counts.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
-           static_cast<uint8_t*>(sizes.data_ptr()), p, e, rank, stride, group, programs, bytes,
-           row_stride, hidden_size);
+    launch(blocks, stream, static_cast<uint8_t*>(counts.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
+           static_cast<uint8_t*>(sizes.data_ptr()), summary.defined() ? static_cast<uint8_t*>(summary.data_ptr()) : nullptr,
+           p, e, rank, stride, group, programs, bytes, row_stride, hidden_size);
     return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
   };
   at_npu::native::OpCommand::RunOpApi("HmcRouteOffsets", run);
-  return {offsets, sizes};
+  return {offsets, sizes, summary};
+}
+
+std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_t rank, int64_t ub,
+                                             int64_t hidden_size) {
+  auto metadata = RouteMetadata(counts, rank, ub, hidden_size, false);
+  return {std::get<0>(metadata), std::get<1>(metadata)};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> RouteOffsetsAndSummary(
+    const at::Tensor& payload, int64_t rank, int64_t ub, int64_t hidden_size) {
+  return RouteMetadata(payload, rank, ub, hidden_size, true);
 }
 }  // namespace
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
   m.def("route_offsets(Tensor counts, int rank, int ub, int hidden_size=1) -> (Tensor, Tensor)");
+  m.def("route_offsets_and_summary(Tensor payload, int rank, int ub, int hidden_size) -> (Tensor, Tensor, Tensor)");
 }
-TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) { m.impl("route_offsets", RouteOffsets); }
+TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
+  m.impl("route_offsets", RouteOffsets);
+  m.impl("route_offsets_and_summary", RouteOffsetsAndSummary);
+}
 
 #if HMC_UTILITY_ARCH3510
 namespace {
