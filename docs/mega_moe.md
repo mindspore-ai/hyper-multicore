@@ -160,7 +160,8 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 
 - `ascend910_93` 支持 BF16 EIO 和 EOI。A3 MTE Push 在槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   带显式 `source_token_bound` 的内置策略按接收容量准入，使用相同的配额规划和路由描述。
-  Reentrant checkpoint 重算沿用已保存的放置与权重快照协议。
+  Reentrant checkpoint 重算沿用已保存的放置，融合路径恢复已保存的借用权重。
+  首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
 - `ascend950` 支持 MXFP8 EIO，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
   并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
   `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，
@@ -360,6 +361,7 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts.executor for layer in
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
+A3 BF16 共用有界副本规划的串行层可在同一个物理 workspace 中切换副本槽宽，调用仍使用各自的计划。
 共享组内的层必须具有相同的具体类型、规范化有效配置和权重布局；各 EP rank 对应层也须一致。
 配置比较使用规范化后的字段值，不依赖 `MegaMoeNumericsOptions` 或 `MegaMoeTuningOptions`
 的对象身份；省略配置与显式默认配置可以共享。
