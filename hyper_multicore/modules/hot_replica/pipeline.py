@@ -108,6 +108,9 @@ class ReplicaPipeline:
         self.epoch += 1
         if self.epoch > _MAX_EPOCH:
             raise RuntimeError("HotReplica replica epochs exhausted")
+        # Projection weights and dW alias the generic bank, including a
+        # checkpoint suffix staged between this binding's forward and backward.
+        pool.generation += 1
         slots, received, owned = binding.edges
         rank_lines = pool.ranks * pool.local_experts * _LINE_WORDS
         credit = self.storage[:rank_lines].view(pool.ranks, pool.local_experts, _LINE_WORDS)

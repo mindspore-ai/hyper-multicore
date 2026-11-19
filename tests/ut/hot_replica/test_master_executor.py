@@ -65,3 +65,19 @@ def test_replica_signal_extent_follows_the_physical_gradient_rows(layout, bands)
     assert not supports_pipeline(spec, 5)
     expected_words = (3 * pool.ranks + 2 + bands * pool.blocks) * pool.local_experts * 16
     assert ReplicaPipeline(pool).signal_words == expected_words
+
+
+def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident_weights():
+    """Retiring the BF16 weight lease also covers FP32 dW writes into the same bank."""
+    bank = (torch.empty((4, 4, 8)), torch.empty((4, 8, 2)))
+    pool = SimpleNamespace(local_experts=2, ranks=2, rank=0, hidden=8, intermediate=2, blocks=2,
+                           expert_weight_layout="EOI", leased_banks=bank, generation=0)
+    pipeline = ReplicaPipeline(pool)
+    pipeline.storage = torch.empty(pipeline.signal_words, dtype=torch.int32)
+    binding = SimpleNamespace(token=object(), edges=(0, (), ()))
+    pipeline.begin(bank, binding, backward=False)
+    assert pool.generation == 1
+    staged = pool.generation
+    pipeline.begin(bank, binding, backward=True)
+    assert binding.weight_epoch == 1 and binding.gradient_epoch == 2
+    assert pool.generation > staged
