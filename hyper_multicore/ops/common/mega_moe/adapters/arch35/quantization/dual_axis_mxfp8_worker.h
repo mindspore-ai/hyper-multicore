@@ -13,7 +13,7 @@
 #include "dynamic_mx_quant_with_dual_axis/arch35/dynamic_mx_quant_with_dual_axis_base.h"
 #include "swiglu_mx_quant_with_dual_axis/arch35/swiglu_mx_quant_with_dual_axis_regbase.h"
 #include "swiglu_backward_mx_quant_with_dual_axis/arch35/swiglu_backward_mx_quant_with_dual_axis_regbase.h"
-
+#include "common/mega_moe/adapters/arch35/quantization/row_only_swiglu_mxfp8_worker.h"
 
 namespace MulticoreMx {
 __aicore__ inline int64_t MxQuantCeil(int64_t value, int64_t block) {
@@ -29,14 +29,19 @@ __aicore__ inline void ExecuteMxQuantRange(const MxQuantDescriptor& r, GM_ADDR s
   const int64_t source_width = r.task_type == MX_SWIGLU_TASK ? 2 * width : width;
   source += start * source_width * sizeof(bfloat16_t);
   row += start * width;
-  column += start * width;
   row_scale += start * (width / 32);
-  column_scale += (expert_start / 64 + r.expert_index + row_begin / 64) * width * 2;
+  if (r.task_type == MX_QUANT_ROW_TASK) {
+    column = row;
+    column_scale = row_scale;
+  } else {
+    column += start * width;
+    column_scale += (expert_start / 64 + r.expert_index + row_begin / 64) * width * 2;
+  }
 #if (__NPU_ARCH__ == 3510)
   const int64_t overflow_mode = AscendC::GetCtrlSpr<60, 60>();
 #endif
   AscendC::TPipe pipe;
-  if (r.task_type == MX_QUANT_TASK) {
+  if (r.task_type == MX_QUANT_TASK || r.task_type == MX_QUANT_ROW_TASK) {
     DynamicMxQuantWithDualAxisTilingData tiling{};
     tiling.totalCoreNum = tiling.usedCoreNum = r.worker_count;
     tiling.roundMode = 4;
@@ -59,11 +64,19 @@ __aicore__ inline void ExecuteMxQuantRange(const MxQuantDescriptor& r, GM_ADDR s
     tiling.dimNeg2IsOdd = MxQuantCeil(count, 32) % 2;
     tiling.scale1ColCountPerBatch = width / 32;
     tiling.scale2RowCountPerBatch = MxQuantCeil(count, 64) * 2;
-    DynamicMxQuantWithDualAxis::DynamicMxQuantWithDualAxisBase<
-      bfloat16_t, fp8_e4m3fn_t, fp8_e4m3fn_t, AscendC::RoundMode::CAST_RINT, 1>
-      op(&tiling, &pipe, r.worker_index);
-    op.Init(source, row, row_scale, column, column_scale);
-    op.Process();
+    if (r.task_type == MX_QUANT_ROW_TASK) {
+      DynamicMxQuantWithDualAxis::DynamicMxQuantWithDualAxisBase<
+        bfloat16_t, fp8_e4m3fn_t, fp8_e4m3fn_t, AscendC::RoundMode::CAST_RINT, 1, true>
+        op(&tiling, &pipe, r.worker_index);
+      op.Init(source, row, row_scale, column, column_scale);
+      op.Process();
+    } else {
+      DynamicMxQuantWithDualAxis::DynamicMxQuantWithDualAxisBase<
+        bfloat16_t, fp8_e4m3fn_t, fp8_e4m3fn_t, AscendC::RoundMode::CAST_RINT, 1>
+        op(&tiling, &pipe, r.worker_index);
+      op.Init(source, row, row_scale, column, column_scale);
+      op.Process();
+    }
   } else if (r.task_type == MX_SWIGLU_TASK) {
     SwigluMxQuantWithDualAxisTilingData tiling{};
     tiling.usedCoreNum = r.worker_count;
@@ -121,7 +134,9 @@ __aicore__ inline void ExecuteMxQuant(const MxQuantDescriptor& r, GM_ADDR source
 }
 
 __aicore__ inline void ExecuteMxQuantTask(const MulticoreRuntime::TaskDesc& task, GM_ADDR* input_list) {
-  const bool backward = static_cast<uint32_t>(task.task_type) == MX_SWIGLU_GRAD_TASK;
+  const uint32_t kind = static_cast<uint32_t>(task.task_type);
+  const bool backward = kind == MX_SWIGLU_GRAD_TASK;
+  const bool row_only = kind == MX_QUANT_ROW_TASK || kind == MX_SWIGLU_ROW_TASK;
   const uint32_t group_slot = backward ? 2 : 1;
   AscendC::GlobalTensor<uint64_t> records;
   records.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(
@@ -130,11 +145,17 @@ __aicore__ inline void ExecuteMxQuantTask(const MulticoreRuntime::TaskDesc& task
   auto values = reinterpret_cast<uint64_t*>(&record);
   for (uint32_t index = 0; index < sizeof(record) / sizeof(uint64_t); ++index)
     values[index] = records.GetValue(task.extra_value_0 * (sizeof(record) / sizeof(uint64_t)) + index);
-  ExecuteMxQuant(record, input_list[task.inputs[0].input_position],
-    backward ? input_list[task.inputs[1].input_position] : nullptr,
-    input_list[task.inputs[group_slot].input_position], input_list[task.outputs[0].input_position],
-    input_list[task.outputs[1].input_position], input_list[task.outputs[2].input_position],
-    input_list[task.outputs[3].input_position]);
+  auto source = input_list[task.inputs[0].input_position];
+  auto groups = input_list[task.inputs[group_slot].input_position];
+  auto row = input_list[task.outputs[0].input_position];
+  auto row_scale = input_list[task.outputs[1].input_position];
+  if (kind == MX_SWIGLU_ROW_TASK) {
+    ExecuteMxSwigluRowOnly(record, source, groups, row, row_scale);
+    return;
+  }
+  ExecuteMxQuant(record, source, backward ? input_list[task.inputs[1].input_position] : nullptr,
+    groups, row, row_scale, row_only ? nullptr : input_list[task.outputs[2].input_position],
+    row_only ? nullptr : input_list[task.outputs[3].input_position]);
 }
 }  // namespace MulticoreMx
 #endif

@@ -22,6 +22,7 @@ namespace hyper_multicore::shmem::runtime {
 inline constexpr std::string_view kHeapSizeEnv = "HYPER_MULTICORE_SHMEM_HEAP_SIZE";
 inline constexpr std::string_view kTimeoutEnv = "HYPER_MULTICORE_SHMEM_TIMEOUT_SEC";
 inline constexpr std::string_view kDataEngineEnv = "HYPER_MULTICORE_SHMEM_DATA_ENGINE";
+inline constexpr std::string_view kUdmaQpNumEnv = "HYPER_MULTICORE_SHMEM_UDMA_QP_NUM";
 inline constexpr std::string_view kBootstrapEndpointEnv = "HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT";
 
 inline constexpr uint64_t kDefaultHeapSizeBytes = 1073741824ULL;
@@ -35,12 +36,17 @@ enum class DataEngine : uint8_t {
   MteUdma,
 };
 
+constexpr bool IsValidUdmaQpCount(DataEngine engine, uint32_t count) {
+  return count == 1U || (engine == DataEngine::MteUdma && (count == 8U || count == 16U || count == 32U));
+}
+
 /** @brief Validated, framework-independent Runtime configuration. */
 struct Config {
   uint64_t heap_size_bytes;
   uint32_t timeout_seconds;
   DataEngine data_engine;
   std::string bootstrap_endpoint_base;
+  uint32_t udma_qp_num = 1U;
 };
 
 /**

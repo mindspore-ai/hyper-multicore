@@ -14,6 +14,9 @@
 # ============================================================================
 """Validate the actual input device and selected HotReplica artifacts before allocation."""
 
+import os
+from pathlib import Path
+
 import torch
 from hyper_multicore import _collective
 from hyper_multicore._loader import load_torch_npu, query_npu_arch, validate_native_compatibility
@@ -39,6 +42,29 @@ def _require_a3(tensor):
             raise RuntimeError(f"Selected HotReplica artifact is missing: {key}")
 
 
-def require_capability(tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> None:
+def _require_mx(tensor):
+    """Validate the A5 transport contract before starting SHMEM."""
+    if tensor.device.type != "npu" or tensor.dtype != torch.bfloat16:
+        raise ValueError("MXFP8 HotReplica requires BF16 input on Ascend950")
+    load_torch_npu()
+    index = tensor.device.index
+    if index is None:
+        index = torch.npu.current_device()
+    if query_npu_arch(index) != 3510:
+        raise ValueError("MXFP8 HotReplica requires Ascend950")
+    if os.environ.get("HCCL_OP_EXPANSION_MODE") != "AICPU_CacheDisable":
+        raise ValueError("MXFP8 HotReplica prefetch requires HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable")
+    selected = validate_native_compatibility()
+    adapter = selected["variant"]["shmem_so"].get("arch35")
+    if adapter is None:
+        raise RuntimeError("The selected Torch/PTA adapter has no Ascend950 support")
+    planner = selected["root"] / Path(adapter).parent / "hot_replica/_replica_host.so"
+    from ._planner.mx_host import load_mx_planner  # pylint: disable=import-outside-toplevel
+
+    load_mx_planner(planner)
+
+
+def require_capability(tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *, mx=False) -> None:
     """Converge capability failures before any rank allocates a bank or enters transfer."""
-    _collective.collective_call(lambda: _require_a3(tensor), stage="HotReplica capability", group=group)
+    check = _require_mx if mx else _require_a3
+    _collective.collective_call(lambda: check(tensor), stage="HotReplica capability", group=group)

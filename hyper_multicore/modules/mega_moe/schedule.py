@@ -55,7 +55,7 @@ class ExpertStages:
         return range(begin + expert * width + lane, begin + (expert + 1) * width, self.cores)
 
 
-def _expert_stages(graph, spec, forward, cfg):
+def _expert_stages(graph, spec, forward, cfg, mx_activation_first):
     """Identify which expert and math stage own each scheduled task."""
     # These are mathematical roles, not descriptor ports or physical worker IDs.
     aliases = ({'up': 'up_proj', 'down': 'down_proj', 'activation': 'swiglu',
@@ -69,7 +69,7 @@ def _expert_stages(graph, spec, forward, cfg):
     vectors = ('activation',) if forward else ('activation_grad',)
     if spec.precision == 'mxfp8':
         if not forward:
-            cubes = ('dw_down', 'da', 'dw_up', 'dx')
+            cubes = ('da', 'dw_down', 'dw_up', 'dx') if mx_activation_first else ('dw_down', 'da', 'dw_up', 'dx')
         vectors = ('quant_input', *vectors)
     offsets, offset = {}, 0
     for op in graph.topological_sort():
@@ -122,6 +122,20 @@ def _builder_order(stages):
     return [list(queue) for queue in stages.original_cubes], vectors
 
 
+def _reserve_mx_gradient_workers(vectors):
+    """Free four even AIVs while keeping projection producers in window order."""
+    lanes = vectors[::2]
+    reserved = 4
+    if len(lanes) != 32 or len({len(queue) for queue in lanes}) != 1:
+        raise ValueError("MX gradient helpers require 32 equal logical math queues")
+    # Merge by window position before distributing. Appending displaced
+    # producers to the tail of existing queues can introduce a wait cycle.
+    work = [task for position in zip(*lanes) for task in position]
+    active = len(lanes) - reserved
+    for lane in range(len(lanes)):
+        vectors[2 * lane] = [] if lane < reserved else work[lane - reserved::active]
+
+
 # Add implemented policies here; no placeholder strategies or dynamic plugins.
 _POLICIES = {TWO_EXPERT_PIPELINE: _two_expert_pipeline, BUILDER_ORDER: _builder_order}
 
@@ -140,16 +154,25 @@ def describe_schedule_policy(name):
             'architecture': 'arch35'}
 
 
-def configure_expert_queues(cfg, graph, spec, *, forward):
+def configure_expert_queues(cfg, graph, spec, *, forward, mx_gradient_helpers=False, mx_activation_first=False):
     """Compile a policy over fixed QP0 owners and serialize the existing queue ABI."""
     if spec.schedule_policy == 'auto':
         spec = replace(spec, schedule_policy=TWO_EXPERT_PIPELINE)
-    stages = _expert_stages(graph, spec, forward, cfg)
+    stages = _expert_stages(graph, spec, forward, cfg, mx_activation_first)
     describe_schedule_policy(spec.schedule_policy)
     cubes, math = _POLICIES[spec.schedule_policy](stages)
+    if mx_gradient_helpers:
+        if forward or spec.precision != 'mxfp8' or spec.transport_engine != 'udma':
+            raise ValueError("MX gradient helpers require the backward UDMA graph")
+        _reserve_mx_gradient_workers(math)
     communication = [tid for tid in cfg.vector_task_indices[:cfg.task_index_num[1]]
                      if cfg.all_tasks[tid].task_type in (*TRANSPORT_TASKS, TaskType.TASK_TERMINATE)]
     vectors = transport_queues(cfg, spec, communication)
+    if spec.architecture == 3510 and spec.precision == 'mxfp8' and spec.transport_engine == 'udma':
+        # These queues own arithmetic dependencies only. Transport keeps its QP0 polling interval.
+        for queue in (*cubes, *math):
+            for tid in queue:
+                cfg.all_tasks[tid].dependency_poll_interval_us = 5
     for queue, compute in zip(vectors, math):
         queue.extend(compute)
     result = install_worker_queues(cfg, cubes, vectors, cube_ready_depth=spec.ready_depth or 0,

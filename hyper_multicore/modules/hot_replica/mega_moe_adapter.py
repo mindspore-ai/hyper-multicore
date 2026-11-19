@@ -26,9 +26,12 @@ import torch
 from hyper_multicore.modules.mega_moe.heap_manager import _WorkspaceLayout, _workspace_layout
 from hyper_multicore.modules.mega_moe.spec import _align_capacity
 
+from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
+from .bounded_placement import BoundedPlacement
 from .checkpoint import is_checkpointing
-from .placement import ExpertPlacement, placement_receive_limit
-from ..base_planner import BasePlanner, PlacementRequest
+from .placement import placement_receive_limit
+from .pipeline import supports_pipeline
+from .planner import HotReplicaPlanner
 from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
 
 if TYPE_CHECKING:
@@ -76,7 +79,8 @@ def workspace_reservations(
         source = _align_capacity(bound)
         native, virtual = _bounded_receive(specification, source, dtype, cube_cores)
         reservations.append((specification, _workspace_layout(specification, dtype, native, source)))
-        virtual_spec = {**specification, "num_experts": 2 * specification["num_experts"], "hot_replica": False, "source_token_bound": None, "planner_key": None}
+        virtual_spec = {**specification, "num_experts": 2 * specification["num_experts"],
+                        "hot_replica": False, "source_token_bound": None, "planner_key": None}
         headroom += _workspace_layout(virtual_spec, dtype, virtual, source).required_bytes
         local = specification["num_experts"] // specification["ep_size"]
         bank = local, specification["hidden_size"], specification["intermediate_size"]
@@ -89,33 +93,42 @@ def workspace_reservations(
 _SHARED_BANKS = weakref.WeakKeyDictionary()
 
 
-def _get_mega_bank(hidden, parent, owner):
+def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reservations=()):
     """Register a HotReplica allocation in the existing MegaMoE heap transaction."""
     spec = parent.spec
     manager = parent.heap_manager
-    key = (spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype)
+    # Fused peer epochs and MX returns belong to one execution owner.
+    pipeline = owner.bounded is not None
+    owner_id = id(owner) if pipeline or pool_type is not SharedExpertPool else None
+    key = (spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id)
     with manager.access():
         banks = _SHARED_BANKS.setdefault(manager, weakref.WeakValueDictionary())
         pool = banks.get(key)
         if pool is None or pool.closed:
-            pool = SharedExpertPool(
+            pool = pool_type(
                 hidden, spec.ep_group, spec.local_experts, spec.intermediate_size,
                 spec.num_cube_cores, spec.expert_weight_layout, root=manager, access=manager.access,
+                pipeline=pipeline,
             )
             reservation = {
-                "kind": "hot_replica_expert_bank", "layout": spec.expert_weight_layout, "local_experts": spec.local_experts,
+                "kind": pool.pool_kind, "layout": spec.expert_weight_layout, "local_experts": spec.local_experts,
             }
             signature = (
-                "hot_replica_expert_bank", spec.local_experts, spec.hidden_size, spec.intermediate_size,
+                pool.pool_kind, spec.local_experts, spec.hidden_size, spec.intermediate_size,
                 str(hidden.dtype), spec.expert_weight_layout,
             )
             layout = _WorkspaceLayout(pool.allocation_bytes, signature, spec.local_experts)
-            manager.reserve(((reservation, layout),), allow_resize=True)
-            manager.bind(pool, spec, reservation)
+            added = manager.reserve((*reservations, (reservation, layout)), allow_resize=True)
+            try:
+                manager.bind(pool, spec, reservation)
+            except Exception:
+                manager.rollback_reservations(added, None)
+                raise
             try:
                 pool.allocate()
             except Exception:
                 manager.close_workspace(pool)
+                manager.rollback_reservations(added, None)
                 raise
             banks[key] = pool
             pool.owners = weakref.WeakSet()
@@ -134,6 +147,10 @@ class PlacementResources:
         self.pool = None
         self.geometries = {}
         self.source_bound = specification.get("source_token_bound")
+        planner_key = specification.get("planner_key")
+        built_in = planner_key and planner_key[:2] == (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__)
+        self.bounded = (BoundedPlacement(parent.spec) if built_in and self.source_bound is None
+                        and supports_pipeline(parent.spec, 1) and parent.heap_manager.heap_limit is None else None)
         self.statistics = {
             "invocations": 0, "placements": 0,
             "route_replays": 0, "route_replay_misses": 0, "skipped_recomputes": 0,
@@ -153,6 +170,21 @@ class PlacementResources:
         """Choose a virtual route only after the existing count exchange validates it."""
         request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, host_rows=host_rows)
         return self.bind(hidden, planner.plan(request))
+
+    def select_bounded(self, hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, *,
+                       host_rows=None, snapshot=None):
+        """Run the bounded A3 policy over the existing route readback."""
+        del host_rows
+        self.statistics["invocations"] += 1
+        spec = self.parent.spec
+        peak = summary[2]
+        average = (sum(source_rows) + spec.ep_size - 1) // spec.ep_size
+        projections = 2 * bool(autograd_mask & 4) + bool(autograd_mask & 8) if autograd_mask & 1 else 0
+        saved = peak - average
+        if not saved or (4 * saved < peak if projections == 3 else 5 * saved < 2 * peak):
+            return None
+        placement = self.bounded.select(hidden, ids, gathered[:, 3:], source_rows, inverse, projections, snapshot)
+        return self.bind(hidden, placement, fused=True)
 
     def request(
         self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: tuple[int, ...],
@@ -176,14 +208,19 @@ class PlacementResources:
         )
 
     def bind(
-        self, hidden: torch.Tensor, placement: ExpertPlacement | None,
+        self, hidden: torch.Tensor, placement: ExpertPlacement | None, *, fused: bool = False,
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Use a prepared placement to bind the existing BF16 runtime."""
         if placement is None:
             return None
         self.statistics["placements"] += 1
         resources = self._geometry(hidden, placement)
-        binding = ExpertWeightBinding(self.pool, placement, self.parent.spec.expert_weight_layout)
+        spec = self.parent.spec
+        fused = (
+            fused and bool(placement.copies_by_rank)
+            and 3 * placement.borrowed_capacity <= 2 * spec.local_experts
+        )
+        binding = ExpertWeightBinding(self.pool, placement, spec.expert_weight_layout, fused=fused)
         return resources, placement, binding
 
     def _geometry(self, hidden, placement):

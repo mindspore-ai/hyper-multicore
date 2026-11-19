@@ -33,7 +33,9 @@ def test_one_frontend_dispatches_without_owning_external_weights(precision):
               patch.object(backend, 'forward', return_value=object()) as forward):
             result = layer(hidden, ids, probs, tokens_per_expert=counts, expert_weights=roots)
             assert result is forward.return_value
-            prepare.assert_called_once_with(flat, ids, probs, counts, roots, resources, weight_error=False, planner=None)
+            prepare.assert_called_once_with(
+                flat, ids, probs, counts, roots, resources, weight_error=False, planner=None, training=True,
+            )
             forward.assert_called_once_with(layer, hidden, flat, ids, probs, roots, resources, route)
         assert not layer.state_dict()
     finally:
@@ -55,16 +57,24 @@ def test_frontend_never_owns_parameters_and_rejects_legacy_entry_points():
         get_backend('unknown')
 
 
-def test_mx_passes_current_roots_and_prepared_route_to_autograd():
+@pytest.mark.parametrize('placed', [False, True])
+def test_mx_passes_current_roots_and_prepared_route_to_autograd(placed):
     """Pass current roots and the prepared route through to autograd."""
     roots = (object(), object())
     layer = SimpleNamespace(local_experts=6, hidden_size=64, intermediate_size=64,
                             nograd_no_clone=True)
-    hidden, flat, ids, probs, resources, route = [object() for _ in range(6)]
+    hidden, flat, ids, probs, resources = [object() for _ in range(5)]
+    placement = SimpleNamespace(placement=object(), prefetch=object(), gradients=object()) if placed else None
+    route = SimpleNamespace(weight_binding=placement, execution_resources=object())
     with (patch.object(mx_backend, 'MXFP8Execution') as execution,
           patch.object(mx_backend, 'execute_mxfp8_experts') as run):
         result = mx_backend.forward(layer, hidden, flat, ids, probs, roots, resources, route)
-        execution.assert_called_once_with(resources, nograd_no_clone=True)
+        if placed:
+            execution.assert_called_once_with(route.execution_resources, nograd_no_clone=True,
+                                              placement=placement.placement, weight_prefetch=placement.prefetch,
+                                              gradient_pool=placement.gradients)
+        else:
+            execution.assert_called_once_with(resources, nograd_no_clone=True)
         run.assert_called_once_with(hidden, *roots, route, probs, ((6, 64, 128), (6, 64, 64)),
                                     execution.return_value)
         assert result is run.return_value

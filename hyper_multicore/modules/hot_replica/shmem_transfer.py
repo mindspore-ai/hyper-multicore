@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import threading
 import weakref
 from typing import Any
@@ -34,6 +34,7 @@ from hyper_multicore.shmem import _lifecycle
 
 from .bank_ops import prefetch_banks, reduce_banks
 from .placement import ExpertPlacement
+from .pipeline import ReplicaPipeline
 
 @contextmanager
 def _ordered_transfers(pool: Any):
@@ -58,10 +59,12 @@ _ROOT_TRANSFER_EVENTS = weakref.WeakKeyDictionary()
 class SharedExpertPool:
     """Lease expert storage under an active SHMEM lifecycle."""
 
+    pool_kind = "hot_replica_expert_bank"
+
     def __init__(
         self, hidden: torch.Tensor, group: torch.distributed.ProcessGroup,
         local_experts: int, intermediate_size: int, blocks: int, layout: str, *,
-        root: Any, access: Callable[[], AbstractContextManager],
+        root: Any, access: Callable[[], AbstractContextManager], pipeline: bool = False,
     ) -> None:
         """Describe a bank that either EP backend can allocate and lease."""
         self.group = group
@@ -90,11 +93,14 @@ class SharedExpertPool:
         }
         self.capacity_floor = local_experts
         self.expert_weight_layout = layout
+        self.pipeline = ReplicaPipeline(self) if pipeline else None
 
     @property
     def allocation_bytes(self) -> int:
-        """Report the aligned combined weight-bank requirement."""
-        return 6 * self.local_experts * self.hidden * self.intermediate * self.dtype.itemsize + 1024
+        """Report the aligned combined bank and optional peer-event requirement."""
+        weights = 6 * self.local_experts * self.hidden * self.intermediate * self.dtype.itemsize + 1024
+        signal_bytes = 0 if self.pipeline is None else 4 * self.pipeline.signal_words + 512
+        return weights + signal_bytes
 
     def allocate(self) -> None:
         """Allocate after the caller has acquired the runtime and reserved capacity."""
@@ -110,11 +116,15 @@ class SharedExpertPool:
                     allocated.append(shmem.empty(shape, dtype=self.dtype, alignment=512))
             finally:
                 self.weights = tuple(allocated)
+            if self.pipeline is not None:
+                self.pipeline.allocate()
             if self.completion_event is None:
                 self.completion_event = torch.npu.Event()
 
     def _free(self) -> None:
         self._alternate_banks = ()
+        if self.pipeline is not None:
+            self.pipeline.free()
         # A later collective free can fail. Retire each successful allocation
         # immediately so a retry does not free the same SHMEM storage twice.
         while self.weights:
@@ -133,6 +143,12 @@ class SharedExpertPool:
             (2 * self.local_experts, self.intermediate, self.hidden),
         )
 
+    def _allocations(self, dtype):
+        specs = tuple((shape, dtype) for shape in self._bank_shapes())
+        if self.pipeline is None:
+            return self.weights, specs
+        return (*self.weights, self.pipeline.storage), (*specs, ((self.pipeline.signal_words,), torch.int32))
+
     def describe_restart_allocations(
         self,
         spec: Any,
@@ -141,11 +157,12 @@ class SharedExpertPool:
     ) -> tuple[Any, ...]:
         """Participate in HyperMulticore's atomic allocation replacement, without rebuilding runtime."""
         del spec, receive_capacity
+        tensors, specs = self._allocations(dtype)
         return tuple(
             _lifecycle._AllocationReplacement(  # pylint: disable=protected-access
-                tensor, _lifecycle._AllocationSpec(shape, dtype, 512)  # pylint: disable=protected-access
+                tensor, _lifecycle._AllocationSpec(shape, tensor_dtype, 512)  # pylint: disable=protected-access
             )
-            for tensor, shape in zip(self.weights, self._bank_shapes())
+            for tensor, (shape, tensor_dtype) in zip(tensors, specs)
         )
 
     def validate_restart_allocations(
@@ -159,10 +176,11 @@ class SharedExpertPool:
         del spec, current_capacity
         if self.in_use:
             raise RuntimeError("Active HotReplica bank prevents heap growth")
-        if len(replacements) != len(self.weights):
+        tensors, specs = self._allocations(dtype)
+        if len(replacements) != len(tensors):
             raise RuntimeError("HotReplica bank restart allocation mapping changed")
-        for tensor, replacement, shape in zip(self.weights, replacements, self._bank_shapes()):
-            if replacement.current is not tensor or tuple(tensor.shape) != shape or tensor.dtype != dtype:
+        for tensor, replacement, (shape, tensor_dtype) in zip(tensors, replacements, specs):
+            if replacement.current is not tensor or tuple(tensor.shape) != shape or tensor.dtype != tensor_dtype:
                 raise RuntimeError("HotReplica bank restart mapping does not match committed storage")
         return bool(self.weights)
 
@@ -175,10 +193,12 @@ class SharedExpertPool:
     ) -> None:
         """Validate every replacement before the HeapManager commits any owner."""
         del spec, receive_capacity
-        if len(tensors) != len(self._bank_shapes()):
+        _, specs = self._allocations(dtype)
+        if len(tensors) != len(specs):
             raise RuntimeError("HotReplica bank restart returned incomplete storage")
         if any(
-            tuple(tensor.shape) != shape or tensor.dtype != dtype for tensor, shape in zip(tensors, self._bank_shapes())
+            tuple(tensor.shape) != shape or tensor.dtype != tensor_dtype
+            for tensor, (shape, tensor_dtype) in zip(tensors, specs)
         ):
             raise RuntimeError("HotReplica bank restart returned an incompatible allocation")
 
@@ -193,7 +213,11 @@ class SharedExpertPool:
         """Bind new bank tensors after HMC replaces the symmetric heap."""
         del spec, dtype, device, receive_capacity
         self._alternate_banks = ()
-        self.weights = tuple(tensors)
+        if self.pipeline is None:
+            self.weights = tensors
+        else:
+            self.weights = tensors[:-1]
+            self.pipeline.bind(tensors[-1])
         self.generation += 1
         # The heap transaction retired the previous bank. Retain its completion
         # event as a conservative first-use dependency, but forget its stream.
@@ -279,6 +303,8 @@ class SharedExpertPool:
         """Publish current owner weights and fill borrowed slots on the lease stream."""
         if not self.in_use:
             raise RuntimeError("HotReplica prefetch requires an active bank lease")
+        if self.pipeline is not None:
+            self.pipeline.resident = None
         with _ordered_transfers(self):
             if snapshot is None:
                 prefetch_banks(weights, self.leased_banks, copies, self.rank, self.blocks)
@@ -361,16 +387,35 @@ class ExpertWeightBinding:
     snapshot: Any = None
     generation: int | None = None
     staged_generation: int | None = None
+    fused: bool = False
+    token: object = field(default_factory=object)
+    transfers: tuple = ()
+    gradient_storage: tuple = ()
+
+    def __post_init__(self):
+        self.edges = self.pool.pipeline.plan(self.placement) if self.fused else None
+
+    @property
+    def owns_returns(self):
+        return self.fused and bool(self.edges[2])
 
     def prepare_replay(self) -> None:
         """Restore the saved suffix while the framework replays attention and routing."""
         if self.snapshot is not None:
             self.staged_generation = self.pool.stage_snapshot(self.layout, self.snapshot)
 
-    def acquire(self, weights: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    def acquire(
+        self, weights: tuple[torch.Tensor, ...], *, backward: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """Lease reusable banks and publish this graph's saved owner weights."""
         self.pool.claim(self.layout)
         try:
+            if self.fused:
+                with _ordered_transfers(self.pool):
+                    result = self.pool.pipeline.begin(weights, self, backward)
+                stats = self.pool.statistics
+                stats["fused_prefetches"] = stats.get("fused_prefetches", 0) + 1
+                return result
             if self.generation is not None and self.generation == self.pool.generation:
                 self.pool.statistics["backward_cache_hits"] += 1
                 return self.pool.active_weights(self.placement.borrowed_capacity)
@@ -382,8 +427,17 @@ class ExpertWeightBinding:
             self.generation = self.pool.generation
             return borrowed
         except BaseException:
-            self.pool.release()
+            try:
+                if self.fused:
+                    self.pool.pipeline.resident = None
+                    self.pool.pipeline.complete(self)
+            finally:
+                self.pool.release()
             raise
+
+    def runtime(self, ordinary, gradients=None):
+        """Select split weights and optional in-kernel dW for this launch."""
+        return self.pool.pipeline.runtime(ordinary, self, gradients) if self.fused else None
 
     def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
         """Keep only the borrowed suffix from the original checkpoint forward."""
@@ -400,6 +454,10 @@ class ExpertWeightBinding:
         self, gradients: tuple[torch.Tensor, ...], weights: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
         """Return partial expert gradients to owners before casting parameter gradients."""
+        if self.fused:
+            stats = self.pool.statistics
+            stats["fused_gradient_returns"] = stats.get("fused_gradient_returns", 0) + 1
+            return gradients
         return self.pool.return_generated_gradients(
             gradients, self.placement.copies, output_dtypes=tuple(w.dtype for w in weights),
             published_slots=self.placement.published_slots,
@@ -407,6 +465,8 @@ class ExpertWeightBinding:
 
     def release(self) -> None:
         """Record completion after both expert compute and peer gradient reads."""
+        if self.fused:
+            self.pool.pipeline.complete(self)
         self.pool.release()
 
     def track_graph(self, ctx: Any) -> None:

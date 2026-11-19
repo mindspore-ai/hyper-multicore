@@ -130,6 +130,14 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
                      selected_env.get("LD_LIBRARY_PATH", "")])}
                 for name in ("_a3_allocator.so", "_hot_replica_shared_bridge.so"):
                     validate_elf(replica_output / name, identity["host_arch"], run.commands, link_env)
+        if backend == "arch35":
+            with run.commands.scope("HotReplica"):
+                replica_output = output / "hot_replica"
+                run.commands(
+                    [str(python), str(ROOT / "hyper_multicore/modules/hot_replica/build.py"),
+                     "--phase", "mx-host", "--output-dir", str(replica_output)],
+                    label=f"compile-{identifier}-hot_replica-mx-host", env=selected_env)
+                validate_elf(replica_output / "_replica_host.so", identity["host_arch"], run.commands, selected_env)
         with run.commands.scope("Load"):
             load_backend(python, payload, common, sdk, backend, run, selected_env, identifier)
         validate_elf(output / "hyper_multicore_shmem_torch.so", identity["host_arch"], run.commands, selected_env)

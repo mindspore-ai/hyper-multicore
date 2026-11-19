@@ -21,13 +21,14 @@ from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, 
 from hyper_multicore.scheduler.runtime import allocate_runtime_config
 from hyper_multicore.scheduler.scheduler import revise_task_queue
 from hyper_multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
-from hyper_multicore.tasks.gmm_mxfp8 import Mxfp8GmmFillConfig, serialize_mx_gmm_descriptors
+from hyper_multicore.tasks.gmm_mxfp8 import MX_GMM_TASK_TYPE, Mxfp8GmmFillConfig, serialize_mx_gmm_descriptors
 from hyper_multicore.tasks.quantization_mxfp8 import (MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK,
+    MX_QUANT_ROW_TASK, MX_SWIGLU_ROW_TASK,
     Mxfp8QuantFillConfig, serialize_mx_quant_descriptors)
 from hyper_multicore.tasks.swiglu_mxfp8 import Mxfp8SwiGLUFillConfig
 from hyper_multicore.tasks.utils import add_dynamic_data, add_terminate
 from ...spec import MegaMoeSpec
-from ...schedule import configure_expert_queues
+from ...schedule import TWO_EXPERT_PIPELINE, configure_expert_queues
 
 
 @dataclass
@@ -49,18 +50,22 @@ class MXFP8Runtime:
     buffer_count: int
     transport_schedule: str = 'QP1'
     native_operator: str = 'HyperMegaMoeMxfp8'
+    gradient_ready_events: tuple[tuple[int, ...], ...] = ()
 
 
 def _add_compute(graph: ComputeGraph, name: str, specs: dict[int, TensorSpec],
                  inputs: list[int], outputs: list[int], fill: Any, workers: int,
                  op_type: OpType = OpType.GMM) -> None:
+    parameter_position = None
+    if isinstance(fill, Mxfp8GmmFillConfig) and (fill.guest_weights is not None or fill.guest_output is not None):
+        parameter_position = fill.diagnostic_parameter_position
     graph.add_op(OperatorNode(
         name=name, op_type=op_type, inputs=[specs[index] for index in inputs],
         outputs=[specs[index] for index in outputs], param_positions=inputs + outputs,
         split_value=1, split_spec=SplitSpec(
             split_inputs=None, split_output_dims=[0] * len(outputs),
             task_num_fn=lambda tsv: tsv.single_rank_expert_num * workers,
-        ), tiling_position=-1, fill_config=fill,
+        ), tiling_position=-1, fill_config=fill, diagnostic_parameter_position=parameter_position,
     ))
 
 
@@ -86,10 +91,10 @@ def _add_transport(graph: ComputeGraph, specs: dict[int, TensorSpec], *, forward
             fill.event_group = specs[1].shape[0]
 
 
-def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
+def _buffer_specs(spec: MegaMoeSpec, forward: bool, guests: bool, gradient_helpers: bool) -> dict[int, TensorSpec]:
     """Define logical buffer positions for the selected MX graph direction."""
     h, width, rows, experts = spec.hidden_size, spec.intermediate_size, spec.routed_slots, spec.local_experts
-    count = 27 if forward else 33
+    count = (27 if forward else 33) + (5 if guests else 0) + (3 if gradient_helpers else 0)
     result = {index: TensorSpec(f'buffer_{index}', [rows, h], index, dtype_size=1) for index in range(count)}
     ordinary = ({0: h, 2: h, 7: 2 * width, 11: h, 12: h} if forward
                 else {0: h, 2: h, 6: h, 8: width, 9: 2 * width, 12: h, 13: h, 18: 2 * width})
@@ -113,46 +118,84 @@ def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
     return result
 
 
-def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool) -> MXFP8Runtime:
+def _mx_gradient_ready_events(cfg: Any, experts: int, cubes: int) -> tuple:
+    """Read the full-K producer fences from the actual FP32 TN tasks."""
+    projections = {6: 0, 38: 0, 18: 1, 39: 1}
+    events = [[[] for _ in range(experts)] for _ in range(2)]
+    for task in cfg.all_tasks[:cfg.task_num]:
+        if task.task_type != MX_GMM_TASK_TYPE:
+            continue
+        position = task.outputs[0].input_position
+        if position in projections:
+            events[projections[position]][task.task_index // cubes].append(task.trigger_event)
+    if any(len(group) != cubes or len(set(group)) != 1 or cfg.all_event_num_triggers[group[0]] != cubes
+           for projection in events for group in projection):
+        raise ValueError("FP32 return must wait for every TN Cube producer")
+    return tuple(tuple(group[0] for group in projection) for projection in events)
+
+
+def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool, row_only: bool = False,
+                       home_experts: int | None = None, gradient_helpers: bool = False) -> MXFP8Runtime:
     """Wire per-expert dependencies; preserve adopted math, transport and task boundaries."""
     if spec.swiglu_limit is not None:
         raise ValueError("MX tasks currently require unclamped activation")
+    if row_only and not forward:
+        raise ValueError("MX backward requires both quantization axes")
+    if home_experts is not None and not 0 < home_experts < spec.local_experts:
+        raise ValueError("An MX replica graph requires an original home bank and guest slots")
+    if gradient_helpers and (forward or home_experts is None or spec.partial_weight_grad_dtype != "float32"
+                             or spec.dispatch_mode != 'push'):
+        raise ValueError("MX gradient return requires guest slots and FP32 TN output")
+    activation_first = gradient_helpers and spec.schedule_policy in ('auto', TWO_EXPERT_PIPELINE)
     values = _MXTaskValues(tp=1, ep=spec.ep_size, seq_size=spec.local_num_tokens,
                            all_expert_num=spec.num_experts, top_k=spec.top_k,
                            compute_stages=4 if forward else 6, dispatch_mode=spec.dispatch_mode)
-    specs, graph, gmms, quants = _buffer_specs(spec, forward), ComputeGraph(), [], []
+    specs = _buffer_specs(spec, forward, home_experts is not None, gradient_helpers)
+    graph, gmms, quants = ComputeGraph(), [], []
     _add_transport(graph, specs, forward=forward, dispatch_split=spec.dispatch_split, combine_split=spec.combine_split)
     h, width, capacity, cubes = spec.hidden_size, spec.intermediate_size, spec.receive_capacity, spec.num_cube_cores
     vectors = 2 * cubes
     glist, gtable, qtable = (6, 25, 26) if forward else (19, 31, 32)
+    types = {MX_QUANT_TASK: OpType.QUANTIZE, MX_QUANT_ROW_TASK: OpType.QUANTIZE,
+             MX_SWIGLU_TASK: OpType.SWIGLU_QUANT, MX_SWIGLU_ROW_TASK: OpType.SWIGLU_QUANT,
+             MX_SWIGLU_GRAD_TASK: OpType.SWIGLU_GRAD_QUANT}
 
     def quant(name, kind, columns, inputs, outputs, first=False):
+        op_type = types[kind]
+        fill = Mxfp8QuantFillConfig if op_type == OpType.QUANTIZE else Mxfp8SwiGLUFillConfig
         _add_compute(graph, name, specs, inputs + [glist, qtable], outputs,
-                     (Mxfp8QuantFillConfig if kind == MX_QUANT_TASK else Mxfp8SwiGLUFillConfig)(
-                         kind, columns, vectors, first, quants), vectors,
-                     {MX_QUANT_TASK: OpType.QUANTIZE, MX_SWIGLU_TASK: OpType.SWIGLU_QUANT,
-                      MX_SWIGLU_GRAD_TASK: OpType.SWIGLU_GRAD_QUANT}[kind])
+                     fill(kind, columns, vectors, first, quants), vectors, op_type)
 
-    def gmm(name, layout, dims, inputs, output, scales):
+    def gmm(name, layout, dims, inputs, output, scales, projection=None):
+        guest_weights = None
+        if home_experts is not None and projection is not None:
+            first = 27 if forward else 33
+            position = first + 2 * projection
+            guest_weights = (home_experts, position, position + 1, first + 4)
+        guest_output = (home_experts, 38 if output == 6 else 39) if gradient_helpers and layout == 'TN' else None
         _add_compute(graph, name, specs, inputs + [glist, gtable], [output],
-                     Mxfp8GmmFillConfig(layout, *dims, *scales, cubes, gmms), cubes)
+                     Mxfp8GmmFillConfig(layout, *dims, *scales, cubes, gmms, guest_weights, guest_output,
+                                        prezeroed_output=layout == 'TN'), cubes)
 
     if forward:
-        quant('quant_x', MX_QUANT_TASK, h, [0], [16, 17, 18, 19], first=True)
-        gmm('up', 'NN', (capacity, 2 * width, h), [16, 5], 7, (17, 23))
-        quant('swiglu_quant', MX_SWIGLU_TASK,
-              width, [7], [8, 20, 21, 22])
-        gmm('down', 'NN', (capacity, h, width), [8, 9], 11, (20, 24))
+        quant('quant_x', MX_QUANT_ROW_TASK if row_only else MX_QUANT_TASK, h, [0],
+              [16, 17] if row_only else [16, 17, 18, 19], first=True)
+        gmm('up', 'NN', (capacity, 2 * width, h), [16, 5], 7, (17, 23), projection=0)
+        quant('swiglu_quant', MX_SWIGLU_ROW_TASK if row_only else MX_SWIGLU_TASK,
+              width, [7], [8, 20] if row_only else [8, 20, 21, 22])
+        gmm('down', 'NN', (capacity, h, width), [8, 9], 11, (20, 24), projection=1)
         order = ['dispatch', 'quant_x', 'up', 'swiglu_quant', 'down', 'combine']
     else:
         quant('quant_dy', MX_QUANT_TASK, h, [0], [20, 21, 22, 23], first=True)
         gmm('dw2', 'TN', (width, h, capacity), [5, 22], 6, (24, 23))
-        gmm('da', 'NT', (capacity, width, h), [20, 7], 8, (21, 25))
+        gmm('da', 'NT', (capacity, width, h), [20, 7], 8, (21, 25), projection=1)
         quant('swiglu_grad_quant', MX_SWIGLU_GRAD_TASK, 2 * width, [9, 8], [10, 26, 27, 28])
         gmm('dw1', 'TN', (h, 2 * width, capacity), [17, 27], 18, (30, 28))
-        gmm('dx', 'NT', (capacity, h, 2 * width), [10, 11], 12, (26, 29))
+        gmm('dx', 'NT', (capacity, h, 2 * width), [10, 11], 12, (26, 29), projection=0)
         order = ['dispatch', 'quant_dy', 'dw2', 'da', 'swiglu_grad_quant', 'dw1', 'dx', 'combine']
     for left, right in zip(order, order[1:]):
+        if activation_first and right == 'da':
+            left = 'quant_dy'
         graph.add_edge(left, right)
     graph.propagate_splits(values)
     tasks = 1 + sum(op.task_num for op in graph.topological_sort())
@@ -160,8 +203,17 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool) -> MXFP8Runtime:
     cfg = allocate_runtime_config(tasks, event_capacity, spec.local_experts, num_workers=2 * cubes)
     init_task_split_value(values)
     values.rank_id = spec.rank_id
+    dw2_start = 0
     for op in graph.topological_sort():
+        start = values.pre_task_num
         op.fill_config.fill(cfg, op, values)
+        if activation_first and op.name == 'dw2':
+            dw2_start = start
+        if activation_first and op.name == 'da':
+            # Both consume the same dY quantization. Leave the full TN fence
+            # on dW2 for return helpers while SwiGLU can start as dW2 runs.
+            for offset in range(op.task_num):
+                cfg.all_tasks[start + offset].dependent_event = cfg.all_tasks[dw2_start + offset].dependent_event
     combine = graph.get_op('combine')
     add_terminate(cfg, values, combine.task_num)
     middle_vectors = sum(graph.get_op(name).task_num for name in order
@@ -173,8 +225,10 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool) -> MXFP8Runtime:
     cfg.atomic_add_values[0] = 1
     configure_ready_handshake(cfg, values)
     validate_runtime_config(cfg, values, cubes)
-    cfg = configure_expert_queues(cfg, graph, spec, forward=forward)
+    cfg = configure_expert_queues(cfg, graph, spec, forward=forward, mx_gradient_helpers=gradient_helpers,
+                                  mx_activation_first=activation_first)
+    gradient_ready = _mx_gradient_ready_events(cfg, spec.local_experts, cubes) if gradient_helpers else ()
     native_operator = 'HyperMegaMoeMxfp8' if forward else 'HyperMegaMoeMxfp8Grad'
     return MXFP8Runtime(graph, cfg, serialize_mx_gmm_descriptors(gmms),
-                        serialize_mx_quant_descriptors(quants), 27 if forward else 33,
-                        f'{spec.schedule_policy}/QP1', native_operator)
+                        serialize_mx_quant_descriptors(quants), len(specs),
+                        f'{spec.schedule_policy}/QP1', native_operator, gradient_ready)

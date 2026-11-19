@@ -509,6 +509,7 @@ def prepare_topk_route(
     autograd_mask: int = 0,
     prepare_workspace: Callable[[int, int], None] | None = None,
     select_placement: Callable | None = None,
+    reuse_placement_geometry: bool = False,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -529,7 +530,8 @@ def prepare_topk_route(
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
-                                      workspace, autograd_mask, prepare_workspace, select_placement)
+                                      workspace, autograd_mask, prepare_workspace, select_placement,
+                                      reuse_placement_geometry)
     permuted = None
     if _can_fuse_count(hidden_states, spec, tokens_per_expert):
         permuted, counts = _permute_and_count(hidden_states, topk_ids, spec)
@@ -941,6 +943,7 @@ def _prepare_dynamic_route(
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
     prepare_workspace: Callable[[int, int], None] | None = None,
     select_placement: Callable | None = None,
+    reuse_placement_geometry: bool = False,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
     # Invalid dynamic ranks must still enter the original collective before failing.
@@ -950,20 +953,29 @@ def _prepare_dynamic_route(
     route_stream = (torch.npu.current_stream(hidden_states.device)
                     if workspace is not None and hidden_states.device.type == "npu" else None)
     permuted = None
-    if within_limit and _can_fuse_count(hidden_states, spec, supplied_counts):
-        permuted, supplied_counts = _permute_and_count(hidden_states, topk_ids, spec)
-    counts, payload, invalid = _dynamic_route_payload(
-        hidden_states, flat_ids, spec, supplied_counts, autograd_mask, workspace, stream=route_stream)
+    payload = None
+    if within_limit and reuse_placement_geometry and supplied_counts is None:
+        from ..hot_replica.counts import route_payload  # pylint: disable=import-outside-toplevel
+
+        payload = route_payload(topk_ids, spec.num_experts, autograd_mask)
+    separate_counts = payload is not None
+    if separate_counts:
+        counts, invalid = payload[3:], False
+    else:
+        if within_limit and _can_fuse_count(hidden_states, spec, supplied_counts):
+            permuted, supplied_counts = _permute_and_count(hidden_states, topk_ids, spec)
+        counts, payload, invalid = _dynamic_route_payload(
+            hidden_states, flat_ids, spec, supplied_counts, autograd_mask, workspace, stream=route_stream)
     if workspace is not None and spec.dispatch_mode != "pull":
         workspace.wait_for_reuse(stream=route_stream)
     gathered, work = _start_dynamic_gather(payload, spec)
     # Ordinary storage remains valid if count agreement triggers a SHMEM restart.
-    if permuted is None:
+    if permuted is None and not separate_counts:
         permuted = _stage_dynamic_permutation(hidden_states, topk_ids, spec, invalid, workspace)
     if select_placement is not None:
         return _prepare_placed_route(hidden_states, topk_ids, spec, workspace, permuted,
                                      counts, gathered, work, route_stream, prepare_workspace,
-                                     select_placement, autograd_mask)
+                                     select_placement, autograd_mask, reuse_placement_geometry)
     permuted, summary, host_rows, metadata, work = _resolve_dynamic_permutation(
         hidden_states, topk_ids, spec, workspace, permuted, invalid, route_stream,
         prepare_workspace, gathered, work)
@@ -973,34 +985,49 @@ def _prepare_dynamic_route(
 
 
 def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,
-                          work, stream, prepare_workspace, select_placement, autograd_mask=0):
+                          work, stream, prepare_workspace, select_placement, autograd_mask=0,
+                          reuse_placement_geometry=False):
     """Select a per-call route between count validation and capacity commitment."""
     if work is not None:
         work.wait()
-    source_rows = []
-    summary, host_rows, metadata = _read_cached_route(
-        gathered, spec, workspace, hidden.device, source_rows, stream=stream)
-    selected = select_placement(
-        hidden, ids, gathered, summary, source_rows, permuted[1], autograd_mask, host_rows=host_rows,
-    )
+    inverse = None if permuted is None else permuted[1]
+    if reuse_placement_geometry:
+        from ..hot_replica.bounded_placement import read_placement_wire  # pylint: disable=import-outside-toplevel
+
+        snapshot = read_placement_wire(gathered, spec, workspace, stream)
+        summary = snapshot.summary
+        host_rows = None
+        selected = select_placement(hidden, ids, gathered, summary, snapshot.source_rows,
+                                    inverse, autograd_mask, snapshot=snapshot)
+        metadata = snapshot.ordinary_metadata(spec, hidden) if selected is None else None
+    else:
+        source_rows = []
+        summary, host_rows, metadata = _read_cached_route(
+            gathered, spec, workspace, hidden.device, source_rows, stream=stream)
+        selected = select_placement(
+            hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, host_rows=host_rows,
+        )
     if selected is None:
-        # Preserve every ordinary route, schedule and capacity decision.
         prepare_workspace(summary[1], summary[2])
+        if permuted is None:
+            permuted = _permute_topk_input(hidden, ids)
         return _finalize_dynamic_route(
             permuted, counts, summary, host_rows, metadata, None, gathered, spec,
             workspace, hidden.device, hidden.shape[0])
     resources, placement, binding = selected
     virtual_spec, virtual_workspace = resources.spec, resources.workspace
     table = placement.counts_by_source
-    virtual_spec = replace(virtual_spec, num_experts=table.shape[1])
+    if virtual_spec.num_experts != table.shape[1]:
+        virtual_spec = replace(virtual_spec, num_experts=table.shape[1])
     virtual_counts = table[virtual_spec.rank_id].contiguous()
-    virtual_table = torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
+    metadata = placement.route_metadata
+    virtual_table = gathered if metadata is not None else torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
     local_load = placement.received_rows(virtual_spec.rank_id)
     virtual_summary = max(1, local_load), summary[1], placement.receive_capacity
     resources.prepare_auto_workspace(virtual_summary[1], virtual_summary[2], hidden)
     virtual_tokens = _permute_topk_input(hidden, placement.virtual_ids)
     route = _finalize_dynamic_route(
-        virtual_tokens, virtual_counts, virtual_summary, None, None, None, virtual_table,
+        virtual_tokens, virtual_counts, virtual_summary, None, metadata, None, virtual_table,
         virtual_spec, virtual_workspace, hidden.device, hidden.shape[0])
     return replace(route, execution_resources=resources, weight_binding=binding)
 

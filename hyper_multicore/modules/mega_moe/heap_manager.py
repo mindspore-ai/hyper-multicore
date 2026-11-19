@@ -373,8 +373,102 @@ class _HeapManager:
                                            max(entry.layout.receive_capacity, _align_capacity(received)),
                                            max(spec.local_num_tokens, tokens))
                 layouts = [layout if item is entry else item.layout for item in self.entries]
-            self._restart(layouts, self._budget(self._required_bytes(layouts)))
+            required = self._required_bytes(layouts)
+            heap_bytes = self._budget(required)
+            if not self._grow_mx_push_storage(entry, layout, required, heap_bytes):
+                self._restart(layouts, heap_bytes)
             return entry.bound_spec
+
+    def _grow_mx_push_storage(
+        self, entry: _HeapEntry, layout: _WorkspaceLayout, required: int, heap_bytes: int,
+    ) -> bool:
+        """Grow MX Push scratch inside the attached heap without rebinding other owners."""
+        spec = entry.bound_spec
+        workspace = entry.workspace
+        if (not self._runtime_attached or heap_bytes != self.heap_bytes
+                or spec.architecture != 3510 or spec.precision != "mxfp8"
+                or spec.dispatch_mode != "push" or spec.apply_probs_before_fc2):
+            return False
+        new_spec = self._layout_spec(entry, layout)
+        replacements = workspace.describe_restart_allocations(new_spec, self.dtype, layout.receive_capacity)
+        # MX Push saves owned activations and invocation metadata. Retained
+        # backward reads these two serial transport buffers from the workspace
+        # at launch. Event storage and the expert bank keep their identities.
+        old_layout = entry.layout
+        data_fields = (
+            ("expert_buffer", old_layout.receive_capacity, layout.receive_capacity),
+            ("routed_buffer", spec.routed_slots, new_spec.routed_slots),
+        )
+        changed = tuple((name, item, old_rows) for (name, old_rows, new_rows), item in zip(data_fields, replacements)
+                        if old_rows != new_rows)
+        temporary_bytes = sum(old_rows * spec.hidden_size * self.element_size for _, _, old_rows in changed)
+        if required + temporary_bytes > self.heap_bytes:
+            return False
+
+        started = time.perf_counter()
+
+        def prepare() -> None:
+            workspace.validate_restart_allocations(spec, self.dtype, old_layout.receive_capacity, replacements)
+            if workspace.used:
+                workspace.completion_event.synchronize()
+
+        owner_index = next(index for index, candidate in enumerate(self.entries) if candidate is entry)
+        signature = tuple((name, item.target) for name, item, _ in changed)
+        self._run_and_check_consistency(
+            prepare, stage="MX Push growth preflight", value=(owner_index, old_layout, layout, signature),
+        )
+        try:
+            stages_ms = self._replace_mx_push_buffers(workspace, changed)
+        except Exception:
+            self.state = "failed"
+            raise
+        if replacements:
+            workspace.expert_capacity = layout.receive_capacity
+            workspace.routed_slots = new_spec.routed_slots
+        workspace.capacity_floor = layout.receive_capacity
+        entry.bound_spec = new_spec
+        entry.layout = layout
+        self.epoch += 1
+        self.growth_records.append({
+            "epoch": self.epoch,
+            "mode": "mx_push_storage",
+            "old_heap_bytes": self.heap_bytes,
+            "heap_bytes": self.heap_bytes,
+            "old_receive": old_layout.receive_capacity,
+            "receive": layout.receive_capacity,
+            "old_source": spec.local_num_tokens,
+            "source": new_spec.local_num_tokens,
+            "replaced": [name for name, _, _ in changed],
+            "total_ms": (time.perf_counter() - started) * 1000,
+            "stages_ms": stages_ms,
+            "capacities": [item.layout.receive_capacity for item in self.entries],
+        })
+        return True
+
+    @staticmethod
+    def _replace_mx_push_buffers(
+        workspace: MegaMoeWorkspace, changed: tuple[tuple[str, _lifecycle._AllocationReplacement, int], ...],
+    ) -> dict[str, float]:
+        """Allocate replacements before releasing quiescent scratch tensors."""
+        started = time.perf_counter()
+        staged = []
+        try:
+            for name, item, _ in changed:
+                target = item.target
+                tensor = shmem.empty(target.shape, dtype=target.dtype, alignment=target.alignment_bytes)
+                staged.append((name, tensor))
+        except Exception:
+            for _, tensor in reversed(staged):
+                shmem.free(tensor)
+            raise
+        bound = time.perf_counter()
+        # Publish before freeing so a failed collective free cannot strand
+        # the new Allocation outside its sole workspace owner.
+        for name, tensor in staged:
+            setattr(workspace, name, tensor)
+        for _, item, _ in changed:
+            shmem.free(item.current)
+        return {"allocate_ms": (bound - started) * 1000, "release_ms": (time.perf_counter() - bound) * 1000}
 
     @staticmethod
     def _layout_spec(entry: _HeapEntry, layout: _WorkspaceLayout) -> MegaMoeSpec:

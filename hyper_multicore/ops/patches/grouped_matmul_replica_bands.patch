@@ -1,0 +1,63 @@
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
+@@ -187,6 +187,7 @@
+                        y, user1,  &gmmBaseParams_, &mmTilingData_, &tPipe);                                        \
+         processClass<decltype(computeOp)> op(computeOp);                                                           \
+         op.Init(&gmmBaseParams_, &mmTilingData_, gmmArrayAddr_, groupList, tiling);                                \
++        op.bandProducer.Set(band_flags, band_epoch, band_rows);                                     \
+         op.Process();                                                                                              \
+     } while (0)
+ 
+@@ -383,7 +384,8 @@
+                                                      GM_ADDR offset, GM_ADDR antiquantScale, GM_ADDR antiquantOffset,
+                                                      GM_ADDR groupList, GM_ADDR perTokenScale, GM_ADDR y,
+                                                      GM_ADDR workspace, GM_ADDR tiling, bool transA, bool transB,
+-                                                     bool fp32Output = false)
++                                                     bool fp32Output = false, GM_ADDR band_flags = nullptr,
++                                                     int32_t band_epoch = 0, uint32_t band_rows = 0)
+ {
+     TPipe tPipe;
+     AscendCUtils::SetOverflow(1);
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.h
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+@@ -17,6 +17,7 @@
+ 
+ #include "grouped_matmul_utils.h"
+ #include "kernel_operator.h"
++#include "../runtime/gradient_band_producer.h"
+ 
+ namespace GROUPED_MATMUL {
+ 
+@@ -132,6 +133,8 @@
+ 
+  public:
+     /** @brief constructor */
++    MulticoreRuntime::GradientBandProducer bandProducer;
++
+     __aicore__ inline GMMProcess(ComputeType& computeOp_) : computeOp(computeOp_) {}
+ 
+     __aicore__ inline void Init(const GMMBaseParams* __restrict gmmBaseParamsIn,
+@@ -305,9 +308,23 @@
+         uint32_t curBlock = coreIdx >= count ? coreIdx : coreIdx + gmmBaseParams->coreNum;
+         uint32_t thresholdM_dimN = thresholdBlockNum * mnConfig.blockDimN;
+ 
++        if (bandProducer.Enabled()) {
++            bandProducer.Begin(mnConfig.m, coreIdx, gmmBaseParams->coreNum);
++            MNConfig planned = mnConfig;
++            for (uint32_t block = curBlock; block < curCount; block += gmmBaseParams->coreNum) {
++                MNBlockIdxCompute(planned, block, count, thresholdM_dimN);
++                const uint32_t row = planned.mIdx * planned.singleM;
++                bandProducer.Expect(row, planned.m - row < planned.singleM ? planned.m - row : planned.singleM);
++            }
++            bandProducer.PublishEmpty();
++        }
+         while (curBlock < curCount) {
+             MNBlockIdxCompute(mnConfig, curBlock, count, thresholdM_dimN);
+             computeOp.MMCompute(groupIdx, mnConfig, coreIdx);
++            if (bandProducer.Enabled()) {
++                const uint32_t row = mnConfig.mIdx * mnConfig.singleM;
++                bandProducer.Retire(row, mnConfig.m - row < mnConfig.singleM ? mnConfig.m - row : mnConfig.singleM);
++            }
+             computeOp.VectorCompute(mnConfig);
+             curBlock += gmmBaseParams->coreNum;
+         }

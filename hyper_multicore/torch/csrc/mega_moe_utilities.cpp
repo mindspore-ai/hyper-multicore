@@ -153,6 +153,31 @@ TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
 }
 TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) { m.impl("route_offsets", RouteOffsets); }
 
+#if HMC_UTILITY_ARCH3510
+namespace {
+void PublishMxProjectionReady(const at::Tensor& flag, const at::Tensor& epoch) {
+  TORCH_CHECK(flag.scalar_type() == at::kInt && epoch.scalar_type() == at::kInt &&
+              flag.numel() == 1 && epoch.numel() == 1 && flag.is_contiguous() && epoch.is_contiguous() &&
+              flag.device() == epoch.device() && flag.device().type() == c10::DeviceType::PrivateUse1,
+              "MX projection readiness requires two INT32 device scalars");
+  const c10::DeviceGuard guard(flag.device());
+  auto stream = c10_npu::getCurrentNPUStream(flag.get_device()).stream(false);
+  auto run = [=]() -> int {
+    return aclrtMemcpyAsync(flag.data_ptr(), sizeof(int32_t), epoch.data_ptr(),
+                            sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+  };
+  // A data-move command can run while the fused consumer occupies all AIVs.
+  at_npu::native::OpCommand::RunOpApi("HmcPublishMxProjectionReady", run);
+}
+}  // namespace
+TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
+  m.def("hot_replica_publish_mx_projection_ready_(Tensor(a!) flag, Tensor epoch) -> ()");
+}
+TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
+  m.impl("hot_replica_publish_mx_projection_ready_", &PublishMxProjectionReady);
+}
+#endif
+
 extern "C" void HmcLaunchPermuteFromMapping_arch2201(unsigned blocks, void* stream, uint8_t* tokens, uint8_t* mapping,
                                             uint8_t* probabilities, uint8_t* output, uint8_t* output_probabilities,
                                             int64_t token_count, int64_t row_bytes, int64_t top_k);

@@ -43,11 +43,15 @@ _OPS_NN_PATHS = (
     "index/linear_index/op_host/op_api",
 )
 _OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
+_MX_QUANT_OPERATORS = (
+    "dynamic_mx_quant_with_dual_axis",
+    "swiglu_mx_quant",
+    "swiglu_mx_quant_with_dual_axis",
+    "swiglu_backward_mx_quant_with_dual_axis",
+)
 _ARCH35_OPS_NN_PATHS = (
     "common/inc/op_kernel",
-    "quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35",
-    "quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35",
-    "quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35",
+    *(f"quant/{operator}/op_kernel/arch35" for operator in _MX_QUANT_OPERATORS),
 )
 _OPS_TRANSFORMER_MHC_PATHS = (
     "common/include",
@@ -131,7 +135,7 @@ def main() -> int:
         _OPS_TRANSFORMER_MHC_PATHS,
     )
     _apply_locked_adapters(ops_nn_copy, lock["ops_nn"], architecture=args.architecture)
-    _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"])
+    _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"], architecture=args.architecture)
     _apply_locked_adapters(transformer_mhc_copy, transformer_revisions["mhc"])
 
     source_root = work_dir / "source"
@@ -161,13 +165,11 @@ def _compose_arch35_sources(source_root: Path, ops_nn: Path, ops_tensor: Path, l
     target = source_root / "arch35"
     shutil.copytree(ops_tensor / "include" / "blaze", target / "include" / "blaze")
     shutil.copytree(ops_nn / "activation/swi_glu_grad/op_kernel/arch35", target / "swi_glu_grad/arch35")
-    for operator in ("dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
-                     "swiglu_backward_mx_quant_with_dual_axis"):
+    for operator in _MX_QUANT_OPERATORS:
         destination = target / operator
         shutil.copytree(ops_nn / "quant" / operator / "op_kernel/arch35", destination / "arch35")
     # These are standard relative dependencies of the exported arch35 headers.
-    for operator in ("swi_glu_grad", "dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
-                     "swiglu_backward_mx_quant_with_dual_axis"):
+    for operator in ("swi_glu_grad", *_MX_QUANT_OPERATORS):
         shutil.copytree(ops_nn / "common/inc/op_kernel", target / operator / "inc")
     files = {str(path.relative_to(target)): _sha256(path)
              for path in sorted(target.rglob("*")) if path.is_file()}

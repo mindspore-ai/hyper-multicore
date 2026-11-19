@@ -67,6 +67,7 @@ assert 'torch_npu' not in sys.modules
         Expectation: The package exports its business modules and diagnostic helpers.
         """
         self.assertCountEqual(multicore.__all__, [
+            "BasePlanner", "ExpertPlacement", "PlacementRequest", "MegaMoePlacementOptions",
             "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaKernelDiagnostics",
             "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
         ])

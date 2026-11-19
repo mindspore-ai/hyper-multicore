@@ -203,11 +203,18 @@ class MegaMoeExperts(MulticoreModule):
         """
         numerics, tuning, scheduler = _resolve_expert_options(precision, numerics_options, tuning_options)
         planner = _placement_planner(expert_placement)
-        if planner is not None and (precision != "bf16" or tuning.dispatch_mode != "push"):
-            raise ValueError("HotReplica requires BF16 precision and push dispatch")
         source_bound = planner.source_token_bound if planner is not None else None
         planner_key = None
         if planner is not None:
+            if tuning.dispatch_mode != "push":
+                raise ValueError("HotReplica requires push dispatch")
+            if precision == "mxfp8":
+                from ..hot_replica.planner import HotReplicaPlanner  # pylint: disable=import-outside-toplevel
+
+                if type(planner) is not HotReplicaPlanner or source_bound is not None:
+                    raise ValueError("MXFP8 HotReplica requires the built-in planner without a source token bound")
+                if numerics.partial_weight_grad_dtype != "float32":
+                    raise ValueError("MXFP8 HotReplica requires float32 partial weight gradients")
             settings = planner.configuration_key()
             if not isinstance(settings, str):
                 raise TypeError("Planner configuration_key() must return a string")
@@ -528,8 +535,10 @@ class MegaMoeExperts(MulticoreModule):
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
-        with prepare_expert_invocation(hidden_flat, topk_ids, topk_weights, tokens_per_expert,
-                                       weights, resources, weight_error=weight_error, planner=self._planner) as route:
+        with prepare_expert_invocation(
+            hidden_flat, topk_ids, topk_weights, tokens_per_expert, weights, resources,
+            weight_error=weight_error, planner=self._planner, training=self.training,
+        ) as route:
             return self._backend.forward(
                 self, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route,
             )

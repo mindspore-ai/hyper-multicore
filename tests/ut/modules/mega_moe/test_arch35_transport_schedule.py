@@ -6,6 +6,7 @@ import pytest
 
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_multicore.modules.mega_moe.schedule import explain_schedule
 from hyper_multicore.modules.mega_moe.transport import TRANSPORT_TASKS, validate_transport_owners
 from hyper_multicore.shmem._ordering import SubmissionOrder
 from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
@@ -73,6 +74,29 @@ def test_mx_graph_coverage_and_shared_protocol(ep, mode):
         validate_transport_owners(cfg, spec, vectors)
         # Persistent ready/completion lanes have the same positions in F/R/B.
         assert cfg.event_capacity == phases[0].config.event_capacity
+
+
+def test_active_mx_activation_gradient_waits_for_dy_before_dw2():
+    """The reordered Cube queue must never wait on the next task's TN fence."""
+    spec = MegaMoeSpec(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
+                       num_experts=128, top_k=8, initial_capacity_factor=1.25,
+                       receive_capacity=65536, ep_size=16, ep_group=None, rank_id=0,
+                       num_cube_cores=32, dispatch_mode='push', dispatch_split=512, combine_split=512,
+                       architecture=3510, transport_engine='udma', ready_depth=0, precision='mxfp8',
+                       partial_weight_grad_dtype='float32')
+    plan = build_mxfp8_runtime(spec, forward=False, home_experts=6, gradient_helpers=True)
+    layout = explain_schedule(plan.config)
+    stages = layout['schedule']['stages']
+    da, count = stages['da']
+    dw2, dw_count = stages['dw_down']
+    assert count == dw_count
+    for lane, queue in enumerate(layout['queues'][:32]):
+        assert queue['tasks'][:2] == [da + lane, dw2 + lane]
+    for expert, event in enumerate(plan.gradient_ready_events[0]):
+        index = expert * 32
+        first, second = [layout['tasks'][index + start] for start in (da, dw2)]
+        assert first['dependent_event'] == second['dependent_event'] != event
+        assert second['trigger_event'] == event
 
 
 @pytest.mark.parametrize('tokens', [128, 256, 768, 4096])

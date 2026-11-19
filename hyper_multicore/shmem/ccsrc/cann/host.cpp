@@ -21,8 +21,6 @@
 #include "cann/log.h"
 #include "shmem.h"
 
-#define HP_SHMEM_UDMA_QP_NUM 1U
-
 namespace hyper_multicore::shmem::cann::host {
 namespace {
 
@@ -246,7 +244,7 @@ runtime::Status initialize(const InitOptions &options) {
   }
 
   if (options.data_engine == runtime::DataEngine::MteUdma) {
-    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, HP_SHMEM_UDMA_QP_NUM);
+    const int32_t qp_status = aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, options.udma_qp_num);
     if (qp_status != ACLSHMEM_SUCCESS) {
       return CannFailure("aclshmemx_set_qp_num", qp_status);
     }
@@ -255,7 +253,7 @@ runtime::Status initialize(const InitOptions &options) {
     if (get_status != ACLSHMEM_SUCCESS) {
       return CannFailure("aclshmemx_get_qp_num", get_status);
     }
-    if (actual_qps != HP_SHMEM_UDMA_QP_NUM) {
+    if (actual_qps != options.udma_qp_num) {
       return InvalidArgument("UDMA QP count does not match the requested configuration");
     }
   }
@@ -338,6 +336,18 @@ void put_on_stream(uintptr_t remote_dst, uintptr_t local_src, uint64_t bytes, in
   aclshmemx_putmem_on_stream(reinterpret_cast<void *>(remote_dst), reinterpret_cast<void *>(local_src),
                              static_cast<std::size_t>(bytes), target_pe,
                              reinterpret_cast<aclrtStream>(stream.native_handle));
+}
+
+runtime::Status put_sdma_on_stream(uintptr_t remote_dst, uintptr_t local_src, uint64_t bytes,
+                                  int32_t target_pe, const runtime::StreamView &stream) {
+  void *mapped = aclshmem_ptr(reinterpret_cast<void *>(remote_dst), target_pe);
+  if (mapped == nullptr) {
+    return InvalidArgument("SDMA requires a directly mapped SHMEM peer");
+  }
+  const auto status = aclrtMemcpyAsync(mapped, bytes, reinterpret_cast<const void *>(local_src), bytes,
+                                     ACL_MEMCPY_DEVICE_TO_DEVICE,
+                                     reinterpret_cast<aclrtStream>(stream.native_handle));
+  return status == ACL_SUCCESS ? Success() : AclFailure("aclrtMemcpyAsync", status);
 }
 
 void get_on_stream(uintptr_t local_dst, uintptr_t remote_src, uint64_t bytes, int32_t source_pe,

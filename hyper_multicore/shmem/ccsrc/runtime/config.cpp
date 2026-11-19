@@ -30,6 +30,7 @@ struct ConfigInput {
   std::optional<std::string> heap_size;
   std::optional<std::string> timeout;
   std::optional<std::string> data_engine;
+  std::optional<std::string> udma_qp_num;
   std::optional<std::string> bootstrap_endpoint_base;
 };
 
@@ -118,6 +119,17 @@ Result<Config> ParseConfig(const ConfigInput &input) {
     }
     config.data_engine = engine == "mte_udma" ? DataEngine::MteUdma : DataEngine::Mte;
   }
+  if (input.udma_qp_num.has_value()) {
+    auto qp_count = ParsePositiveUnsigned<uint32_t>(*input.udma_qp_num, kUdmaQpNumEnv);
+    if (!qp_count.ok()) {
+      return Result<Config>::Failure(qp_count.error());
+    }
+    config.udma_qp_num = qp_count.value();
+    if (!IsValidUdmaQpCount(config.data_engine, config.udma_qp_num)) {
+      return Result<Config>::Failure(InvalidConfig(std::string(kUdmaQpNumEnv) +
+                                    " must be 1, 8, 16 or 32; multiple QPs require mte_udma"));
+    }
+  }
 
   const std::string_view endpoint = input.bootstrap_endpoint_base.has_value()
                                       ? std::string_view(*input.bootstrap_endpoint_base)
@@ -138,6 +150,7 @@ Result<Config> LoadConfigFromEnvironment() {
   input.heap_size = ReadEnvironment(kHeapSizeEnv);
   input.timeout = ReadEnvironment(kTimeoutEnv);
   input.data_engine = ReadEnvironment(kDataEngineEnv);
+  input.udma_qp_num = ReadEnvironment(kUdmaQpNumEnv);
   input.bootstrap_endpoint_base = ReadEnvironment(kBootstrapEndpointEnv);
   return ParseConfig(input);
 }

@@ -12,6 +12,8 @@ from hyper_multicore.tasks.utils import fill_expert_compute_tasks
 MX_QUANT_TASK = 143
 MX_SWIGLU_TASK = 145
 MX_SWIGLU_GRAD_TASK = 146
+MX_SWIGLU_ROW_TASK = 164
+MX_QUANT_ROW_TASK = 165
 MX_QUANT_MAGIC = 0x4D585154
 _RECORD = struct.Struct('<IHH8I3Q')
 
@@ -41,15 +43,16 @@ class MxQuantDescriptor:
             raise ValueError('MX quant columns must be a positive multiple of 64')
         if self.worker_count == 0 or self.worker_index >= self.worker_count:
             raise ValueError('MX quant worker_index must be smaller than positive worker_count')
-        if self.task_type not in (MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK):
+        if self.task_type not in (MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK,
+                                  MX_QUANT_ROW_TASK, MX_SWIGLU_ROW_TASK):
             raise ValueError('Unsupported MX quant task type')
         if self.task_type == MX_SWIGLU_GRAD_TASK and self.columns % 128:
             raise ValueError('SwiGLU backward output columns must be a multiple of 128')
 
     @property
     def block_rows(self) -> int:
-        """Match the upstream packed-column quantization block height."""
-        return 64
+        """Match the block height of the selected quantization kernel."""
+        return 16 if self.task_type == MX_SWIGLU_ROW_TASK else 64
 
     @property
     def block_columns(self) -> int:

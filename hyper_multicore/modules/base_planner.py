@@ -17,9 +17,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from .mega_moe.route import RouteMetadata
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,9 @@ class ExpertPlacement:
     local_receive_capacity: int | None = None
     transfer_experts: int | None = None
     published_slots: int | None = None
+    copies_by_rank: tuple[tuple[int, ...], ...] = ()
+    route_metadata: RouteMetadata | None = None
+    owner_rows: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate the shared layout without reading any device tensor values."""

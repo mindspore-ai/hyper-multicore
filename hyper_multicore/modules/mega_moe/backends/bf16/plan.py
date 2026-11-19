@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -54,6 +54,7 @@ from hyper_multicore.scheduler.config import (
     TaskSplitValue,
 )
 from hyper_multicore.scheduler.graph import ComputeGraph
+from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 
 from ...schedule import configure_expert_queues
 from ...diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
@@ -169,7 +170,8 @@ def _uses_explicit_queues(spec: MegaMoeSpec) -> bool:
 
 
 def _build_runtime_artifacts(
-    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None,
+    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None, *,
+    replica_pipeline: bool = False, reserve_merge_workers: bool = False,
 ) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     explicit_queues = _uses_explicit_queues(spec)
@@ -240,8 +242,21 @@ def _build_runtime_artifacts(
         batch_experts=spec.batch_experts,
         dependency_poll_interval=FAST_DEPENDENCY_POLL_INTERVAL_US,
     )
-    for graph, config in ((forward_graph, forward_data), (backward_graph, backward_data)):
-        policy.apply(config, graph, task_values, spec.num_cube_cores)
+    # The PR2 replica backward completes projection waves in builder order.
+    # The forward still interleaves expert projections to overlap dispatch.
+    backward_policy = replace(policy, pipeline_cube=False) if replica_pipeline else policy
+    for graph, config, schedule in ((forward_graph, forward_data, policy),
+                                    (backward_graph, backward_data, backward_policy)):
+        schedule.apply(config, graph, task_values, spec.num_cube_cores)
+        if replica_pipeline and not schedule.pipeline_cube:
+            # Split address operands and compact dW destinations are one expert per task.
+            for task_id in config.cube_task_indices[:config.task_index_num[0]]:
+                config.all_tasks[task_id].extra_value_1 = GroupedMatmulTaskMode.SINGLE_GROUP
+    if compact and reserve_merge_workers:
+        end = backward_data.task_index_num[1]
+        for worker, queue in enumerate(backward_data.worker_queues[spec.num_cube_cores:]):
+            queue.begin = min(worker // 2, end) if worker % 2 else end
+            queue.stride = spec.num_cube_cores
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -275,6 +290,7 @@ def _prepare_diagnostics(
 
 def build_mega_moe_plan(
     spec: MegaMoeSpec, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
+    replica_pipeline: bool = False, reserve_merge_workers: bool = False,
 ) -> MegaMoePlan:
     """Build trimmed dense forward/backward runtime images without fusion slots.
 
@@ -282,21 +298,26 @@ def build_mega_moe_plan(
         spec: Validated local-token and expert topology specification.
         device: NPU device receiving serialized descriptors and tiling tensors.
         weight_grad_dtype: Keep partial expert weight gradients in FP32.
+        replica_pipeline: Use one GMM group per split weight and gradient destination.
+        reserve_merge_workers: Give the even AIV lanes to owner gradient consumers.
 
     Returns:
         Rank-local forward and backward runtime resources.
     """
     if weight_grad_dtype not in (None, torch.float32):
         raise ValueError("Partial expert gradients support only the native dtype or FP32")
+    if replica_pipeline and (spec.architecture != 2201 or spec.batch_experts or weight_grad_dtype != torch.float32):
+        raise ValueError("A3 replica pipeline requires per-expert GMMs and FP32 partial gradients")
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(
-        spec, weight_grad_dtype)
+        spec, weight_grad_dtype, replica_pipeline=replica_pipeline, reserve_merge_workers=reserve_merge_workers)
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
         spec, forward_graph, forward_config, backward_graph, backward_config, device,
     )
     gmm_options = {
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
-        "num_groups": (1 if not spec.batch_experts and hasattr(forward_graph.get_op("dispatch"), "compact_lanes")
+        "num_groups": (1 if replica_pipeline or (
+                       not spec.batch_experts and hasattr(forward_graph.get_op("dispatch"), "compact_lanes"))
                        else spec.local_experts),
         "num_cube_cores": spec.num_cube_cores,
     }

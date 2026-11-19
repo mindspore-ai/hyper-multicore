@@ -32,8 +32,36 @@ from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
-    ExpertWeightBinding, PlacementResources, workspace_reservations,
+    ExpertWeightBinding, PlacementResources, _get_mega_bank, workspace_reservations,
 )
+from hyper_multicore.modules.hot_replica.mx_gradient import GRADIENT_HELPERS, MXGradientPool
+
+
+def test_mx_gradient_bank_registers_with_the_virtual_workspace():
+    """Reserve the FP32 guest inbox and both projections in the route transaction."""
+    hidden = torch.empty((0, 128), dtype=torch.bfloat16)
+    spec = SimpleNamespace(local_experts=6, hidden_size=128, intermediate_size=64, num_cube_cores=24,
+                           ep_group=object(), expert_weight_layout="EIO")
+    manager = Mock()
+    manager.access.side_effect = nullcontext
+    owner = Mock(bounded=None)
+    virtual_reservation = ({"kind": "virtual-route"}, object())
+    with (patch("torch.distributed.get_rank", return_value=0),
+          patch("torch.distributed.get_world_size", return_value=16),
+          patch.object(MXGradientPool, "allocate") as allocate):
+        pool = _get_mega_bank(hidden, SimpleNamespace(spec=spec, heap_manager=manager), owner,
+                              pool_type=MXGradientPool, reservations=(virtual_reservation,))
+    reservations, = manager.reserve.call_args.args
+    assert reservations[0] is virtual_reservation and len(reservations) == 2
+    key, layout = reservations[1]
+    assert key["kind"] == "hot_replica_mx_gradients"
+    fp32_guests = 2 * 3 * spec.hidden_size * spec.intermediate_size * 4
+    flags = (3 * pool.flag_words + GRADIENT_HELPERS * 16) * 4
+    scratch = GRADIENT_HELPERS * 2 * pool.chunk_elements * 4
+    assert layout.required_bytes == fp32_guests + flags + scratch + 1024
+    assert owner in pool.owners and pool.pipeline is None
+    manager.bind.assert_called_once_with(pool, spec, key)
+    allocate.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -151,6 +179,17 @@ def test_failed_weight_publication_releases_bank():
     with pytest.raises(RuntimeError, match="launch failed"):
         binding.acquire((object(), object()))
     pool.release.assert_called_once()
+
+
+def test_failed_split_publication_drains_streams_before_bank_release():
+    pool = Mock()
+    pool.pipeline.begin.side_effect = RuntimeError("peer copy failed")
+    binding = ExpertWeightBinding(pool, Mock(), "EIO", fused=True)
+    with patch("hyper_multicore.modules.hot_replica.shmem_transfer._ordered_transfers",
+               return_value=nullcontext()), pytest.raises(RuntimeError, match="peer copy failed"):
+        binding.acquire((object(), object()))
+    assert [name for name, _, _ in pool.method_calls][-2:] == ["pipeline.complete", "release"]
+    assert pool.pipeline.resident is None
 
 
 def test_child_resources_prevent_parent_cleanup():
@@ -381,7 +420,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
         expert = MegaMoeExperts(hidden_size=8, intermediate_size=4, num_experts=4, top_k=1, expert_placement=options)
     hidden, ids = torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int32)
     probs, roots = torch.ones(2, 1), (torch.empty(2, 8, 8), torch.empty(2, 4, 8))
-    spec = SimpleNamespace(auto_tokens=True, dispatch_mode="push", intermediate_size=4, rank_id=0,
+    spec = SimpleNamespace(auto_tokens=True, dispatch_mode="push", precision="bf16", intermediate_size=4, rank_id=0,
                            num_cube_cores=24, apply_probs_before_fc2=True)
     owner = SimpleNamespace(spec=spec, workspace=Mock(), prepare_auto_workspace=Mock())
     owner.placement = PlacementResources(owner, expert._resource_group.specification, False)

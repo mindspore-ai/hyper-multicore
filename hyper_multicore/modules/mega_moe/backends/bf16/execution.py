@@ -33,10 +33,19 @@ def forward(
     del module
     module_resources = resources
     resources = route.execution_resources or resources
-    if route.weight_binding is None:
+    binding = route.weight_binding
+    pipeline = binding is not None and binding.fused
+    if pipeline:
+        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device,
+                                         weight_grad_dtype=torch.float32, replica_pipeline=True,
+                                         reserve_merge_workers=binding.owns_returns)
+        if plan.fwd_diagnostics.is_active or plan.bwd_diagnostics.is_active:
+            binding.fused = False
+            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+    elif binding is None or module_resources.placement.source_bound is None:
         plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
     else:
-        placement = route.weight_binding.placement
+        placement = binding.placement
         num_experts = placement.counts_by_source.shape[1]
         placement_owner = module_resources.placement
         home = module_resources.spec.local_experts

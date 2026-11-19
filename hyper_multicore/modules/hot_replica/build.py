@@ -68,7 +68,8 @@ def build_kernels(output: Path, sdk: Path) -> None:
         "-Wl,-z,relro,-z,now,-z,noexecstack",
         *[
             str(source / name)
-            for name in ("a3_allocator.asc", "hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp")
+            for name in ("a3_allocator.asc", "hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp",
+                         "replica_counts.cpp")
         ],
         "-o",
         str(output / "libhmc_hot_replica_kernels.so"),
@@ -144,15 +145,32 @@ def build_adapters(output: Path, sdk: Path, device_root: Path, standard: int) ->
         )
 
 
+def build_mx_host(output: Path) -> None:
+    """Compile the exact MX planner for this adapter's Python ABI."""
+    output.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [*shlex.split(os.environ.get("CXX", "g++")), "-std=c++17", "-shared", "-fPIC", "-O3",
+         "-Wl,-z,relro,-z,now,-z,noexecstack", "-fno-fast-math", "-ffp-contract=off",
+         f"-I{sysconfig.get_path('include')}", str(Path(__file__).parent / "csrc/mx_planner.cpp"),
+         "-o", str(output / "_replica_host.so")],
+        check=True,
+    )
+
+
 def main() -> None:
     """Build isolated artifacts; the enclosing build publishes and hashes them."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("common", "adapter"), required=True)
+    parser.add_argument("--phase", choices=("common", "adapter", "mx-host"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--sdk-root", type=Path, required=True)
+    parser.add_argument("--sdk-root", type=Path)
     parser.add_argument("--device-root", type=Path)
     parser.add_argument("--cxx-standard", type=int, default=17)
     args = parser.parse_args()
+    if args.phase == "mx-host":
+        build_mx_host(args.output_dir)
+        return
+    if args.sdk_root is None:
+        parser.error("--sdk-root is required for A3 builds")
     if args.phase == "common":
         build_kernels(args.output_dir, args.sdk_root)
     else:

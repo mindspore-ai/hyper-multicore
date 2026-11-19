@@ -67,6 +67,18 @@
             "architectures": [
               "arch35"
             ]
+          },
+          {
+            "path": "hyper_multicore/ops/patches/mx_quant_row_only.patch",
+            "sha256": "1e9089b709ae3ebb47162c7859696d40759ba488d5cbcc3ddbe84be865c03098",
+            "purpose": "skip unused packed-column quantization outputs in no-grad forward",
+            "architectures": ["arch35"]
+          },
+          {
+            "path": "hyper_multicore/ops/patches/swiglu_mx_quant_row_only.patch",
+            "sha256": "7e7e3eaa1aeacfb26d0b48225d693beae1b939bd8cc3868f5dacf58acd8079ff",
+            "purpose": "supply a logical vector index to the row-only SwiGLU kernel",
+            "architectures": ["arch35"]
           }
         ],
         "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
@@ -86,6 +98,22 @@
                 "path": "hyper_multicore/ops/patches/grouped_matmul_fusion.patch",
                 "sha256": "61506f77d380a36617c6e5e7ffbca689d18030c13c3f205a53113b2f07d7884c",
                 "purpose": "expose the selected grouped-matmul path as an inline building block"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/grouped_matmul_replica_bands.patch",
+                "sha256": "9613ceb3905e5e96597db9e0b10b121bcafdf96e1b44327320ba492f643d100b",
+                "purpose": "publish FP32 TN output bands after full-K output completion",
+                "architectures": [
+                  "arch22"
+                ]
+              },
+              {
+                "path": "hyper_multicore/ops/patches/grouped_matmul_direct_split.patch",
+                "sha256": "9710862dcd01fbc9e429b4c3adc73bc1d65bc8333cc455163c5f29009df2c154",
+                "purpose": "pass dynamic per-expert GMM splits without rewriting GM tiling and group lists",
+                "architectures": [
+                  "arch22"
+                ]
               }
             ],
             "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

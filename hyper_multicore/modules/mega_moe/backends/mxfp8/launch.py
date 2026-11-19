@@ -8,6 +8,7 @@ import torch
 
 from hyper_multicore.torch.ops import _load_native
 
+from ...route import _upload_route_tensor
 from ...spec import MegaMoeSpec
 from .launch_contract import serialize_mx_launch_metadata
 
@@ -43,7 +44,7 @@ def prepare_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
                          events: torch.Tensor, spec: MegaMoeSpec) -> torch.Tensor:
     """Upload the bounds of the current native operands."""
     metadata = serialize_mxfp8_launch(buffers, runtime, events, spec)
-    return torch.frombuffer(bytearray(metadata), dtype=torch.uint8).to(device=runtime.device)
+    return _upload_route_tensor(torch.frombuffer(bytearray(metadata), dtype=torch.uint8), runtime.device)
 
 
 def launch_mxfp8_experts(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,

@@ -274,12 +274,14 @@ def _prepare_backward_execution(
     plan: MegaMoePlan,
     saved: _SavedBackwardState,
     grad_output: Any,
-    *, all_experts_active: bool = False,
+    *, all_experts_active: bool = False, owner_weights: tuple[torch.Tensor, ...] | None = None,
 ) -> _BackwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for backward."""
     dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
                 else _workspace_tensor(workspace.expert_buffer, "expert_buffer"))
     grad_x = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
+    weights = (saved.weight1, saved.weight2) if owner_weights is None else owner_weights
+    groups = saved.group_list if owner_weights is None else saved.group_list[:weights[0].shape[0]]
     return _BackwardExecution(
         dispatch=dispatch,
         grad_x=grad_x,
@@ -293,11 +295,10 @@ def _prepare_backward_execution(
             plan.spec,
             saved.dispatch.shape[0],
             grad_output,
-            saved.weight1,
-            saved.weight2,
+            *weights,
             dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
-            weight_grad_dtype=plan.weight_grad_dtype,
-            group_list=saved.group_list,
+            weight_grad_dtype=plan.weight_grad_dtype if owner_weights is None else weights[0].dtype,
+            group_list=groups,
             all_experts_active=all_experts_active,
         ),
     )
@@ -402,7 +403,7 @@ def _launch_forward_kernel(
     weight1: Any,
     weight2: Any,
     execution: _ForwardExecution,
-    *, stream: Any = None,
+    *, stream: Any = None, runtime_override: torch.Tensor | None = None,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -425,14 +426,15 @@ def _launch_forward_kernel(
         metadata.combine_size,
     )
     if not plan.fwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.fwd_runtime_config, stream=stream)
+        runtime = plan.fwd_runtime_config if runtime_override is None else runtime_override
+        record_plan_stream(plan, runtime, stream=stream)
         multicore_ops.mega_moe(
             *kernel_parameters,
             execution.gmm_workspace,
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            plan.fwd_runtime_config,
+            runtime,
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -470,7 +472,7 @@ def _launch_backward_kernel(
     saved: _SavedBackwardState,
     grad_output: Any,
     execution: _BackwardExecution,
-    *, stream: Any = None,
+    *, stream: Any = None, runtime_override: torch.Tensor | None = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -498,7 +500,8 @@ def _launch_backward_kernel(
         saved.group_list,
     )
     if not plan.bwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.bwd_runtime_config, stream=stream)
+        runtime = plan.bwd_runtime_config if runtime_override is None else runtime_override
+        record_plan_stream(plan, runtime, stream=stream)
         multicore_ops.mega_moe_grad(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -508,7 +511,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            plan.bwd_runtime_config,
+            runtime,
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -651,7 +654,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution.source,
                 weight1,
                 weight2,
-                execution, stream=workspace.lease_stream)
+                execution, stream=workspace.lease_stream,
+                runtime_override=weight_binding.runtime(plan.fwd_runtime_config) if acquired else None)
             output = execution.combine[:ctx.source_rows]
             if not spec.apply_probs_before_fc2:
                 output = output.clone()
@@ -704,7 +708,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         acquired = False
         try:
             if binding is not None:
-                operands = binding.acquire(owner_weights)
+                operands = binding.acquire(owner_weights, backward=True)
                 acquired = True
                 saved = replace(saved, weight1=operands[0], weight2=operands[1])
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
@@ -716,12 +720,17 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved,
                 grad_output,
                 all_experts_active=ctx.all_experts_active,
+                owner_weights=owner_weights if acquired and binding.fused else None,
             )
+            runtime = None
+            if acquired and binding.fused:
+                gradients = execution.intermediates
+                runtime = binding.runtime(plan.bwd_runtime_config, (gradients.grad_weight1, gradients.grad_weight2))
             _launch_backward_kernel(
                 plan,
                 saved,
                 source,
-                execution, stream=workspace.lease_stream)
+                execution, stream=workspace.lease_stream, runtime_override=runtime)
             if plan.spec.apply_probs_before_fc2 and ctx.needs_input_grad[7]:
                 grad_topk_weights = (
                     workspace.probabilities(plan.spec).slice(ctx.source_rows, gradient=True).index_select(
@@ -917,7 +926,8 @@ def _execute_mega_moe_without_autograd(
         _launch_forward_kernel(
             plan, route.metadata.for_kernel(plan.spec.hidden_size), execution.source,
             _native_weight_operand(weight1, plan),
-            _native_weight_operand(weight2, plan), execution, stream=workspace.lease_stream)
+            _native_weight_operand(weight2, plan), execution, stream=workspace.lease_stream,
+            runtime_override=weight_binding.runtime(plan.fwd_runtime_config) if acquired else None)
         rows = route.routed_tokens.shape[0]
         if not rows:
             return route.routed_tokens.new_empty((0, plan.spec.hidden_size))

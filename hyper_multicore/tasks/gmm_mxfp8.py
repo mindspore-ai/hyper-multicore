@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from hyper_multicore.scheduler.config import TaskSplitValue
+from hyper_multicore.scheduler.config import TaskDescC, TaskSplitValue
 from hyper_multicore.scheduler.graph import OperatorNode
 from hyper_multicore.tasks.utils import fill_expert_compute_tasks
 
@@ -16,6 +16,7 @@ MX_GMM_VERSION = 1
 MX_GMM_TASK_TYPE = 142
 MX_GMM_MAX_BUFFERS = 64
 MX_GMM_DYNAMIC_GROUP = 1
+MX_GMM_PREZEROED_OUTPUT = 2
 MX_GMM_LAYOUTS = {'NN': 0, 'NT': 1, 'TN': 2}
 MX_GMM_OUTPUT_BF16 = 0
 MX_GMM_OUTPUT_FP32 = 1
@@ -120,20 +121,52 @@ class Mxfp8GmmFillConfig:
     w_scale: int
     workers: int
     records: list
+    guest_weights: tuple[int, int, int, int] | None = None
+    guest_output: tuple[int, int] | None = None
+    prezeroed_output: bool = False
+
+    def diagnostic_parameter_position(self, task: TaskDescC, io: str, index: int, position: int) -> int:
+        """Resolve the two ABI operands that differ between home and guest experts."""
+        expert = task.task_index // self.workers
+        if io == 'input' and index == 1 and self.guest_weights is not None and expert >= self.guest_weights[0]:
+            return self.guest_weights[1]
+        if io == 'output' and index == 0 and self.guest_output is not None and expert >= self.guest_output[0]:
+            return self.guest_output[1]
+        return position
 
     def fill(self, cfg: Any, op: OperatorNode, tsv: TaskSplitValue) -> None:
         """Populate the runtime tasks and keep their descriptor indices in sync."""
         indices = []
         for expert in range(tsv.single_rank_expert_num):
+            slot, weight_scale = expert, self.w_scale
+            if self.guest_weights is not None and expert >= self.guest_weights[0]:
+                slot -= self.guest_weights[0]
+                weight_scale = self.guest_weights[2]
+            output_slot = expert
+            if self.guest_output is not None and expert >= self.guest_output[0]:
+                output_slot -= self.guest_output[0]
             for worker in range(self.workers):
                 indices.append(len(self.records))
                 self.records.append(make_mx_gmm_descriptor(
                     layout=self.layout, m=self.m, n=self.n, k=self.k,
-                    x_scale_position=self.x_scale, w_scale_position=self.w_scale,
+                    x_scale_position=self.x_scale, w_scale_position=weight_scale,
                     cube_count=self.workers, cube_index=worker, group_list_offset=expert * 8,
-                    w_offset=0 if self.layout == 'TN' else expert * self.n * self.k,
-                    w_scale_offset=0 if self.layout == 'TN' else expert * self.n * self.k // 32,
-                    y_offset=expert * self.m * self.n * op.outputs[0].dtype_size if self.layout == 'TN' else 0,
+                    w_offset=0 if self.layout == 'TN' else slot * self.n * self.k,
+                    w_scale_offset=0 if self.layout == 'TN' else slot * self.n * self.k // 32,
+                    y_offset=output_slot * self.m * self.n * op.outputs[0].dtype_size if self.layout == 'TN' else 0,
                     output_dtype=MX_GMM_OUTPUT_FP32 if op.outputs[0].dtype_size == 4 else MX_GMM_OUTPUT_BF16,
                 ))
+                if self.prezeroed_output:
+                    self.records[-1].flags |= MX_GMM_PREZEROED_OUTPUT
+        stage_start = tsv.pre_task_num
         fill_expert_compute_tasks(cfg, op, tsv, MX_GMM_TASK_TYPE, self.workers, False, indices, cube=True)
+        if self.guest_weights is not None:
+            home, position, _, ready_position = self.guest_weights
+            for offset in range(home * self.workers, len(indices)):
+                task = cfg.all_tasks[stage_start + offset]
+                task.inputs[1].input_position = position
+                task.extra_value_1 = ready_position + 1
+        if self.guest_output is not None:
+            home, position = self.guest_output
+            for offset in range(home * self.workers, len(indices)):
+                cfg.all_tasks[stage_start + offset].outputs[0].input_position = position

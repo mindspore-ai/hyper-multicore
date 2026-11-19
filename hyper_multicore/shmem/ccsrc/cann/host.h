@@ -34,6 +34,7 @@ struct InitOptions {
   runtime::DataEngine data_engine;
   std::string_view effective_bootstrap_endpoint;
   std::string_view unique_id{};
+  uint32_t udma_qp_num = 1U;
 };
 
 namespace host {
@@ -70,6 +71,10 @@ void barrier_on_stream(const runtime::StreamView &stream);
 /** @brief Enqueue a byte Put from local GM to a symmetric address on one target Root PE. */
 void put_on_stream(uintptr_t remote_dst, uintptr_t local_src, uint64_t bytes, int32_t target_pe,
                    const runtime::StreamView &stream);
+
+/** @brief Enqueue a peer SDMA copy to a directly mapped symmetric destination. */
+runtime::Status put_sdma_on_stream(uintptr_t remote_dst, uintptr_t local_src, uint64_t bytes,
+                                  int32_t target_pe, const runtime::StreamView &stream);
 
 /** @brief Enqueue a byte Get from a symmetric address on one source Root PE to local GM. */
 void get_on_stream(uintptr_t local_dst, uintptr_t remote_src, uint64_t bytes, int32_t source_pe,

@@ -11,6 +11,7 @@ constexpr uint32_t MX_GMM_VERSION = 1;
 constexpr uint32_t MX_GMM_TASK_TYPE = 142;
 constexpr uint32_t MX_GMM_MAX_BUFFERS = 64;
 constexpr uint32_t MX_GMM_DYNAMIC_GROUP = 1;
+constexpr uint32_t MX_GMM_PREZEROED_OUTPUT = 2;
 
 enum class MxLayout : uint32_t { NN = 0, NT = 1, TN = 2 };
 enum class MxOutput : uint32_t { BF16 = 0, FP32 = 1 };

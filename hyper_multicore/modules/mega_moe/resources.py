@@ -15,6 +15,7 @@
 """Precision-independent workspace, lease and distributed resource ownership."""
 from collections.abc import Mapping
 from dataclasses import replace
+import os
 from typing import Any
 import torch
 import torch.distributed as dist
@@ -46,13 +47,15 @@ class _MegaMoeExecutionResources:
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
         # Agree on optional stages before any HotReplica-only collective.
-        if specification.get("hot_replica"):
+        placement = specification.get("hot_replica", False)
+        mx_placement = placement and self.spec.precision == "mxfp8"
+        if placement:
             from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
-            require_capability(tensor, specification["ep_group"])
+            require_capability(tensor, specification["ep_group"], mx=mx_placement)
         initial_headroom = 0
         if workspace_layout is not None:
             reservations = ((specification, workspace_layout),)
-        elif specification.get("hot_replica"):
+        elif placement and not mx_placement:
             from hyper_multicore.modules.hot_replica.mega_moe_adapter import workspace_reservations  # pylint: disable=import-outside-toplevel
 
             reservations, initial_headroom = workspace_reservations(
@@ -76,13 +79,16 @@ class _MegaMoeExecutionResources:
             def construct() -> None:
                 """Build and bind local resources before converging construction results."""
                 transport = self.spec.transport_engine
-                if transport in (None, "udma"):
-                    active_udma = shmem.debug_state()["config"]["data_engine"] == "mte_udma"
+                if transport in (None, "udma") or mx_placement:
+                    config = shmem.debug_state()["config"]
+                    active_udma = config["data_engine"] == "mte_udma"
                     if transport == "udma" and not active_udma:
                         raise ValueError("UDMA tasks require SHMEM initialized with mte_udma")
                     if transport is None:
                         transport = "udma" if active_udma else "mte"
                         self.spec = replace(self.spec, transport_engine=transport)
+                if mx_placement and (transport != "udma" or config["udma_qp_num"] not in (8, 16, 32)):
+                    raise ValueError("MXFP8 HotReplica requires mte_udma and 8, 16 or 32 UDMA QPs")
                 if transport == "udma":
                     moe_transport.require_queue_backend()
                 self.plan = self._initial_plan(tensor)
@@ -104,7 +110,10 @@ class _MegaMoeExecutionResources:
         self._closed = False
         self._workspace_closed = False
         self.placement = None
-        if specification.get("hot_replica"):
+        if mx_placement:
+            from ..hot_replica.mx_adapter import MXPlacementResources  # pylint: disable=import-outside-toplevel
+            self.placement = MXPlacementResources(self, specification, shared)
+        elif placement:
             from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources  # pylint: disable=import-outside-toplevel
             self.placement = PlacementResources(self, specification, shared)
 
@@ -162,6 +171,8 @@ class _MegaMoeExecutionResources:
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
+        if self.spec.architecture == 3510:
+            manifest = (*manifest, os.environ.get("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM", "1"))
         # Resource groups must have the same order as their symmetric allocations.
         manifests = [None] * self.spec.ep_size
         dist.all_gather_object(manifests, manifest, group=self.spec.ep_group)

@@ -74,7 +74,7 @@ __aicore__ inline void ZeroMxWeightGradient(const MxGmmDescriptor& r, GM_ADDR y)
 __aicore__ inline void ExecuteMxGmm(const MxGmmDescriptor& r, GM_ADDR x, GM_ADDR w,
                                    GM_ADDR xs, GM_ADDR ws, GM_ADDR y) {
   if (r.m == 0 || r.k == 0) {
-    if (r.layout == static_cast<uint32_t>(MxLayout::TN)) {
+    if (r.layout == static_cast<uint32_t>(MxLayout::TN) && !(r.flags & MX_GMM_PREZEROED_OUTPUT)) {
       ZeroMxWeightGradient(r, y);
     }
     return;
@@ -123,6 +123,35 @@ __aicore__ inline MxGmmDescriptor LoadMxGmmDescriptor(const __gm__ MxGmmDescript
 }
 
 template <class Task>
+__aicore__ inline void WaitMxProjectionWeight(const Task& task, const MxGmmDescriptor& r, GM_ADDR* inputs,
+                                              const __gm__ MxLaunchDescriptor* launch) {
+  if (task.extra_value_1 == 0 || r.m == 0 || r.k == 0) return;
+  const uint32_t port = task.extra_value_1 - 1;
+  if ((port != 31 && port != 37) || port >= launch->buffer_count ||
+      launch->buffer_bytes[port] != 5 * sizeof(uint64_t) || r.layout == static_cast<uint32_t>(MxLayout::TN)) {
+    AscendC::Trap();
+  }
+  auto info = reinterpret_cast<__gm__ uint64_t*>(inputs[port]);
+  const uint64_t epoch = info[0], home = info[3], slots = info[4];
+  const uint64_t expert = r.group_list_offset / sizeof(int64_t);
+  const uint32_t first = port - 4, weight = task.inputs[1].input_position;
+  if (home == 0 || home + slots != launch->experts / launch->ep || expert < home ||
+      expert - home >= slots || (weight != first && weight != first + 2) || epoch == 0 || epoch > INT32_MAX) {
+    AscendC::Trap();
+  }
+  const uint64_t base = info[1 + (weight - first) / 2];
+  if (base == 0 || base % 64) AscendC::Trap();
+  const uint64_t address = base + (expert - home) * 64;
+  auto value = reinterpret_cast<__gm__ volatile int32_t*>(address);
+  AscendC::GlobalTensor<int32_t> flag;
+  flag.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(address), 1);
+  do {
+    AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                      AscendC::DcciDst::CACHELINE_OUT>(flag);
+  } while (*value < static_cast<int32_t>(epoch));
+}
+
+template <class Task>
 __aicore__ inline void ExecuteMxGmmTask(const Task& task, GM_ADDR* inputs,
                                        const __gm__ MxLaunchDescriptor* launch) {
   CheckMxRange(static_cast<uint64_t>(task.extra_value_0) * sizeof(MxGmmDescriptor),
@@ -130,7 +159,8 @@ __aicore__ inline void ExecuteMxGmmTask(const Task& task, GM_ADDR* inputs,
   auto table = reinterpret_cast<__gm__ MxGmmDescriptor*>(inputs[task.inputs[3].input_position]);
   MxGmmDescriptor r = LoadMxGmmDescriptor(table + task.extra_value_0);
   if (!IsMxGmmDescriptorValid(r) || r.x_scale_position >= launch->buffer_count ||
-      r.w_scale_position >= launch->buffer_count || (r.flags & ~MX_GMM_DYNAMIC_GROUP) != 0) {
+      r.w_scale_position >= launch->buffer_count || (r.flags & ~(MX_GMM_DYNAMIC_GROUP | MX_GMM_PREZEROED_OUTPUT)) != 0 ||
+      ((r.flags & MX_GMM_PREZEROED_OUTPUT) && r.layout != static_cast<uint32_t>(MxLayout::TN))) {
     AscendC::Trap();
   }
   if (r.flags & MX_GMM_DYNAMIC_GROUP) {
@@ -151,6 +181,7 @@ __aicore__ inline void ExecuteMxGmmTask(const Task& task, GM_ADDR* inputs,
   CheckMxRange(r.y_offset, m * n * output_bytes, launch->buffer_bytes[task.outputs[0].input_position]);
   CheckMxRange(r.x_scale_offset, m * ((k + 63) / 64) * 2, launch->buffer_bytes[r.x_scale_position]);
   CheckMxRange(r.w_scale_offset, n * ((k + 63) / 64) * 2, launch->buffer_bytes[r.w_scale_position]);
+  WaitMxProjectionWeight(task, r, inputs, launch);
   ExecuteMxGmm(r, inputs[task.inputs[0].input_position] + r.x_offset,
                inputs[task.inputs[1].input_position] + r.w_offset,
                inputs[r.x_scale_position] + r.x_scale_offset,

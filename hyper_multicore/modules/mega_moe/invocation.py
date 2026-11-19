@@ -33,7 +33,7 @@ def prepare_expert_invocation(
     hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
     counts: torch.Tensor | None, weights: tuple[torch.Tensor, torch.Tensor],
     resources: "_MegaMoeExecutionResources", *, weight_error: bool = False,
-    planner: "BasePlanner | None" = None,
+    planner: "BasePlanner | None" = None, training: bool = True,
 ) -> Iterator[PreparedTopKRoute]:
     """Converge weight errors on the existing route collective before physical binding.
 
@@ -54,8 +54,10 @@ def prepare_expert_invocation(
         resources.prepare_auto_workspace(tokens, received, hidden)
         claimed = pull
 
-    record = None
-    if not pull and resources.placement is not None:
+    placement = getattr(resources, "placement", None)
+    mx_placement = placement is not None and resources.spec.precision == "mxfp8"
+    record, replay = None, False
+    if not pull and placement is not None and not mx_placement:
         from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
 
         record, replay = route_record(resources)
@@ -77,8 +79,12 @@ def prepare_expert_invocation(
             record = None
 
     options = {"autograd_mask": mask}
-    if planner is not None:
-        options["select_placement"] = partial(resources.placement.select, planner=planner)
+    if planner is not None and not mx_placement:
+        if placement.bounded is not None and record is None and not replay:
+            options["select_placement"] = placement.select_bounded
+            options["reuse_placement_geometry"] = resources.spec.ep_size * resources.spec.num_experts <= 16384
+        else:
+            options["select_placement"] = partial(placement.select, planner=planner)
     if resources.spec.auto_tokens:
         options["prepare_workspace"] = prepare_workspace
     elif pull:
@@ -89,8 +95,11 @@ def prepare_expert_invocation(
     try:
         # Routing may allocate or replace persistent SHMEM owners.
         with torch.inference_mode(False), torch.no_grad():
-            route = prepare_topk_route(hidden, ids, probs, resources.spec, counts,
-                                       workspace=resources.workspace, **options)
+            if mx_placement:
+                route = placement.prepare_route(hidden, ids, probs, counts, mask, training=training)
+            else:
+                route = prepare_topk_route(hidden, ids, probs, resources.spec, counts,
+                                           workspace=resources.workspace, **options)
         if not pull and not resources.spec.auto_tokens:
             with torch.inference_mode(False):
                 resources.ensure_capacity(route.maximum_received_slots)
