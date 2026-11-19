@@ -230,7 +230,7 @@ def test_fp32_owner_gradient_reaches_native_reduction_without_rounding():
 
 
 @pytest.mark.parametrize(("partial_dtype", "new_bridge", "native"), [
-    (torch.bfloat16, True, True), (torch.bfloat16, False, False), (torch.float32, True, True),
+    (torch.bfloat16, True, True), (torch.bfloat16, False, False), (torch.float32, True, False),
 ])
 def test_native_home_gradient_keeps_fp32_guest_payload_and_legacy_fallback(partial_dtype, new_bridge, native):
     """Keep original local precision and the ordered FP32 wire in the buffered reducer."""

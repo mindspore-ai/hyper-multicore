@@ -67,7 +67,8 @@ def reduce_banks(
         for slot, gradient in zip(slots, gradients):
             slot[:count].copy_(gradient[local : local + count])
     bridge = load_bridge()
-    fits = getattr(bridge, "buffered_plan_fits", None) if prefer_buffered else None
+    native_home = prefer_buffered and gradients[0].dtype == torch.bfloat16
+    fits = getattr(bridge, "buffered_plan_fits", None) if native_home else None
     buffered = bridge.reduce_buffered if (fits is not None and 0 < extra <= local and
                                           fits(local, copies.shape[0], extra)) else None
     owners = []
@@ -75,7 +76,7 @@ def reduce_banks(
         home = gradient[:local]
         bf16 = output_dtypes is not None and output_dtypes[i] == torch.bfloat16
         reduce = bridge.reduce
-        if buffered is not None and (bf16 or home.dtype == torch.float32):
+        if buffered is not None and bf16 and home.dtype == torch.bfloat16:
             reduce = buffered
         else:
             home = home.float()
