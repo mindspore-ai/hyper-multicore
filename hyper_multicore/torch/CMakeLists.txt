@@ -15,6 +15,7 @@ endif()
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
 hp_detect_torch_build_contract("${Python3_EXECUTABLE}" TORCH)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/torch_cxx_standard.txt" "${TORCH_CXX_STANDARD}")
 hp_detect_op_plugin_version("${TORCH_PACKAGE_ROOT}" "${TORCH_NPU_PACKAGE_ROOT}" TORCH_OP_PLUGIN_VERSION)
 
 set(TORCH_INCLUDE_ROOT "${TORCH_PACKAGE_ROOT}/include")

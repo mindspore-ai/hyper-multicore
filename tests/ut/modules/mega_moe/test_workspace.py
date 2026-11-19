@@ -266,3 +266,19 @@ class TestReadyEventWorkspace(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_inference_first_workspace_remains_mutable_for_training():
+    """Ensure persistent workspace tensors permit training after inference."""
+    spec = SimpleNamespace(apply_probs_before_fc2=False, receive_capacity=128, routed_slots=256,
+                           hidden_size=16, ep_size=2, num_experts=8, dispatch_mode="push")
+    workspace = MegaMoeWorkspace(shared=True)
+    with (patch.object(workspace_module.shmem, "empty", side_effect=lambda shape, **kw:
+                       torch.empty(shape, dtype=kw["dtype"])),
+          patch.object(workspace_module.torch, "npu", create=True)):
+        with torch.inference_mode():
+            workspace.ensure(spec, torch.bfloat16, torch.device("cpu"))
+        for tensor in (workspace.forward_event_counters, workspace.backward_event_counters,
+                       workspace.expert_buffer, workspace.gmm_workspace):
+            assert not tensor.is_inference()
+            tensor.zero_()

@@ -134,6 +134,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         """
         tensors = tuple(torch.ones(1) for _ in range(13))
         context = Mock()
+        context.weight_binding = None
         context.needs_input_grad = (False,) * 9
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
@@ -235,7 +236,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         spec = SimpleNamespace(apply_probs_before_fc2=False, hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
                                dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False)
-        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None)
+        plan = SimpleNamespace(
+            spec=spec, reuse_backward_dispatch=False, weight_grad_dtype=None, event_counter_bytes=None,
+        )
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
@@ -257,7 +260,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         down_pointers = []
         backward_capacities = []
 
-        def release_workspace(*, stream=None) -> None:
+        def release_workspace(*, stream: Any = None) -> None:
             """Make accidental reads after the lease immediately observable."""
             self.assertIs(stream, workspace.lease_stream)
             workspace.expert_buffer.fill_(float("nan"))
@@ -309,7 +312,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             args[6].fill_(tag)
             args[18].fill_(tag)
 
-        def zero_cold(first, second, groups):
+        def zero_cold(first: torch.Tensor, second: torch.Tensor, groups: torch.Tensor) -> None:
+            """Clear expert gradient slices whose cumulative token counts are unchanged."""
             previous = 0
             for expert, end in enumerate(groups.tolist()):
                 if end == previous:

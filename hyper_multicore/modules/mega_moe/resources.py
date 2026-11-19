@@ -1,4 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Precision-independent workspace, lease and distributed resource ownership."""
 from collections.abc import Mapping
 from dataclasses import replace
@@ -7,13 +20,14 @@ import torch
 import torch.distributed as dist
 from hyper_multicore import _collective, shmem
 from . import transport as moe_transport
-from .heap_manager import _get_heap_manager, _workspace_layout
+from .heap_manager import _WorkspaceLayout, _get_heap_manager, _workspace_layout
 from .spec import bind_mega_moe_spec
 from .workspace import MegaMoeWorkspace
 
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
+    @torch.inference_mode(False)
     def __init__(
         self,
         specification: dict[str, Any],
@@ -22,6 +36,7 @@ class _MegaMoeExecutionResources:
         expert_weight_layout: str,
         shared: bool,
         active_specifications: tuple[Mapping[str, Any], ...],
+        workspace_layout: _WorkspaceLayout | None = None,
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         bound_specification = {**specification, "expert_weight_layout": expert_weight_layout}
@@ -30,12 +45,27 @@ class _MegaMoeExecutionResources:
         self._plans = {}
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
-        reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
+        # Agree on optional stages before any HotReplica-only collective.
+        if specification.get("hot_replica"):
+            from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
+            require_capability(tensor, specification["ep_group"])
+        initial_headroom = 0
+        if workspace_layout is not None:
+            reservations = ((specification, workspace_layout),)
+        elif specification.get("hot_replica"):
+            from hyper_multicore.modules.hot_replica.mega_moe_adapter import workspace_reservations  # pylint: disable=import-outside-toplevel
+
+            reservations, initial_headroom = workspace_reservations(
+                active_specifications, tensor.dtype, self.spec.num_cube_cores
+            )
+        else:
+            reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         added_specifications = self.heap_manager.reserve(
             reservations,
             allow_resize=any(item.get("dispatch_mode", "push") == "push" or item.get("auto_tokens", False)
                              for item in active_specifications),
+            initial_headroom=initial_headroom,
         )
         attached = False
         self.plan = None
@@ -73,6 +103,10 @@ class _MegaMoeExecutionResources:
             raise
         self._closed = False
         self._workspace_closed = False
+        self.placement = None
+        if specification.get("hot_replica"):
+            from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources  # pylint: disable=import-outside-toplevel
+            self.placement = PlacementResources(self, specification, shared)
 
     def ensure_capacity(self, maximum_received_slots: int) -> None:
         """Submit a larger layout, falling back to minimum capacity within an explicit budget.
@@ -85,7 +119,7 @@ class _MegaMoeExecutionResources:
     def lifecycle_signature(self) -> tuple[Any, ...]:
         """Identify allocations independently of process-local group addresses."""
         return (
-            "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
+            "mega_moe", self.placement is not None, self.spec.local_num_tokens, self.spec.hidden_size,
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
             self.spec.expert_weight_layout, self.spec.apply_probs_before_fc2, self.spec.partial_weight_grad_dtype,
@@ -111,7 +145,8 @@ class _MegaMoeExecutionResources:
 
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""
-        return self._workspace_closed or self.workspace.can_close()
+        return ((self._workspace_closed or self.workspace.can_close())
+                and (self.placement is None or self.placement.can_close()))
 
     def _validate_distributed_configuration(self, specifications: tuple[Mapping[str, Any], ...]) -> None:
         """Reject different allocation manifests before acquiring symmetric memory."""
@@ -123,7 +158,7 @@ class _MegaMoeExecutionResources:
                   "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
-                  "batch_experts", "nominal_schedule")
+                  "batch_experts", "nominal_schedule", "hot_replica", "source_token_bound", "planner_key")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -138,6 +173,8 @@ class _MegaMoeExecutionResources:
         """Release the workspace and leave the shared SHMEM lifecycle."""
         if self._closed:
             return
+        if self.placement is not None:
+            self.placement.close()
         if not self._workspace_closed:
             self.heap_manager.close_workspace(self.workspace)
             self._workspace_closed = True

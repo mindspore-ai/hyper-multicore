@@ -14,7 +14,7 @@
 # ============================================================================
 """Check the physical backward schedule before sharing transient storage."""
 
-from collections import defaultdict
+import numpy as np
 
 from hyper_multicore.scheduler.config import RuntimeConfigC, TaskDescC, TaskType
 
@@ -26,103 +26,82 @@ _SWIGLU_GRAD = 10
 _INPUT_GRAD = 12
 
 
-def _worker_read_order(
-    tasks: list[TaskDescC], num_experts: int, num_cores: int,
-) -> bool:
-    """Require every Cube to finish both receive readers before writing dX."""
-    for worker in range(num_cores):
-        locations = {}
-        for index, task in enumerate(tasks[worker::num_cores]):
-            output = task.outputs[0].input_position
-            if output not in (_WEIGHT2_GRAD, _ACTIVATION_GRAD, _INPUT_GRAD):
-                continue
-            key = (output, task.task_index // num_cores)
-            if key in locations or task.task_type != TaskType.TASK_GROUPED_MATMUL:
-                return False
-            locations[key] = index
-        if len(locations) != 3 * num_experts:
+def _worker_read_order(outputs, task_indices, task_types, num_experts, num_cores):
+    """Each worker must run exactly one W2, activation and input gradient per expert, in order."""
+    positions = []
+    for output in (_WEIGHT2_GRAD, _ACTIVATION_GRAD, _INPUT_GRAD):
+        index = np.flatnonzero(outputs == output)
+        if len(index) != num_experts * num_cores or np.any(task_types[index] != TaskType.TASK_GROUPED_MATMUL):
             return False
-        for expert in range(num_experts):
-            order = [locations.get((output, expert), -1)
-                     for output in (_WEIGHT2_GRAD, _ACTIVATION_GRAD, _INPUT_GRAD)]
-            if not 0 <= order[0] < order[1] < order[2]:
-                return False
-    return True
-
-
-def _expert_events_join_readers(
-    cfg: RuntimeConfigC, cube_tasks: list[TaskDescC], vector_tasks: list[TaskDescC],
-    num_experts: int, num_cores: int,
-) -> bool:
-    """Require the existing event chain to join all readers of each expert."""
-    acts = defaultdict(list)
-    gates = defaultdict(list)
-    swiglu = defaultdict(list)
-    for task in cube_tasks:
-        expert = task.task_index // num_cores
-        if task.outputs[0].input_position == _ACTIVATION_GRAD:
-            acts[expert].append(task)
-        elif task.outputs[0].input_position == _INPUT_GRAD:
-            gates[expert].append(task)
-    for task in vector_tasks:
-        if task.task_type != TaskType.TASK_SWI_GLU_GRAD:
-            continue
-        if task.task_split_num < num_experts or task.task_split_num % num_experts:
+        experts = task_indices[index] // num_cores
+        if np.any(experts >= num_experts):
             return False
-        expert = task.task_index // (task.task_split_num // num_experts)
-        swiglu[expert].append(task)
-    producers = defaultdict(list)
-    for task in cube_tasks + vector_tasks:
-        producers[task.trigger_event].append(task)
-    return all(_expert_dependency_chain(cfg, acts[expert], gates[expert], swiglu[expert], num_cores, producers)
-               for expert in range(num_experts))
+        # Worker assignment is round-robin by queue position, independently of task_index.
+        slot = experts * num_cores + index % num_cores
+        by_slot = np.full(num_experts * num_cores, -1, dtype=np.intp)
+        by_slot[slot] = index
+        if np.any(by_slot < 0):
+            return False
+        positions.append(by_slot)
+    w2, activation, dx = positions[0], positions[1], positions[2]
+    return bool(np.all(w2 < activation) and np.all(activation < dx))
 
 
-def _event_joins_tasks(cfg: RuntimeConfigC, tasks: list[TaskDescC], producers: dict) -> bool:
-    """Require a completion event to include exactly these nonempty tasks."""
-    event = tasks[0].trigger_event
-    return (len(producers[event]) == len(tasks)
-            and cfg.all_event_num_triggers[event] == len(tasks)
-            and all(task.trigger_event == event for task in tasks))
-
-
-def _expert_dependency_chain(
-    cfg: RuntimeConfigC, acts: list[TaskDescC], gates: list[TaskDescC],
-    swiglu: list[TaskDescC], num_cores: int, producers: dict,
-) -> bool:
-    """Join every expert reader before any task overwrites its receive rows."""
-    if len(acts) != num_cores or len(gates) != num_cores or not swiglu:
-        return False
-    if not _event_joins_tasks(cfg, acts, producers) or not _event_joins_tasks(cfg, swiglu, producers):
-        return False
-    act_event = acts[0].trigger_event
-    swiglu_event = swiglu[0].trigger_event
-    return (all(task.dependent_event == act_event and task.outputs[0].input_position == _SWIGLU_GRAD
-                for task in swiglu)
-            and all(task.dependent_event == swiglu_event for task in gates))
+def _joined_events(tasks, experts, task_ids, producers, thresholds, num_experts):
+    """Return the single fully joined completion event for each expert or None."""
+    if np.size(task_ids) == 0 or np.any(experts >= num_experts):
+        return None
+    counts = np.bincount(experts, minlength=num_experts)
+    if np.any(counts == 0):
+        return None
+    triggers = tasks["trigger_event"][task_ids]
+    events = np.empty(num_experts, dtype=triggers.dtype)
+    events[experts] = triggers
+    if (np.any(events[experts] != triggers) or np.any(events >= len(thresholds))
+            or np.any(producers[events] != counts) or np.any(thresholds[events] != counts)):
+        return None
+    return events
 
 
 def can_reuse_backward_dispatch(cfg: RuntimeConfigC, num_experts: int, num_cores: int) -> bool:
-    """Check a validated runtime before reusing received dY storage for dX.
-
-    Args:
-        cfg: Validated, fully reordered backward runtime descriptors.
-        num_experts: Number of local experts.
-        num_cores: Number of active Cube workers.
-
-    Returns:
-        Whether every receive reader precedes dX through worker order and
-        the existing full-expert completion events. Unknown readers or changed
-        schedules disable reuse without adding dependencies to the hot path.
-    """
-    if cfg.task_index_num[2]:
+    """Validate the physical reader order and event joins before aliasing dY storage as dX."""
+    if cfg.task_index_num[2] or num_experts <= 0 or num_cores <= 0:
         return False
-    cube_tasks = [cfg.all_tasks[index] for index in cfg.cube_task_indices[:cfg.task_index_num[0]]]
-    vector_tasks = [cfg.all_tasks[index] for index in cfg.vector_task_indices[:cfg.task_index_num[1]]]
-    for task in cube_tasks + vector_tasks:
-        reads_dispatch = any(task.inputs[index].input_position == _DISPATCH for index in range(task.num_inputs))
-        if reads_dispatch and (task.task_type != TaskType.TASK_GROUPED_MATMUL
-                               or task.outputs[0].input_position not in (_WEIGHT2_GRAD, _ACTIVATION_GRAD)):
+    tasks = np.frombuffer(cfg.all_tasks, dtype=np.dtype(TaskDescC))
+    cube = np.ctypeslib.as_array(cfg.cube_task_indices)[:cfg.task_index_num[0]]
+    vector = np.ctypeslib.as_array(cfg.vector_task_indices)[:cfg.task_index_num[1]]
+    active = np.concatenate((cube, vector))
+    # Read scalar fields from the wire layout. Indexing the record array itself
+    # would copy whole task descriptors, including unused input and output ports.
+    out = tasks["outputs"][:, 0]["input_position"]
+    kinds = tasks["task_type"]
+    allowed = (kinds[active] == TaskType.TASK_GROUPED_MATMUL) & np.isin(out[active], (_WEIGHT2_GRAD, _ACTIVATION_GRAD))
+    other = active[~allowed]
+    ports = tasks["inputs"]["input_position"]
+    for port in range(ports.shape[1]):
+        if np.any((tasks["num_inputs"][other] > port) & (ports[other, port] == _DISPATCH)):
             return False
-    return (_worker_read_order(cube_tasks, num_experts, num_cores)
-            and _expert_events_join_readers(cfg, cube_tasks, vector_tasks, num_experts, num_cores))
+
+    indices = tasks["task_index"]
+    cube_out = out[cube]
+    if not _worker_read_order(cube_out, indices[cube], kinds[cube], num_experts, num_cores):
+        return False
+    acts = cube[cube_out == _ACTIVATION_GRAD]
+    gates = cube[cube_out == _INPUT_GRAD]
+    swiglu = vector[kinds[vector] == TaskType.TASK_SWI_GLU_GRAD]
+    splits = tasks["task_split_num"][swiglu]
+    if np.any(splits < num_experts) or np.any(splits % num_experts) or np.any(out[swiglu] != _SWIGLU_GRAD):
+        return False
+    experts = indices[swiglu] // (splits // num_experts)
+    thresholds = np.ctypeslib.as_array(cfg.all_event_num_triggers)
+    triggers = tasks["trigger_event"][active]
+    if np.any(triggers >= len(thresholds)):
+        return False
+    producers = np.bincount(triggers, minlength=len(thresholds))
+    act_event = _joined_events(tasks, indices[acts] // num_cores, acts, producers, thresholds, num_experts)
+    swiglu_event = _joined_events(tasks, experts, swiglu, producers, thresholds, num_experts)
+    if act_event is None or swiglu_event is None:
+        return False
+    dependency = tasks["dependent_event"]
+    return bool(np.all(dependency[swiglu] == act_event[experts])
+                and np.all(dependency[gates] == swiglu_event[indices[gates] // num_cores]))

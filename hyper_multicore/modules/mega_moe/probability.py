@@ -92,9 +92,11 @@ class ProbabilityFillConfig:
         token_operator.fill_config = self.token_config
         start = topology.pre_task_num
         self.token_config.fill(config, token_operator, topology)
+        # Assignment to each embedded ctypes field copies the descriptor by value.
+        descriptor = self.binding.layout.descriptor()
         for index in range(start, start + operator.task_num):
             task = config.all_tasks[index]
-            task.outputs[task.num_outputs] = self.binding.layout.descriptor()
+            task.outputs[task.num_outputs] = descriptor
             task.num_outputs += 1
             task.extra_value_1 |= int(self.binding.option)
             validate_task_options(task)

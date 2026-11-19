@@ -14,6 +14,7 @@
 # ============================================================================
 """Fast source-build checks using temporary data and no framework or device runtime."""
 
+from collections.abc import Iterator
 from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import fcntl
 import hashlib
@@ -52,7 +53,7 @@ ARTIFACTS = BOOTSTRAP.load_module("artifacts")
 MERGE = BOOTSTRAP.load_module("merge_multicore_vendors")
 
 
-def write(path, text="fixture"):
+def write(path: Path, text: str = "fixture") -> Path:
     """Create one small fixture without touching checkout outputs."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -64,10 +65,39 @@ def git(directory: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
 
 
+class _HandoffCommands:
+    """Record commands and publish the controlled SDK handoff."""
+
+    def __init__(self, handoff: dict[str, dict[str, object]]) -> None:
+        """Keep the SDK handoff and recorded build commands."""
+        self.handoff, self.calls = handoff, []
+        self.fail_vendor = False
+        self.events = []
+        self.add_event = self.events.append
+
+    def scope(self, name: str) -> nullcontext[str]:
+        """Accept a command scope without changing command recording."""
+        return nullcontext(name)
+
+    def __call__(self, command: list[str], **kwargs: Any) -> str | None:
+        """Record the command and emit the handoff during the common build."""
+        self.calls.append(command)
+        if command[:2] == ["cmake", "-S"] and command[2].endswith("/torch"):
+            build_dir = Path(command[command.index("-B") + 1])
+            write(build_dir / "torch_cxx_standard.txt", "20")
+        if self.fail_vendor and kwargs.get("label", "").startswith("vendor-"):
+            raise RuntimeError("vendor failed")
+        if kwargs.get("label") == "common-prepare":
+            write(Path(kwargs["env"]["HP_SHMEM_HANDOFF"]), json.dumps({"architectures": self.handoff}))
+            return json.dumps({"ops_nn_source": "nn", "ops_transformer_source": "transformer",
+                               "host_input_identity": "f" * 64, "pending": list(self.handoff)})
+        return None
+
+
 class BuildChecks(unittest.TestCase):
     """Protect dependency requests, cached kernels, output commits and owned paths."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Keep every filesystem effect and environment setting local to this check."""
         self.resources = ExitStack()
         self.addCleanup(self.resources.close)
@@ -158,33 +188,27 @@ class BuildChecks(unittest.TestCase):
                     self.assertFalse(Path(env["TOOL_CALLS"]).exists())
                     self.assertFalse((root / "build/native/.build.lock").exists())
 
+    def _assert_framework_artifacts(self, commands, record, sdks, common):
+        """Check per-framework outputs and the common HotReplica handoff."""
+        configured = [call for call in commands.calls if call[:2] == ["cmake", "-S"]]
+        self.assertEqual(len(configured), 1 + len(sdks))
+        self.assertEqual(set(record["shmem_so"]), set(sdks))
+        self.assertEqual(record["id"], "pt2.12.0-pta2.12.0.post3-ffffffffffff")
+        self.assertIn(record["id"], record["torch_so"])
+        replica_calls = [call for call in commands.calls if "--phase" in call
+                      and any(str(value).endswith("/hot_replica/build.py") for value in call)]
+        self.assertEqual([call[call.index("--phase") + 1] for call in replica_calls],
+                         ["common", "adapter"])
+        self.assertEqual(record["hot_replica"]["soc"], "ascend910_93")
+        self.assertEqual(replica_calls[1][replica_calls[1].index("--cxx-standard") + 1], "20")
+        for backend in sdks:
+            flag = "-DHP_SHMEM_SOC_TYPE=" + sdks[backend]["sdk_soc_type"]
+            binding = next(call for call in configured if flag in call)
+            self.assertIn(f"-DSHMEM_OPS_LIB={common}/shmem/lib/{backend}/libhyper_multicore_shmem_ops.so",
+                          binding)
+
     def test_backend_handoff_reaches_bindings_and_rejects_mismatch(self):
         """Share Torch once and compile every requested binding against its own SDK."""
-        class Commands:
-            """Record commands and publish the controlled SDK handoff."""
-
-            def __init__(self, handoff: dict[str, dict[str, object]]) -> None:
-                """Keep the SDK handoff and recorded build commands."""
-                self.handoff, self.calls = handoff, []
-                self.fail_vendor = False
-                self.events = []
-                self.add_event = self.events.append
-
-            def scope(self, name: str) -> nullcontext[str]:
-                """Accept a command scope without changing command recording."""
-                return nullcontext(name)
-
-            def __call__(self, command: list[str], **kwargs: Any) -> str | None:
-                """Record the command and emit the handoff during the common build."""
-                self.calls.append(command)
-                if self.fail_vendor and kwargs.get("label", "").startswith("vendor-"):
-                    raise RuntimeError("vendor failed")
-                if kwargs.get("label") == "common-prepare":
-                    write(Path(kwargs["env"]["HP_SHMEM_HANDOFF"]), json.dumps({"architectures": self.handoff}))
-                    return json.dumps({"ops_nn_source": "nn", "ops_transformer_source": "transformer",
-                                       "host_input_identity": "f" * 64, "pending": list(self.handoff)})
-                return None
-
         previous_common = None
         for socs, mismatch in (("ascend910b,ascend910_93,ascend950", False),
                                ("ascend910_93", False), ("ascend950", True)):
@@ -195,7 +219,7 @@ class BuildChecks(unittest.TestCase):
                        for name, selected in args.architectures.items()}
             if mismatch:
                 handoff["arch35"]["sdk_soc_type"] = "Ascend910B"
-            commands = Commands(handoff)
+            commands = _HandoffCommands(handoff)
             run = SimpleNamespace(commands=commands, events=[], isolated=False)
             identity = {"python_abi": "cp310", "host_arch": "aarch64", "torch_version": "2.12.0",
                         "pta_version": "2.12.0.post3", "torch_cxx11_abi": True,
@@ -217,16 +241,7 @@ class BuildChecks(unittest.TestCase):
                 write(common / "stale-selection")
                 previous_common = common
                 _, record = BUILD.build_framework(Path(sys.executable), identity, common, sdks, args, run)
-                configured = [call for call in commands.calls if call[:2] == ["cmake", "-S"]]
-                self.assertEqual(len(configured), 1 + len(sdks))
-                self.assertEqual(set(record["shmem_so"]), set(sdks))
-                self.assertEqual(record["id"], "pt2.12.0-pta2.12.0.post3-ffffffffffff")
-                self.assertIn(record["id"], record["torch_so"])
-                for backend in sdks:
-                    flag = "-DHP_SHMEM_SOC_TYPE=" + sdks[backend]["sdk_soc_type"]
-                    binding = next(call for call in configured if flag in call)
-                    self.assertIn(f"-DSHMEM_OPS_LIB={common}/shmem/lib/{backend}/libhyper_multicore_shmem_ops.so",
-                                  binding)
+                self._assert_framework_artifacts(commands, record, sdks, common)
                 if len(sdks) == 2:
                     commands.calls.clear()
                     commands.fail_vendor = True
@@ -658,7 +673,8 @@ time.sleep(30)
                               "dependencies_extra": ["https://mirror.example/simple"]}}
         commands = []
 
-        def run(command, **_kwargs):
+        def run(command: list[str], **_kwargs: Any) -> None:
+            """Record installation commands and create their expected fixture outputs."""
             commands.append(command)
             if "--dest" in command:
                 name, version = command[-1].split("==")
@@ -670,7 +686,8 @@ time.sleep(30)
             if "--report" in command:
                 write(Path(command[command.index("--report") + 1]), '{"install": []}')
 
-        def probe(python, expected):
+        def probe(python: Path, expected: dict[str, str]) -> list[dict[str, str]]:
+            """Return installed package records after checking the selected environment."""
             self.assertEqual(python.parent.parent.parent, self.root / "envs")
             self.assertEqual(expected, {"torch": "1.0.0", "torch-npu": "1.0.0"})
             probes.append(expected)
@@ -766,7 +783,7 @@ time.sleep(30)
             self.assertFalse(json.loads(request.read_text(encoding="utf-8"))["reused"])
 
     @contextmanager
-    def staged_build(self):
+    def staged_build(self) -> Iterator[tuple[SimpleNamespace, WORKSPACE.BuildOutputs]]:
         """Run actual publication with only expensive preparation and native workers replaced."""
         candidate = write(self.root / "staging/candidate/new.so").parent
         wheel = write(self.root / "staging/candidate.whl")

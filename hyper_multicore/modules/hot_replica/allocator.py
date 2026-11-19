@@ -1,0 +1,87 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Load the HotReplica placement kernels independently of expert execution."""
+
+import ctypes
+import importlib
+import importlib.util
+from functools import lru_cache
+from pathlib import Path
+import sys
+from types import ModuleType
+
+import torch
+from hyper_multicore._loader import validate_native_compatibility
+from hyper_multicore._native_manifest import SHMEM_DEPENDENCIES
+
+# Public enum from CANN's acl/acl_platform.h; the capacity itself is queried.
+from hyper_multicore._device import device_ub_bytes as _device_ub_bytes
+
+
+def native_library_path(filename: str) -> Path:
+    """Resolve HotReplica only from the selected, integrity-validated framework artifact."""
+
+    selected = validate_native_compatibility()
+    artifacts = selected["variant"].get("hot_replica")
+    if artifacts is None:
+        raise RuntimeError("Selected HMC adapter has no Atlas A3 HotReplica capability")
+    key = {
+        "_a3_allocator.so": "allocator",
+        "_hot_replica_shared_bridge.so": "bridge",
+        "libhmc_hot_replica_kernels.so": "kernels",
+    }[filename]
+    return selected["root"] / artifacts[key]
+
+
+@lru_cache(maxsize=1)
+def _load_kernels():
+    """Load the selected private dependencies without initializing a SHMEM root."""
+
+    selected = validate_native_compatibility()
+    root = selected["root"] / selected["manifest"]["architectures"]["arch22"]["shmem_root"]
+    handles = tuple(ctypes.CDLL(str(root / name), mode=ctypes.RTLD_LOCAL) for name in SHMEM_DEPENDENCIES)
+    return handles, ctypes.CDLL(str(native_library_path("libhmc_hot_replica_kernels.so")), mode=ctypes.RTLD_GLOBAL)
+
+
+def load_native_extension(name: str) -> ModuleType:
+    """Load only the matching, integrity-validated framework host bridge."""
+    module_name = __package__ + "." + name
+    library = native_library_path(name + ".so").resolve()
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        if Path(getattr(cached, "__file__", "")).resolve() != library:
+            raise RuntimeError(f"HotReplica extension already loaded from another artifact: {module_name}")
+        return cached
+    _load_kernels()
+    spec = importlib.util.spec_from_file_location(module_name, library)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load HotReplica extension: {module_name}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    return module
+
+
+@lru_cache(maxsize=1)
+def load_allocator() -> ModuleType:
+    """Load the device allocator without initializing another SHMEM runtime."""
+    return load_native_extension("_a3_allocator")
+
+
+def allocate_experts(counts: torch.Tensor, capacity: int) -> list[torch.Tensor]:
+    """Run expert placement with the current device's CANN-reported UB budget."""
+    if counts.device.type != "npu":
+        raise ValueError("HotReplica placement requires counts on an Ascend NPU")
+    return load_allocator().allocate(counts, capacity, _device_ub_bytes(counts.device.index))

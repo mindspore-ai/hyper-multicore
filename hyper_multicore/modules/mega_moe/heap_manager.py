@@ -169,6 +169,7 @@ class _HeapManager:
         reservations: tuple[tuple[Mapping[str, Any], _WorkspaceLayout], ...],
         *,
         allow_resize: bool,
+        initial_headroom: int = 0,
     ) -> tuple[Mapping[str, Any], ...]:
         """Add lazy reservations and resize an attached Runtime when required."""
         with self.access():
@@ -180,9 +181,9 @@ class _HeapManager:
                 configured = os.getenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
                 if not self._configured:
                     self._run_and_check_consistency(
-                        lambda: self._configure(configured),
+                        lambda: self._configure(configured, initial_headroom),
                         stage="Configuration",
-                        value=(configured, str(self.dtype), tuple(layouts)),
+                        value=(configured, str(self.dtype), tuple(layouts), initial_headroom),
                     )
                     self._configured = True
                 else:
@@ -396,9 +397,9 @@ class _HeapManager:
             )
         return self.heap_limit if self.heap_limit is not None else max(self.heap_bytes, required)
 
-    def _configure(self, configured: str | None) -> None:
-        """Validate the explicit Heap limit and select the initial budget."""
-        required = self._required_bytes([entry.layout for entry in self.entries])
+    def _configure(self, configured: str | None, headroom: int = 0) -> None:
+        """Validate the explicit Heap limit and budget unbound reservations."""
+        required = _round_heap_bytes(sum(entry.layout.required_bytes for entry in self.entries) + headroom)
         if configured is not None:
             try:
                 self.heap_limit = int(configured)

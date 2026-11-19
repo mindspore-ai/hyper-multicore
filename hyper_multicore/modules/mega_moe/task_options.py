@@ -20,7 +20,7 @@ from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.tasks.alltoall import ShmemTaskPartition, ShmemTransferEngine
 from hyper_multicore.scheduler.config import TaskType
 from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
-from .probability_abi import ProbabilityLayout
+from .probability_abi import PROBABILITY_POSITION_BACKWARD, PROBABILITY_POSITION_FORWARD, ProbabilityLayout
 
 
 class MegaMoeActivationWeighting(IntEnum):
@@ -34,6 +34,15 @@ class MegaMoeTransportPayload(IntEnum):
     TOKENS = 0
     TOKENS_WITH_PROBABILITIES = 4
     TOKENS_WITH_PROBABILITY_GRADIENTS = 8
+
+
+_ACTIVATION_MASK = int(SwiGluTaskIteration.PERSISTENT_LANES | SwiGluClampPosition.AFTER_SILU
+                       | MegaMoeActivationWeighting.BEFORE_FC2)
+_TRANSPORT_MASK = int(ShmemTaskPartition.RUNTIME_ROWS | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES
+                      | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS | ShmemTransferEngine.UDMA)
+_GMM_MODES = frozenset(GroupedMatmulTaskMode)
+_ACTIVATION_PORT = {TaskType.TASK_SWI_GLU: PROBABILITY_POSITION_FORWARD,
+                    TaskType.TASK_SWI_GLU_GRAD: PROBABILITY_POSITION_BACKWARD}
 
 
 def activation_weighting(task: Any) -> MegaMoeActivationWeighting:
@@ -51,9 +60,7 @@ def transport_payload(task: Any) -> MegaMoeTransportPayload:
 
 
 def _activation_options(task: Any) -> bool:
-    allowed = int(SwiGluTaskIteration.PERSISTENT_LANES | SwiGluClampPosition.AFTER_SILU
-                  | MegaMoeActivationWeighting.BEFORE_FC2)
-    if task.extra_value_1 & ~allowed:
+    if task.extra_value_1 & ~_ACTIVATION_MASK:
         raise ValueError(f"invalid activation flags {task.extra_value_1:#x}")
     if task.extra_value_1 & SwiGluClampPosition.AFTER_SILU and task.extra_value_0 == 0:
         raise ValueError("clamp position requires a clamp limit")
@@ -61,9 +68,7 @@ def _activation_options(task: Any) -> bool:
 
 
 def _transport_options(task: Any) -> bool:
-    allowed = int(ShmemTaskPartition.RUNTIME_ROWS | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES
-                  | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS | ShmemTransferEngine.UDMA)
-    if task.extra_value_1 & ~allowed:
+    if task.extra_value_1 & ~_TRANSPORT_MASK:
         raise ValueError(f"invalid transport flags {task.extra_value_1:#x}")
     payload = transport_payload(task)
     if (task.task_type == TaskType.TASK_SHMEM_GET_MEM
@@ -78,8 +83,7 @@ def _validate_operands(task: Any, weighted: bool, inputs: int) -> None:
     if not weighted:
         return
     layout = ProbabilityLayout.from_descriptor(task.outputs[1])
-    positions = {TaskType.TASK_SWI_GLU: 16, TaskType.TASK_SWI_GLU_GRAD: 25}
-    if layout.parameter_position != positions.get(task.task_type, layout.parameter_position):
+    if layout.parameter_position != _ACTIVATION_PORT.get(task.task_type, layout.parameter_position):
         raise ValueError("probability operand uses the wrong forward/backward port")
 
 
@@ -87,7 +91,7 @@ def validate_task_options(task: Any) -> None:
     """Reject unknown bits, conflicting payloads and missing auxiliary operands."""
     kind = task.task_type
     if kind == TaskType.TASK_GROUPED_MATMUL:
-        if task.extra_value_1 not in tuple(GroupedMatmulTaskMode) or task.num_inputs != 3 or task.num_outputs != 1:
+        if task.extra_value_1 not in _GMM_MODES or task.num_inputs != 3 or task.num_outputs != 1:
             raise ValueError("invalid grouped matmul task mode or operands")
     elif kind in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
         _validate_operands(task, _activation_options(task), 1 if kind == TaskType.TASK_SWI_GLU else 2)

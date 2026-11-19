@@ -112,6 +112,7 @@ class ProbabilityWorkspace:
     """Cache scalar-plane aliases for one allocation and one immutable plan stride."""
 
     def __init__(self, buffer: torch.Tensor, stride: int) -> None:
+        """Create probability-plane views using the committed allocation stride."""
         self.buffer = buffer
         self.stride = stride
         self.planes = (buffer if buffer.shape[1] == stride else
@@ -357,6 +358,11 @@ class MegaMoeWorkspace:
                 raise ValueError("MegaMoe workspace cannot change device, dtype, routed shape, or capacity.")
             return
 
+        self._allocate_buffers(spec, dtype, device, requested_capacity)
+
+    @torch.inference_mode(False)
+    def _allocate_buffers(self, spec, dtype, device, requested_capacity):
+        """Create mutable persistent buffers even after an inference-only first call."""
         allocations = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             routed_slots=spec.routed_slots,

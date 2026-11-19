@@ -1,3 +1,17 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 """Shared error convergence, source leases and dynamic MX plan bounds."""
 from collections import OrderedDict
@@ -18,15 +32,15 @@ from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 def test_error_converges_in_existing_route_and_releases_source_lease(mode):
     """Use the existing collective to reject weights and release the Pull lease."""
     resources = SimpleNamespace(spec=SimpleNamespace(dispatch_mode=mode, auto_tokens=True),
-                                workspace=Mock(), prepare_auto_workspace=Mock())
+                                workspace=Mock(), prepare_auto_workspace=Mock(), placement=None)
     hidden, ids, probs = torch.ones(1, 64), torch.zeros(1, 1), torch.ones(1, 1)
-    def reject(*args, **options):
+    def _reject(*args, **options):
         del args
         assert options['autograd_mask'] == _INVALID_WEIGHT_MASK
         options['prepare_workspace'](128, 0)
         raise ValueError('collective invalid weight')
     # Invalid roots are deliberately not inspected before the collective.
-    with patch.object(invocation, 'prepare_topk_route', side_effect=reject) as route:
+    with patch.object(invocation, 'prepare_topk_route', side_effect=_reject) as route:
         with pytest.raises(ValueError, match='collective invalid weight'):
             with invocation.prepare_expert_invocation(hidden, ids, probs, None, (None, None),
                                                        resources, weight_error=True):

@@ -96,7 +96,7 @@ def resource_path(root: Path, relative: str) -> Path:
     return resolved
 
 
-def variant_selection_key(variant: dict):
+def variant_selection_key(variant: dict) -> tuple[str, tuple[str, str, bool]]:
     """Validate the unique adapter ID and stable branch/ABI selector."""
     identifier = variant.get("id")
     if not isinstance(identifier, str) or not re.fullmatch(r"[a-zA-Z0-9._-]+", identifier):
@@ -109,7 +109,7 @@ def variant_selection_key(variant: dict):
     return identifier, key
 
 
-def validate_adapter_paths(root: Path, variant: dict, backends: dict):
+def validate_adapter_paths(root: Path, variant: dict, backends: dict) -> None:
     """Require the shared Torch adapter and one binding for each packaged backend."""
     expected_torch = f"adapters/{variant['id']}/libhyper_multicore_torch.so"
     expected_shmem = {name: f"adapters/{variant['id']}/shmem/{name}/hyper_multicore_shmem_torch.so"
@@ -120,6 +120,20 @@ def validate_adapter_paths(root: Path, variant: dict, backends: dict):
         path = resource_path(root, expected)
         if not path.is_file() or not path.stat().st_size:
             raise ValueError(f"Missing adapter resource: {expected}")
+
+    replica = variant.get("hot_replica")
+    if replica is not None:
+        expected = {
+            "soc": "ascend910_93", "kernels": "shmem/lib/arch22/hot_replica/libhmc_hot_replica_kernels.so",
+            "allocator": f"adapters/{variant['id']}/shmem/arch22/hot_replica/_a3_allocator.so",
+            "bridge": f"adapters/{variant['id']}/shmem/arch22/hot_replica/_hot_replica_shared_bridge.so",
+        }
+        if replica != expected or "ascend910_93" not in backends.get("arch22", {}).get("soc_list", []):
+            raise ValueError("Invalid HotReplica adapter capability or artifact paths")
+        for key in ("allocator", "bridge", "kernels"):
+            path = resource_path(root, replica[key])
+            if not path.is_file() or not path.stat().st_size:
+                raise ValueError(f"Missing HotReplica artifact: {key}")
 
 
 def validate_architecture(root: Path, name: str, backend: dict) -> None:
@@ -200,7 +214,7 @@ def select_shmem_backend(manifest: dict, npu_arch: int) -> tuple[str, dict]:
     return matches[0]
 
 
-def validate_build_records(info: dict, manifest: dict):
+def validate_build_records(info: dict, manifest: dict) -> list[dict]:
     """Match platform and requested adapter IDs to actual build provenance."""
     if info.get("schema_version") != 3:
         raise ValueError("Native payload requires schema 3; rebuild with bash build.sh")
@@ -229,17 +243,17 @@ def validate_backend_provenance(info: dict, manifest: dict) -> None:
         raise ValueError("Build identity and backend SoCs disagree")
 
 
-def validate_variant_provenance(record: dict, variant: dict):
+def validate_variant_provenance(record: dict, variant: dict) -> None:
     """Match each adapter selector and library path to its actual framework build."""
     if (release(record["torch_version"]) != variant["torch_release"]
             or release(record["pta_version"]) != variant["pta_release"]):
         raise ValueError(f"Adapter branch disagrees with actual build: {variant['id']}")
     if any(record.get(k) != variant.get(k)
-           for k in ("torch_release", "pta_release", "torch_cxx11_abi", "torch_so", "shmem_so")):
+           for k in ("torch_release", "pta_release", "torch_cxx11_abi", "torch_so", "shmem_so", "hot_replica")):
         raise ValueError(f"Adapter provenance mismatch: {variant['id']}")
 
 
-def payload_members(root: Path, info: dict):
+def payload_members(root: Path, info: dict) -> tuple[dict[str, str], set[str]]:
     """Require an exact native-resource set, including files not selected for loading."""
     recorded = info.get("payload_sha256")
     if not isinstance(recorded, dict) or not recorded:
@@ -252,7 +266,7 @@ def payload_members(root: Path, info: dict):
     return recorded, actual
 
 
-def validate_resource_hashes(root: Path, info: dict, recorded: dict, actual: set):
+def validate_resource_hashes(root: Path, info: dict, recorded: dict[str, str], actual: set[str]) -> None:
     """Check every recorded resource and require separate native-library digests."""
     for relative, digest in recorded.items():
         if file_sha256(resource_path(root, relative)) != digest:
