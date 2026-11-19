@@ -531,7 +531,7 @@ def test_a3_saved_route_uses_shared_quota_geometry(bound):
     """Use the reserved quotas across F and R, retaining unreserved bank admission."""
     spec = SimpleNamespace(
         architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
-        ep_size=2, rank_id=0, local_experts=4, hidden_size=32, intermediate_size=64,
+        ep_size=2, rank_id=0, num_experts=8, local_experts=4, hidden_size=32, intermediate_size=64,
         top_k=2, num_cube_cores=24, apply_probs_before_fc2=True, expert_weight_layout="EOI",
     )
     owner = SimpleNamespace(

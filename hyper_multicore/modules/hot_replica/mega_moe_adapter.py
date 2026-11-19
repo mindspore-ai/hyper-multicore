@@ -25,6 +25,7 @@ import torch
 
 from hyper_multicore.modules.mega_moe.heap_manager import _WorkspaceLayout, _workspace_layout
 from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_capacity, _resolve_receive_capacity
+from hyper_multicore.scheduler.config import mega_moe_event_capacity
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
 from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
@@ -94,7 +95,9 @@ def workspace_reservations(
 _SHARED_BANKS = weakref.WeakKeyDictionary()
 
 
-def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reservations=(), pipeline=False):
+def _get_mega_bank(
+    hidden, parent, owner, *, pool_type=SharedExpertPool, reservations=(), pipeline=False, workspace_growth=None,
+):
     """Register a HotReplica allocation in the existing MegaMoE heap transaction."""
     spec = parent.spec
     manager = parent.heap_manager
@@ -118,7 +121,8 @@ def _get_mega_bank(hidden, parent, owner, *, pool_type=SharedExpertPool, reserva
                 str(hidden.dtype), spec.expert_weight_layout,
             )
             layout = _WorkspaceLayout(pool.allocation_bytes, signature, spec.local_experts)
-            added = manager.reserve((*reservations, (reservation, layout)), allow_resize=True)
+            added = manager.reserve((*reservations, (reservation, layout)), allow_resize=True,
+                                    workspace_growth=workspace_growth)
             try:
                 manager.bind(pool, spec, reservation)
             except Exception:
@@ -158,6 +162,12 @@ class PlacementResources:
             self.bounded = BoundedPlacement(parent.spec) if has_reservation or not heap_limited else None
         else:
             self.bounded = None
+        spec = parent.spec
+        self.reuses_parent_workspace = (
+            self.bounded is not None and self.source_bound is None
+            and mega_moe_event_capacity(spec.num_experts, spec.ep_size)
+            == mega_moe_event_capacity(2 * spec.num_experts, spec.ep_size)
+        )
         self.pipeline_enabled = bool(built_in) and supports_pipeline(parent.spec, 1)
         self.statistics = {
             "invocations": 0, "placements": 0,
@@ -274,6 +284,19 @@ class PlacementResources:
 
         spec = self.parent.spec
         manager = self.parent.heap_manager
+        source = max(_COMMUNICATION_SPLIT, _align_capacity(tokens))
+        receive = _align_capacity(placement.receive_capacity)
+        if self.reuses_parent_workspace:
+            if self.pool is None:
+                if self.shared:
+                    receive = max(receive, _resolve_receive_capacity(
+                        spec.initial_capacity_factor, source * spec.top_k, spec.ep_size,
+                    ))
+                self.pool = _get_mega_bank(
+                    hidden, self.parent, self, pipeline=self.pipeline_enabled,
+                    workspace_growth=(self.parent.workspace, source, receive),
+                )
+            return self.parent
         shared_geometry = self.shared and self.bounded is not None
         width = spec.local_experts if self.source_bound is not None or shared_geometry else placement.borrowed_capacity
         if width in self.geometries:
@@ -283,8 +306,6 @@ class PlacementResources:
             "hot_replica": False, "source_token_bound": None, "planner_key": None,
             "num_experts": spec.ep_size * (spec.local_experts + width),
         }
-        source = max(_COMMUNICATION_SPLIT, _align_capacity(tokens))
-        receive = _align_capacity(placement.receive_capacity)
         if self.source_bound is not None:
             bound = _align_capacity(self.source_bound)
             _, virtual = _bounded_receive(self.specification, bound, hidden.dtype, spec.num_cube_cores)

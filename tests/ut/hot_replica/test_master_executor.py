@@ -31,13 +31,14 @@ from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16
 
 
 def test_serial_replica_widths_share_one_reservation_with_the_bank():
-    """Reserve real token rows and reuse the physical workspace across route widths."""
+    """Keep one virtual reservation when the home counters cannot cover all widths."""
     spec = SimpleNamespace(local_experts=6, ep_size=32, top_k=8, initial_capacity_factor=1.25,
                            expert_weight_layout="EIO")
     owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
     owner.parent = SimpleNamespace(spec=spec, heap_manager=SimpleNamespace(heap_limit=None))
     owner.pool, owner.geometries = None, {}
     owner.source_bound, owner.shared, owner.bounded, owner.specification = None, True, object(), {}
+    owner.reuses_parent_workspace = False
     owner.pipeline_enabled = True
     hidden = torch.empty(0, dtype=torch.bfloat16)
     layout = Mock()
@@ -52,6 +53,27 @@ def test_serial_replica_widths_share_one_reservation_with_the_bank():
     bank.assert_called_once_with(hidden, owner.parent, owner, pipeline=True, reservations=((specification, layout),))
     resource.assert_called_once()
     assert resource.call_args.kwargs["workspace_layout"] is layout
+
+
+def test_serial_replica_widths_reuse_home_when_event_capacity_matches():
+    """B0 and replica calls can use the same communication buffers with distinct plans."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        local_experts=6, num_experts=192, ep_size=32, top_k=8, initial_capacity_factor=1.25,
+        expert_weight_layout="EOI", hidden_size=5120, intermediate_size=1792,
+    )
+    parent = SimpleNamespace(spec=spec, workspace=object(), heap_manager=SimpleNamespace(heap_limit=None))
+    planner = mega_moe_adapter.HotReplicaPlanner
+    owner = mega_moe_adapter.PlacementResources(
+        parent, {"planner_key": (planner.__module__, planner.__qualname__)}, shared=False,
+    )
+    hidden = torch.empty(0, dtype=torch.bfloat16)
+    with patch.object(mega_moe_adapter, "_get_mega_bank") as bank:
+        for width in (1, 2, 6):
+            assert owner._geometry(hidden, SimpleNamespace(borrowed_capacity=width, receive_capacity=33792), 4096) is parent
+    bank.assert_called_once_with(hidden, parent, owner, pipeline=True,
+                                 workspace_growth=(parent.workspace, 4096, 33792))
+    assert not owner.geometries
 
 
 @pytest.mark.parametrize(("first", "second"), [("EIO", "EOI"), ("EOI", "EIO")])

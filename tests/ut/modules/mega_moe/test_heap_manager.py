@@ -201,6 +201,23 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             self.assertEqual(restart.call_count, 1)
         self.assertEqual(manager.epoch, 1)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_home_workspace_growth_and_bank_bind_use_one_restart(self) -> None:
+        """Grow the reused source and receive buffers while reserving a cold replica bank."""
+        manager, workspace, retained = self._automatic_workspace("push")
+        manager._runtime_attached = True
+        bank = {"kind": "expert_bank"}
+        reservations = ((bank, self._layout(4 * 1024**2, 2, "bank")),)
+        with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+            manager.reserve(reservations, allow_resize=True, workspace_growth=(workspace, 512, 1792))
+            self.assertEqual(len(manager.entries), 2)
+            self.assertEqual(workspace.routed_slots, 1024)
+            self.assertEqual(workspace.capacity_floor, 1792)
+            self.assertEqual(retained.local_num_tokens, 128)
+            manager.ensure_token_capacity(workspace, 512, 1792)
+            restart.assert_called_once()
+
     def setUp(self) -> None:
         """Install one-rank lifecycle and configuration boundaries."""
         self.reference = SimpleNamespace(

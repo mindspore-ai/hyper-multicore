@@ -170,14 +170,23 @@ class _HeapManager:
         *,
         allow_resize: bool,
         initial_headroom: int = 0,
+        workspace_growth: tuple[MegaMoeWorkspace, int, int] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         """Add lazy reservations and resize an attached Runtime when required."""
         with self.access():
             previous_count = len(self.entries)
             previous_configuration = self._configured, self.heap_limit, self.heap_bytes
             added_specifications = self._reserve(reservations)
-            layouts = [entry.layout for entry in self.entries]
             try:
+                layouts = [entry.layout for entry in self.entries]
+                growth = None
+                if workspace_growth is not None:
+                    if not self._runtime_attached:
+                        raise RuntimeError("Workspace growth requires an attached SHMEM Runtime")
+                    workspace, tokens, received = workspace_growth
+                    growth = self._token_growth_layouts(self._entry_for_workspace(workspace), tokens, received)
+                    if growth is not None:
+                        _, layouts = growth
                 configured = os.getenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
                 if not self._configured:
                     self._run_and_check_consistency(
@@ -193,7 +202,7 @@ class _HeapManager:
                         value=tuple(layouts),
                     )
                     required = self._required_bytes(layouts)
-                    if required > self.heap_bytes:
+                    if required > self.heap_bytes or growth is not None:
                         if self.workspaces and not allow_resize:
                             raise RuntimeError("Create all resources before initializing a fixed SHMEM layout")
                         heap_bytes = self._budget(required)
@@ -352,32 +361,42 @@ class _HeapManager:
         """
         with self.access():
             entry = self._entry_for_workspace(workspace)
-            spec = entry.bound_spec
-            if spec is None or not spec.auto_tokens:
-                raise RuntimeError("Automatic token growth requires an automatic workspace")
-            grow_source = tokens > spec.local_num_tokens
-            grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
-            if not grow_source and not grow_receive:
-                return spec
-            factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
-            token_limit = ((2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128) * 128
-            token_capacity = (_align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
-                              if grow_source else spec.local_num_tokens)
-            receive_capacity = entry.layout.receive_capacity
-            if grow_receive:
-                receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
-            layout = _workspace_layout(entry.specification, self.dtype, receive_capacity, token_capacity)
-            layouts = [layout if item is entry else item.layout for item in self.entries]
-            if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
-                layout = _workspace_layout(entry.specification, self.dtype,
-                                           max(entry.layout.receive_capacity, _align_capacity(received)),
-                                           max(spec.local_num_tokens, tokens))
-                layouts = [layout if item is entry else item.layout for item in self.entries]
+            growth = self._token_growth_layouts(entry, tokens, received)
+            if growth is None:
+                return entry.bound_spec
+            layout, layouts = growth
             required = self._required_bytes(layouts)
             heap_bytes = self._budget(required)
             if not self._grow_mx_push_storage(entry, layout, required, heap_bytes):
                 self._restart(layouts, heap_bytes)
             return entry.bound_spec
+
+    def _token_growth_layouts(
+        self, entry: _HeapEntry, tokens: int, received: int,
+    ) -> tuple[_WorkspaceLayout, list[_WorkspaceLayout]] | None:
+        """Project one dynamic workspace growth against all pending reservations."""
+        spec = entry.bound_spec
+        if spec is None or not spec.auto_tokens:
+            raise RuntimeError("Automatic token growth requires an automatic workspace")
+        grow_source = tokens > spec.local_num_tokens
+        grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
+        if not grow_source and not grow_receive:
+            return None
+        factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
+        token_limit = ((2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128) * 128
+        token_capacity = (_align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
+                          if grow_source else spec.local_num_tokens)
+        receive_capacity = entry.layout.receive_capacity
+        if grow_receive:
+            receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
+        layout = _workspace_layout(entry.specification, self.dtype, receive_capacity, token_capacity)
+        layouts = [layout if item is entry else item.layout for item in self.entries]
+        if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
+            layout = _workspace_layout(entry.specification, self.dtype,
+                                       max(entry.layout.receive_capacity, _align_capacity(received)),
+                                       max(spec.local_num_tokens, tokens))
+            layouts = [layout if item is entry else item.layout for item in self.entries]
+        return layout, layouts
 
     def _grow_mx_push_storage(
         self, entry: _HeapEntry, layout: _WorkspaceLayout, required: int, heap_bytes: int,

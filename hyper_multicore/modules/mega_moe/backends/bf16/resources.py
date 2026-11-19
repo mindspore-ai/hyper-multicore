@@ -55,7 +55,10 @@ class BF16Resources(_MegaMoeExecutionResources):
         spec = self.spec
         key = bucket if weight_grad_dtype is None else (bucket, weight_grad_dtype)
         if route_experts is not None:
-            if not 0 < route_experts <= spec.num_experts or route_experts % spec.ep_size:
+            experts = spec.num_experts
+            if self.placement is not None and self.placement.reuses_parent_workspace:
+                experts *= 2
+            if not 0 < route_experts <= experts or route_experts % spec.ep_size:
                 raise ValueError("HotReplica route geometry exceeds the shared workspace")
             spec = replace(
                 spec, num_experts=route_experts,
