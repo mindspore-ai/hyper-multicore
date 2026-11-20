@@ -70,12 +70,12 @@ assert 'torch_npu' not in sys.modules
         self.assertCountEqual(multicore.__all__, [
             "BasePlanner", "ExpertPlacement", "PlacementRequest",
             "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaMoePlacementOptions",
-            "MegaKernelDiagnostics",
+            "MegaKernelDiagnostics", "SwiGLUParameters", "SiTUGLUParameters",
             "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
         ])
         self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))
         for name in ("MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaMoePlacementOptions",
-                     "BasePlanner", "ExpertPlacement", "PlacementRequest"):
+                     "BasePlanner", "ExpertPlacement", "PlacementRequest", "SwiGLUParameters", "SiTUGLUParameters"):
             self.assertTrue(callable(getattr(multicore, name)))
         for name in ("MhcState", "MegaMhcOutput", "GateOutput", "GateBackend"):
             self.assertFalse(hasattr(multicore, name))

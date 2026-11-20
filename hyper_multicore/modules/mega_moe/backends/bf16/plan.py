@@ -34,7 +34,6 @@ from hyper_multicore.modules.mega_moe.backends.bf16.backward.storage import can_
 from hyper_multicore.modules.mega_moe.backends.bf16.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
     get_gate_grad_tiling_bytes,
-    get_swiglu_grad_tiling_bytes,
     get_w1_grad_tiling_bytes,
     get_w2_grad_tiling_bytes,
 )
@@ -46,16 +45,15 @@ from hyper_multicore.modules.mega_moe.backends.bf16.forward.graph import (
 )
 from hyper_multicore.modules.mega_moe.backends.bf16.forward.tiling_tables import (
     get_down_proj_tiling_bytes,
-    get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
+from hyper_multicore.modules.mega_moe.schedule import configure_expert_queues
 from hyper_multicore.scheduler.config import (
     FAST_DEPENDENCY_POLL_INTERVAL_US,
     TaskSplitValue,
 )
 from hyper_multicore.scheduler.graph import ComputeGraph
 
-from ...schedule import configure_expert_queues
 from ...diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
 from ...probability import (
     PROBABILITY_POSITION_FORWARD, PROBABILITY_POSITION_BACKWARD,
@@ -66,6 +64,7 @@ from ...schedule_policy import (
 )
 from ...spec import MegaMoeSpec
 from ...tensor_dump import attach_mega_moe_l1_view_resolvers
+from .activation import prepare_activation_tiling
 
 
 @dataclass(frozen=True)
@@ -131,15 +130,6 @@ def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
     return torch.from_numpy(array).to(device=device, dtype=torch.uint8)
 
 
-def _resize_swiglu_tiling(data: bytes, num_cube_cores: int) -> bytes:
-    """Resize the baseline 24-core repeated struct for the active workers."""
-    baseline_workers = 49
-    if len(data) % baseline_workers:
-        raise RuntimeError("invalid baseline SwiGLU tiling byte length.")
-    struct_size = len(data) // baseline_workers
-    return data[:struct_size] * (2 * num_cube_cores + 1)
-
-
 def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     """Translate rank-local token shape into scheduler task coordinates.
 
@@ -183,8 +173,7 @@ def _build_runtime_artifacts(
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
-        swiglu_limit=spec.swiglu_limit,
-        clamp_after_activation=spec.clamp_after_activation,
+        activation_parameters=spec.activation_parameters,
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
     )
@@ -209,8 +198,7 @@ def _build_runtime_artifacts(
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
-        swiglu_limit=spec.swiglu_limit,
-        clamp_after_activation=spec.clamp_after_activation,
+        activation_parameters=spec.activation_parameters,
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
     )
@@ -241,8 +229,8 @@ def _build_runtime_artifacts(
         batch_experts=spec.batch_experts,
         dependency_poll_interval=FAST_DEPENDENCY_POLL_INTERVAL_US,
     )
-    for graph, config in ((forward_graph, forward_data), (backward_graph, backward_data)):
-        policy.apply(config, graph, task_values, spec.num_cube_cores)
+    policy.apply(forward_data, forward_graph, task_values, spec.num_cube_cores, forward=True)
+    policy.apply(backward_data, backward_graph, task_values, spec.num_cube_cores, forward=False)
     return forward_graph, forward_data, backward_graph, backward_data
 
 
@@ -314,12 +302,8 @@ def build_mega_moe_plan(
             device,
         ),
         swiglu_tiling=_tensor_from_bytes(
-            _resize_swiglu_tiling(
-                get_swiglu_tiling_bytes(
-                    forward_graph.get_op("swiglu").split_value,
-                    intermediate_size=spec.intermediate_size,
-                ),
-                spec.num_cube_cores,
+            prepare_activation_tiling(
+                spec, backward=False, rows_per_task=forward_graph.get_op("activation").split_value,
             ),
             device,
         ),
@@ -348,12 +332,8 @@ def build_mega_moe_plan(
             device,
         ),
         swiglu_grad_tiling=_tensor_from_bytes(
-            _resize_swiglu_tiling(
-                get_swiglu_grad_tiling_bytes(
-                    backward_graph.get_op("swiglu_grad").split_value,
-                    intermediate_size=spec.intermediate_size,
-                ),
-                spec.num_cube_cores,
+            prepare_activation_tiling(
+                spec, backward=True, rows_per_task=backward_graph.get_op("activation").split_value,
             ),
             device,
         ),

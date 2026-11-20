@@ -123,6 +123,7 @@ class _MegaMoeExecutionResources:
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
             self.spec.expert_weight_layout, self.spec.apply_probs_before_fc2, self.spec.partial_weight_grad_dtype,
+            self.spec.activation_parameters,
             self.spec.precision, self.spec.transport_engine, self.spec.ready_depth,
             self.spec.schedule_policy, self.spec.lowering,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
@@ -154,7 +155,7 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "clamp_after_activation",
+                  "dispatch_split", "combine_split", "activation_parameters",
                   "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",

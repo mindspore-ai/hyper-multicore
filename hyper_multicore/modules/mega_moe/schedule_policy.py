@@ -61,8 +61,7 @@ def compact_graph(graph: ComputeGraph, topology: TaskSplitValue, workers: int, n
 def pipeline_vector_queue(config: RuntimeConfigC, graph: ComputeGraph, topology: TaskSplitValue) -> None:
     """Pipeline dispatch, activation and return with two experts in flight."""
     dispatch = graph.get_op("dispatch")
-    activation = graph.get_op("swiglu_grad" if any(op.name == "swiglu_grad" for op in graph.topological_sort())
-                              else "swiglu")
+    activation = graph.get_op("activation")
     combine = graph.get_op("combine")
     ids = list(config.vector_task_indices[:config.task_index_num[1]])
     experts = topology.single_rank_expert_num
@@ -104,6 +103,7 @@ def pipeline_vector_queue(config: RuntimeConfigC, graph: ComputeGraph, topology:
 
 def pipeline_cube_queue(
     config: RuntimeConfigC, graph: ComputeGraph, topology: TaskSplitValue, workers: int,
+    *, forward: bool,
 ) -> None:
     """Keep producer/consumer projections near each other for bounded expert lookahead."""
     ids = list(config.cube_task_indices[:config.task_index_num[0]])
@@ -117,18 +117,16 @@ def pipeline_cube_queue(
     for task_id in ids:
         task = config.all_tasks[task_id]
         stages[roles[task_id]][task.task_index // workers].append(task_id)
-    backward = any(op.name == "swiglu_grad" for op in graph.topological_sort())
-    first_ops = ("w2_grad", "act_grad") if backward else ("up_proj",)
-    second_ops = ("gate_grad", "w1_grad") if backward else ("down_proj",)
-    first, second = first_ops, second_ops
+    first_stages = ("up_proj",) if forward else ("w2_grad", "act_grad")
+    second_stages = ("down_proj",) if forward else ("gate_grad", "w1_grad")
     reordered = []
     for expert in range(topology.single_rank_expert_num):
-        for stage in first:
+        for stage in first_stages:
             reordered.extend(stages[stage][expert])
         if expert:
-            for stage in second:
+            for stage in second_stages:
                 reordered.extend(stages[stage][expert-1])
-    for stage in second:
+    for stage in second_stages:
         reordered.extend(stages[stage][topology.single_rank_expert_num-1])
     if sorted(reordered) != sorted(ids):
         raise RuntimeError("Expert Cube pipeline lost or duplicated tasks")
@@ -188,7 +186,8 @@ class MegaMoeSchedulePolicy:
     batch_experts: bool = False
     dependency_poll_interval: int = 5
 
-    def apply(self, config: RuntimeConfigC, graph: ComputeGraph, topology: TaskSplitValue, workers: int) -> None:
+    def apply(self, config: RuntimeConfigC, graph: ComputeGraph, topology: TaskSplitValue, workers: int,
+              *, forward: bool) -> None:
         """Schedule existing typed stages while preserving their task/credit contract."""
         if not self.vector_ready_queue:
             config.queue_layout = 0
@@ -208,7 +207,7 @@ class MegaMoeSchedulePolicy:
         elif self.pipeline_vector:
             pipeline_vector_queue(config, graph, topology)
         if self.pipeline_cube:
-            pipeline_cube_queue(config, graph, topology, workers)
+            pipeline_cube_queue(config, graph, topology, workers, forward=forward)
             for task_id in config.cube_task_indices[:config.task_index_num[0]]:
                 config.all_tasks[task_id].extra_value_1 = GroupedMatmulTaskMode.SINGLE_GROUP
         if self.vector_ready_queue:

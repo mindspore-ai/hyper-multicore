@@ -13,7 +13,7 @@ PyTorch 接口；各特性的原理、用法和限制由对应文档说明。
 | 采集任务时间线 | `profiler.mega_kernel_profile()` | [诊断指南](../docs/diagnostics.md#采集任务时间线) |
 | 采集调用或任务边界的张量 | `dump.tensor_dump()` | [诊断指南](../docs/diagnostics.md#采集张量快照) |
 
-MegaMoE 的配套数值配置使用 `MegaMoeNumericsOptions`，字段与用法见[数值配置](../docs/mega_moe.md#模型数学与数值语义)。
+MegaMoE 的激活配置使用 `SwiGLUParameters` / `SiTUGLUParameters`，通用数值配置使用 `MegaMoeNumericsOptions`，字段与用法见[数值配置](../docs/mega_moe.md#模型数学与数值语义)。
 各接口的精度支持和诊断能力见对应特性文档。
 
 应用通过公共入口导入：
@@ -28,7 +28,8 @@ from hyper_multicore.diagnostics import dump, profiler
 
 ## 接口稳定性
 
-`MegaMoeExperts` 与 `MegaMoeNumericsOptions` 是已明确声明的公开稳定 API。
+`MegaMoeExperts`、`MegaMoeNumericsOptions`、`SwiGLUParameters` 与 `SiTUGLUParameters` 是公开稳定 API。
+激活参数类型的公开不代表对应设备实现已经可用，支持范围见 MegaMoE 特性指南。
 
 `MegaGate`、`MegaMhc` 和诊断采集接口是公开使用入口；当前文档未为其单独声明跨版本兼容性保证。
 公开导出本身不等于稳定 API 承诺。

@@ -14,37 +14,75 @@
 # ============================================================================
 """Stable model numerical options owned by the MegaMoE component."""
 
+import math
+import struct
 from dataclasses import dataclass
 from typing import Literal
 
 
+def _is_finite_number(value: object) -> bool:
+    """Accept integers and finite floats, excluding booleans."""
+    return ((isinstance(value, int) and not isinstance(value, bool))
+            or (isinstance(value, float) and math.isfinite(value)))
+
+
+def _check_positive_float32(name: str, value: float) -> None:
+    """Check that a positive parameter stays finite and positive in float32."""
+    if _is_finite_number(value) and value > 0:
+        try:
+            encoded = struct.unpack("<f", struct.pack("<f", value))[0]
+        except (OverflowError, struct.error):
+            pass
+        else:
+            if math.isfinite(encoded) and encoded > 0:
+                return
+    raise ValueError(f"{name} must be a finite positive float32-representable number, got {value!r}")
+
+
+@dataclass(frozen=True, kw_only=True)  # pylint: disable=unexpected-keyword-arg
+class SwiGLUParameters:
+    """SwiGLU clipping; None disables clipping on both gate and up branches.
+
+    The gate is clipped above clamp_limit, before or after SiLU. The up
+    branch is clipped to [-clamp_limit, clamp_limit].
+    """
+
+    clamp_limit: float | None = None
+    clamp_after_silu: bool = False
+
+    def __post_init__(self) -> None:
+        if self.clamp_limit is not None:
+            _check_positive_float32("clamp_limit", self.clamp_limit)
+        if not isinstance(self.clamp_after_silu, bool):
+            raise TypeError("clamp_after_silu must be a boolean")
+
+
+@dataclass(frozen=True, kw_only=True)  # pylint: disable=unexpected-keyword-arg
+class SiTUGLUParameters:
+    """SiTUGLU parameters; nonpositive linear_beta disables up-branch tanh.
+
+    Describes the algorithm only. Execution requires an available backend.
+    """
+
+    beta: float
+    linear_beta: float = 0.0
+
+    def __post_init__(self) -> None:
+        _check_positive_float32("beta", self.beta)
+        if not _is_finite_number(self.linear_beta):
+            raise ValueError("linear_beta must be a finite number")
+        if self.linear_beta > 0:
+            _check_positive_float32("linear_beta", self.linear_beta)
+
+
 @dataclass(frozen=True)
 class MegaMoeNumericsOptions:
-    """Define the model's MegaMoe activation and probability semantics.
+    """Probability placement and partial weight-gradient precision.
 
-    Import from ``hyper_multicore`` and pass to
-    ``MegaMoeExperts(numerics_options=...)``. The executor validates these
-    immutable options during construction. Defaults preserve ordinary SwiGLU
-    and after-FC2 probability weighting. These are stable model semantics;
-    tuning policies cannot override them.
-
-    Args:
-        partial_weight_grad_dtype: None or "native" uses BF16 partial weight
-            gradients. "float32" writes the partial gradients in FP32 before
-            autograd converts or accumulates them for the parameter.
-        swiglu_limit: Optional positive, finite float32-representable clamp
-            limit. The gate branch is clipped only above the limit; the up
-            branch is clipped to ``[-limit, limit]``. None disables clipping.
-        clamp_after_silu: Clip SiLU(gate) before multiplying by up when True;
-            otherwise clip gate before applying SiLU. Must be a bool and has
-            no effect when swiglu_limit is None.
-        apply_probs_before_fc2: Weight activated features before FC2 when True;
-            otherwise weight expert outputs after FC2. Must be a bool. The
-            before-FC2 path first rounds activations to BF16, multiplies FP32
-            probabilities, and rounds to BF16 again before FC2.
+    Numerical choices are fixed for the executor. Before-FC2 weighting rounds
+    activations to BF16, multiplies FP32 probabilities, then rounds to BF16
+    again. Activation-specific parameters belong to the activation object.
     """
 
     partial_weight_grad_dtype: Literal["native", "float32"] | None = None
-    swiglu_limit: float | None = None
-    clamp_after_silu: bool = False
     apply_probs_before_fc2: bool = False

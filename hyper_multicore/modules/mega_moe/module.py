@@ -18,8 +18,6 @@ from __future__ import annotations
 
 __all__ = ["MegaMoeExperts"]
 
-import math
-import struct
 from collections.abc import Mapping
 from typing import Any
 
@@ -27,7 +25,9 @@ import torch
 import torch.distributed as dist
 
 from hyper_multicore import shmem
-from hyper_multicore.modules.mega_moe.numerics import MegaMoeNumericsOptions
+from hyper_multicore.modules.mega_moe.numerics import (
+    MegaMoeNumericsOptions, SiTUGLUParameters, SwiGLUParameters,
+)
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
 from ..module import MulticoreModule
@@ -50,34 +50,6 @@ class _InvalidExpertWeights(ValueError):
 
 class _InvalidExpertWeightType(TypeError):
     """Expert dtype that must be rejected consistently across EP ranks."""
-
-
-def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
-    """Validate a positive clamp value that survives float32 serialization."""
-    if swiglu_limit is None:
-        return
-    valid_type = isinstance(swiglu_limit, (int, float)) and not isinstance(
-        swiglu_limit, bool
-    )
-    try:
-        encoded_limit = (
-            struct.unpack("<f", struct.pack("<f", float(swiglu_limit)))[0]
-            if valid_type
-            else 0.0
-        )
-        valid_value = (
-            valid_type
-            and math.isfinite(swiglu_limit)
-            and math.isfinite(encoded_limit)
-            and encoded_limit > 0
-        )
-    except (OverflowError, TypeError, ValueError, struct.error):
-        valid_value = False
-    if not valid_value:
-        raise ValueError(
-            "swiglu_limit must be None or a finite positive float32-representable number, "
-            f"got {swiglu_limit!r}."
-        )
 
 
 def _resolve_ep_size(ep_group: Any | None) -> int:
@@ -115,7 +87,19 @@ def _validate_precision_schedule(precision, scheduler):
         raise ValueError("MXFP8 requires dense per-expert lowering")
 
 
-def _resolve_expert_options(precision, numerics_options, tuning_options):
+def _resolve_activation_parameters(
+    activation: SwiGLUParameters | SiTUGLUParameters | None,
+) -> SwiGLUParameters:
+    """Resolve the default and validate the selected activation type."""
+    activation_parameters = SwiGLUParameters() if activation is None else activation
+    if isinstance(activation_parameters, SiTUGLUParameters):
+        raise NotImplementedError("SiTUGLU execution is not implemented in MegaMoeExperts")
+    if not isinstance(activation_parameters, SwiGLUParameters):
+        raise TypeError("activation must be SwiGLUParameters, SiTUGLUParameters or None")
+    return activation_parameters
+
+
+def _resolve_expert_options(precision, activation, numerics_options, tuning_options):
     """Validate options that bind numerical semantics and scheduling for the module."""
     if numerics_options is not None and not isinstance(numerics_options, MegaMoeNumericsOptions):
         raise TypeError("numerics_options must be MegaMoeNumericsOptions or None")
@@ -123,19 +107,18 @@ def _resolve_expert_options(precision, numerics_options, tuning_options):
         raise TypeError("tuning_options must be MegaMoeTuningOptions or None")
     numerics = MegaMoeNumericsOptions() if numerics_options is None else numerics_options
     tuning = MegaMoeTuningOptions() if tuning_options is None else tuning_options
-    for name, value in (("apply_probs_before_fc2", numerics.apply_probs_before_fc2),
-                        ("clamp_after_silu", numerics.clamp_after_silu)):
-        if not isinstance(value, bool):
-            raise TypeError(f"{name} must be a boolean")
+    if not isinstance(numerics.apply_probs_before_fc2, bool):
+        raise TypeError("apply_probs_before_fc2 must be a boolean")
     if precision not in ("bf16", "mxfp8"):
         raise ValueError("MegaMoE precision must be bf16 or mxfp8")
-    if precision == "mxfp8" and (numerics.swiglu_limit is not None or numerics.apply_probs_before_fc2):
-        raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
     if numerics.partial_weight_grad_dtype not in (None, "native", "float32"):
         raise ValueError("partial_weight_grad_dtype must be native, float32 or None")
     scheduler = validate_schedule_options(tuning.scheduler)
     _validate_precision_schedule(precision, scheduler)
-    return numerics, tuning, scheduler
+    activation_parameters = _resolve_activation_parameters(activation)
+    if precision == "mxfp8" and (activation_parameters.clamp_limit is not None or numerics.apply_probs_before_fc2):
+        raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
+    return numerics, tuning, scheduler, activation_parameters
 
 
 class MegaMoeExperts(MulticoreModule):
@@ -170,6 +153,7 @@ class MegaMoeExperts(MulticoreModule):
         top_k: int,
         ep_group: Any | None = None,
         precision: str = "bf16",
+        activation: SwiGLUParameters | SiTUGLUParameters | None = None,
         numerics_options: MegaMoeNumericsOptions | None = None,
         tuning_options: MegaMoeTuningOptions | None = None,
         expert_placement: MegaMoePlacementOptions | None = None,
@@ -178,7 +162,7 @@ class MegaMoeExperts(MulticoreModule):
 
         Args:
             hidden_size: Input and output hidden dimension.
-            intermediate_size: SwiGLU intermediate dimension per expert.
+            intermediate_size: Intermediate dimension per expert after activation.
             num_experts: Global routed-expert count.
             top_k: Experts selected for every token.
             ep_group: Explicit EP group; expert ownership follows group-local rank order.
@@ -186,11 +170,10 @@ class MegaMoeExperts(MulticoreModule):
                 can be active in SHMEM per process. Its size determines the local expert count.
                 May be omitted for a standalone single-rank process.
             precision: ``"bf16"`` for standard weights or ``"mxfp8"`` for external MX roots.
-            numerics_options: Stable activation and probability semantics, imported
-                from ``hyper_multicore``. None selects ordinary SwiGLU and after-FC2
-                weighting. Options specify the clamp limit and its position relative
-                to SiLU, plus the probability position relative to FC2. The before-FC2
-                path rounds activations to BF16 both before and after FP32 weighting.
+            activation: Immutable algorithm parameters. None selects ordinary SwiGLU.
+                Passing SiTUGLUParameters raises NotImplementedError at construction.
+            numerics_options: Probability placement and partial-gradient precision.
+                None uses after-FC2 probability weighting and native partial dW.
             expert_placement: Placement strategy and planner. Adaptive placement
                 requires A3 BF16 push execution and a multi-rank EP group.
             tuning_options: Public experimental tuning controls, imported from
@@ -201,7 +184,9 @@ class MegaMoeExperts(MulticoreModule):
         Numerical choices and tuning options are fixed for this instance.
         Construct another executor to change them.
         """
-        numerics, tuning, scheduler = _resolve_expert_options(precision, numerics_options, tuning_options)
+        numerics, tuning, scheduler, activation_parameters = _resolve_expert_options(
+            precision, activation, numerics_options, tuning_options,
+        )
         planner = _placement_planner(expert_placement)
         if planner is not None and (precision != "bf16" or tuning.dispatch_mode != "push"):
             raise ValueError("HotReplica requires BF16 precision and push dispatch")
@@ -219,8 +204,7 @@ class MegaMoeExperts(MulticoreModule):
             "num_experts": num_experts,
             "top_k": top_k,
             "partial_weight_grad_dtype": numerics.partial_weight_grad_dtype,
-            "swiglu_limit": numerics.swiglu_limit,
-            "clamp_after_activation": numerics.clamp_after_silu,
+            "activation_parameters": activation_parameters,
             "apply_probs_before_fc2": numerics.apply_probs_before_fc2,
             "ep_size": _resolve_ep_size(ep_group),
             "ep_group": ep_group,
@@ -284,14 +268,9 @@ class MegaMoeExperts(MulticoreModule):
         return self._resource_group.specification["precision"]
 
     @property
-    def swiglu_limit(self) -> float | None:
-        """Return the fixed clamp limit, or None for ordinary SwiGLU."""
-        return self._resource_group.specification["swiglu_limit"]
-
-    @property
-    def clamp_after_silu(self) -> bool:
-        """Report whether the gate clamp follows SiLU, before multiplication by up."""
-        return self._resource_group.specification["clamp_after_activation"]
+    def activation(self) -> SwiGLUParameters | SiTUGLUParameters:
+        """Return the immutable activation parameters fixed for this executor."""
+        return self._resource_group.specification["activation_parameters"]
 
     @property
     def apply_probs_before_fc2(self) -> bool:
@@ -312,18 +291,15 @@ class MegaMoeExperts(MulticoreModule):
             intermediate_size=specification["intermediate_size"],
             num_experts=specification["num_experts"],
             top_k=specification["top_k"],
-            swiglu_limit=specification["swiglu_limit"],
             ep_size=specification["ep_size"],
             dispatch_split=specification["dispatch_split"],
             combine_split=specification["combine_split"],
             auto_tokens=specification.get("auto_tokens", False),
         )
-        swiglu_limit = specification["swiglu_limit"]
         return {
             **specification,
             "initial_capacity_factor": initial_capacity_factor,
             "capacity_growth_factor": capacity_growth_factor,
-            "swiglu_limit": float(swiglu_limit) if swiglu_limit is not None else None,
         }
 
     @staticmethod
@@ -334,7 +310,6 @@ class MegaMoeExperts(MulticoreModule):
         intermediate_size: int,
         num_experts: int,
         top_k: int,
-        swiglu_limit: float | None,
         ep_size: int,
         dispatch_split: int,
         combine_split: int,
@@ -360,7 +335,6 @@ class MegaMoeExperts(MulticoreModule):
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})."
             )
-        _validate_swiglu_limit(swiglu_limit)
         for name, split in (("dispatch_split", dispatch_split), ("combine_split", combine_split)):
             if (not isinstance(split, int) or isinstance(split, bool)
                     or split <= 0 or split % _COMMUNICATION_SPLIT):

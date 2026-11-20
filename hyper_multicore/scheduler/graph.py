@@ -127,16 +127,23 @@ class ComputeGraph:
     def __init__(self) -> None:
         """Initialize an empty compute graph."""
         self.task_validator: Optional[Callable[..., None]] = None
-        self._nodes: dict[str, OperatorNode] = {}
-        self._insertion_order: list[str] = []
+        self._nodes_by_name: dict[str, OperatorNode] = {}
+        self._insertion_order: list[str] = []  # One concrete name per node, in insertion order.
 
-    def add_op(self, op: OperatorNode) -> 'ComputeGraph':
+    def add_op(self, op: OperatorNode, *, alias: str | None = None) -> 'ComputeGraph':
         """Add an operator node to the graph.
 
         Args:
             op: Operator node to append.
+            alias: Optional additional name for the same node.
         """
-        self._nodes[op.name] = op
+        names = [op.name]
+        if alias is not None and alias != op.name:
+            names.append(alias)
+        for name in names:
+            if name in self._nodes_by_name:
+                raise ValueError(f"Operator name {name!r} is already registered")
+        self._nodes_by_name.update(dict.fromkeys(names, op))
         self._insertion_order.append(op.name)
         return self
 
@@ -149,8 +156,8 @@ class ComputeGraph:
             src: Source node or its registered name.
             dst: Destination node or its registered name.
         """
-        s = src if isinstance(src, OperatorNode) else self._nodes[src]
-        d = dst if isinstance(dst, OperatorNode) else self._nodes[dst]
+        s = src if isinstance(src, OperatorNode) else self.get_op(src)
+        d = dst if isinstance(dst, OperatorNode) else self.get_op(dst)
         s.successors.append(d)
         d.predecessors.append(s)
         return self
@@ -161,21 +168,21 @@ class ComputeGraph:
         Args:
             name: Registered operator name.
         """
-        return self._nodes[name]
+        return self._nodes_by_name[name]
 
     def topological_sort(self) -> List[OperatorNode]:
         """Kahn's algorithm; insertion order used for tie-breaking."""
-        in_deg = {n: len(op.predecessors) for n, op in self._nodes.items()}
+        in_deg = {n: len(self._nodes_by_name[n].predecessors) for n in self._insertion_order}
         queue  = deque(n for n in self._insertion_order if in_deg[n] == 0)
         order  = []
         while queue:
             n = queue.popleft()
-            order.append(self._nodes[n])
-            for succ in self._nodes[n].successors:
+            order.append(self._nodes_by_name[n])
+            for succ in self._nodes_by_name[n].successors:
                 in_deg[succ.name] -= 1
                 if in_deg[succ.name] == 0:
                     queue.append(succ.name)
-        if len(order) != len(self._nodes):
+        if len(order) != len(self._insertion_order):
             raise ValueError("ComputeGraph has a cycle")
         return order
 
@@ -189,7 +196,8 @@ class ComputeGraph:
         Args:
             tsv: Topology values used to resolve split counts.
         """
-        for op in self._nodes.values():
+        for name in self._insertion_order:
+            op = self._nodes_by_name[name]
             for t in op.inputs + op.outputs:
                 t.split_dim = -1
                 t.split_num = 1

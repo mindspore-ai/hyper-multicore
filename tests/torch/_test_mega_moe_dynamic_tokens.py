@@ -28,7 +28,7 @@ import torch_npu  # pylint: disable=unused-import
 from torch.nn import functional
 from torch.utils.checkpoint import checkpoint
 
-from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
 from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.mega_moe import route as route_module
 from tests.common.multicore._evidence_helpers import EXTENDED_LEVEL1
@@ -343,7 +343,7 @@ def _configuration_failures(world: int, rank: int, device: torch.device) -> None
         module = _MegaMoeExperts(
             hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
             num_experts=world * 6, top_k=6, ep_group=dist.group.WORLD,
-            numerics_options=MegaMoeNumericsOptions(swiglu_limit=swiglu_limit),
+            activation=SwiGLUParameters(clamp_limit=swiglu_limit), numerics_options=MegaMoeNumericsOptions(),
             tuning_options=MegaMoeTuningOptions(
                 dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"), dispatch_split=split),
         ).to(device=device, dtype=torch.bfloat16)
@@ -773,8 +773,11 @@ def test_numerical_modes() -> None:
                 layer = _MegaMoeExperts(
                     hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE, num_experts=world * 2,
                     top_k=2, ep_group=dist.group.WORLD, expert_weight_layout=layout,
-                    numerics_options=MegaMoeNumericsOptions(
-                        swiglu_limit=limit, clamp_after_silu=after_silu, apply_probs_before_fc2=before_fc2),
+                    activation=SwiGLUParameters(
+                        clamp_limit=limit,
+                        clamp_after_silu=after_silu,
+                    ),
+                    numerics_options=MegaMoeNumericsOptions(apply_probs_before_fc2=before_fc2),
                     tuning_options=MegaMoeTuningOptions(dispatch_mode=mode),
                 ).to(device=device, dtype=torch.bfloat16)
                 try:

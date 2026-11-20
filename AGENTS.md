@@ -6,7 +6,7 @@
 
 代码应集中表达业务规则和状态，用当前需求足够的直接实现，让调用方少了解内部细节。目录与文件数量不是职责分离的尺度。修改代码时读取[架构规则](.agent/rules/architecture.md)和[代码质量](.agent/rules/code-quality.md)，据此选择落点与实现。
 
-日常工作按[轻量变更流程](.agent/workflows/change.md)推进；只有需要解决设计取舍或恢复任务时才展开记录。修改文档或公开行为时使用[文档规则](.agent/rules/documentation.md)，测试与结果范围查[验证映射](.agent/references/validation-map.md)。
+开始修改、检视或交付代码时，按[轻量变更流程](.agent/workflows/change.md)核对本轮范围和实际 diff。只有需要解决设计取舍或恢复任务时才展开记录。修改文档或公开行为时使用[文档规则](.agent/rules/documentation.md)，测试与结果范围查[验证映射](.agent/references/validation-map.md)。
 
 ## 项目地图与任务导航
 

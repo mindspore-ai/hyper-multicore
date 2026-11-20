@@ -14,9 +14,9 @@
 # ============================================================================
 """MoE-FFN backward compute graph."""
 
-from typing import Optional
-
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
+from hyper_multicore.modules.mega_moe.backends.bf16.activation import build_activation_node
+from hyper_multicore.modules.mega_moe.numerics import SiTUGLUParameters, SwiGLUParameters
 from hyper_multicore.modules.mega_moe.probability import declare_probability_dataflow
 from hyper_multicore.modules.mega_moe.task_options import validate_task_options
 from hyper_multicore.scheduler.config import TaskSplitValue
@@ -25,7 +25,6 @@ from hyper_multicore.scheduler.graph import (
 )
 from hyper_multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
 from hyper_multicore.tasks.gmm import GmmFillConfig
-from hyper_multicore.tasks.swiglu import SwiGLUFillConfig
 
 # Tiling buffer positions in the C++ runtime descriptor array.
 _TILING_POS_ACT_GRAD    = 20
@@ -73,7 +72,8 @@ def _build_bwd_tensor_specs(
     act_grad_y = TensorSpec(
         "act_grad_y", [tsv.per_rank_seq, intermediate_size],
         param_position=8, dtype_size=dtype_size, tensor_type=1, is_dynamic=True)
-    swiglu_dy = TensorSpec(
+    # Slot 9 holds the saved forward input and retains its historical dump name.
+    swiglu_input = TensorSpec(
         "swiglu_dy", [tsv.per_rank_seq, intermediate_size * 2],
         param_position=9, dtype_size=dtype_size, tensor_type=1, is_dynamic=True)
     swiglu_out = TensorSpec(
@@ -113,18 +113,17 @@ def _build_bwd_tensor_specs(
         param_position=19, dtype_size=8)
     return (target, target_offset, src, src_offset, size_d,
             w2_grad_x1, w2_grad_y, act_grad_weight, act_grad_y,
-            swiglu_dy, swiglu_out, gate_grad_weight, gate_grad_y,
+            swiglu_input, swiglu_out, gate_grad_weight, gate_grad_y,
             combine_out, target_offset_c, src_offset_c, size_c,
             w1_grad_x1, w1_grad_y, glist)
 
 
 def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
-                         swiglu_sv, num_cube_cores, clamp_after_activation=False,
-                         swiglu_limit=None, expert_weight_layout="EIO"):
-    """Create dispatch, act_grad, w2_grad, swiglu_grad operator nodes."""
+                         swiglu_sv, num_cube_cores, activation_parameters, expert_weight_layout="EIO"):
+    """Create dispatch, act_grad, w2_grad and activation gradient nodes."""
     (target, target_offset, src, src_offset, size_d,
      w2_grad_x1, w2_grad_y, act_grad_weight, act_grad_y,
-     swiglu_dy, swiglu_out, *_) = specs
+     swiglu_input, swiglu_out, *_) = specs
     glist = specs[-1]
     dispatch = OperatorNode(
         name="dispatch", op_type=OpType.ALLTOALL,
@@ -133,7 +132,8 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
         param_positions=[1, 2, 3, 4, 0], split_value=dispatch_sv,
         split_spec=SplitSpec(
             split_inputs=None, split_output_dims=[0],
-            task_num_fn=lambda tsv: tsv.all_expert_num * ((tsv.per_expert_seq_to_other + dispatch_sv - 1) // dispatch_sv),
+            task_num_fn=lambda tsv: tsv.all_expert_num * (
+                (tsv.per_expert_seq_to_other + dispatch_sv - 1) // dispatch_sv),
         ),
         tiling_position=-1,
         fill_config=AllToAllFillConfig(moe_type=AllToAllType.DISPATCH, advance="vector",
@@ -169,19 +169,13 @@ def _build_bwd_ops_first(tsv, specs, *, dispatch_sv, act_grad_sv, w2_grad_sv,
                                   out_offset=False, advance="cube_custom",
                                   event_delta=tsv.single_rank_expert_num, num_cube_cores=num_cube_cores),
     )
-    swiglu_grad = OperatorNode(
-        name="swiglu_grad", op_type=OpType.SWIGLU_GRAD,
-        diagnostic_name="SwiGLUGrad",
-        inputs=[act_grad_y, swiglu_dy], outputs=[swiglu_out],
+    activation = build_activation_node(
+        activation_parameters, backward=True,
+        inputs=[act_grad_y, swiglu_input], outputs=[swiglu_out],
         param_positions=[8, 9, 10], split_value=swiglu_sv,
-        split_spec=SplitSpec(
-            split_inputs=[(0, 0)], split_output_dims=[0],
-            task_num_fn=lambda tsv: (tsv.per_expert_seq // swiglu_sv) * tsv.single_rank_expert_num,
-        ),
         tiling_position=_TILING_POS_SWIGLU_GRAD,
-        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit, clamp_after_activation=clamp_after_activation),
     )
-    return dispatch, act_grad, w2_grad, swiglu_grad
+    return dispatch, act_grad, w2_grad, activation
 
 
 def _build_bwd_ops_second(specs, *, gate_grad_sv, w1_grad_sv, combine_sv, num_cube_cores,
@@ -247,14 +241,13 @@ def build_backward_graph(tsv: TaskSplitValue, *,
                          intermediate_size: int = 2048,
                          dtype_size:        int = 2,
                          num_cube_cores:    int = DEFAULT_CORE_SPEC.num_cube_cores,
-                         swiglu_limit:      Optional[float] = None,
+                         activation_parameters: SwiGLUParameters | SiTUGLUParameters | None = None,
                          expert_weight_layout: str = "EIO",
-                        clamp_after_activation: bool = False,
                         apply_probs_before_fc2: bool = False) -> ComputeGraph:
     """Build the MoE-FFN backward DAG.
 
     Execution order:
-      dispatch -> {act_grad, w2_grad} -> swiglu_grad -> gate_grad -> {combine, w1_grad}
+      dispatch -> {act_grad, w2_grad} -> activation -> gate_grad -> {combine, w1_grad}
     act_grad and w2_grad run in parallel (both depend on dispatch).
     combine and w1_grad run in parallel (both depend on gate_grad).
 
@@ -263,7 +256,7 @@ def build_backward_graph(tsv: TaskSplitValue, *,
       act_grad:     [x=0, weight=7, glist=19 | y=8]
       w2_grad EIO:  [x1=5, x2=0, glist=19 | y=6]
       w2_grad EOI:  [x1=0, x2=5, glist=19 | y=6]
-      swiglu_grad:  [x=8, dy=9 | out=10]
+      activation:   [dy=8, x=9 | dx=10]
       gate_grad:    [x=10, weight=11, glist=19 | y=12]
       combine:      [target_offset=14, src=12, src_offset=15, size=16 | target=13]
       w1_grad EIO:  [x1=17, x2=10, glist=19 | y=18]
@@ -278,11 +271,10 @@ def build_backward_graph(tsv: TaskSplitValue, *,
         dispatch_sv / act_grad_sv / w2_grad_sv / swiglu_sv / gate_grad_sv /
         w1_grad_sv / combine_sv: tile sizes per operator.
         hidden_size: model hidden dimension.
-        intermediate_size: FFN intermediate dimension after SwiGLU halving.
+        intermediate_size: FFN intermediate dimension after activation.
         dtype_size: bytes per activation element (2=bf16, 4=fp32).
         num_cube_cores: number of AIC cube cores on the target device.
-        swiglu_limit: optional positive clamp limit for SwiGLU; ``None`` keeps
-            the original unclamped operator path.
+        activation_parameters: Algorithm parameters; None selects ordinary SwiGLU.
         expert_weight_layout: Logical expert-weight axis order, either ``"EIO"`` or ``"EOI"``.
 
     Returns:
@@ -293,11 +285,11 @@ def build_backward_graph(tsv: TaskSplitValue, *,
     specs = _build_bwd_tensor_specs(
         tsv, hidden_size, intermediate_size, dtype_size, expert_weight_layout
     )
-    dispatch, act_grad, w2_grad, swiglu_grad = _build_bwd_ops_first(
+    dispatch, act_grad, w2_grad, activation = _build_bwd_ops_first(
         tsv, specs,
         dispatch_sv=dispatch_sv, act_grad_sv=act_grad_sv,
         w2_grad_sv=w2_grad_sv, swiglu_sv=swiglu_sv, num_cube_cores=num_cube_cores,
-        swiglu_limit=swiglu_limit, clamp_after_activation=clamp_after_activation,
+        activation_parameters=SwiGLUParameters() if activation_parameters is None else activation_parameters,
         expert_weight_layout=expert_weight_layout,
     )
     gate_grad, combine, w1_grad = _build_bwd_ops_second(
@@ -309,14 +301,15 @@ def build_backward_graph(tsv: TaskSplitValue, *,
     graph = ComputeGraph()
     graph.task_validator = validate_task_options
     (graph.add_op(dispatch).add_op(act_grad).add_op(w2_grad)
-          .add_op(swiglu_grad).add_op(gate_grad).add_op(combine).add_op(w1_grad)
-          .add_edge(dispatch,    act_grad)
-          .add_edge(dispatch,    w2_grad)
-          .add_edge(act_grad,    swiglu_grad)
-          .add_edge(swiglu_grad, gate_grad)
-          .add_edge(gate_grad,   combine)
-          .add_edge(gate_grad,   w1_grad))
+          .add_op(activation, alias="activation").add_op(gate_grad).add_op(combine).add_op(w1_grad)
+          .add_edge(dispatch,   act_grad)
+          .add_edge(dispatch,   w2_grad)
+          .add_edge(act_grad,   activation)
+          .add_edge(activation, gate_grad)
+          .add_edge(gate_grad,  combine)
+          .add_edge(gate_grad,  w1_grad))
     if apply_probs_before_fc2:
         declare_probability_dataflow(graph, tsv.ep * tsv.per_rank_seq,
+                                     activation_op=activation,
                                      backward=True, pull=tsv.dispatch_mode == "pull")
     return graph

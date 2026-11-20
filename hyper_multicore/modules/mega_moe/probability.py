@@ -19,7 +19,7 @@ from copy import copy
 from dataclasses import dataclass, replace
 from typing import Any
 
-from hyper_multicore.scheduler.graph import TensorEffect
+from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, TensorEffect
 from hyper_multicore.scheduler.config import TaskType
 
 from .task_options import (
@@ -102,7 +102,9 @@ class ProbabilityFillConfig:
             validate_task_options(task)
 
 
-def declare_probability_dataflow(graph: Any, stride: int, *, backward: bool, pull: bool) -> None:
+def declare_probability_dataflow(
+    graph: ComputeGraph, stride: int, *, activation_op: OperatorNode, backward: bool, pull: bool,
+) -> None:
     """Declare scalar aliases/effects before splitting, lowering and scheduling.
 
     Dispatch carries source p with tokens. Activation consumes received p; its
@@ -111,27 +113,27 @@ def declare_probability_dataflow(graph: Any, stride: int, *, backward: bool, pul
     """
     position = PROBABILITY_POSITION_BACKWARD if backward else PROBABILITY_POSITION_FORWARD
     layout = ProbabilityLayout(stride, position)
-    bindings = {
-        "dispatch": ProbabilityTaskBinding(layout, MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES,
-                                            ("source_p",), remote_writes=("received_p",)),
-        "swiglu_grad" if backward else "swiglu": ProbabilityTaskBinding(
+    dispatch_op = graph.get_op("dispatch")
+    bindings = [
+        (dispatch_op, ProbabilityTaskBinding(layout, MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES,
+                                          ("source_p",), remote_writes=("received_p",))),
+        (activation_op, ProbabilityTaskBinding(
             layout, MegaMoeActivationWeighting.BEFORE_FC2, ("received_p",),
-            writes=("received_dp",) if backward else ()),
-    }
+            writes=("received_dp",) if backward else ())),
+    ]
     if backward:
-        bindings["combine"] = ProbabilityTaskBinding(
+        bindings.append((graph.get_op("combine"), ProbabilityTaskBinding(
             layout, MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS,
-            ("received_dp",), remote_writes=("returned_dp",))
-    for name, binding in bindings.items():
-        operator = graph.get_op(name)
+            ("received_dp",), remote_writes=("returned_dp",))))
+    for operator, binding in bindings:
         operand = layout.tensor_spec()
-        reads, writes, remote, remote_reads = binding.reads, binding.writes, binding.remote_writes, ()
-        if name == "dispatch" and pull:
-            reads, writes, remote, remote_reads = (), ("received_p",), (), ("source_p",)
+        reads, writes, remote_writes, remote_reads = binding.reads, binding.writes, binding.remote_writes, ()
+        if operator is dispatch_op and pull:
+            reads, writes, remote_writes, remote_reads = (), ("received_p",), (), ("source_p",)
         operator.outputs.append(operand)
         operator.param_positions.append(position)
         operator.split_spec = replace(operator.split_spec,
                                       split_output_dims=[*operator.split_spec.split_output_dims, -1])
-        operator.tensor_effects = (TensorEffect(operand, reads, writes, remote, remote_reads,
+        operator.tensor_effects = (TensorEffect(operand, reads, writes, remote_writes, remote_reads,
                                                 completion="token_and_scalar"),)
         operator.fill_config = ProbabilityFillConfig(operator.fill_config, binding)

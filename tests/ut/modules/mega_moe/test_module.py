@@ -29,7 +29,7 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
-from hyper_multicore import MegaMoeNumericsOptions, _automatic, _collective
+from hyper_multicore import MegaMoeNumericsOptions, _automatic, _collective, SwiGLUParameters
 from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.mega_moe import module as mega_moe_module
 from hyper_multicore.modules.mega_moe import resources as common_resources
@@ -301,7 +301,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(mega_moe_module._MegaMoeExecutionResources)
         resources.spec = SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EOI", architecture=2201)
         specification = {"local_num_tokens": 128, "auto_tokens": True, "expert_weight_layout": "EOI",
-                         "swiglu_limit": 0.5, "clamp_after_activation": False, "apply_probs_before_fc2": False}
+                         "activation_parameters": SwiGLUParameters(clamp_limit=0.5), "apply_probs_before_fc2": False}
 
         def capture(output: list, manifest: Any, *, peer_manifest: list, **_kwargs: Any) -> None:
             """Record the independently normalized peer manifest."""
@@ -312,7 +312,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             """Converge the two ranks' different mathematical configurations."""
             output[:] = [manifest, peer_manifest[0]]
 
-        for field, value in (("swiglu_limit", 7.0), ("clamp_after_activation", True),
+        for field, value in (("activation_parameters", SwiGLUParameters(clamp_limit=7.0)),
+                             ("activation_parameters", SwiGLUParameters(clamp_limit=0.5, clamp_after_silu=True)),
                              ("apply_probs_before_fc2", True)):
             peer_manifest = []
             with patch.object(mega_moe_module.dist, "all_gather_object",
@@ -338,8 +339,8 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.assertEqual((specification["dispatch_mode"], specification["initial_capacity_factor"],
                           specification["capacity_growth_factor"]), ("push", 1.25, 1.25))
         self.assertEqual(list(experts.parameters()), [])
-        self.assertIsNone(experts.swiglu_limit)
-        self.assertFalse(experts.clamp_after_silu)
+        self.assertIsNone(experts.activation.clamp_limit)
+        self.assertFalse(experts.activation.clamp_after_silu)
         self.assertFalse(experts.apply_probs_before_fc2)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -493,19 +494,21 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.addCleanup(ordinary.close)
         for limit, clamp_after_silu, apply_probs_before_fc2 in product((None, 0.5), (False, True), (False, True)):
             with self.subTest(limit=limit, clamp=clamp_after_silu, probs=apply_probs_before_fc2):
-                layer = MegaMoeExperts(**options, numerics_options=MegaMoeNumericsOptions(
-                    swiglu_limit=limit, clamp_after_silu=clamp_after_silu,
-                    apply_probs_before_fc2=apply_probs_before_fc2))
+                layer = MegaMoeExperts(
+                    **options,
+                    activation=SwiGLUParameters(clamp_limit=limit, clamp_after_silu=clamp_after_silu),
+                    numerics_options=MegaMoeNumericsOptions(apply_probs_before_fc2=apply_probs_before_fc2),
+                )
                 self.addCleanup(layer.close)
                 specification = layer._resource_group.specification
-                for name, value, field in (("swiglu_limit", limit, "swiglu_limit"),
-                                           ("clamp_after_silu", clamp_after_silu, "clamp_after_activation"),
-                                           ("apply_probs_before_fc2", apply_probs_before_fc2,
-                                            "apply_probs_before_fc2")):
-                    self.assertEqual(getattr(layer, name), value)
-                    self.assertEqual(specification[field], value)
-                    with self.assertRaises(AttributeError):
-                        setattr(layer, name, value)
+                self.assertEqual(layer.activation, SwiGLUParameters(
+                    clamp_limit=limit, clamp_after_silu=clamp_after_silu))
+                self.assertEqual(specification["activation_parameters"], layer.activation)
+                self.assertEqual(layer.apply_probs_before_fc2, apply_probs_before_fc2)
+                with self.assertRaises(AttributeError):
+                    layer.activation = SwiGLUParameters()
+                with self.assertRaises(AttributeError):
+                    layer.apply_probs_before_fc2 = False
                 if limit is not None or clamp_after_silu or apply_probs_before_fc2:
                     with self.assertRaisesRegex(ValueError, "identical configuration"):
                         MegaMoeExperts.share_execution_resources([ordinary, layer])
@@ -518,7 +521,10 @@ class TestMegaMoeExperts(unittest.TestCase):
         for name in ("clamp_after_silu", "apply_probs_before_fc2"):
             for value in (None, 0, 1, "true", [], {}, torch.tensor(True)):
                 with self.subTest(name=name, value=value), self.assertRaisesRegex(TypeError, name):
-                    MegaMoeExperts(**options, numerics_options=MegaMoeNumericsOptions(**{name: value}))
+                    if name == "clamp_after_silu":
+                        SwiGLUParameters(clamp_after_silu=value)
+                    else:
+                        MegaMoeExperts(**options, numerics_options=MegaMoeNumericsOptions(**{name: value}))
         for value in ({}, {"dispatch_mode": "pull"}, "pull", object()):
             with self.subTest(options=value), self.assertRaisesRegex(TypeError, "tuning_options"):
                 MegaMoeExperts(**options, tuning_options=value)
@@ -677,12 +683,12 @@ class TestMegaMoeExperts(unittest.TestCase):
             intermediate_size=8,
             num_experts=4,
             top_k=2,
-            numerics_options=MegaMoeNumericsOptions(swiglu_limit=10),
+            activation=SwiGLUParameters(clamp_limit=10), numerics_options=MegaMoeNumericsOptions(),
         )
         try:
-            self.assertEqual(experts.swiglu_limit, 10.0)
+            self.assertEqual(experts.activation.clamp_limit, 10.0)
             self.assertEqual(
-                experts._resource_group.specification["swiglu_limit"],
+                experts._resource_group.specification["activation_parameters"].clamp_limit,
                 10.0,
             )
         finally:
@@ -700,14 +706,14 @@ class TestMegaMoeExperts(unittest.TestCase):
         ):
             with (
                 self.subTest(swiglu_limit=invalid_limit),
-                self.assertRaisesRegex(ValueError, "swiglu_limit"),
+                self.assertRaisesRegex(ValueError, "clamp_limit"),
             ):
                 MegaMoeExperts(
                     hidden_size=16,
                     intermediate_size=8,
                     num_experts=4,
                     top_k=2,
-                    numerics_options=MegaMoeNumericsOptions(swiglu_limit=invalid_limit),
+                    activation=SwiGLUParameters(clamp_limit=invalid_limit), numerics_options=MegaMoeNumericsOptions(),
                 )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
