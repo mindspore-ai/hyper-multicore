@@ -44,6 +44,14 @@ class MXBindings:
 
 
 @dataclass(frozen=True)
+class _MXCountSnapshot:
+    """Source counts and expert totals from the same validated route."""
+
+    counts: np.ndarray
+    expert_totals: np.ndarray
+
+
+@dataclass(frozen=True)
 class _MXGeometry:
     """Exact device route descriptors and host transfer ownership."""
 
@@ -70,12 +78,13 @@ def _snapshot_summary(gathered, spec, source_rows):
     """Use the same exact readback for count agreement and an active B2 plan."""
     wire = gathered.cpu().numpy()
     counts = wire[:, 3:]
-    expert_loads = counts.sum(0, dtype=np.int64).reshape(spec.ep_size, spec.local_experts)
+    expert_totals = counts.sum(0, dtype=np.int64)
+    expert_loads = expert_totals.reshape(spec.ep_size, spec.local_experts)
     rows = np.column_stack((wire[:, :3], counts.sum(1, dtype=np.int64), counts.min(1), counts.max(1),
                             expert_loads.sum(1), expert_loads.min(1))).tolist()
     result = route._summarize_dynamic_rows(rows, spec, all_experts_active=rows[spec.rank_id][7] > 0)
     source_rows.extend(row[3] for row in rows)
-    return result, counts
+    return result, _MXCountSnapshot(counts, expert_totals)
 
 
 def _source_indices(hidden, ids, spec):
@@ -194,17 +203,18 @@ class MXPlacementResources(PlacementResources):
             return None
         if self.nodes is None:
             self.nodes = _rank_nodes(spec.ep_group, spec.ep_size)
-        if use_snapshot and snapshot is None:
-            snapshot = gathered.cpu().numpy()[:, 3:]
+        snapshot_counts = snapshot.counts if snapshot is not None else None
+        if use_snapshot and snapshot_counts is None:
+            snapshot_counts = gathered.cpu().numpy()[:, 3:]
             self.statistics["mx_full_route_readbacks"] += 1
-        if snapshot is None and raw is None:
+        if snapshot_counts is None and raw is None:
             raw = gathered.tolist()
-        counts = None if snapshot is not None else tuple(tuple(row[3:]) for row in raw)
+        counts = None if snapshot_counts is not None else tuple(tuple(row[3:]) for row in raw)
         training = bool(mask & _TRAINING_MASK)
         credit = spec.intermediate_size // 2 if training else 0
         use_peak_policy = (spec.ep_size, spec.num_experts, spec.hidden_size, spec.intermediate_size,
                            spec.top_k, tokens) == (16, 96, 5120, 1792, 8, 4096)
-        key = (snapshot.tobytes() if snapshot is not None else counts,
+        key = (snapshot_counts.tobytes() if snapshot_counts is not None else counts,
                credit, use_peak_policy, tokens, hidden.shape[0], stream)
         cache = self._geometry_cache if use_snapshot else None
         if cache is not None and key in cache:
@@ -213,7 +223,7 @@ class MXPlacementResources(PlacementResources):
             return cache[key][0]
         if self._cache_key != key:
             if counts is None:
-                counts = tuple(map(tuple, snapshot.tolist()))
+                counts = tuple(map(tuple, snapshot_counts.tolist()))
             capacity = tokens * spec.ep_size * spec.top_k
             if use_peak_policy:
                 plan = build_mx_peak_plan(counts, self.config, capacity=capacity, minimum_rows=_MINIMUM_ROWS,
@@ -226,6 +236,7 @@ class MXPlacementResources(PlacementResources):
                     counts, self.config, capacity=capacity, minimum_rows=_MINIMUM_ROWS,
                     minimum_reduction=_MINIMUM_REDUCTION, row_credit=credit, nodes=self.nodes,
                     transfer_rows=mx_guest_transfer_rows(spec.intermediate_size),
+                    validated_expert_totals=tuple(snapshot.expert_totals.tolist()) if snapshot is not None else None,
                 )
             else:
                 plan = build_aligned_expert_plan(

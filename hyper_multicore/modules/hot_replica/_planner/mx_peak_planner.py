@@ -249,11 +249,12 @@ def _refine_local_peak(geometry, home, nodes, minimum, transfer_rows):
 
 @lru_cache(maxsize=64)
 def build_mx_local_peak_plan(counts, config, *, capacity, minimum_rows, minimum_reduction,
-                             row_credit, nodes, transfer_rows):
-    """Refine admitted splits before generating the exact per-source quotas."""
+                             row_credit, nodes, transfer_rows, validated_expert_totals=None):
+    """Refine splits, reusing totals only from a route that already validated its counts."""
     matrix, threshold, nodes = _aligned_inputs(counts, config, capacity, minimum_rows, minimum_reduction,
-                                               0, row_credit, nodes)
-    totals = tuple(map(sum, zip(*matrix)))
+                                               0, row_credit, nodes,
+                                               counts_validated=validated_expert_totals is not None)
+    totals = validated_expert_totals if validated_expert_totals is not None else tuple(map(sum, zip(*matrix)))
     geometry = _select_aligned(totals, config, capacity, minimum_rows, threshold, 0, row_credit, nodes)
     geometry = _refine_local_peak(geometry, config.home_experts, nodes, max(64, minimum_rows), transfer_rows)
     return _materialize_aligned(matrix, config, geometry.slots, geometry.intervals)

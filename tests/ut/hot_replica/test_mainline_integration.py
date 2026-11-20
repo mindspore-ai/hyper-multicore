@@ -27,13 +27,57 @@ from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.mega_moe import route, resources as resource_module
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _plan_events
-from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
+from hyper_multicore.modules.hot_replica import capability, checkpoint as replay, mx_adapter
+from hyper_multicore.modules.hot_replica._planner import aligned
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
     ExpertWeightBinding, PlacementResources, _bind_custom_copy_rows, _get_mega_bank,
 )
 from hyper_multicore.modules.hot_replica.mx_gradient import GRADIENT_HELPERS, MXGradientPool
+from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+
+
+@pytest.mark.parametrize("local_experts", (4, 6, 8))
+def test_mx_snapshot_reuses_validated_totals_in_the_active_plan(local_experts):
+    """The validated snapshot takes the same exact placement as the raw count path."""
+    ep, tokens, top_k = 32, 4096, 8
+    spec = MegaMoeSpec(local_num_tokens=tokens, hidden_size=5120, intermediate_size=1792,
+                       num_experts=ep * local_experts, top_k=top_k, initial_capacity_factor=4,
+                       receive_capacity=ep * tokens * top_k, ep_size=ep, ep_group=None,
+                       rank_id=0, num_cube_cores=32, auto_tokens=True, architecture=3510, precision="mxfp8")
+    resource = mx_adapter.MXPlacementResources(SimpleNamespace(spec=spec, workspace=object()), {}, True)
+    resource.nodes = tuple(rank // 8 for rank in range(ep))
+    resource._previous_active = True
+    wire = torch.zeros((ep, spec.num_experts + 3), dtype=torch.int32)
+    wire[:, 1] = tokens
+    wire[:, 2] = mx_adapter._TRAINING_MASK
+    wire[:, 3:3 + top_k] = tokens
+    hidden = SimpleNamespace(shape=(tokens, spec.hidden_size), device=wire.device)
+    source_rows = []
+    summary, _, _, snapshot = resource._read_route(wire, hidden, None, source_rows, use_snapshot=True)
+
+    def _geometry(plan, *_):
+        return SimpleNamespace(plan=plan, storage_bytes=lambda: 0)
+
+    with patch.object(mx_adapter, "_render_geometry", side_effect=_geometry):
+        baseline = resource._select(hidden, wire, summary, wire.tolist(), source_rows,
+                                    mx_adapter._TRAINING_MASK, None)
+        with patch.object(aligned, "_counts_matrix", side_effect=AssertionError("counts already validated")):
+            actual = resource._select(hidden, wire, summary, None, source_rows, mx_adapter._TRAINING_MASK, None,
+                                      snapshot=snapshot, use_snapshot=True)
+            repeated = resource._select(hidden, wire, summary, None, source_rows, mx_adapter._TRAINING_MASK, None,
+                                        snapshot=snapshot, use_snapshot=True)
+    assert baseline.plan.transfers
+    baseline.plan.validate()
+    assert actual.plan == baseline.plan
+    assert repeated is actual
+
+    # A negative expert count is invalid even when the source sum is correct.
+    wire[0, 3 + top_k] = -1
+    wire[0, 4 + top_k] = 1
+    with pytest.raises(RuntimeError, match="actual distinct Top-K"):
+        resource._read_route(wire, hidden, None, [], use_snapshot=True)
 
 
 def test_mx_gradient_bank_registers_with_the_virtual_workspace():

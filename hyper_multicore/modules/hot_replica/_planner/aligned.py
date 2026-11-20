@@ -96,9 +96,10 @@ def build_aligned_expert_plan(counts: Sequence[Sequence[int]], config: ExpertRep
                           transfer_row_credit, nodes)
 
 
-def _aligned_inputs(counts, config, limit, minimum_rows, reduction, minimum_saved, credit, rank_nodes):
+def _aligned_inputs(counts, config, limit, minimum_rows, reduction, minimum_saved, credit, rank_nodes,
+                    *, counts_validated=False):
     """Validate the placement request once before searching any alternatives."""
-    matrix = _counts_matrix(counts)
+    matrix = counts if counts_validated else _counts_matrix(counts)
     if len(matrix) != config.ep_size or len(matrix[0]) != config.num_experts:
         raise ValueError("Aligned counts must match the logical expert topology")
     _integer(limit, "Aligned expert capacity", 0)
