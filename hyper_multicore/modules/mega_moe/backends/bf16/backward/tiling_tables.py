@@ -189,4 +189,5 @@ def get_swiglu_grad_tiling_bytes(split_value: int, *,
         raise KeyError(f"No swiglu_grad tiling for split_value={split_value}")
     td = copy.copy(td)
     td.colLen = intermediate_size
+    td.is32BAligned = int(intermediate_size % 16 == 0)
     return _expand_swiglu_struct(td)
