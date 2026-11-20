@@ -15,6 +15,8 @@
 """MoE-FFN forward compute graph."""
 
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
+from hyper_multicore.modules.mega_moe.backends.bf16.activation import build_activation_node
+from hyper_multicore.modules.mega_moe.numerics import SiTUGLUParameters, SwiGLUParameters
 from hyper_multicore.modules.mega_moe.probability import declare_probability_dataflow
 from hyper_multicore.modules.mega_moe.task_options import validate_task_options
 from hyper_multicore.scheduler.config import TaskSplitValue
@@ -23,7 +25,6 @@ from hyper_multicore.scheduler.graph import (
 )
 from hyper_multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
 from hyper_multicore.tasks.gmm import GmmFillConfig
-from hyper_multicore.tasks.swiglu import SwiGLUFillConfig
 
 # Tiling buffer positions in the C++ runtime descriptor array.
 _TILING_POS_UP_PROJ = 17
@@ -98,7 +99,7 @@ def _build_fwd_tensor_specs(
 
 
 def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
-                   down_proj_sv, combine_sv, num_cube_cores, clamp_after_activation=False, swiglu_limit=None):
+                   down_proj_sv, combine_sv, num_cube_cores, activation_parameters):
     """Create all OperatorNode objects for the forward graph."""
     (target, target_offset, src, src_offset, size_d,
      up_proj_weight, up_proj_glist, up_proj_y, swiglu_out,
@@ -113,7 +114,8 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
         split_value=dispatch_sv,
         split_spec=SplitSpec(
             split_inputs=None, split_output_dims=[0],
-            task_num_fn=lambda tsv: tsv.all_expert_num * ((tsv.per_expert_seq_to_other + dispatch_sv - 1) // dispatch_sv),
+            task_num_fn=lambda tsv: tsv.all_expert_num * (
+                (tsv.per_expert_seq_to_other + dispatch_sv - 1) // dispatch_sv),
         ),
         tiling_position=-1,
         fill_config=AllToAllFillConfig(moe_type=AllToAllType.DISPATCH, advance="vector",
@@ -132,17 +134,11 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
         fill_config=GmmFillConfig(offset_inputs={0}, rank_in_event=True, global_trigger=False,
                                   out_offset=True, advance="cube", num_cube_cores=num_cube_cores),
     )
-    swiglu = OperatorNode(
-        name="swiglu", op_type=OpType.SWIGLU,
-        diagnostic_name="SwiGLU",
+    activation = build_activation_node(
+        activation_parameters, backward=False,
         inputs=[up_proj_y], outputs=[swiglu_out],
         param_positions=[7, 8], split_value=swiglu_sv,
-        split_spec=SplitSpec(
-            split_inputs=[(0, 0)], split_output_dims=[0],
-            task_num_fn=lambda tsv: (tsv.per_expert_seq // swiglu_sv) * tsv.single_rank_expert_num,
-        ),
         tiling_position=_TILING_POS_SWIGLU,
-        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit, clamp_after_activation=clamp_after_activation),
     )
     down_proj = OperatorNode(
         name="down_proj", op_type=OpType.GMM,
@@ -169,7 +165,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
         tiling_position=-1,
         fill_config=AllToAllFillConfig(moe_type=AllToAllType.COMBINE, advance="vector", event_group=1),
     )
-    return dispatch, up_proj, swiglu, down_proj, combine
+    return dispatch, up_proj, activation, down_proj, combine
 
 
 def build_forward_graph(tsv: TaskSplitValue, *,
@@ -182,16 +178,15 @@ def build_forward_graph(tsv: TaskSplitValue, *,
                         intermediate_size: int = 2048,
                         dtype_size:        int = 2,
                         num_cube_cores:    int = DEFAULT_CORE_SPEC.num_cube_cores,
-                        swiglu_limit:      float | None = None,
+                        activation_parameters: SwiGLUParameters | SiTUGLUParameters | None = None,
                         expert_weight_layout: str = "EIO",
-                        clamp_after_activation: bool = False,
                         apply_probs_before_fc2: bool = False) -> ComputeGraph:
-    """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
+    """Build the MoE-FFN forward DAG: dispatch -> up_proj -> activation -> down_proj -> combine.
 
     Operator execution order and param_positions (C++ memory slots):
       dispatch:  [target_offset=1, src=2, src_offset=3, size=4 | target=0]
       up_proj:   [x=0, weight=5, glist=6 | y=7]
-      swiglu:    [x=7 | out=8]
+      activation: [x=7 | out=8]
       down_proj: [x=8, weight=9, glist=10 | y=11]
       combine:   [target_offset=13, src=11, src_offset=14, size=15 | target=12]
 
@@ -203,11 +198,10 @@ def build_forward_graph(tsv: TaskSplitValue, *,
         down_proj_sv: tile size for down-projection GMM (cube cores).
         combine_sv: tile size for combine AllToAll (vector cores).
         hidden_size: model hidden dimension.
-        intermediate_size: FFN intermediate dimension after SwiGLU halving.
+        intermediate_size: FFN intermediate dimension after activation.
         dtype_size: bytes per activation element (2=bf16, 4=fp32).
         num_cube_cores: number of AIC cube cores on the target device.
-        swiglu_limit: optional positive clamp limit for SwiGLU; ``None`` keeps
-            the original unclamped operator path.
+        activation_parameters: Algorithm parameters; None selects ordinary SwiGLU.
         expert_weight_layout: Logical expert-weight axis order, either ``"EIO"`` or ``"EOI"``.
 
     Returns:
@@ -218,20 +212,22 @@ def build_forward_graph(tsv: TaskSplitValue, *,
     specs = _build_fwd_tensor_specs(
         tsv, hidden_size, intermediate_size, dtype_size, expert_weight_layout
     )
-    dispatch, up_proj, swiglu, down_proj, combine = _build_fwd_ops(
+    dispatch, up_proj, activation, down_proj, combine = _build_fwd_ops(
         tsv, specs,
         dispatch_sv=dispatch_sv, up_proj_sv=up_proj_sv, swiglu_sv=swiglu_sv,
         down_proj_sv=down_proj_sv, combine_sv=combine_sv, num_cube_cores=num_cube_cores,
-        swiglu_limit=swiglu_limit, clamp_after_activation=clamp_after_activation,
+        activation_parameters=SwiGLUParameters() if activation_parameters is None else activation_parameters,
     )
     graph = ComputeGraph()
     graph.task_validator = validate_task_options
-    (graph.add_op(dispatch).add_op(up_proj).add_op(swiglu).add_op(down_proj).add_op(combine)
+    (graph.add_op(dispatch).add_op(up_proj)
+          .add_op(activation, alias="activation").add_op(down_proj).add_op(combine)
           .add_edge(dispatch,  up_proj)
-          .add_edge(up_proj,   swiglu)
-          .add_edge(swiglu,    down_proj)
+          .add_edge(up_proj,   activation)
+          .add_edge(activation, down_proj)
           .add_edge(down_proj, combine))
     if apply_probs_before_fc2:
         declare_probability_dataflow(graph, tsv.ep * tsv.per_rank_seq,
+                                     activation_op=activation,
                                      backward=False, pull=tsv.dispatch_mode == "pull")
     return graph

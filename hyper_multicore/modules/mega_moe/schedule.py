@@ -58,13 +58,14 @@ class ExpertStages:
 def _expert_stages(graph, spec, forward, cfg):
     """Identify which expert and math stage own each scheduled task."""
     # These are mathematical roles, not descriptor ports or physical worker IDs.
-    aliases = ({'up': 'up_proj', 'down': 'down_proj', 'activation': 'swiglu',
-                'dw_down': 'w2_grad', 'da': 'act_grad', 'dx': 'gate_grad',
-                'dw_up': 'w1_grad', 'activation_grad': 'swiglu_grad'}
-               if spec.precision == 'bf16' else
-               {'activation': 'swiglu_quant', 'dw_down': 'dw2', 'dw_up': 'dw1',
-                'quant_input': 'quant_x' if forward else 'quant_dy',
-                'activation_grad': 'swiglu_grad_quant'})
+    if spec.precision == 'bf16':
+        activation = graph.get_op('activation')
+        aliases = {'up': 'up_proj', 'down': 'down_proj', 'dw_down': 'w2_grad', 'da': 'act_grad',
+                   'dx': 'gate_grad', 'dw_up': 'w1_grad',
+                   'activation': activation.name, 'activation_grad': activation.name}
+    else:
+        aliases = {'activation': 'swiglu_quant', 'dw_down': 'dw2', 'dw_up': 'dw1',
+                   'quant_input': 'quant_x' if forward else 'quant_dy', 'activation_grad': 'swiglu_grad_quant'}
     cubes = ('up', 'down') if forward else ('dw_down', 'da', 'dx', 'dw_up')
     vectors = ('activation',) if forward else ('activation_grad',)
     if spec.precision == 'mxfp8':

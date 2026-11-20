@@ -115,10 +115,10 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     task_num_all = sum(op.task_num for op in graph.topological_sort())
 
     dispatch_op = graph.get_op("dispatch")
-    swiglu_op   = graph.get_op("swiglu")
+    activation_op = graph.get_op("activation")
     combine_op  = graph.get_op("combine")
     add_terminate(cfg, tsv, combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_op.task_num, combine_op.task_num)
+    revise_task_queue(cfg, tsv, dispatch_op.task_num, activation_op.task_num, combine_op.task_num)
     add_dynamic_data(cfg, tsv, dynamic_input_position=6)
 
     cfg.task_num = task_num_all
@@ -168,14 +168,14 @@ def _describe_graph(context: _GenerationContext) -> None:
 
     dispatch_op  = graph.get_op("dispatch")
     up_proj_op   = graph.get_op("up_proj")
-    swiglu_op    = graph.get_op("swiglu")
+    activation_op = graph.get_op("activation")
     down_proj_op = graph.get_op("down_proj")
     combine_op   = graph.get_op("combine")
 
     print(f"[fwd] tp={args.tp} ep={args.ep} seq={args.seq_size} "
           f"E={args.all_expert_num} topk={args.top_k}")
     print(f"      dispatch={dispatch_op.task_num}  up_proj={up_proj_op.task_num}  "
-          f"swiglu={swiglu_op.task_num}  down_proj={down_proj_op.task_num}  "
+          f"{activation_op.name}={activation_op.task_num}  down_proj={down_proj_op.task_num}  "
           f"combine={combine_op.task_num}")
 
 
@@ -185,7 +185,7 @@ def _write_tiling_files(context: _GenerationContext) -> None:
     graph = context.graph
     num_groups = context.task_values.single_rank_expert_num
     up_proj_op = graph.get_op("up_proj")
-    swiglu_op = graph.get_op("swiglu")
+    activation_op = graph.get_op("activation")
     down_proj_op = graph.get_op("down_proj")
     up_proj_bytes   = get_up_proj_tiling_bytes(up_proj_op.split_value,
                                                hidden_size=args.hidden_size,
@@ -197,7 +197,7 @@ def _write_tiling_files(context: _GenerationContext) -> None:
                                                  intermediate_size=args.intermediate_size,
                                                  num_groups=num_groups,
                                                  num_cube_cores=args.num_cube_cores)
-    swiglu_bytes    = get_swiglu_tiling_bytes(swiglu_op.split_value,
+    swiglu_bytes    = get_swiglu_tiling_bytes(activation_op.split_value,
                                               intermediate_size=args.intermediate_size)
 
     write_bin(os.path.join(args.output_dir, 'up_proj_tiling.bin'), up_proj_bytes)

@@ -25,7 +25,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
-from hyper_multicore import MegaMoePlacementOptions, MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore import MegaMoePlacementOptions, MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
 from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.hot_replica import mega_moe_adapter
@@ -137,11 +137,13 @@ def main() -> None:
                     num_experts=local_experts * 2,
                     top_k=k,
                     ep_group=dist.group.WORLD,
+                    activation=SwiGLUParameters(
+                        clamp_limit=0.15,
+                        clamp_after_silu=number % 2 == 0,
+                    ),
                     numerics_options=MegaMoeNumericsOptions(
                         apply_probs_before_fc2=before,
                         partial_weight_grad_dtype=dw,
-                        swiglu_limit=0.15,
-                        clamp_after_silu=number % 2 == 0,
                     ),
                     expert_placement=MegaMoePlacementOptions("adaptive", HotReplicaPlanner()) if enabled else None,
                     tuning_options=MegaMoeTuningOptions(

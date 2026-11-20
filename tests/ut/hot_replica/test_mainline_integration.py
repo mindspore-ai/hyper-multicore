@@ -22,10 +22,12 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from hyper_multicore import BasePlanner, ExpertPlacement, MegaMoePlacementOptions, MegaMoeExperts
+from hyper_multicore import BasePlanner, ExpertPlacement, MegaMoePlacementOptions, MegaMoeExperts, SwiGLUParameters
 from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
-from hyper_multicore.modules.mega_moe import route, resources as resource_module
+from hyper_multicore.modules.hot_replica.runtime import _BorrowedExpertWeights
+from hyper_multicore.modules.mega_moe import invocation, module as mega_moe_module, route
+from hyper_multicore.modules.mega_moe import resources as resource_module
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _plan_events
 from hyper_multicore.modules.mega_moe.heap_manager import _workspace_layout
 from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
@@ -262,7 +264,7 @@ def test_bailing_source_bound_reserves_ordinary_and_virtual_storage():
         "hot_replica": True, "source_token_bound": 4096,
     }
     entries, headroom = workspace_reservations(
-        (ordinary, dict(ordinary, swiglu_limit=1.0)), torch.bfloat16, 24,
+        (ordinary, dict(ordinary, activation_parameters=SwiGLUParameters(clamp_limit=1.0))), torch.bfloat16, 24,
     )
     assert [layout.receive_capacity for _, layout in entries] == [110208, 110208]
     assert [layout.token_capacity for _, layout in entries] == [4096, 4096]
@@ -368,15 +370,13 @@ def test_virtual_event_views_keep_the_ready_generation_at_the_physical_tail():
 
 def test_forward_uses_injected_planner_after_count_exchange():
     """Use the injected instance and its row bound on the normal forward path."""
-    from hyper_multicore.modules.mega_moe import invocation, module
 
     class RecordingPlanner(BasePlanner):
         def plan(self, request):
             self.seen = request
-            return None
 
     planner = RecordingPlanner(source_token_bound=4096)
-    with patch.object(module, "_resolve_ep_size", return_value=2):
+    with patch.object(mega_moe_module, "_resolve_ep_size", return_value=2):
         options = MegaMoePlacementOptions(strategy="adaptive", planner=planner)
         expert = MegaMoeExperts(hidden_size=8, intermediate_size=4, num_experts=4, top_k=1, expert_placement=options)
     hidden, ids = torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int32)
@@ -384,12 +384,14 @@ def test_forward_uses_injected_planner_after_count_exchange():
     spec = SimpleNamespace(auto_tokens=True, dispatch_mode="push", intermediate_size=4, rank_id=0,
                            num_cube_cores=24, apply_probs_before_fc2=True)
     owner = SimpleNamespace(spec=spec, workspace=Mock(), prepare_auto_workspace=Mock())
+    # pylint: disable-next=protected-access
     owner.placement = PlacementResources(owner, expert._resource_group.specification, False)
     counts = torch.tensor([[0, 2, 1, 2, 0, 0, 0], [0, 2, 1, 0, 0, 0, 2]])
     ordinary = object()
 
     def exchanged(*args, **kwargs):
         assert args[0] is hidden
+        # pylint: disable-next=protected-access
         return route._prepare_placed_route(
             hidden, ids, spec, owner.workspace, (hidden, ids), counts[0, 3:], counts, None, None,
             kwargs["prepare_workspace"], kwargs["select_placement"], kwargs["autograd_mask"],
@@ -404,6 +406,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
             patch.object(invocation, "prepare_topk_route", side_effect=exchanged) as exchange,
             patch.object(route, "_read_cached_route", return_value=((2, 128, 2), None, None)) as read,
             patch.object(route, "_finalize_dynamic_route", return_value=ordinary),
+            # pylint: disable-next=protected-access
             patch.object(expert._backend, "forward", return_value=hidden) as forward,
         ):
             assert expert(hidden, ids, probs, expert_weights=roots) is hidden
@@ -418,7 +421,6 @@ def test_forward_uses_injected_planner_after_count_exchange():
 
 def test_borrowed_fp32_targets_keep_partials_and_restore_owner_dtype():
     """Return the FP32 partial without converting it to the compute dtype."""
-    from hyper_multicore.modules.hot_replica.runtime import _BorrowedExpertWeights
 
     first = torch.ones((1, 1, 2), requires_grad=True)
     second = torch.ones((1, 1, 1), dtype=torch.bfloat16, requires_grad=True)
@@ -474,12 +476,13 @@ def test_checkpoint_request_is_training_independently_of_reservation(bound):
 
 def test_manifest_checks_custom_policy_settings():
     """Different settings on two ranks fail in the resource configuration exchange."""
-    cls = resource_module._MegaMoeExecutionResources
+    # pylint: disable-next=protected-access
+    validate = resource_module._MegaMoeExecutionResources._validate_distributed_configuration
     owner = SimpleNamespace(spec=SimpleNamespace(ep_size=2, ep_group=object(), expert_weight_layout="EIO",
                                                  architecture="ascend910_93"))
     def manifest(key):
         with patch.object(resource_module.dist, "all_gather_object") as gather:
-            cls._validate_distributed_configuration(owner, ({"planner_key": ("example", "Skew", key)},))
+            validate(owner, ({"planner_key": ("example", "Skew", key)},))
         return gather.call_args.args[1]
 
     remote = manifest("1.5")
@@ -489,4 +492,4 @@ def test_manifest_checks_custom_policy_settings():
 
     with patch.object(resource_module.dist, "all_gather_object", side_effect=mismatch):
         with pytest.raises(ValueError, match="configurations differ"):
-            cls._validate_distributed_configuration(owner, ({"planner_key": ("example", "Skew", "2.0")},))
+            validate(owner, ({"planner_key": ("example", "Skew", "2.0")},))

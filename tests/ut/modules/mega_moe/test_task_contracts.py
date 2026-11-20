@@ -15,8 +15,14 @@
 """Malformed task rejection and graph-declared probability effects."""
 from dataclasses import replace
 import unittest
+from unittest.mock import patch
 
-from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts, _build_task_values
+from hyper_multicore.modules.mega_moe.backends.bf16.activation import build_activation_node
+from hyper_multicore.modules.mega_moe.backends.bf16.backward import graph as backward_graph
+from hyper_multicore.modules.mega_moe.backends.bf16.forward import graph as forward_graph
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import (
+    _build_runtime_artifacts, _build_task_values, build_mega_moe_plan,
+)
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.schedule_policy import MegaMoeSchedulePolicy, pipeline_cube_queue
 from hyper_multicore.modules.mega_moe.task_options import validate_task_options
@@ -47,19 +53,19 @@ class TestTaskContracts(unittest.TestCase):
                     self.assertIs(effect.operand, op.outputs[-1])
                     self.assertEqual(effect.completion, "token_and_scalar")
                     self.assertEqual(effect.operand.shape, [4, 2048])
-                dispatch, = graph.get_op("dispatch").tensor_effects
+                dispatch_effect, = graph.get_op("dispatch").tensor_effects
                 if mode == "pull":
-                    self.assertEqual(dispatch.remote_reads, ("source_p",))
-                    self.assertEqual(dispatch.writes, ("received_p",))
+                    self.assertEqual(dispatch_effect.remote_reads, ("source_p",))
+                    self.assertEqual(dispatch_effect.writes, ("received_p",))
                 else:
-                    self.assertEqual(dispatch.reads, ("source_p",))
-                    self.assertEqual(dispatch.remote_writes, ("received_p",))
+                    self.assertEqual(dispatch_effect.reads, ("source_p",))
+                    self.assertEqual(dispatch_effect.remote_writes, ("received_p",))
                 self.assertTrue(serialize_runtime_config(config))
-            activation, = bwd.get_op("swiglu_grad").tensor_effects
-            self.assertEqual(activation.writes, ("received_dp",))
-            combine, = bwd.get_op("combine").tensor_effects
-            self.assertEqual(combine.reads, activation.writes)
-            self.assertEqual(combine.remote_writes, ("returned_dp",))
+            activation_effect, = bwd.get_op("activation").tensor_effects
+            self.assertEqual(activation_effect.writes, ("received_dp",))
+            combine_effect, = bwd.get_op("combine").tensor_effects
+            self.assertEqual(combine_effect.reads, activation_effect.writes)
+            self.assertEqual(combine_effect.remote_writes, ("returned_dp",))
 
     def test_final_serializer_rejects_invalid_options(self):
         """Unknown bits and a communication-only bit cannot enter a SwiGLU task."""
@@ -129,9 +135,34 @@ class TestTaskContracts(unittest.TestCase):
         for task in moved.all_tasks:
             task.outputs[0].input_position = 0
         topology = _build_task_values(spec)
-        pipeline_cube_queue(moved, graph, topology, spec.num_cube_cores)
+        pipeline_cube_queue(moved, graph, topology, spec.num_cube_cores, forward=True)
         self.assertEqual(list(moved.cube_task_indices), list(config.cube_task_indices))
         policy = MegaMoeSchedulePolicy(vector_ready_queue=False, pipeline_vector=True, pipeline_cube=True)
-        policy.apply(moved, graph, topology, spec.num_cube_cores)
+        policy.apply(moved, graph, topology, spec.num_cube_cores, forward=True)
         self.assertEqual(moved.queue_layout, 0)
         self.assertEqual(list(moved.cube_task_indices), list(config.cube_task_indices))
+
+    def test_activation_node_rename_preserves_plan(self):
+        """Changing the node name preserves probability operands and scheduled tasks."""
+        def _rename_activation(*args, **kwargs):
+            node = build_activation_node(*args, **kwargs)
+            node.name = "renamed_" + node.name
+            return node
+
+        specs = (replace(self.spec(), local_num_tokens=131072, lowering="compact"),
+                 replace(self.spec(), architecture=3510))
+        for spec in specs:
+            with self.subTest(architecture=spec.architecture):
+                baseline = build_mega_moe_plan(spec, "cpu")
+                with (
+                    patch.object(forward_graph, "build_activation_node", _rename_activation),
+                    patch.object(backward_graph, "build_activation_node", _rename_activation),
+                ):
+                    candidate = build_mega_moe_plan(spec, "cpu")
+                for direction, name in (("forward", "swiglu"), ("backward", "swiglu_grad")):
+                    old_graph = getattr(baseline, direction + "_graph")
+                    new_graph = getattr(candidate, direction + "_graph")
+                    self.assertIs(old_graph.get_op("activation"), old_graph.get_op(name))
+                    self.assertEqual(new_graph.get_op("activation").name, "renamed_" + name)
+                for field in ("fwd_runtime_config", "bwd_runtime_config", "swiglu_tiling", "swiglu_grad_tiling"):
+                    self.assertTrue(getattr(baseline, field).equal(getattr(candidate, field)), field)

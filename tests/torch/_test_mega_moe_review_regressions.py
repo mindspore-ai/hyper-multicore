@@ -20,9 +20,11 @@ import os
 from typing import Any
 from unittest.mock import patch
 
+
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from hyper_multicore import SwiGLUParameters
 from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
 from hyper_multicore.modules.mega_moe.backends.bf16 import resources as resources_module
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import MegaMoePlan, build_mega_moe_plan
@@ -68,9 +70,7 @@ def test_compact_header_uses_normal_ready_queue() -> None:
     device = torch.device("npu", 0)
     for layout in _LAYOUTS:
         for clamp in (False, True):
-            options = {"clamp_after_silu": clamp} if clamp else {}
-            if clamp:
-                options["swiglu_limit"] = 0.5
+            options = {"activation": SwiGLUParameters(clamp_limit=0.5, clamp_after_silu=True)} if clamp else {}
             layer = _layer(layout, **options).to(device=device, dtype=torch.bfloat16)
             try:
                 tokens = 393216

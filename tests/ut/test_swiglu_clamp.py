@@ -18,6 +18,7 @@ import math
 import struct
 import unittest
 
+from hyper_multicore import SwiGLUParameters
 from hyper_multicore.modules.mega_moe.backends.bf16.backward.graph import (
     build_backward_graph,
 )
@@ -57,7 +58,7 @@ class TestSwiGLUClamp(unittest.TestCase):
                     hidden_size=16,
                     intermediate_size=8,
                     num_cube_cores=20,
-                    swiglu_limit=expected_limit,
+                    activation_parameters=SwiGLUParameters(clamp_limit=expected_limit),
                 )
                 graph.propagate_splits(values)
                 runtime_config = build_runtime_config(
@@ -82,7 +83,7 @@ class TestSwiGLUClamp(unittest.TestCase):
                               (build_backward_graph, TaskType.TASK_SWI_GLU_GRAD)):
             values = TaskSplitValue(tp=1, ep=1, seq_size=128, all_expert_num=4, top_k=2)
             graph = builder(values, hidden_size=16, intermediate_size=8, num_cube_cores=20,
-                            swiglu_limit=0.5, clamp_after_activation=True)
+                            activation_parameters=SwiGLUParameters(clamp_limit=0.5, clamp_after_silu=True))
             graph.propagate_splits(values)
             config = build_runtime_config(graph, values, num_cube_cores=20)
             tasks = [t for t in config.all_tasks[:config.task_num] if t.task_type == kind]
@@ -162,7 +163,7 @@ class TestSwiGLUClamp(unittest.TestCase):
                     hidden_size=16,
                     intermediate_size=8,
                     num_cube_cores=20,
-                    swiglu_limit=clamp_limit,
+                    activation_parameters=SwiGLUParameters(clamp_limit=clamp_limit),
                 )
                 graph.propagate_splits(values)
                 build_runtime_config(graph, values, num_cube_cores=20)

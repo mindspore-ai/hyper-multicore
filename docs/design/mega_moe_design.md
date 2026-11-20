@@ -61,6 +61,10 @@ combine 需要 dX。实际允许的并行度还取决于任务填充、任务依
 
 ## 精度后端与计算适配
 
+公开 `activation` 在构造时确定，内部以不可变 `activation_parameters` 经资源配置传入 spec 和 plan。
+[BF16 激活模块](../../hyper_multicore/modules/mega_moe/backends/bf16/activation.py) 负责前后向节点构建和在线 tiling，现有 DAG 继续连接相同的张量端口。
+执行器在构造时拒绝尚未接入的 SiTUGLU。EP 配置一致性检查比较激活参数，反向保留对应前向的 plan。
+
 BF16 的 plan 将实际 H/I 传给 GMM 与 SwiGLU tiling 准备逻辑。
 当前[前向 tiling](../../hyper_multicore/modules/mega_moe/backends/bf16/forward/tiling_tables.py)和
 [反向 tiling](../../hyper_multicore/modules/mega_moe/backends/bf16/backward/tiling_tables.py)
@@ -121,6 +125,9 @@ MXFP8 训练集成层通过内部标签接口 `mx_profile_scope(layer=..., phase
 BF16 后端先建立由算子和张量依赖组成的数学图。算子的 `SplitSpec` 描述从哪些输入取得分块信息、
 如何切分输出以及如何计算任务数量。选择 compact 时，lowering 先将相应算子的任务数量改为持久 lane 的数量；
 随后图按依赖顺序传播分块信息，让每个算子得到本次需要处理的分块与任务数。
+
+前向和反向图各自把选定的激活节点登记为 `activation`。计划和队列按此名称定位节点，
+节点本身保留具体算子名、任务类型和诊断名称。
 
 分块信息确定后，任务填充器把每个算子展开为 task，写入参数位置、数据偏移及等待和发布的依赖事件。
 组件生成路径补齐终止与通信协议信息，队列编排再安排各 worker 负责的任务及其候选顺序。

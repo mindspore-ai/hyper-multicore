@@ -33,13 +33,14 @@ class TestMegaMoeNumericsOptions(unittest.TestCase):
         """Load a numerical configuration without loading the executor or NPU backend."""
         code = """
 import sys
-from hyper_multicore import MegaMoeNumericsOptions
+from hyper_multicore import MegaMoeNumericsOptions, SwiGLUParameters, SiTUGLUParameters
 from hyper_multicore.modules.mega_moe.numerics import MegaMoeNumericsOptions as OwnedNumerics
 assert MegaMoeNumericsOptions is OwnedNumerics
 assert MegaMoeNumericsOptions.__module__ == "hyper_multicore.modules.mega_moe.numerics"
 options = MegaMoeNumericsOptions()
-assert options.swiglu_limit is None
-assert options.clamp_after_silu is False
+assert SwiGLUParameters().clamp_limit is None
+assert SwiGLUParameters().clamp_after_silu is False
+assert SiTUGLUParameters(beta=1.0).linear_beta == 0.0
 assert options.apply_probs_before_fc2 is False
 assert 'torch_npu' not in sys.modules
 assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
@@ -55,12 +56,11 @@ assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
     def test_layer_specific_numerics_preserve_immutable_defaults(self) -> None:
         """Derive a layer's numerical configuration without mutating a shared default."""
         default = MegaMoeNumericsOptions()
-        adjusted = replace(default, swiglu_limit=7.0, clamp_after_silu=True, apply_probs_before_fc2=True)
+        adjusted = replace(default, apply_probs_before_fc2=True)
         self.assertEqual(default, MegaMoeNumericsOptions())
-        self.assertEqual((adjusted.swiglu_limit, adjusted.clamp_after_silu, adjusted.apply_probs_before_fc2),
-                         (7.0, True, True))
+        self.assertTrue(adjusted.apply_probs_before_fc2)
         for options in (default, adjusted):
-            for name in ("swiglu_limit", "clamp_after_silu", "apply_probs_before_fc2"):
+            for name in ("partial_weight_grad_dtype", "apply_probs_before_fc2"):
                 with self.subTest(options=options, name=name), self.assertRaises(FrozenInstanceError):
                     setattr(options, name, getattr(options, name))
 
@@ -68,7 +68,8 @@ assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
               card_mark="allcards", essential_mark="essential")
     def test_tuning_and_internal_plan_fields_are_not_numerical_options(self) -> None:
         """Keep the stable numerical object free of scheduling and unfinished gradient policies."""
-        for name in ("dispatch_mode", "initial_capacity_factor", "capacity_growth_factor", "dispatch_split",
+        for name in ("swiglu_limit", "clamp_after_silu", "dispatch_mode", "initial_capacity_factor",
+                     "capacity_growth_factor", "dispatch_split",
                      "combine_split", "weight_grad_dtype", "batch_experts", "nominal_schedule"):
             with self.subTest(name=name), self.assertRaisesRegex(TypeError, name):
                 MegaMoeNumericsOptions(**{name: True})
