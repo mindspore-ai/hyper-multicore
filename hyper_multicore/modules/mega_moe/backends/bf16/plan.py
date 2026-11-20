@@ -65,7 +65,7 @@ from ...probability import (
 from ...schedule_policy import (
     MegaMoeSchedulePolicy, compact_graph,
 )
-from ...spec import MegaMoeSpec
+from ...spec import MegaMoeSpec, _COMMUNICATION_SPLIT, _align_capacity
 from ...tensor_dump import attach_mega_moe_l1_view_resolvers
 
 
@@ -176,11 +176,23 @@ def _build_runtime_artifacts(
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     explicit_queues = _uses_explicit_queues(spec)
     task_values = _build_task_values(spec)
+    dispatch_split, combine_split = spec.dispatch_split, spec.combine_split
+    if (explicit_queues and spec.auto_tokens and spec.lowering == "auto"
+            and spec.dispatch_mode == "pull" and spec.transport_engine == "mte"):
+        # Coarsen default descriptors when EP already supplies communication
+        # concurrency. Keep at least four fragments at large source lengths.
+        fragments = max(4, 2 * spec.num_cube_cores // spec.ep_size)
+        rows = (spec.plan_tokens + fragments - 1) // fragments
+        split = min(_align_capacity(rows), 8 * _COMMUNICATION_SPLIT)
+        if dispatch_split == _COMMUNICATION_SPLIT:
+            dispatch_split = split
+        if combine_split == _COMMUNICATION_SPLIT:
+            combine_split = split
     forward_graph = build_forward_graph(
         task_values,
-        dispatch_sv=spec.dispatch_split,
+        dispatch_sv=dispatch_split,
         swiglu_sv=spec.swiglu_split,
-        combine_sv=spec.combine_split,
+        combine_sv=combine_split,
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
@@ -204,9 +216,9 @@ def _build_runtime_artifacts(
     )
     backward_graph = build_backward_graph(
         task_values,
-        dispatch_sv=spec.dispatch_split,
+        dispatch_sv=dispatch_split,
         swiglu_sv=spec.swiglu_split,
-        combine_sv=spec.combine_split,
+        combine_sv=combine_split,
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,

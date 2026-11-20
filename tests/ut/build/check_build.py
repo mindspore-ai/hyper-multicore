@@ -197,14 +197,20 @@ class BuildChecks(unittest.TestCase):
         self.assertIn(record["id"], record["torch_so"])
         replica_calls = [call for call in commands.calls if "--phase" in call
                       and any(str(value).endswith("/hot_replica/build.py") for value in call)]
-        has_a3 = "ascend910_93" in sdks.get("arch22", {}).get("soc_list", ())
-        phases = ["common", "adapter"] if has_a3 else []
-        if "arch35" in sdks:
-            phases.append("mx-host")
-        self.assertEqual([call[call.index("--phase") + 1] for call in replica_calls], phases)
-        if has_a3:
-            self.assertEqual(record["hot_replica"]["soc"], "ascend910_93")
-            adapter = replica_calls[1]
+        targets = {"arch22": ("ascend910_93", "hot_replica", "2201"),
+                   "arch35": ("ascend950", "hot_replica_bf16_arch35", "3510")}
+        expected = [(backend, target) for backend, target in targets.items()
+                    if target[0] in sdks.get(backend, {}).get("soc_list", ())]
+        phases = [call[call.index("--phase") + 1] for call in replica_calls]
+        self.assertEqual(phases.count("common"), len(expected))
+        self.assertEqual(phases.count("adapter"), len(expected))
+        self.assertEqual(phases.count("mx-host"), int("arch35" in sdks))
+        for backend, (soc, key, arch) in expected:
+            self.assertEqual(record[key]["soc"], soc)
+            device = common / f"shmem/lib/{backend}/hot_replica"
+            common_call = next(call for call in replica_calls if "--npu-arch" in call and str(device) in call)
+            self.assertEqual(common_call[common_call.index("--npu-arch") + 1], arch)
+            adapter = next(call for call in replica_calls if "--device-root" in call and str(device) in call)
             self.assertEqual(adapter[adapter.index("--cxx-standard") + 1], "20")
         if "arch35" in sdks:
             mx_host = replica_calls[-1]

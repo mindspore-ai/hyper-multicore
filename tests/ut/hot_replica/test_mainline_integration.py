@@ -69,7 +69,7 @@ def test_mx_gradient_bank_registers_with_the_virtual_workspace():
     [
         ("bf16", "push", True, TypeError),
         ("mxfp8", "push", HotReplicaPlanner(), ValueError),
-        ("bf16", "pull", HotReplicaPlanner(), ValueError),
+        ("mxfp8", "pull", HotReplicaPlanner(), ValueError),
     ],
 )
 def test_unsupported_configuration_fails_before_binding(precision, mode, value, error):
@@ -106,6 +106,32 @@ def test_placement_requires_multiple_ranks():
             top_k=2,
             expert_placement=MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner()),
         )
+
+
+def test_bf16_pull_accepts_adaptive_placement():
+    """Bind the existing BF16 placement configuration to Pull."""
+    from hyper_multicore.modules.mega_moe import module
+
+    with patch.object(module, "_resolve_ep_size", return_value=2):
+        expert = MegaMoeExperts(
+            hidden_size=128, intermediate_size=128, num_experts=4, top_k=2,
+            tuning_options=MegaMoeTuningOptions(dispatch_mode="pull"),
+            expert_placement=MegaMoePlacementOptions("adaptive", HotReplicaPlanner()),
+        )
+    try:
+        assert expert._resource_group.specification["dispatch_mode"] == "pull"  # pylint: disable=protected-access
+        assert expert._resource_group.specification["hot_replica"]  # pylint: disable=protected-access
+    finally:
+        expert.close()
+
+
+def test_a3_bf16_pull_keeps_replica_capability_guard():
+    """Reject an unqualified replica transport before allocating its banks."""
+    with (
+        patch.object(capability._collective, "exchange", side_effect=lambda value, **_: [value, value]),
+        pytest.raises(RuntimeError, match="BF16 HotReplica Pull requires Ascend950"),
+    ):
+        capability.require_capability(None, None, architecture=2201, dispatch_mode="pull")
 
 
 @pytest.mark.parametrize("options", [None, MegaMoePlacementOptions(strategy="none")])
@@ -145,6 +171,18 @@ def test_supported_device_requires_selected_adapter_artifacts():
         capability._require_a3(tensor)  # pylint: disable=protected-access
 
 
+def test_a5_bf16_requires_its_own_replica_bank(tmp_path):
+    tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=0), dtype=torch.bfloat16)
+    artifacts = {"soc": "ascend950", "bridge": "bridge.so", "kernels": "kernels.so"}
+    selected = {"root": tmp_path, "variant": {"hot_replica_bf16_arch35": artifacts}}
+    (tmp_path / artifacts["bridge"]).touch()
+    with patch.object(capability, "validate_native_compatibility", return_value=selected):
+        with pytest.raises(RuntimeError, match="Ascend950 BF16 HotReplica artifact is missing: kernels"):
+            capability.require_capability(tensor, None, architecture=3510)
+        (tmp_path / artifacts["kernels"]).touch()
+        capability.require_capability(tensor, None, architecture=3510)
+
+
 def test_mx_capability_checks_cube_geometry_before_loading_replica_artifacts() -> None:
     """Converge a device limitation during binding, before a hotspot can allocate guest resources."""
     tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=3), dtype=torch.bfloat16)
@@ -162,7 +200,7 @@ def test_no_move_preserves_original_prepared_route_and_capacity():
     """Preserve validated routing and capacity when placement is declined."""
     hidden = torch.empty(2, 8)
     ids = torch.tensor([[0], [1]])
-    spec, workspace, metadata = object(), object(), object()
+    spec, workspace, metadata = SimpleNamespace(dispatch_mode="push"), object(), object()
     counts = torch.tensor([1, 1])
     gathered = torch.tensor([[0, 2, 1, 1, 1]])
     permutation = (hidden, torch.tensor([0, 1]))
@@ -275,7 +313,8 @@ def test_placement_reuses_validated_source_totals_and_autograd_mask():
 
     with patch.object(route, "_read_cached_route", side_effect=read), patch.object(route, "_finalize_dynamic_route"):
         route._prepare_placed_route(  # pylint: disable=protected-access
-            hidden, ids, object(), object(), (hidden, ids), counts, gathered, None, None, Mock(), selection, 1
+            hidden, ids, SimpleNamespace(dispatch_mode="push"), object(), (hidden, ids), counts, gathered,
+            None, None, Mock(), selection, 1
         )
     assert selection.call_args.args[4] == [2, 6]
     assert selection.call_args.args[6] == 1
@@ -309,7 +348,7 @@ def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
     """Reuse negative cost decisions without caching routes or current weights."""
     spec = SimpleNamespace(
         architecture=0, ep_size=2, local_experts=4, top_k=2, hidden_size=8,
-        intermediate_size=4, num_cube_cores=24, rank_id=0, apply_probs_before_fc2=True,
+        intermediate_size=4, num_cube_cores=24, rank_id=0, apply_probs_before_fc2=True, dispatch_mode="push",
     )
     owner = PlacementResources(SimpleNamespace(spec=spec), {}, False)
     hidden, ids, gathered = torch.empty(2, 8), torch.zeros(2, 2), torch.zeros(2, 11)
@@ -590,7 +629,7 @@ def test_custom_placement_derives_fused_rows_from_counts(guest_count):
 def test_checkpoint_request_is_training_independently_of_reservation(bound):
     """Keep the checkpoint state even when no initial capacity is supplied."""
     spec = SimpleNamespace(architecture=0, rank_id=0, intermediate_size=4, num_cube_cores=24,
-                           apply_probs_before_fc2=True)
+                           apply_probs_before_fc2=True, dispatch_mode="push")
     owner = SimpleNamespace(spec=spec, workspace=SimpleNamespace(capacity_floor=128))
     resources = PlacementResources(owner, {"source_token_bound": bound}, False)
     ids = torch.tensor([[0]])

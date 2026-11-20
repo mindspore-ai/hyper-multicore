@@ -22,29 +22,37 @@ from pathlib import Path
 import sys
 from types import ModuleType
 
-from hyper_multicore._loader import validate_native_compatibility
-from hyper_multicore._native_manifest import SHMEM_DEPENDENCIES
+from hyper_multicore._loader import select_native_shmem, validate_native_compatibility
+from hyper_multicore._native_manifest import HOT_REPLICA_BF16_TARGETS, SHMEM_DEPENDENCIES
+
+
+@lru_cache(maxsize=1)
+def _selection():
+    selected = validate_native_compatibility()
+    backend, sdk = select_native_shmem(selected)
+    _, key = HOT_REPLICA_BF16_TARGETS[backend]
+    artifacts = selected["variant"].get(key)
+    if artifacts is None:
+        raise RuntimeError(f"Selected HMC adapter has no {backend} BF16 HotReplica capability")
+    return selected["root"], sdk["shmem_root"], artifacts
+
 
 def native_library_path(filename: str) -> Path:
-    """Resolve HotReplica only from the selected, integrity-validated framework artifact."""
-
-    selected = validate_native_compatibility()
-    artifacts = selected["variant"].get("hot_replica")
-    if artifacts is None:
-        raise RuntimeError("Selected HMC adapter has no Atlas A3 HotReplica capability")
+    """Resolve HotReplica from the framework variant and active SHMEM backend."""
+    root, _, artifacts = _selection()
     key = {
         "_hot_replica_shared_bridge.so": "bridge",
         "libhmc_hot_replica_kernels.so": "kernels",
     }[filename]
-    return selected["root"] / artifacts[key]
+    return root / artifacts[key]
 
 
 @lru_cache(maxsize=1)
 def _load_kernels():
     """Load the selected private dependencies without initializing a SHMEM root."""
 
-    selected = validate_native_compatibility()
-    root = selected["root"] / selected["manifest"]["architectures"]["arch22"]["shmem_root"]
+    root, sdk, _ = _selection()
+    root = root / sdk
     handles = tuple(ctypes.CDLL(str(root / name), mode=ctypes.RTLD_LOCAL) for name in SHMEM_DEPENDENCIES)
     return handles, ctypes.CDLL(str(native_library_path("libhmc_hot_replica_kernels.so")), mode=ctypes.RTLD_GLOBAL)
 

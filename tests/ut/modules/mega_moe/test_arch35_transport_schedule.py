@@ -1,4 +1,5 @@
 """Check complete real expert DAGs and QP0 ownership without device execution."""
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,6 +11,7 @@ from hyper_multicore.modules.mega_moe.schedule import explain_schedule
 from hyper_multicore.modules.mega_moe.transport import TRANSPORT_TASKS, validate_transport_owners
 from hyper_multicore.shmem._ordering import SubmissionOrder
 from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
+from hyper_multicore.scheduler.config import TaskType
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
 
 
@@ -53,6 +55,26 @@ def test_qp0_submission_order_reuses_completion_event():
     order.claim(second)
     second.wait_event.assert_called_once_with(completion)
     order.release(second, completion)
+
+
+def test_default_mte_pull_uses_available_lanes_and_coarser_fragments():
+    """Retain each remote credit while reducing the default descriptor count."""
+    spec = MegaMoeSpec(4096, 512, 128, 96, 8, None, 32768, 16, None, 0, 32,
+                       dispatch_mode='pull', architecture=3510, auto_tokens=True)
+    graph, cfg, _, _ = _build_runtime_artifacts(spec)
+    assert graph.get_op('dispatch').task_num == 4 * spec.num_experts
+    dense, _, _, _ = _build_runtime_artifacts(replace(spec, lowering='dense', dispatch_split=256))
+    assert dense.get_op('dispatch').task_num == 16 * spec.num_experts
+    by_peer = {}
+    for worker, queue in enumerate(cfg.worker_queues[32:]):
+        for tid in cfg.vector_task_indices[queue.begin:queue.end]:
+            task = cfg.all_tasks[tid]
+            if task.task_type != TaskType.TASK_SHMEM_GET_MEM:
+                continue
+            peer = task.task_index // (task.task_split_num // spec.ep_size)
+            by_peer.setdefault(peer, set()).add(worker)
+    assert len(by_peer) == spec.ep_size
+    assert all(len(owners) == 2 for peer, owners in by_peer.items() if peer != spec.rank_id)
 
 
 @pytest.mark.parametrize('ep,mode', [(4, 'push'), (8, 'pull'), (64, 'push'), (64, 'pull')])

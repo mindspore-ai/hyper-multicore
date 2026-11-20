@@ -33,15 +33,21 @@ def forward(
     del module
     module_resources = resources
     resources = route.execution_resources or resources
+    pull = resources.spec.dispatch_mode == "pull"
     binding = route.weight_binding
     ordinary_options = {}
     if binding is not None:
         route_experts = binding.placement.counts_by_source.shape[1]
         if route_experts != resources.spec.num_experts:
             ordinary_options["route_experts"] = route_experts
+        if resources.spec.architecture == 3510:
+            # Preserve the precision of the owner and guest partials through the bank reduction.
+            ordinary_options["weight_grad_dtype"] = torch.float32
     if binding is not None and module_resources.placement.source_bound is not None:
         home = module_resources.spec.local_experts
-        nominal = (home >= 2 * resources.spec.num_cube_cores and resources.spec.intermediate_size < 2048
+        nominal = (not pull and resources.spec.architecture == 2201
+                   and home >= 2 * resources.spec.num_cube_cores
+                   and resources.spec.intermediate_size < 2048
                    and resources.spec.lowering != "dense" and resources.spec.ready_depth is None)
         ordinary_options.update(
             weight_grad_dtype=torch.float32,
@@ -62,18 +68,17 @@ def forward(
             binding.fused = False
     if binding is None or not binding.fused:
         plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **ordinary_options)
-    pull = resources.spec.dispatch_mode == "pull"
     before_fc2 = resources.spec.apply_probs_before_fc2
     options = {} if route.weight_binding is None else {"weight_binding": route.weight_binding}
     record = route.checkpoint_record
     if not torch.is_grad_enabled():
         save = None
-        if record is not None and before_fc2 and hidden_flat.shape[0]:
+        if record is not None and not pull and before_fc2 and hidden_flat.shape[0]:
             save = _save_replay_activations(record, plan.spec, route, hidden_flat, topk_weights)
         return _execute_mega_moe_without_autograd(
             topk_weights, *weights, route, plan, resources.workspace,
             workspace_claimed=pull, save_activation=save, **options).reshape_as(hidden_states)
-    if record is not None and record.allow_activation:
+    if record is not None and not pull and record.allow_activation:
         module_resources.placement.statistics["skipped_recomputes"] += 1
         return _CheckpointedPushFunction.apply(
             hidden_flat, *weights, route.metadata, plan, resources.workspace,

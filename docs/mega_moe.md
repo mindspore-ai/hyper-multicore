@@ -149,7 +149,7 @@ output = experts(
 
 ### 自适应专家放置
 
-为多 rank EP 的 Push 执行启用热点专家副本时，将下列配置传给 `MegaMoeExperts` 的 `expert_placement`。
+为多 rank EP 启用热点专家副本时，将下列配置传给 `MegaMoeExperts` 的 `expert_placement`。
 
 ```python
 from hyper_multicore import MegaMoePlacementOptions
@@ -166,7 +166,10 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
   显式 source bound 的放置沿用 FP32 partial。
   副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
-- `ascend950` 支持 MXFP8 EIO，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
+- `ascend950` 的 BF16 Push 和 Pull 使用 arch35 副本 bank 和独立的权重预取、梯度归并。
+  Pull 将实际选中的路由发布到对称源区，由执行 rank 拉取 token。
+  激活副本时以 FP32 计算和归并原属专家及借用专家的局部权重梯度，写回时转换为公开参数类型。
+- `ascend950` 支持 MXFP8 EIO Push，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
   并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
   `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，
   `HYPER_MULTICORE_SHMEM_UDMA_QP_NUM` 设置为 8、16 或 32。

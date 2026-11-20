@@ -191,9 +191,9 @@ class MegaMoeExperts(MulticoreModule):
                 weighting. Options specify the clamp limit and its position relative
                 to SiLU, plus the probability position relative to FC2. The before-FC2
                 path rounds activations to BF16 both before and after FP32 weighting.
-            expert_placement: Placement strategy and planner for multi-rank Push execution.
-                Adaptive placement supports BF16 on Ascend910_93 and MXFP8 on Ascend950.
-                MXFP8 requires the built-in planner and FP32 partial weight gradients.
+            expert_placement: Placement strategy and planner for multi-rank execution.
+                Adaptive placement supports BF16 Push on Ascend910_93 and BF16 Push and Pull on Ascend950.
+                Ascend950 MXFP8 requires Push, the built-in planner and FP32 partial weight gradients.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.
                 Options are validated and copied into the instance configuration;
@@ -207,11 +207,11 @@ class MegaMoeExperts(MulticoreModule):
         source_bound = planner.source_token_bound if planner is not None else None
         planner_key = None
         if planner is not None:
-            if tuning.dispatch_mode != "push":
-                raise ValueError("HotReplica requires push dispatch")
             if precision == "mxfp8":
                 from ..hot_replica.planner import HotReplicaPlanner  # pylint: disable=import-outside-toplevel
 
+                if tuning.dispatch_mode != "push":
+                    raise ValueError("MXFP8 HotReplica requires push dispatch")
                 if type(planner) is not HotReplicaPlanner or source_bound is not None:
                     raise ValueError("MXFP8 HotReplica requires the built-in planner without a source token bound")
                 if numerics.partial_weight_grad_dtype != "float32":

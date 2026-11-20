@@ -526,7 +526,7 @@ def prepare_topk_route(
     workspace: MegaMoeWorkspace | None = None,
     *,
     autograd_mask: int = 0,
-    prepare_workspace: Callable[[int, int], None] | None = None,
+    prepare_workspace: Callable[..., None] | None = None,
     select_placement: Callable | None = None,
     reuse_placement_geometry: bool = False,
 ) -> PreparedTopKRoute:
@@ -541,7 +541,7 @@ def prepare_topk_route(
         workspace: Optional workspace ordered before the count exchange. Pull
             requires a lease acquired by the caller or the automatic-capacity callback.
         autograd_mask: Group-consistent gradient participation flags in dynamic mode.
-        prepare_workspace: Capacity callback, run before pull publication.
+        prepare_workspace: Capacity and lease callback, optionally for selected execution resources.
 
     Returns:
         Permuted tokens and exact native route metadata.
@@ -873,6 +873,14 @@ def _publish_staged_pull(
     return output, permuted[1]
 
 
+def _materialize_route_permutation(hidden, ids, spec, workspace, permuted=None):
+    """Prepare the selected route in the storage its dispatch will consume."""
+    if spec.dispatch_mode == "pull":
+        return (_permute_dynamic_pull(hidden, ids, spec, workspace) if permuted is None else
+                _publish_staged_pull(permuted, hidden, spec, workspace))
+    return _permute_topk_input(hidden, ids) if permuted is None else permuted
+
+
 def _dynamic_header(
     values: tuple[int, int, int], dtype: torch.dtype, device: Any, workspace: MegaMoeWorkspace | None,
     *, stream: Any = None,
@@ -936,7 +944,7 @@ def _start_dynamic_gather(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[tor
 def _resolve_dynamic_permutation(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, spec: MegaMoeSpec,
     workspace: MegaMoeWorkspace | None, permuted: tuple | None, invalid: bool,
-    route_stream: Any, prepare_workspace: Callable[[int, int], None] | None,
+    route_stream: Any, prepare_workspace: Callable[..., None] | None,
     gathered: torch.Tensor, work: Any,
 ) -> tuple[tuple | None, _RouteSummary | None, list | None, RouteMetadata | None, Any]:
     """Resolve the automatic/pull/ordinary permutation branch after the exchange."""
@@ -954,13 +962,8 @@ def _resolve_dynamic_permutation(
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
         prepare_workspace(summary.plan_tokens, summary.maximum)
-    if invalid:
-        permuted = None
-    elif spec.dispatch_mode == "pull":
-        permuted = (_permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if permuted is None else
-                    _publish_staged_pull(permuted, hidden_states, spec, workspace))
-    elif permuted is None:
-        permuted = _permute_topk_input(hidden_states, topk_ids)
+    permuted = (None if invalid else
+                _materialize_route_permutation(hidden_states, topk_ids, spec, workspace, permuted))
     return permuted, summary, host_rows, metadata, work
 
 
@@ -991,7 +994,7 @@ def _finalize_dynamic_route(
 def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
-    prepare_workspace: Callable[[int, int], None] | None = None,
+    prepare_workspace: Callable[..., None] | None = None,
     select_placement: Callable | None = None,
     reuse_placement_geometry: bool = False,
 ) -> PreparedTopKRoute:
@@ -1059,8 +1062,7 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
         )
     if selected is None:
         prepare_workspace(summary.plan_tokens, summary.maximum)
-        if permuted is None:
-            permuted = _permute_topk_input(hidden, ids)
+        permuted = _materialize_route_permutation(hidden, ids, spec, workspace, permuted)
         return _finalize_dynamic_route(
             permuted, counts, summary, host_rows, metadata, None, gathered, spec,
             workspace, hidden.device, hidden.shape[0])
@@ -1074,8 +1076,11 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     virtual_table = gathered if metadata is not None else torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
     local_load = placement.received_rows(virtual_spec.rank_id)
     virtual_summary = _RouteSummary(max(1, local_load), summary.plan_tokens, placement.receive_capacity)
-    resources.prepare_auto_workspace(virtual_summary.plan_tokens, virtual_summary.maximum, hidden)
-    virtual_tokens = _permute_topk_input(hidden, placement.virtual_ids)
+    if spec.dispatch_mode == "pull":
+        prepare_workspace(virtual_summary.plan_tokens, virtual_summary.maximum, selected=resources)
+    else:
+        resources.prepare_auto_workspace(virtual_summary.plan_tokens, virtual_summary.maximum, hidden)
+    virtual_tokens = _materialize_route_permutation(hidden, placement.virtual_ids, virtual_spec, virtual_workspace)
     route = _finalize_dynamic_route(
         virtual_tokens, virtual_counts, virtual_summary, None, metadata, None, virtual_table,
         virtual_spec, virtual_workspace, hidden.device, hidden.shape[0])

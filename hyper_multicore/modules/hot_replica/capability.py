@@ -69,17 +69,35 @@ def _require_mx(tensor, cube_cores: int):
     load_mx_planner(planner)
 
 
+def _require_a5_bf16(tensor):
+    """Require the dedicated BF16 bank on Ascend950 before binding the graph."""
+    if tensor.device.type != "npu" or tensor.dtype != torch.bfloat16:
+        raise ValueError("BF16 HotReplica requires BF16 input on Ascend950")
+    selected = validate_native_compatibility()
+    artifacts = selected["variant"].get("hot_replica_bf16_arch35")
+    if artifacts is None or artifacts.get("soc") != "ascend950":
+        raise RuntimeError("The selected Torch/PTA adapter has no Ascend950 BF16 HotReplica artifacts")
+    for key in ("bridge", "kernels"):
+        if not (selected["root"] / artifacts[key]).is_file():
+            raise RuntimeError(f"Selected Ascend950 BF16 HotReplica artifact is missing: {key}")
+
+
 def require_capability(
-    tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *, mx_cube_cores: int | None = None,
+    tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *,
+    mx_cube_cores: int | None = None, architecture: int | None = None, dispatch_mode: str = "push",
 ) -> bool:
     """Validate artifacts and agree on the A3 BF16 partial protocol before transfer."""
     local_error = None
     bf16_partials = False
     try:
-        if mx_cube_cores is None:
-            bf16_partials = _require_a3(tensor)
-        else:
+        if mx_cube_cores is not None:
             _require_mx(tensor, mx_cube_cores)
+        elif architecture == 3510:
+            _require_a5_bf16(tensor)
+        elif dispatch_mode == "pull":
+            raise ValueError("BF16 HotReplica Pull requires Ascend950")
+        else:
+            bf16_partials = _require_a3(tensor)
     except Exception as error:  # pylint: disable=broad-exception-caught
         local_error = error
     failure = None if local_error is None else _collective.failure_report(local_error)

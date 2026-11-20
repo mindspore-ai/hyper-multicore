@@ -30,6 +30,10 @@ SHMEM_DEPENDENCIES = (
 )
 SHMEM_RESOURCES = (*SHMEM_DEPENDENCIES,
                    "shmem/aclshmem_bootstrap_uid.so", "shmem/aclshmem_bootstrap_config_store.so")
+HOT_REPLICA_BF16_TARGETS = {
+    "arch22": ("ascend910_93", "hot_replica"),
+    "arch35": ("ascend950", "hot_replica_bf16_arch35"),
+}
 
 
 def framework_package(package: str) -> dict:
@@ -109,6 +113,15 @@ def variant_selection_key(variant: dict) -> tuple[str, tuple[str, str, bool]]:
     return identifier, key
 
 
+def hot_replica_bf16_paths(identifier: str, backend: str) -> dict[str, str]:
+    """Describe one architecture's BF16 replica bank and Torch bridge."""
+    return {
+        "soc": HOT_REPLICA_BF16_TARGETS[backend][0],
+        "kernels": f"shmem/lib/{backend}/hot_replica/libhmc_hot_replica_kernels.so",
+        "bridge": f"adapters/{identifier}/shmem/{backend}/hot_replica/_hot_replica_shared_bridge.so",
+    }
+
+
 def validate_adapter_paths(root: Path, variant: dict, backends: dict) -> None:
     """Require the shared Torch adapter and one binding for each packaged backend."""
     expected_torch = f"adapters/{variant['id']}/libhyper_multicore_torch.so"
@@ -121,16 +134,15 @@ def validate_adapter_paths(root: Path, variant: dict, backends: dict) -> None:
         if not path.is_file() or not path.stat().st_size:
             raise ValueError(f"Missing adapter resource: {expected}")
 
-    replica = variant.get("hot_replica")
-    if replica is not None:
-        expected = {
-            "soc": "ascend910_93", "kernels": "shmem/lib/arch22/hot_replica/libhmc_hot_replica_kernels.so",
-            "bridge": f"adapters/{variant['id']}/shmem/arch22/hot_replica/_hot_replica_shared_bridge.so",
-        }
+    for backend, (soc, key) in HOT_REPLICA_BF16_TARGETS.items():
+        replica = variant.get(key)
+        if replica is None:
+            continue
+        expected = hot_replica_bf16_paths(variant["id"], backend)
         # Accept manifests from wheels that still package the A3 allocator.
-        if isinstance(replica, dict) and "allocator" in replica:
+        if backend == "arch22" and isinstance(replica, dict) and "allocator" in replica:
             expected["allocator"] = f"adapters/{variant['id']}/shmem/arch22/hot_replica/_a3_allocator.so"
-        if replica != expected or "ascend910_93" not in backends.get("arch22", {}).get("soc_list", []):
+        if replica != expected or soc not in backends.get(backend, {}).get("soc_list", []):
             raise ValueError("Invalid HotReplica adapter capability or artifact paths")
         for key in (key for key in expected if key != "soc"):
             path = resource_path(root, replica[key])
@@ -250,8 +262,9 @@ def validate_variant_provenance(record: dict, variant: dict) -> None:
     if (release(record["torch_version"]) != variant["torch_release"]
             or release(record["pta_version"]) != variant["pta_release"]):
         raise ValueError(f"Adapter branch disagrees with actual build: {variant['id']}")
-    if any(record.get(k) != variant.get(k)
-           for k in ("torch_release", "pta_release", "torch_cxx11_abi", "torch_so", "shmem_so", "hot_replica")):
+    paths = ("torch_release", "pta_release", "torch_cxx11_abi", "torch_so", "shmem_so",
+             *(key for _, key in HOT_REPLICA_BF16_TARGETS.values()))
+    if any(record.get(key) != variant.get(key) for key in paths):
         raise ValueError(f"Adapter provenance mismatch: {variant['id']}")
 
 

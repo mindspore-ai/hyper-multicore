@@ -49,8 +49,8 @@ def cann_includes(cann: Path, source: Path, sdk: Path) -> list[str]:
     return [f"-I{path}" for path in paths if path.is_dir()]
 
 
-def build_kernels(output: Path, sdk: Path) -> None:
-    """Compile framework-independent AscendC code once per selected A3 backend."""
+def build_kernels(output: Path, sdk: Path, npu_arch: int) -> None:
+    """Compile framework-independent AscendC code for the selected SHMEM backend."""
     source = Path(__file__).parent / "csrc"
     cann = Path(os.environ["ASCEND_HOME_PATH"])
     output.mkdir(parents=True, exist_ok=True)
@@ -58,7 +58,7 @@ def build_kernels(output: Path, sdk: Path) -> None:
         "bisheng",
         "-x",
         "asc",
-        "--npu-arch=dav-2201",
+        f"--npu-arch=dav-{npu_arch}",
         "--cce-auto-sync=off",
         "--cce-fatobj-link",
         "-shared",
@@ -161,14 +161,15 @@ def main() -> None:
     parser.add_argument("--sdk-root", type=Path)
     parser.add_argument("--device-root", type=Path)
     parser.add_argument("--cxx-standard", type=int, default=17)
+    parser.add_argument("--npu-arch", type=int, choices=(2201, 3510), default=2201)
     args = parser.parse_args()
     if args.phase == "mx-host":
         build_mx_host(args.output_dir)
         return
     if args.sdk_root is None:
-        parser.error("--sdk-root is required for A3 builds")
+        parser.error("--sdk-root is required for BF16 HotReplica builds")
     if args.phase == "common":
-        build_kernels(args.output_dir, args.sdk_root)
+        build_kernels(args.output_dir, args.sdk_root, args.npu_arch)
     else:
         if args.device_root is None:
             parser.error("--device-root is required for adapter builds")

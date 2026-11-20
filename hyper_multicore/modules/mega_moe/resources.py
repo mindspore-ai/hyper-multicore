@@ -55,6 +55,7 @@ class _MegaMoeExecutionResources:
             from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
             replica_bf16_partials = require_capability(
                 tensor, specification["ep_group"], mx_cube_cores=self.spec.num_cube_cores if mx_placement else None,
+                architecture=self.spec.architecture, dispatch_mode=self.spec.dispatch_mode,
             )
         initial_headroom = 0
         if workspace_layout is not None:

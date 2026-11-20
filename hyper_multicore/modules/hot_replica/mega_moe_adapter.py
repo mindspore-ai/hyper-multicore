@@ -222,8 +222,10 @@ class PlacementResources:
                 supported and not spec.batch_experts and self.source_bound is None
                 and not uses_wider_gradient_bands(spec)
             )
+        share_push_workspace = ((self.pipeline_enabled or supported and not spec.batch_experts)
+                                and self.source_bound is None)
         self.reuses_parent_workspace = (
-            (self.pipeline_enabled or supported and not spec.batch_experts) and self.source_bound is None
+            (spec.dispatch_mode == "pull" or share_push_workspace)
             and mega_moe_event_capacity(spec.num_experts, spec.ep_size)
             == mega_moe_event_capacity(2 * spec.num_experts, spec.ep_size)
         )
@@ -295,7 +297,7 @@ class PlacementResources:
         bounded = self.source_bound is not None
         replay = is_checkpointing()
         # Replanning during recompute must not depend on an intervening heap growth.
-        floor = self.parent.workspace.capacity_floor if bounded else None
+        floor = self.parent.workspace.capacity_floor if bounded and spec.dispatch_mode == "push" else None
         if replay and self.bounded is not None and not spec.batch_experts:
             floor = self.initial_receive_floor
         key = (
