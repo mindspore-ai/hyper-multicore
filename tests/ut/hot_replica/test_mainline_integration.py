@@ -379,7 +379,6 @@ def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget):
                                 planner.configuration_key()),
                 "replica_slots_per_rank": budget}
     with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline", return_value=False):
-        with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline", return_value=False):
         placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
     placement.rank_nodes = (0, 1)
     hidden = torch.empty((1, 5120), dtype=torch.bfloat16).expand(4096, 5120)
