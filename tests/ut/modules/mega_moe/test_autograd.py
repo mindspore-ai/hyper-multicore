@@ -35,6 +35,31 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     # pylint: disable=protected-access
 
+    def test_plan_stream_identity_preserves_registration(self) -> None:
+        """Register plan storage without requesting a queue-draining stream handle."""
+        device = Mock(type="npu")
+        forward, backward, tiling, diagnostic = [Mock(spec=torch.Tensor) for _ in range(4)]
+        for tensor in (forward, backward, tiling, diagnostic):
+            tensor.device = device
+        plan = function_module.MegaMoePlan(
+            spec=None, forward_graph=None,
+            fwd_diagnostics=SimpleNamespace(runtime_config=forward),
+            up_proj_tiling=tiling, swiglu_tiling=None, down_proj_tiling=None,
+            backward_graph=None, bwd_diagnostics=SimpleNamespace(runtime_config=backward),
+            act_grad_tiling=None, gate_grad_tiling=None, w1_grad_tiling=None,
+            w2_grad_tiling=None, swiglu_grad_tiling=None,
+        )
+        first = SimpleNamespace(stream_id=10)
+        same = SimpleNamespace(stream_id=10)
+        other = SimpleNamespace(stream_id=20)
+        plan.record_stream(forward, stream=first)
+        plan.record_stream(backward, stream=same)
+        plan.record_stream(diagnostic, stream=same)
+        plan.record_stream(forward, stream=other)
+        for tensor in (forward, backward, tiling):
+            self.assertEqual([entry.args[0] for entry in tensor.record_stream.call_args_list], [first, other])
+        diagnostic.record_stream.assert_called_once_with(same)
+
 
     def test_ragged_pull_uses_reserved_source_prefix(self) -> None:
         """Forward and backward retain SHMEM addresses while exposing only actual rows."""

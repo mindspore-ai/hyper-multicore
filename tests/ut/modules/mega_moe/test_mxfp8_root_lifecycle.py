@@ -27,7 +27,8 @@ def test_missing_backward_storage_reports_required_axis():
         binding.resolve('backward')
 
 
-def test_fresh_physical_root_in_backward_and_no_grad_retention():
+@pytest.mark.parametrize("row_only", [True, False])
+def test_fresh_physical_root_in_backward_and_no_grad_retention(row_only):
     """Verify phase-local physical weights and inference lifetime."""
     shapes = ((1, 64, 128), (1, 64, 64))
     roots = [torch.nn.Parameter(torch.empty(shape, dtype=torch.bfloat16)) for shape in shapes]
@@ -42,15 +43,17 @@ def test_fresh_physical_root_in_backward_and_no_grad_retention():
             """Record the forward weight and retain the requested state."""
             del route, probabilities, w2
             self.retained = retained
-            self.old_data = w1.col_data
+            assert w1.col_data.data_ptr() == roots[0].col_data.data_ptr()
+            assert w1.row_data is None
             return MXFP8ForwardState(hidden.clone(), (), None)
 
         def backward(self, grad, saved, metadata, w1, w2):
             """Check that backward consumes the newly materialized weights."""
-            assert w1.col_data.data_ptr() == roots[0].col_data.data_ptr()
-            assert w1.col_data.data_ptr() != self.old_data.data_ptr()
             del saved, metadata
-            assert w1.row_data is not None and w2.row_data is not None
+            for weight, root in zip((w1, w2), roots):
+                assert weight.row_data.data_ptr() == root.row_data.data_ptr()
+                assert weight.row_scale.data_ptr() == root.row_scale.data_ptr()
+                assert weight.col_data is None and weight.col_scale is None
             return grad, torch.zeros_like(probs), *(torch.zeros_like(root) for root in roots)
 
     execution = Execution()
@@ -58,9 +61,14 @@ def test_fresh_physical_root_in_backward_and_no_grad_retention():
     assert execution.retained
     for root, shape in zip(roots, shapes):
         physical(root, shape)
+        if row_only:
+            root.col_data = root.col_scale = None
     y.sum().backward()
     assert torch.equal(x.grad, torch.ones_like(x))
     assert all(torch.equal(root.grad, torch.zeros_like(root)) for root in roots)
+    for root, shape in zip(roots, shapes):
+        physical(root, shape)
+        root.row_data = root.row_scale = None
     with torch.no_grad():
         execute_mxfp8_experts(x, *roots, None, probs, shapes, execution)
     assert not execution.retained

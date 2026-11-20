@@ -15,6 +15,7 @@
 """Exact framework pairs in reusable isolated environments, with pip-managed dependencies."""
 
 from __future__ import annotations
+from collections.abc import Callable
 import hashlib
 from importlib import import_module
 import json
@@ -26,6 +27,7 @@ import shutil
 import tempfile
 import textwrap
 import sys
+import sysconfig
 import time
 import urllib.parse
 import zipfile
@@ -35,7 +37,7 @@ from .build_workspace import environment_directory
 from .build_utils import atomic_json
 
 
-def digest_json(value) -> str:
+def digest_json(value: object) -> str:
     """Return a deterministic input identity."""
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -94,7 +96,7 @@ def validate_index_url(address: str, name: str) -> None:
         raise ValueError(f"Framework indexes require credential-free HTTPS URLs: {name}")
 
 
-def validate_sources_and_requirements(target: dict):
+def validate_sources_and_requirements(target: dict) -> None:
     """Validate common resolver settings without prescribing a complete package list."""
     requirement_type = import_module("packaging.requirements").Requirement
     canonicalize_name = import_module("packaging.utils").canonicalize_name
@@ -139,14 +141,14 @@ def isolated_environment(python: Path) -> dict:
     return env
 
 
-def build_environment(python: Path, *, isolated=False) -> dict:
+def build_environment(python: Path, *, isolated: bool = False) -> dict:
     """Use the caller's development environment unless a matrix venv is selected."""
     env = isolated_environment(python) if isolated else dict(os.environ)
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     return env
 
 
-def cann_tool_environment(python: Path, *, isolated=False) -> dict:
+def cann_tool_environment(python: Path, *, isolated: bool = False) -> dict:
     """Add available toolkit modules without replacing developer search paths."""
     env = build_environment(python, isolated=isolated)
     cann = Path(env["ASCEND_HOME_PATH"]).resolve()
@@ -201,15 +203,31 @@ def environment_request(target: dict) -> dict:
     return request
 
 
+def python_identity() -> dict:
+    """Identify compatible Python runtimes independently of patch and build metadata."""
+    return {
+        "implementation": sys.implementation.name,
+        "version": list(sys.version_info[:2]),
+        "cache_tag": sys.implementation.cache_tag,
+        "soabi": sysconfig.get_config_var("SOABI"),
+        "arch": platform.machine(),
+    }
+
+
+def verify_python_identity(expected: dict) -> None:
+    """Reject incompatible interpreters while allowing Python patch updates."""
+    actual = python_identity()
+    if actual != expected:
+        raise RuntimeError(f"Framework Python ABI changed: {actual!r} != {expected!r}")
+
+
 def environment_key(target: dict, base_python: Path) -> str:
-    """Separate version requests, Python runtimes and architectures, not transitive versions."""
+    """Separate framework requests and Python ABIs without pinning Python patches."""
     return digest_json(
         {
             "schema": 3,
             "base_python": str(base_python.resolve()),
-            "base_version": sys.version,
-            "abi": sys.implementation.cache_tag,
-            "arch": platform.machine(),
+            "python": python_identity(),
             "request": environment_request(target),
         }
     )
@@ -231,7 +249,7 @@ def extra_index_arguments(target: dict) -> list[str]:
             for argument in ("--extra-index-url", address)]
 
 
-def download_roots(target: dict, directory: Path, python: Path, run) -> list[Path]:
+def download_roots(target: dict, directory: Path, python: Path, run: Callable[..., str | None]) -> list[Path]:
     """Let pip select exact framework wheels from configured primary and extra indexes."""
     roots = directory / "roots"
     roots.mkdir()
@@ -269,7 +287,10 @@ def download_roots(target: dict, directory: Path, python: Path, run) -> list[Pat
     return result
 
 
-def prepare_environment(target: dict, native: Path, run, base_python: Path, *, identity_probe=None) -> Path:
+def prepare_environment(
+    target: dict, native: Path, run: Callable[..., str | None], base_python: Path,
+    *, identity_probe: Callable[[Path, dict], list] | None = None,
+) -> Path:
     """Reuse an exact framework pair without requiring its historical download snapshot."""
     validate_target(target)
     key = environment_key(target, base_python)
@@ -309,7 +330,7 @@ def prepare_environment(target: dict, native: Path, run, base_python: Path, *, i
     return python
 
 
-def install_framework(target, directory, python, run):
+def install_framework(target: dict, directory: Path, python: Path, run: Callable[..., str | None]) -> dict:
     """Use pip's download cache and resolver; retain provenance, not a private wheelhouse."""
     canonicalize_name = import_module("packaging.utils").canonicalize_name
 
@@ -331,14 +352,16 @@ def install_framework(target, directory, python, run):
         return installation
 
 
-def environment_summary(target: dict, record: dict, action: str):
+def environment_summary(target: dict, record: dict, action: str) -> None:
     """Print actual installed versions for both newly created and reused environments."""
     detail = "Torch/PTA pair verified; no download or reinstallation" if action == "REUSE" else "installed and verified"
     message(
         f"PTA {target['pta_build_version']}: environment {'reused' if action == 'REUSE' else 'ready'}; "
         f"{len(record['installed_packages'])} installed packages; {detail}"
     )
-    packages = " ".join(f"{p['name']}=={p['version']}" for p in sorted(record["installed_packages"], key=lambda p: p["name"]))
+    packages = " ".join(
+        f"{p['name']}=={p['version']}" for p in sorted(record["installed_packages"], key=lambda p: p["name"])
+    )
     print(
         "  packages:\n"
         + textwrap.fill(
@@ -353,25 +376,33 @@ def environment_summary(target: dict, record: dict, action: str):
     )
 
 
-def verify_environment(python: Path, target: dict, run, *, identity_probe=None) -> list:
+def verify_environment(
+    python: Path, target: dict, run: Callable[..., str | None],
+    *, identity_probe: Callable[[Path, dict], list] | None = None,
+) -> list:
     """Only Torch/PTA versions constrain reuse; observe all other installed versions."""
     expected = {"torch": target["torch_version"], "torch-npu": target["pta_build_version"]}
     if identity_probe is not None:
         return identity_probe(python, expected)
     code = (
-        "import json,sys; from importlib import metadata; "
+        "import json,os,sys; from importlib import metadata; "
+        "output=os.fdopen(os.dup(1),'w'); os.dup2(2,1); "
+        "sys.path.insert(0,sys.argv[2]); from _hyper_multicore_bootstrap import load_module; "
+        "load_module('framework_environments').verify_python_identity(json.loads(sys.argv[3])); "
         "expected=json.loads(sys.argv[1]); actual={n:metadata.version(n) for n in expected}\n"
         "if actual != expected: "
         "raise RuntimeError(f'Framework environment changed: {actual!r} != {expected!r}')\n"
+        "import torch,torch_npu\n"
         "print(json.dumps(sorted([{'name':d.metadata['Name'],'version':d.version} "
-        "for d in metadata.distributions()],key=lambda p:p['name'].lower())))"
+        "for d in metadata.distributions()],key=lambda p:p['name'].lower())),file=output,flush=True)"
     )
-    return json.loads(run([str(python), "-c", code, json.dumps(expected)],
+    return json.loads(run([str(python), "-c", code, json.dumps(expected), str(Path(__file__).parent),
+                          json.dumps(python_identity())],
                           label=f"identity-{python.parent.parent.name}",
                           env=isolated_environment(python), capture=True))
 
 
-def environment_record(directory: Path):
+def environment_record(directory: Path) -> dict | None:
     """Read successful environments or explicitly owned abandoned installs only."""
     marker = directory / "ready.json"
     if marker.is_symlink() or (directory / "pending.json").is_symlink():

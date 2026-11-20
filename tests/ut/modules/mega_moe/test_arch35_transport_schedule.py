@@ -1,3 +1,17 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Check complete real expert DAGs and QP0 ownership without device execution."""
 from dataclasses import replace
 from types import SimpleNamespace
@@ -46,16 +60,24 @@ def test_qp0_owners_and_complete_bf16_work(ep, mode):
 def test_qp0_submission_order_reuses_completion_event():
     """Keep QP0 submissions ordered with the shared completion event."""
     order = SubmissionOrder()
-    first = SimpleNamespace(npu_stream=10, wait_event=Mock())
-    second = SimpleNamespace(npu_stream=20, wait_event=Mock())
+    first = SimpleNamespace(device="npu:0", stream_id=10, wait_event=Mock())
+    same = SimpleNamespace(device="npu:0", stream_id=10, wait_event=Mock())
+    second = SimpleNamespace(device="npu:0", stream_id=20, wait_event=Mock())
+    other_device = SimpleNamespace(device="npu:1", stream_id=20, wait_event=Mock())
     completion = object()
     order.claim(first)
     with pytest.raises(RuntimeError, match='active submission'):
         order.claim(second)
     order.release(first, completion)
+    order.claim(same)
+    same.wait_event.assert_not_called()
+    order.release(same, completion)
     order.claim(second)
     second.wait_event.assert_called_once_with(completion)
     order.release(second, completion)
+    order.claim(other_device)
+    other_device.wait_event.assert_called_once_with(completion)
+    order.release(other_device, completion)
 
 
 def test_default_mte_pull_uses_available_lanes_and_coarser_fragments():

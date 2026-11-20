@@ -108,7 +108,8 @@ class MegaMoePlan:
             return
         if stream is None:
             stream = torch.npu.current_stream(runtime_config.device)
-        key = (runtime_config.device, stream.npu_stream)
+        # Reading npu_stream can drain the PTA queue while Python holds the GIL.
+        key = (runtime_config.device, stream.stream_id)
         if key not in self._recorded_streams:
             tensors = [value for value in vars(self).values() if isinstance(value, torch.Tensor)]
             tensors.extend((self.fwd_runtime_config, self.bwd_runtime_config))

@@ -26,8 +26,8 @@ class MXFP8PhysicalWeight:
     """Borrow one phase's physical data and packed E8M0 scales without conversion."""
 
     logical_shape: tuple[int, int, int]
-    col_data: torch.Tensor
-    col_scale: torch.Tensor
+    col_data: torch.Tensor | None = None
+    col_scale: torch.Tensor | None = None
     row_data: torch.Tensor | None = None
     row_scale: torch.Tensor | None = None
 
@@ -76,11 +76,11 @@ class MXFP8ExpertWeightBinding:
         return data.view(self.logical_shape), scale.view(scale_shape)
 
     def resolve(self, phase: Literal['forward', 'backward']) -> MXFP8PhysicalWeight:
-        """Read current roots at execution time; backward requires both gathered axes."""
-        if phase not in ('forward', 'backward'):
-            raise ValueError(f'MegaMoE MXFP8 phase must be forward/backward, got {phase!r}.')
-        col_data, col_scale = self._physical_pair('col')
-        row_data = row_scale = None
+        """Resolve only the axis consumed by the current execution phase."""
+        if phase == 'forward':
+            data, scale = self._physical_pair('col')
+            return MXFP8PhysicalWeight(self.logical_shape, col_data=data, col_scale=scale)
         if phase == 'backward':
-            row_data, row_scale = self._physical_pair('row')
-        return MXFP8PhysicalWeight(self.logical_shape, col_data, col_scale, row_data, row_scale)
+            data, scale = self._physical_pair('row')
+            return MXFP8PhysicalWeight(self.logical_shape, row_data=data, row_scale=scale)
+        raise ValueError(f'MegaMoE MXFP8 phase must be forward/backward, got {phase!r}.')

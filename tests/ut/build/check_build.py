@@ -15,6 +15,7 @@
 """Fast source-build checks using temporary data and no framework or device runtime."""
 
 from collections.abc import Iterator
+from collections import namedtuple
 from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import fcntl
 import hashlib
@@ -710,7 +711,11 @@ time.sleep(30)
             return [{"name": name, "version": version} for name, version in expected.items()]
 
         probes = []
-        python = FRAMEWORK.prepare_environment(target, self.root, run, Path(sys.executable), identity_probe=probe)
+        version_info = namedtuple("VersionInfo", "major minor micro releaselevel serial")(*sys.version_info)
+        version = f"{version_info.major}.{version_info.minor}"
+        with patch.object(sys, "version", f"{version}.21 (original interpreter build)"), \
+                patch.object(sys, "version_info", version_info._replace(micro=21)):
+            python = FRAMEWORK.prepare_environment(target, self.root, run, Path(sys.executable), identity_probe=probe)
         installs = [command for command in commands if "--index-url" in command]
         self.assertEqual(len(installs), 3)
         for command in installs:
@@ -719,8 +724,10 @@ time.sleep(30)
                          [target["indexes"][name] for name in ("torch", "pta", "dependencies")])
         commands.clear()
         installation = json.loads((python.parent.parent / "ready.json").read_text())["installation"]
-        self.assertEqual(FRAMEWORK.prepare_environment(
-            target, self.root, run, Path(sys.executable), identity_probe=probe), python)
+        with patch.object(sys, "version", f"{version}.22 (updated interpreter build)"), \
+                patch.object(sys, "version_info", version_info._replace(micro=22)):
+            self.assertEqual(FRAMEWORK.prepare_environment(
+                target, self.root, run, Path(sys.executable), identity_probe=probe), python)
         self.assertFalse(commands)
         renamed = {**target, "id": "renamed"}
         renamed["indexes"] = {**target["indexes"], "dependencies_extra": ["https://new-mirror.example/simple"]}
@@ -741,6 +748,27 @@ time.sleep(30)
         with patch.object(FRAMEWORK, "verify_environment", side_effect=RuntimeError("framework changed")):
             with self.assertRaisesRegex(RuntimeError, "framework changed"):
                 FRAMEWORK.prepare_environment(target, self.root, run, Path(sys.executable))
+
+    def test_framework_python_abi_isolation(self):
+        """Reuse compatible runtimes while separating ABI, version, architecture and base paths."""
+        target = FRAMEWORK.load_targets(ROOT / "hyper_multicore/_build/frameworks.lock.json")[0]
+        base = Path(sys.executable)
+        original = FRAMEWORK.environment_key(target, base)
+        changes = (
+            patch.object(sys, "version_info", (sys.version_info.major, sys.version_info.minor + 1, 0)),
+            patch.object(FRAMEWORK.sysconfig, "get_config_var", return_value="different-soabi"),
+            patch.object(FRAMEWORK.platform, "machine", return_value="different-architecture"),
+        )
+        for change in changes:
+            with change:
+                self.assertNotEqual(FRAMEWORK.environment_key(target, base), original)
+        self.assertNotEqual(FRAMEWORK.environment_key(target, self.root / "another-python"), original)
+
+        run = BUILD.BuildContext(self.root, self.root / "native")
+        run.isolated = True
+        with patch.object(FRAMEWORK.sysconfig, "get_config_var", return_value="incompatible-soabi"):
+            with self.assertRaisesRegex(RuntimeError, "Framework Python ABI changed"):
+                BUILD.probe_identity(base, "ascend910b", run, source={}, expected={"torch": "not-installed"})
 
     def test_environment_pruning_keeps_only_selected_managed_environments(self):
         """Discard old managed installs while preserving current and unrelated data."""

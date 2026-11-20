@@ -52,11 +52,19 @@ def probe_identity(
 ) -> dict:
     """Collect framework identity and installed versions in the target process."""
     code = (
-        "import json,sys; from pathlib import Path; sys.path.insert(0,str(Path(sys.argv[1]).parent)); "
+        "import json,os,sys; from pathlib import Path; "
+        "output=os.fdopen(os.dup(1),'w'); os.dup2(2,1); "
+        "sys.path.insert(0,str(Path(sys.argv[1]).parent)); "
         "from _hyper_multicore_bootstrap import load_module; h=load_module('artifacts'); timings={}; "
+        "expected=json.loads(sys.argv[5])\n"
+        "if expected:\n"
+        "    load_module('framework_environments').verify_python_identity(json.loads(sys.argv[6]))\n"
         "info=h.build_identity(Path(sys.argv[2]),sys.argv[3],source=json.loads(sys.argv[4]),"
-        "timings=timings,expected_versions=json.loads(sys.argv[5])); "
-        "print(json.dumps({'identity':info,'timings':timings,'packages':h.installed_packages()}))"
+        "timings=timings,expected_versions=expected)\n"
+        "if expected:\n"
+        "    import torch_npu\n"
+        "print(json.dumps({'identity':info,'timings':timings,'packages':h.installed_packages()}),"
+        "file=output,flush=True)"
     )
     result = run.commands(
         [
@@ -68,6 +76,7 @@ def probe_identity(
             socs,
             json.dumps(source),
             json.dumps(expected or {}),
+            json.dumps(FRAMEWORK.python_identity() if expected else None),
         ],
         label=f"probe-{python.parent.parent.name}",
         env=FRAMEWORK.build_environment(python, isolated=run.isolated),
