@@ -245,6 +245,24 @@ def test_a3_eio_bf16_bands_preserve_unaligned_matrix_tails(hidden, intermediate)
         assert bands <= 64
 
 
+def test_a3_eio_full_fp32_bank_aligns_its_suffix_for_odd_expert_strides():
+    """The first FP32 partial begins past the last weight at a valid float address."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        local_experts=5, num_experts=10, ep_size=2, hidden_size=5113, intermediate_size=1793,
+        expert_weight_layout="EIO", partial_weight_grad_dtype="float32",
+    )
+    planner = mega_moe_adapter.HotReplicaPlanner
+    configuration = {"planner_key": (planner.__module__, planner.__qualname__)}
+    owner = mega_moe_adapter.PlacementResources(SimpleNamespace(spec=spec), configuration, False)
+    elems = spec.hidden_size * spec.intermediate_size
+    assert owner.bank_extent == 16
+    assert supports_pipeline(spec, spec.local_experts, bank_experts=owner.bank_extent)
+    offset_bytes = elems * (2 * owner.bank_extent - 4 * spec.local_experts)
+    assert offset_bytes % 4 == 0
+    assert offset_bytes >= 2 * spec.local_experts * elems
+
+
 def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident_weights():
     """Retiring the BF16 weight lease also covers FP32 dW writes into the same bank."""
     bank = (torch.empty((4, 4, 8)), torch.empty((4, 8, 2)))

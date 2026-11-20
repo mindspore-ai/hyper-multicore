@@ -335,8 +335,13 @@ class PlacementResources:
 
     @property
     def bank_extent(self):
-        """Keep one weight and one partial-gradient record per possible guest."""
-        return (3 if self._uses_fp32_partials() else 2) * self.parent.spec.local_experts
+        """Keep the guest partial suffix aligned without overlapping weights."""
+        spec = self.parent.spec
+        extent = (3 if self._uses_fp32_partials() else 2) * spec.local_experts
+        if extent % 2 and self.requires_fused_return and spec.hidden_size * spec.intermediate_size % 2:
+            # One BF16 expert record makes the end of both allocations a valid FP32 base.
+            extent += 1
+        return extent
 
     def _geometry(self, hidden, placement, tokens):
         """Cache only static BF16 geometry; retain mainline scheduling choices."""
