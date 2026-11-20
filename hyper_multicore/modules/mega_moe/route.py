@@ -670,7 +670,7 @@ def _read_dynamic_route(
 
 
 def _read_packed_dynamic_route(
-    payload: torch.Tensor, spec: MegaMoeSpec, tokens: int,
+    payload: torch.Tensor, spec: MegaMoeSpec, tokens: int, source_rows: list[int] | None = None,
 ) -> tuple[_RouteSummary, RouteMetadata] | None:
     """Submit invocation-owned offsets before reading the one collective summary."""
     if spec.ep_size * spec.num_experts <= _HOST_ROUTE_MAX_COUNTS:
@@ -686,6 +686,8 @@ def _read_packed_dynamic_route(
         return None
     rows = summary.tolist()
     result = _summarize_dynamic_rows(rows, spec, all_experts_active=rows[spec.rank_id][7] > 0)
+    if source_rows is not None:
+        source_rows.extend(row[3] for row in rows)
     metadata = _unpack_route_offsets(offsets, sizes, spec, result.capacity)
     return result, metadata.with_active_experts(result.all_experts_active, tokens, result.plan_tokens)
 

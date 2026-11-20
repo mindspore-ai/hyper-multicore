@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bind aligned Ascend950 routes to the shared MegaMoe MXFP8 executor."""
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -28,6 +29,9 @@ from .placement import ExpertPlacement
 _MINIMUM_REDUCTION = 0.25
 _MINIMUM_ROWS = 8192
 _TRAINING_MASK = 1 << 7
+_SNAPSHOT_MAX_BYTES = 256 * 1024
+_GEOMETRY_CACHE_ENTRIES = 8
+_GEOMETRY_CACHE_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,28 @@ class _MXGeometry:
     loads: tuple
     rows: tuple
     metadata: route.RouteMetadata
+
+    def storage_bytes(self):
+        """Count backing storage once for offset views and the packed quota input."""
+        views = (self.metadata,) if self.metadata._elements is None else (self.metadata, self.metadata._elements[1])
+        storages = {}
+        for tensor in (self.sorted_ids, self.counts, self.copies,
+                       *(value for view in views for value in vars(view).values() if isinstance(value, torch.Tensor))):
+            storage = tensor.untyped_storage()
+            storages[storage.data_ptr()] = storage.nbytes()
+        return sum(storages.values())
+
+
+def _snapshot_summary(gathered, spec, source_rows):
+    """Use the same exact readback for count agreement and an active B2 plan."""
+    wire = gathered.cpu().numpy()
+    counts = wire[:, 3:]
+    expert_loads = counts.sum(0, dtype=np.int64).reshape(spec.ep_size, spec.local_experts)
+    rows = np.column_stack((wire[:, :3], counts.sum(1, dtype=np.int64), counts.min(1), counts.max(1),
+                            expert_loads.sum(1), expert_loads.min(1))).tolist()
+    result = route._summarize_dynamic_rows(rows, spec, all_experts_active=rows[spec.rank_id][7] > 0)
+    source_rows.extend(row[3] for row in rows)
+    return result, counts
 
 
 def _source_indices(hidden, ids, spec):
@@ -97,7 +123,27 @@ class MXPlacementResources(PlacementResources):
         self.prefetch = None
         self._cache_key = None
         self._cached_geometry = None
+        self._geometry_cache = OrderedDict()
+        self._geometry_cache_bytes = 0
         self._previous_active = False
+        self.statistics.update(mx_full_route_readbacks=0, mx_packed_route_readbacks=0,
+                               mx_packed_home_routes=0, mx_geometry_hits=0,
+                               mx_geometry_misses=0, mx_geometry_cache_peak_bytes=0)
+
+    def _read_route(self, gathered, hidden, stream, source_rows, *, use_snapshot):
+        spec, workspace = self.parent.spec, self.parent.workspace
+        if use_snapshot:
+            if self._previous_active:
+                summary, snapshot = _snapshot_summary(gathered, spec, source_rows)
+                self.statistics["mx_full_route_readbacks"] += 1
+                return summary, None, None, snapshot
+            packed = route._read_packed_dynamic_route(gathered, spec, hidden.shape[0], source_rows)
+            if packed is not None:
+                self.statistics["mx_packed_route_readbacks"] += 1
+                return packed[0], None, packed[1], None
+        summary, raw, metadata = route._read_cached_route(gathered, spec, workspace, hidden.device,
+                                                          source_rows, stream=stream)
+        return summary, raw, metadata, None
 
     def prepare_route(self, hidden, ids, probs, supplied_counts, mask, *, training):
         """Gather logical counts once and materialize only the route selected for this invocation."""
@@ -121,12 +167,17 @@ class MXPlacementResources(PlacementResources):
         if work is not None:
             work.wait()
         source_rows = []
-        summary, raw, metadata = route._read_cached_route(gathered, spec, workspace, hidden.device,
-                                                          source_rows, stream=stream)
+        use_snapshot = (training and spec.auto_tokens and spec.ep_size * spec.num_experts > route._HOST_ROUTE_MAX_COUNTS
+                        and gathered.numel() * gathered.element_size() <= _SNAPSHOT_MAX_BYTES)
+        summary, raw, metadata, snapshot = self._read_route(gathered, hidden, stream, source_rows,
+                                                            use_snapshot=use_snapshot)
         self.statistics["invocations"] += 1
-        geometry = self._select(hidden, gathered, summary, raw, source_rows, mask, stream)
+        geometry = self._select(hidden, gathered, summary, raw, source_rows, mask, stream,
+                                snapshot=snapshot, use_snapshot=use_snapshot)
         self._previous_active = geometry is not None
         if geometry is None:
+            if metadata is not None and use_snapshot:
+                self.statistics["mx_packed_home_routes"] += 1
             child = self.geometries.get(self.config.replica_slots_per_rank)
             received = summary.maximum
             if child is not None:
@@ -141,7 +192,7 @@ class MXPlacementResources(PlacementResources):
         self.statistics["placements"] += 1
         return self._prepare_virtual(hidden, ids, gathered, geometry, summary.plan_tokens, inverse)
 
-    def _select(self, hidden, gathered, summary, raw, source_rows, mask, stream):
+    def _select(self, hidden, gathered, summary, raw, source_rows, mask, stream, *, snapshot=None, use_snapshot=False):
         spec = self.parent.spec
         tokens, peak = summary.plan_tokens, summary.maximum
         average = (sum(source_rows) + spec.ep_size - 1) // spec.ep_size
@@ -149,15 +200,26 @@ class MXPlacementResources(PlacementResources):
             return None
         if self.nodes is None:
             self.nodes = _rank_nodes(spec.ep_group, spec.ep_size)
-        if raw is None:
+        if use_snapshot and snapshot is None:
+            snapshot = gathered.cpu().numpy()[:, 3:]
+            self.statistics["mx_full_route_readbacks"] += 1
+        if snapshot is None and raw is None:
             raw = gathered.tolist()
-        counts = tuple(tuple(row[3:]) for row in raw)
+        counts = None if snapshot is not None else tuple(tuple(row[3:]) for row in raw)
         training = bool(mask & _TRAINING_MASK)
         credit = spec.intermediate_size // 2 if training else 0
         use_peak_policy = (spec.ep_size, spec.num_experts, spec.hidden_size, spec.intermediate_size,
                            spec.top_k, tokens) == (16, 96, 5120, 1792, 8, 4096)
-        key = counts, credit, use_peak_policy, stream
+        key = (snapshot.tobytes() if snapshot is not None else counts,
+               credit, use_peak_policy, tokens, hidden.shape[0], stream)
+        cache = self._geometry_cache if use_snapshot else None
+        if cache is not None and key in cache:
+            cache.move_to_end(key)
+            self.statistics["mx_geometry_hits"] += 1
+            return cache[key][0]
         if self._cache_key != key:
+            if counts is None:
+                counts = tuple(map(tuple, snapshot.tolist()))
             capacity = tokens * spec.ep_size * spec.top_k
             if use_peak_policy:
                 plan = build_mx_peak_plan(counts, self.config, capacity=capacity, minimum_rows=_MINIMUM_ROWS,
@@ -178,7 +240,29 @@ class MXPlacementResources(PlacementResources):
             self._cached_geometry = (_render_geometry(plan, spec, hidden.shape[0], tokens, hidden.device)
                                      if plan.transfers else None)
             self._cache_key = key
+            if cache is not None:
+                self._retain_geometry(key, self._cached_geometry)
+                self.statistics["mx_geometry_misses"] += 1
         return self._cached_geometry
+
+    def _retain_geometry(self, key, geometry):
+        size = geometry.storage_bytes() if geometry is not None else 0
+        if size > _GEOMETRY_CACHE_BYTES:
+            return
+        cache = self._geometry_cache
+        while len(cache) >= _GEOMETRY_CACHE_ENTRIES or self._geometry_cache_bytes + size > _GEOMETRY_CACHE_BYTES:
+            _, (_, released) = cache.popitem(last=False)
+            self._geometry_cache_bytes -= released
+        cache[key] = geometry, size
+        self._geometry_cache_bytes += size
+        self.statistics["mx_geometry_cache_peak_bytes"] = max(self.statistics["mx_geometry_cache_peak_bytes"],
+                                                               self._geometry_cache_bytes)
+
+    def close(self):
+        super().close()
+        self._geometry_cache.clear()
+        self._geometry_cache_bytes = 0
+        self._cache_key = self._cached_geometry = None
 
     def _prepare_virtual(self, hidden, ids, gathered, geometry, tokens, inverse):
         spec = self.parent.spec
