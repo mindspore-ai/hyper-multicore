@@ -33,7 +33,7 @@ from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
 from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
 from .checkpoint import is_checkpointing
 from .placement import placement_receive_limit
-from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
+from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline, uses_wider_gradient_bands
 from .planner import HotReplicaPlanner
 from .shmem_transfer import ExpertWeightBinding, SharedExpertPool, _expert_bank_bytes
 
@@ -112,9 +112,10 @@ def _get_mega_bank(
     """Register a HotReplica allocation in the existing MegaMoE heap transaction."""
     spec = parent.spec
     manager = parent.heap_manager
-    dedicated = pipeline and owner.source_bound is None
+    dedicated = pipeline and owner.dedicated_pipeline
     owner_id = id(owner) if dedicated or pool_type is not SharedExpertPool else None
-    key = (pool_type, spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id, pipeline)
+    extent = owner.bank_extent if pipeline else None
+    key = (pool_type, spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id, extent)
     with manager.access():
         banks = _SHARED_BANKS.setdefault(manager, weakref.WeakValueDictionary())
         pool = banks.get(key)
@@ -134,7 +135,7 @@ def _get_mega_bank(
             if pipeline:
                 if not dedicated:
                     pool.pipeline = ReplicaPipeline(pool, shared_layouts=True)
-                pool.bank_experts = owner.bank_extent
+                pool.bank_experts = extent
                 signature += (pool.bank_experts,)
             layout = _WorkspaceLayout(pool.allocation_bytes, signature, spec.local_experts)
             added = manager.reserve((*reservations, (reservation, layout)), allow_resize=True,
@@ -205,6 +206,7 @@ class PlacementResources:
         self.bf16_partials = False
         self.prefer_bf16_partials = False
         self.pipeline_enabled = False
+        self.dedicated_pipeline = False
         if can_split_weights:
             fp32_partials = self._uses_fp32_partials()
             self.bf16_partials = bf16_partials and not fp32_partials
@@ -213,6 +215,12 @@ class PlacementResources:
             self.pipeline_enabled = (
                 self.bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent, bf16_partials=True)
                 or not self.prefer_bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
+            )
+            # Keep the default path's resident weights and share banks for
+            # optional schedules, custom plans and larger projections.
+            self.dedicated_pipeline = (
+                supported and not spec.batch_experts and self.source_bound is None
+                and not uses_wider_gradient_bands(spec)
             )
         self.reuses_parent_workspace = (
             (self.pipeline_enabled or supported and not spec.batch_experts) and self.source_bound is None

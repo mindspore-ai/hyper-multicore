@@ -28,10 +28,21 @@ def projection_shapes(hidden, intermediate, layout):
     return (hidden, 2 * intermediate), (intermediate, hidden)
 
 
+def _target_band_rows(columns):
+    return max(1, _BAND_BYTES // (columns * 4))
+
+
 def _band_layout(shape):
     rows, columns = shape
-    rows_per_band = max((rows + _MAX_BANDS - 1) // _MAX_BANDS, min(rows, _BAND_BYTES // (columns * 4)))
+    rows_per_band = min(rows, max((rows + _MAX_BANDS - 1) // _MAX_BANDS, _target_band_rows(columns)))
     return rows_per_band, (rows + rows_per_band - 1) // rows_per_band
+
+
+def uses_wider_gradient_bands(spec):
+    """Identify projections requiring more rows per signal than the default band budget."""
+    return any(rows > _MAX_BANDS * _target_band_rows(columns)
+               for rows, columns in projection_shapes(spec.hidden_size, spec.intermediate_size,
+                                                       spec.expert_weight_layout))
 
 
 def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):

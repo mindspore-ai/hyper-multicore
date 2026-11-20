@@ -149,6 +149,7 @@ def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layo
     parent = SimpleNamespace(spec=spec, heap_manager=manager)
     owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
     owner.source_bound, owner.parent = bound, parent
+    owner.dedicated_pipeline = bound is None
     virtual = ({}, mega_moe_adapter._WorkspaceLayout(128, (), 32768))
     extent = 3 * home if bound is not None or partial_dtype == "float32" else 2 * home
     with (patch("torch.distributed.get_rank", return_value=0),
@@ -163,6 +164,34 @@ def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layo
     assert bank_layout.required_bytes == bank_bytes + 4 * pool.pipeline.signal_words + 512
     pool.leased_banks = tuple(torch.empty(shape, device="meta") for shape in pool._bank_shapes())
     assert all(bank.shape[0] == 2 * home for bank in pool._generic_banks())
+
+
+def test_optional_replica_banks_share_only_matching_partial_formats():
+    """Reuse one bank across serial owners with the same physical gradient extent."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=True, dispatch_mode="push", transport_engine="mte",
+        ep_group=None, ep_size=4, local_experts=6, num_experts=24, hidden_size=256,
+        intermediate_size=128, num_cube_cores=24, expert_weight_layout="EIO",
+        partial_weight_grad_dtype=None,
+    )
+    hidden = torch.empty((0, spec.hidden_size), dtype=torch.bfloat16)
+    manager = _HeapManager(None, hidden)
+    planner = mega_moe_adapter.HotReplicaPlanner
+    specification = {"planner_key": (planner.__module__, planner.__qualname__)}
+    with (patch("torch.distributed.get_rank", return_value=0),
+          patch("torch.distributed.get_world_size", return_value=spec.ep_size),
+          patch.object(manager, "reserve"), patch.object(manager, "bind"),
+          patch.object(SharedExpertPool, "allocate")):
+        owners, pools = [], []
+        for layout, partial_dtype in [("EIO", None), ("EOI", None), ("EOI", "float32")]:
+            current = SimpleNamespace(**{**vars(spec), "expert_weight_layout": layout,
+                                         "partial_weight_grad_dtype": partial_dtype})
+            parent = SimpleNamespace(spec=current, heap_manager=manager)
+            owners.append(mega_moe_adapter.PlacementResources(parent, specification, False, bf16_partials=True))
+            pools.append(mega_moe_adapter._get_mega_bank(hidden, parent, owners[-1], pipeline=True))
+    assert pools[0] is pools[1]
+    assert [pool.bank_experts for pool in pools] == [12, 12, 18]
+    assert pools[0].pipeline.shared_layouts
 
 
 @pytest.mark.parametrize("home", [4, 6, 8])
