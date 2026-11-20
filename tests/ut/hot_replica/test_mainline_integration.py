@@ -367,6 +367,35 @@ def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
     assert owner.pool is None and not owner.geometries
 
 
+@pytest.mark.parametrize("budget", [2, 6])
+def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget):
+    spec = SimpleNamespace(
+        architecture=3510, dispatch_mode="push", ep_size=2, local_experts=6, top_k=6, hidden_size=5120,
+        intermediate_size=1792, ep_group=object(), rank_id=0, num_cube_cores=32,
+        apply_probs_before_fc2=False, partial_weight_grad_dtype="float32",
+    )
+    planner = HotReplicaPlanner(replica_slots_per_rank=budget)
+    settings = {"planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__,
+                                planner.configuration_key()),
+                "replica_slots_per_rank": budget}
+    placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
+    placement.rank_nodes = (0, 1)
+    hidden = torch.empty((1, 5120), dtype=torch.bfloat16).expand(4096, 5120)
+    ids = torch.arange(6, dtype=torch.int32).repeat(4096, 1)
+    gathered = torch.tensor([[0] * 3 + [4096] * 6 + [0] * 6] * 2, dtype=torch.int32)
+    inverse = torch.argsort(torch.argsort(ids.flatten(), stable=True))
+    with (
+        patch.object(planner, "plan", side_effect=AssertionError("A3 transfer estimate used on A5")),
+        patch.object(placement, "bind", side_effect=lambda _hidden, plan, **_: plan),
+    ):
+        selected = placement.select(
+            hidden, ids, gathered, route._RouteSummary(4096, 4096, 49152), [24576, 24576], inverse,
+            13, planner=planner, host_rows=gathered.tolist(),
+        )
+    assert 1 <= selected.borrowed_capacity <= budget
+    assert sum(expert >= 0 for expert in selected.copies_by_rank[1]) == min(budget, 3)
+
+
 def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     """Reject stale parameters across ranks, even if the token route matches."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")

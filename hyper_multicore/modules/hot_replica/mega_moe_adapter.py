@@ -28,8 +28,10 @@ from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_c
 from hyper_multicore.scheduler.config import mega_moe_event_capacity
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
+from ._planner.planner import build_expert_replica_plan
+from .bounded_placement import BoundedPlacement, PlacementWire, _rank_nodes, supports_bounded_placement
 from .checkpoint import is_checkpointing
+from .placement import render_placement
 from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline, uses_wider_gradient_bands
 from .planner import HotReplicaPlanner
 from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
@@ -140,6 +142,8 @@ class PlacementResources:
         self.geometries = {}
         self.replica_slots_per_rank = specification.get("replica_slots_per_rank")
         built_in = _uses_builtin_planner(specification)
+        self.uses_a5_quotas = built_in and parent.spec.architecture == 3510 and parent.spec.dispatch_mode == "push"
+        self.rank_nodes = None
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
         supported = built_in and can_split_weights
@@ -199,7 +203,7 @@ class PlacementResources:
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
                                    host_rows=host_rows)
             if self.bounded is None:
-                placement = planner.plan(request)
+                placement = self._plan_a5(request, host_rows) if self.uses_a5_quotas else planner.plan(request)
                 if placement is not None and self.pipeline_enabled:
                     placement = _bind_custom_copy_rows(spec, placement)
             else:
@@ -220,6 +224,30 @@ class PlacementResources:
             return None
         placement = self.bounded.select(hidden, ids, gathered[:, 3:], source_rows, inverse, projections, snapshot)
         return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
+
+    def _plan_a5(self, request, host_rows):
+        """Use bounded quotas with the ordinary Ascend950 BF16 route renderer."""
+        spec = self.parent.spec
+        peak = request.maximum_received
+        average = (request.total_rows + spec.ep_size - 1) // spec.ep_size
+        saved = peak - average
+        if saved <= 0 or (4 * saved < peak if request.training else 5 * saved < 2 * peak):
+            return None
+        if self.rank_nodes is None:
+            self.rank_nodes = _rank_nodes(spec.ep_group, spec.ep_size)
+        counts = ([row[3:] for row in host_rows] if host_rows is not None else
+                  request.counts_by_source.tolist())
+        budget = self.replica_slots_per_rank or spec.local_experts
+        plan = build_expert_replica_plan(
+            counts, min(budget, spec.local_experts), minimum_replica_rows=1024,
+            minimum_load_reduction=0.25 if request.training else 0.4,
+            capacity_limit=peak, receive_capacity=peak, rank_nodes=self.rank_nodes,
+            transfer_row_credit=spec.intermediate_size // 2 if request.training else 0,
+        )
+        if not plan.transfers:
+            return None
+        return render_placement(request.hidden, request.ids, plan, request.rank,
+                                source_inverse=request.source_inverse)
 
     def request(
         self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: _RouteSummary,

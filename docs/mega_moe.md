@@ -167,6 +167,8 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 - `ascend950` 的 BF16 Push 和 Pull 使用 arch35 副本 bank 和独立的权重预取、梯度归并。
   Pull 将实际选中的路由发布到对称源区，由执行 rank 拉取 token。
   激活副本时以 FP32 计算和归并原属专家及借用专家的局部权重梯度，写回时转换为公开参数类型。
+  Push 的内置策略按已交换的计数选择有界配额；BF16 可通过
+  `HotReplicaPlanner(replica_slots_per_rank=2)` 设置每 rank 的借用上限。
 - `ascend950` 支持 MXFP8 EIO Push，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
   并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
   `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，
