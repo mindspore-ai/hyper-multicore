@@ -160,6 +160,11 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 
 - `ascend910_93` 支持 BF16 EIO 和 EOI。A3 MTE Push 在槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。
+  对指定负载，可用 `HotReplicaPlanner(receive_capacity_percent=102)` 进一步限制每 rank 的计划接收行数。
+  参数为不小于 `100` 的整数。按当前 EP 实际平均路由行数取整，再按 `128` 行向上对齐，并取与内置上限的较小值。
+  该选项适用于 BF16 Push。计划在分配前和分配后均检查收益，无法在给定副本预算内满足上限或代价过高时继续使用原属专家路由。
+  `receive_capacity_percent="auto"` 会在内置上限以及按实际平均行数计算的 `110%` 和 `102%` 间评估放置。
+  以计划的最忙 rank 行数、实际权重复制及梯度返回估算代价，再为最优的正收益计划生成派发表。
   Reentrant checkpoint 在初次前向保存放置。重算时，EP 各 rank 的 Top-K 顺序、Router 提供的精确计数和重放状态一致后复用该放置。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
@@ -402,6 +407,11 @@ A3 BF16 共用有界副本规划的串行层可在同一个物理 workspace 中�
 `scope(True)` 进入原始前向与重算。调用方需将两者绑定到同一次 checkpoint 调用，启用梯度，并以一次反向消费完整重算。
 原始前向在 workspace 租约内消费 Combine 结果。重算为反向保存完整的 dispatch 和 Combine 张量，
 包括重新规划路由的调用。需要直接使用原始前向保存张量的调用沿用默认策略。
+
+A3 BF16 MTE Push 的融合副本还可通过 `ReplayCheckpoint(..., guest_snapshot_bytes=...)` 保存原始前向的 guest 权重。
+该参数是每次专家调用在每 rank 上的快照字节上限，默认为 `0`。多个在途 checkpoint 分别持有各自的快照。
+重算时，只有 EP 全组的权重版本、路由和快照就绪状态均通过一致性检查，才恢复本地副本。
+快照超预算或路由、参数变化时沿用该次调用的正常权重传输。此选项可独立于前向拷贝延期启用。
 
 GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图引用仍会占用内存，heap 受显式预算或物理 HBM 容量约束。
 

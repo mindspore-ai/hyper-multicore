@@ -222,7 +222,10 @@ class PlacementResources:
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Choose a virtual route only after the existing count exchange validates it."""
         spec = self.parent.spec
-        if self.bounded is None or checkpointing or spec.batch_experts:
+        receive_capacity_percent = self.specification.get("receive_capacity_percent")
+        if self.bounded is None or checkpointing or spec.batch_experts or receive_capacity_percent is not None:
+            if snapshot is not None:
+                host_rows = snapshot.wire.tolist()
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
                                    host_rows=host_rows)
             if self.bounded is None:
@@ -230,10 +233,10 @@ class PlacementResources:
                 if placement is not None and (self.pipeline_enabled or self.requires_fused_return):
                     placement = _bind_custom_copy_rows(spec, placement, fused_return=self.requires_fused_return)
             else:
-                def build(current, target):
+                def build(current, target, **options):
                     return self.bounded.select(
                         hidden, ids, current.counts_by_source, source_rows, inverse, 0, snapshot,
-                        capacity_target=target, host_rows=host_rows,
+                        capacity_target=target, host_rows=host_rows, **options,
                     )
 
                 placement = planner._plan_by_cost(request, build)
@@ -282,7 +285,8 @@ class PlacementResources:
         spec = self.parent.spec
         replay = is_checkpointing()
         key = (
-            (autograd_mask, replay, tuple(tuple(row) for row in host_rows))
+            (autograd_mask, replay, hidden.shape[-1], hidden.element_size(), ids.shape[-1],
+             spec.intermediate_size, spec.num_cube_cores, tuple(tuple(row) for row in host_rows))
             if host_rows is not None else None
         )
         return PlacementRequest(

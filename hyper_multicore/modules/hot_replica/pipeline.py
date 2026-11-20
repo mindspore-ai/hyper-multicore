@@ -153,7 +153,7 @@ class ReplicaPipeline:
                       for slot, source in enumerate(row[:slots]) if source >= 0 and source // home == pool.rank)
         return slots, received, owned
 
-    def begin(self, weights, binding, backward):
+    def begin(self, weights, binding, backward, *, replay_snapshot=None):
         """Publish projection epochs directly to their current guest consumers."""
         pool = self.pool
         self.epoch += 1
@@ -176,13 +176,15 @@ class ReplicaPipeline:
                 binding.prefetch_table = _words_tensor(
                     (slots, int(backward), pool.rank, pool.ranks, self.storage.data_ptr(),
                      *elements, len(owned), *received, *edges), pool.device)
-            elif binding.snapshot is None:
-                self._publish_weights(weights, binding, ready, rank_lines, backward)
             else:
-                pool.restore_snapshot(binding.snapshot, 0)
-                ready.fill_(self.epoch)
-                stats = pool.statistics
-                stats["fused_snapshot_restores"] = stats.get("fused_snapshot_restores", 0) + 1
+                snapshot = binding.snapshot if replay_snapshot is None else replay_snapshot
+                if snapshot is None:
+                    self._publish_weights(weights, binding, ready, rank_lines, backward)
+                else:
+                    pool.restore_snapshot(snapshot, 0)
+                    ready.fill_(self.epoch)
+                    stats = pool.statistics
+                    stats["fused_snapshot_restores"] = stats.get("fused_snapshot_restores", 0) + 1
             binding.weight_epoch = self.epoch
             self.resident = binding.token
         binding.launch = (_LAUNCH_MAGIC, pool.local_experts, binding.weight_epoch,

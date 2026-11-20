@@ -353,6 +353,39 @@ def test_fused_bank_rebuilds_flags_and_restores_a_retained_binding(home, layout)
         assert pool.pipeline.epoch == 1
 
 
+def test_guest_snapshot_restores_the_selected_invocation_without_changing_the_binding():
+    bank = (torch.full((4, 4, 8), 2, dtype=torch.bfloat16), torch.full((4, 8, 2), 3, dtype=torch.bfloat16))
+    pool = SimpleNamespace(local_experts=2, ranks=2, rank=0, hidden=8, intermediate=2, blocks=2,
+                           expert_weight_layout="EOI", leased_banks=bank, generation=1, statistics={})
+    pool.pipeline = ReplicaPipeline(pool)
+    pool.pipeline.storage = torch.empty(pool.pipeline.signal_words, dtype=torch.int32)
+    placement = SimpleNamespace(borrowed_capacity=2, published_slots=1, copies_by_rank=((2, -1), (-1, -1)))
+    binding = ExpertWeightBinding(pool, placement, "EOI", generation=1, fused=True)
+    with patch("torch.npu.Event"), patch("torch.npu.current_stream"):
+        assert binding.capture_snapshot(bank, maximum_bytes=1) is None
+        first = binding.capture_snapshot(bank, maximum_bytes=bank[0][0].nbytes + bank[1][0].nbytes)
+        for weight in bank:
+            weight.fill_(9)
+        second = binding.capture_snapshot(bank)
+    assert binding.snapshot is None and binding.generation == 1
+
+    def restore(snapshot, start):
+        for weight, tail in zip(bank, snapshot[0]):
+            weight[start:start + tail.shape[0]].copy_(tail)
+
+    with patch.object(pool.pipeline, "_publish_weights") as publish:
+        pool.restore_snapshot = Mock(side_effect=restore)
+        for snapshot, expected in ((second, (9, 9)), (first, (2, 3))):
+            pool.pipeline.begin(bank, binding, backward=False, replay_snapshot=snapshot)
+            assert tuple(int(weight[0, 0, 0]) for weight in bank) == expected
+        pool.pipeline.begin(bank, binding, backward=True)
+        publish.assert_not_called()
+        pool.pipeline.invalidate()
+        pool.pipeline.begin(bank, binding, backward=True)
+        publish.assert_called_once()
+    assert pool.restore_snapshot.call_count == 2 and binding.snapshot is None
+
+
 @pytest.mark.parametrize("layout", ["EIO", "EOI"])
 @pytest.mark.parametrize(("used", "batch_experts", "width"), [(4, False, 4), (5, False, 6),
                                                             (6, False, 6), (5, True, 6)])

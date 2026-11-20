@@ -15,7 +15,7 @@
 """BF16 autograd launch and restoration over the common invocation lifecycle."""
 from typing import Any, TYPE_CHECKING
 import torch
-from hyper_multicore.modules.hot_replica.checkpoint import forward_copy_phase
+from hyper_multicore.modules.hot_replica.checkpoint import forward_copy_phase, guest_weight_replay
 
 from ...route import PreparedTopKRoute, restore_topk_output
 
@@ -89,6 +89,10 @@ def forward(
     checkpoint_replay = _checkpoint_replay(resources.spec)
     if checkpoint_replay is not None:
         options["checkpoint_replay"] = checkpoint_replay
+    if binding is not None and binding.fused and resources.spec.architecture == 2201:
+        guest_weights = guest_weight_replay(record)
+        if guest_weights is not None:
+            options["guest_weights"] = guest_weights
     integrated_unpermute = pull or before_fc2 or checkpoint_replay is not None
     output = execute_mega_moe_with_permutation(
         hidden_flat, topk_ids, *weights, route, plan, resources.workspace,

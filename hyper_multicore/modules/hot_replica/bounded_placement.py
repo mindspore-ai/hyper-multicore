@@ -167,6 +167,7 @@ class BoundedPlacement:
         inverse: torch.Tensor | None, projections: int, snapshot: PlacementWire | None = None,
         *, capacity_target: int | None = None,
         host_rows: list[list[int]] | None = None,
+        alternatives=(), score=None,
     ) -> ExpertPlacement | None:
         """Map the current route through reusable quotas for the agreed receive budget."""
         spec = self.spec
@@ -180,7 +181,8 @@ class BoundedPlacement:
 
         transfers = None
         if capacity_target is not None:
-            plan = build_capacity_plan(wire, capacity_target, replica_slots_per_rank=self.replica_slots_per_rank)
+            plan = build_capacity_plan(wire, capacity_target, replica_slots_per_rank=self.replica_slots_per_rank,
+                                       alternatives=alternatives, score=score)
             if plan is None or not plan.transfers:
                 return None
             # The checkpoint owns this invocation's descriptors. Use the usual

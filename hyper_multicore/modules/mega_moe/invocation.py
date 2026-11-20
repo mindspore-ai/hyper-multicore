@@ -81,7 +81,7 @@ def prepare_expert_invocation(
                             hidden, virtual_ids, selected.spec, selected.workspace,
                         )
                     route = replace(route, routed_tokens=rows, unpermute_mapping=mapping)
-                yield replace(route, checkpoint_record=record) if counts is None else route
+                yield replace(route, checkpoint_record=record) if counts is None or record.guest_snapshot_bytes else route
                 return
             if replay:
                 placement.statistics["route_replay_misses"] += 1
@@ -129,7 +129,7 @@ def _record_checkpoint_route(route, record, counts, ids):
         return route
     record.route = replace(route, routed_tokens=None, unpermute_mapping=None)
     if counts is not None:
-        return route
+        return replace(route, checkpoint_record=record) if record.guest_snapshot_bytes else route
     record.ids = ids.detach().clone()
     record.weight_binding = route.weight_binding
     return replace(route, checkpoint_record=record)
