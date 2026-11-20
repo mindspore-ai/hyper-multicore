@@ -159,9 +159,10 @@ class PlacementResources:
         self.geometries = {}
         self.replica_slots_per_rank = specification.get("replica_slots_per_rank")
         built_in = _uses_builtin_planner(specification)
-        self.uses_a5_quotas = built_in and parent.spec.architecture == 3510 and parent.spec.dispatch_mode == "push"
-        self.rank_nodes = None
         spec = parent.spec
+        self.uses_a5_quotas = (built_in and spec.architecture == 3510
+                               and (spec.dispatch_mode == "push" or spec.transport_engine == "udma"))
+        self.rank_nodes = None
         can_split_weights = supports_bounded_placement(spec)
         self.requires_fused_return = can_split_weights and spec.expert_weight_layout == "EIO"
         supported = built_in and can_split_weights

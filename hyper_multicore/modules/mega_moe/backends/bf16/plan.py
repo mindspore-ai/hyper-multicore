@@ -324,9 +324,9 @@ def build_mega_moe_plan(
     if replica_pipeline and (spec.architecture not in (2201, 3510) or spec.batch_experts):
         raise ValueError("BF16 replica pipeline requires per-expert GMMs")
     if replica_pipeline and spec.architecture == 3510 and (
-        spec.dispatch_mode != "push" or weight_grad_dtype != torch.float32
+        weight_grad_dtype != torch.float32 or (spec.dispatch_mode == "pull" and spec.transport_engine != "udma")
     ):
-        raise ValueError("Ascend950 replica pipeline requires Push and FP32 partial gradients")
+        raise ValueError("Ascend950 replica pipeline requires FP32 partial gradients and UDMA for Pull")
     if reserve_merge_workers and not replica_pipeline:
         raise ValueError("A3 replica merge workers require a split-weight replica plan")
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(

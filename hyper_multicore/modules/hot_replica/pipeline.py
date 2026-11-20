@@ -57,7 +57,7 @@ def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):
     """Limit guest weights and dW to disjoint bank spans."""
     h, i = spec.hidden_size, spec.intermediate_size
     if spec.architecture == 3510:
-        if (h * i % 16 or bf16_partials or spec.dispatch_mode != "push"
+        if (h * i % 16 or bf16_partials or (spec.dispatch_mode == "pull" and spec.transport_engine != "udma")
                 or spec.batch_experts or spec.num_cube_cores <= REPLICA_HELPERS):
             return 0
         extent = 3 * spec.local_experts if bank_experts is None else bank_experts

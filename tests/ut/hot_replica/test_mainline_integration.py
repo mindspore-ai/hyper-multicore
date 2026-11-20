@@ -412,9 +412,11 @@ def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
 
 
 @pytest.mark.parametrize("budget", [2, 6])
-def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget):
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget, dispatch_mode):
     spec = SimpleNamespace(
-        architecture=3510, dispatch_mode="push", ep_size=2, local_experts=6, top_k=6, hidden_size=5120,
+        architecture=3510, dispatch_mode=dispatch_mode, transport_engine="udma", ep_size=2, num_experts=12,
+        local_experts=6, top_k=6, hidden_size=5120,
         intermediate_size=1792, ep_group=object(), rank_id=0, num_cube_cores=32,
         apply_probs_before_fc2=False, partial_weight_grad_dtype="float32", batch_experts=False,
     )
@@ -439,6 +441,16 @@ def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget):
         )
     assert 1 <= selected.borrowed_capacity <= budget
     assert sum(expert >= 0 for expert in selected.copies_by_rank[1]) == min(budget, 3)
+
+
+def test_a5_bf16_mte_pull_uses_the_generic_planner():
+    """Keep the MTE path on its existing admission and separate bank protocol."""
+    spec = SimpleNamespace(architecture=3510, dispatch_mode="pull", transport_engine="mte", num_experts=12, ep_size=2)
+    planner = HotReplicaPlanner()
+    settings = {"planner_key": (type(planner).__module__, type(planner).__qualname__, planner.configuration_key())}
+    placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
+    assert not placement.uses_a5_quotas
+    assert not placement.pipeline_enabled
 
 
 def test_checkpoint_agrees_on_version_and_activation(monkeypatch):

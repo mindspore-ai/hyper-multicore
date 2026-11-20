@@ -100,12 +100,13 @@ def test_default_mte_pull_uses_available_lanes_and_coarser_fragments():
     assert all(len(owners) == 2 for peer, owners in by_peer.items() if peer != spec.rank_id)
 
 
+@pytest.mark.parametrize("mode", ["push", "pull"])
 @pytest.mark.parametrize("ep,cubes", [(4, 28), (32, 32), (64, 36)])
-def test_bf16_replica_helpers_preserve_math_and_transport_work(ep, cubes):
+def test_bf16_replica_helpers_preserve_math_and_transport_work(ep, cubes, mode):
     spec = MegaMoeSpec(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
                        num_experts=ep * 8, top_k=8, initial_capacity_factor=1.25,
                        receive_capacity=40960, ep_size=ep, ep_group=None, rank_id=0,
-                       num_cube_cores=cubes, dispatch_mode="push", dispatch_split=512, combine_split=512,
+                       num_cube_cores=cubes, dispatch_mode=mode, dispatch_split=512, combine_split=512,
                        architecture=3510, transport_engine="udma", ready_depth=0)
     ordinary = _build_runtime_artifacts(spec, torch.float32)
     replica = _build_runtime_artifacts(spec, torch.float32, replica_pipeline=True, reserve_merge_workers=True)
