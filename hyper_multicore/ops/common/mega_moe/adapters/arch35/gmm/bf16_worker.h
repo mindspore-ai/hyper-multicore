@@ -86,8 +86,12 @@ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_
     c += p.c * output_bytes;
   }
   if (start == end) {
-    if (ta) {
-      // Empty expert still owns a complete zero weight gradient. Cache lines are disjoint.
+    // The launch stream has already initialized empty home gradients.
+    // Only a guest with an owner can have its partial read remotely.
+    const bool needs_zero = ta && (gradient == nullptr ||
+        (expert >= gradient->home &&
+         MulticoreMoE::GradientBandGuestOwners(gradient)[expert - gradient->home] != UINT64_MAX));
+    if (needs_zero) {
       AscendC::GlobalTensor<uint32_t> output;
       const uint64_t words = p.m * p.n * output_bytes / sizeof(uint32_t);
       output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(c), words);

@@ -41,6 +41,12 @@ __aicore__ inline uint64_t GradientBandOwnerScratch(const __gm__ ReplicaGradient
   return mapping[expert];
 }
 
+__aicore__ inline const __gm__ uint64_t *GradientBandGuestOwners(
+    const __gm__ ReplicaGradientBandRecord *record) {
+  const auto edges = reinterpret_cast<const __gm__ ReplicaGradientBandEdge *>(record + 1);
+  return reinterpret_cast<const __gm__ uint64_t *>(edges + record->owned) + record->home;
+}
+
 __aicore__ inline __gm__ ReplicaGradientBandRecord *GetReplicaGradientBands(
     const __gm__ ReplicaLaunch *launch, uint32_t projection) {
   if (launch == nullptr || launch->gradient == 0) return nullptr;
@@ -84,8 +90,7 @@ __aicore__ inline void PublishA5ReplicaGradientReady(const __gm__ ReplicaGradien
   using namespace MulticoreRuntime;
   if (record == nullptr || record->guest_ready == 0 || record->rank >= ep || record->slots > record->home ||
       record->owned > ep * record->slots || record->bands != 1) AscendC::Trap();
-  const auto edges = reinterpret_cast<const __gm__ ReplicaGradientBandEdge *>(record + 1);
-  const auto owners = reinterpret_cast<const __gm__ uint64_t *>(edges + record->owned) + record->home;
+  const auto owners = GradientBandGuestOwners(record);
   for (uint32_t slot = worker; slot < record->slots; slot += kA5ReplicaHelpers) {
     const uint64_t peer = owners[slot];
     if (peer == UINT64_MAX) continue;
@@ -292,8 +297,7 @@ __aicore__ inline void ReturnBf16ReplicaGradientBands(const __gm__ ReplicaGradie
 __aicore__ inline void WaitReplicaGradientAcks(const __gm__ ReplicaGradientBandRecord *record) {
 #if !defined(__DAV_CUBE__) && !defined(__DAV_C220_CUBE__)
   using namespace MulticoreRuntime;
-  const auto edges = reinterpret_cast<const __gm__ ReplicaGradientBandEdge *>(record + 1);
-  const auto owners = reinterpret_cast<const __gm__ uint64_t *>(edges + record->owned) + record->home;
+  const auto owners = GradientBandGuestOwners(record);
   for (uint32_t slot = 0; slot < record->slots; ++slot) {
     if (owners[slot] != UINT64_MAX) {
       const uint64_t line = owners[slot] * record->home + slot;
