@@ -625,6 +625,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         workspace_claimed: bool,
         weight_binding: Any = None,
         checkpoint_replay: bool | None = None,
+        guest_weights: Any = None,
     ) -> Any:
         """Launch the BF16 forward op and save owned backward inputs.
 
@@ -641,6 +642,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             topk_weights: Optional Router weights for pull source-output gradients.
             workspace_claimed: Whether the caller owns the forward workspace lease.
             checkpoint_replay: Original or replay phase of an opted-in checkpoint.
+            guest_weights: Checkpoint record and phase for optional guest weight reuse.
 
         Returns:
             Owned token-major rows with integrated unpermutation, otherwise expert-major rows.
@@ -669,9 +671,13 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         ctx.weight_binding = weight_binding
         owner_weights = weight1, weight2
         acquired = False
+        guest_record, is_replay = guest_weights if guest_weights is not None else (None, False)
         try:
             if weight_binding is not None:
-                weight1, weight2 = weight_binding.acquire(owner_weights)
+                if is_replay:
+                    weight1, weight2 = weight_binding.acquire(owner_weights, replay_snapshot=guest_record.guest_weight_snapshot)
+                else:
+                    weight1, weight2 = weight_binding.acquire(owner_weights)
                 acquired = True
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
@@ -693,6 +699,15 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 weight2,
                 execution, stream=workspace.lease_stream,
                 runtime_override=weight_binding.runtime(plan.fwd_runtime_config) if acquired else None)
+            if guest_record is not None and not is_replay:
+                guest_record.guest_weight_snapshot = weight_binding.capture_snapshot(
+                    (weight1, weight2), maximum_bytes=guest_record.guest_snapshot_bytes,
+                )
+                if guest_record.guest_weight_snapshot is not None:
+                    stats = weight_binding.pool.statistics
+                    stats["guest_snapshots"] = stats.get("guest_snapshots", 0) + 1
+                    tails, _ = guest_record.guest_weight_snapshot
+                    stats["guest_snapshot_bytes"] = stats.get("guest_snapshot_bytes", 0) + sum(tail.nbytes for tail in tails)
             return _save_forward_state(
                 ctx, plan, workspace, execution, owner_weights, metadata, permutation_inputs, topk_weights,
             )
@@ -798,6 +813,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
                 None,
                 None,
+                None,
             )
             return gradients[:len(ctx.needs_input_grad)]
         finally:
@@ -891,6 +907,7 @@ def execute_mega_moe_with_permutation(
     workspace_claimed: bool = False,
     weight_binding: Any = None,
     checkpoint_replay: bool | None = None,
+    guest_weights: Any = None,
 ) -> torch.Tensor:
     """Include input permutation backward within the workspace lease.
 
@@ -906,6 +923,7 @@ def execute_mega_moe_with_permutation(
         workspace_claimed: Borrow a caller-held forward lease without releasing it.
             Backward always acquires its own lease on the original workspace.
         checkpoint_replay: Original or replay phase for checkpoint copy deferral.
+        guest_weights: Checkpoint record and phase for optional guest weight reuse.
 
     Returns:
         Owned expert-major rows, or token-major rows when topk_weights is provided,
@@ -923,6 +941,7 @@ def execute_mega_moe_with_permutation(
         workspace_claimed,
         weight_binding,
         checkpoint_replay,
+        guest_weights,
     )
 
 

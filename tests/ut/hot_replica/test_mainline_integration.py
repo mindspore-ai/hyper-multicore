@@ -548,6 +548,51 @@ def test_checkpoint_with_supplied_counts_requires_the_original_order_and_histogr
     assert not wrapped(ids, counts)
 
 
+def test_guest_snapshot_is_invocation_scoped_and_requires_all_ranks(monkeypatch):
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
+    peer_has_snapshot = [True]
+
+    def gather(out, local, **_):
+        out[:] = local
+        if not peer_has_snapshot[0]:
+            out[1] &= 63
+
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    spec = SimpleNamespace(ep_size=2, ep_group=object())
+    owner = object()
+    hidden, ids, counts = torch.ones(1, 4), torch.tensor([[0, 1]]), torch.tensor([1, 1])
+    probs = torch.full((1, 2), .5)
+    version = [0]
+    tapes = [replay.ReplayCheckpoint(lambda: version[0], guest_snapshot_bytes=128) for _ in range(2)]
+    snapshots = [object(), object()]
+    for tape, snapshot in zip(tapes, snapshots):
+        with tape.scope(False):
+            record, _ = replay.route_record(owner)
+            assert replay.guest_weight_replay(record) == (record, False)
+            record.stream = "s"
+            with record.save_supplied_route(ids, counts):
+                record.route = object()
+            record.guest_weight_snapshot = snapshot
+
+    def recompute(tape, same_ids=True):
+        with tape.scope(True):
+            record, active = replay.route_record(owner)
+            agreed = replay.agree_replay(record, hidden, ids if same_ids else ids.flip(1), probs, counts,
+                                         spec, 13, weight_error=False)
+            selection = replay.guest_weight_replay(record)
+            assert active and not record.allow_activation
+            return agreed, selection[0].guest_weight_snapshot if selection is not None else None
+
+    assert recompute(tapes[1]) == (True, snapshots[1])
+    assert recompute(tapes[0]) == (True, snapshots[0])
+    peer_has_snapshot[0] = False
+    assert recompute(tapes[0]) == (True, None)
+    peer_has_snapshot[0] = True
+    assert recompute(tapes[1], same_ids=False) == (False, None)
+    version[0] += 1
+    assert recompute(tapes[1]) == (False, None)
+
+
 def test_early_weight_restore_uses_bank_generation(monkeypatch):
     """A copy can be consumed after its stream event or recovered if the bank changed."""
     monkeypatch.setattr(torch.distributed, "get_rank", lambda _: 0)
