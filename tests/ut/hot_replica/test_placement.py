@@ -17,9 +17,11 @@
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from hyper_multicore.modules.hot_replica import placement
+from hyper_multicore.modules.hot_replica._planner import planner as quota_planner
 from hyper_multicore.modules.hot_replica._planner.aligned import build_aligned_expert_plan
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.mx_peak_planner import build_mx_local_peak_plan
@@ -75,6 +77,22 @@ class TestHotReplicaPlacement(unittest.TestCase):
         self.assertEqual(limit(1024, 8, 64, 8, 2560, 2), 8192)
         self.assertEqual(limit(1024, 8, 64, 8, 65536, 2), 1408)
         self.assertEqual(limit(0, 8, 64, 8, 2560, 2), 0)
+
+    def test_capacity_search_materializes_only_the_selected_feasible_quotas(self) -> None:
+        wire = np.array([[16384] * 4 + [0] * 4] * 2, dtype=np.int32)
+        targets = (73728, 66816)
+        build = quota_planner.build_capacity_plan
+        with patch.object(quota_planner, "_materialize", wraps=quota_planner._materialize) as render:
+            tight = build(wire, 85248, replica_slots_per_rank=2, alternatives=targets,
+                          score=lambda peak, degree: 150000 - peak - 1000 * degree)
+            render.assert_called_once()
+            self.assertLessEqual(max(tight.destination_loads), targets[-1])
+            self.assertEqual(tight.maximum_transfer_degree, 2)
+        limited = build(wire, 85248, replica_slots_per_rank=1, alternatives=targets,
+                        score=lambda peak, degree: 150000 - peak - 1000 * degree)
+        self.assertEqual(limited.maximum_transfer_degree, 1)
+        self.assertGreater(max(limited.destination_loads), targets[0])
+        self.assertIsNone(build(wire, 85248, alternatives=targets, score=lambda *_: -1))
 
     def test_cost_charges_gradient_wire_bytes_and_peer_fanout(self) -> None:
         """Identical arithmetic must not ignore larger gradients or more peers."""

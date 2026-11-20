@@ -163,6 +163,8 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   对指定负载，可用 `HotReplicaPlanner(receive_capacity_percent=102)` 进一步限制每 rank 的计划接收行数。
   参数为不小于 `100` 的整数。按当前 EP 实际平均路由行数取整，再按 `128` 行向上对齐，并取与内置上限的较小值。
   该选项适用于 BF16 Push。计划在分配前和分配后均检查收益，无法在给定副本预算内满足上限或代价过高时继续使用原属专家路由。
+  `receive_capacity_percent="auto"` 会在内置上限以及按实际平均行数计算的 `110%` 和 `102%` 间评估放置。
+  以计划的最忙 rank 行数、实际权重复制及梯度返回估算代价，再为最优的正收益计划生成派发表。
   Reentrant checkpoint 在初次前向保存放置。重算时，EP 各 rank 的 Top-K 顺序、Router 提供的精确计数和重放状态一致后复用该放置。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。

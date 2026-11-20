@@ -16,6 +16,7 @@
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import torch
 from hyper_multicore import _collective
@@ -92,7 +93,7 @@ def has_a5_bf16_pipeline() -> bool:
 def require_capability(
     tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *,
     mx_cube_cores: int | None = None, architecture: int | None = None, dispatch_mode: str = "push",
-    receive_capacity_percent: int | None = None,
+    receive_capacity_percent: int | Literal["auto"] | None = None,
 ) -> bool:
     """Validate artifacts and agree on the A3 BF16 partial protocol before transfer."""
     local_error = None

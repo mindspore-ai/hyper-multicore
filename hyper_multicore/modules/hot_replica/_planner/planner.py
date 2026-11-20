@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -103,6 +103,7 @@ def _traffic_work_is_useful(copies, loads, config, resident, row_credit, minimum
 
 def build_capacity_plan(
     counts_by_source: np.ndarray, target_load: int, *, replica_slots_per_rank: int | None = None,
+    alternatives: tuple[int, ...] = (), score: Callable[[int, int], float] | None = None,
 ) -> ExpertExecutionPlan | None:
     """Keep capacity-based admission stable for the MegaMoE placement policies."""
     limit = 2**31 - 1
@@ -116,10 +117,42 @@ def build_capacity_plan(
     config = ExpertReplicaConfig(experts, ranks, budget)
     _, loads, baseline = _home_layout(counts_by_source, config)
     target = max(1, target_load)
-    if not budget or max(loads) <= target or min(loads) >= target:
+    if not budget:
         return None
-    copies = _capacity_copies(loads, baseline, config, target)
+    if score is None:
+        if max(loads) <= target or min(loads) >= target:
+            return None
+        copies = _capacity_copies(loads, baseline, config, target)
+    else:
+        copies = _best_capacity_copies(loads, baseline, config, target, alternatives, score)
+        if copies is None:
+            return None
     return _materialize(counts_by_source, copies, config, source_locality=False)
+
+
+def _best_capacity_copies(loads, baseline, config, default, alternatives, score):
+    """Compare host quotas before materializing the winner's source table."""
+    lightest, home_peak = min(loads), max(loads)
+    best, best_score = None, 0.0
+    for target in dict.fromkeys((default, *alternatives)):
+        if not lightest < target < home_peak:
+            continue
+        copies = _capacity_copies(loads, [row.copy() for row in baseline], config, target)
+        peak = max(sum(row.values()) for row in copies)
+        if peak >= home_peak or (target != default and peak > target):
+            continue
+        outgoing = [0] * config.ep_size
+        incoming = [0] * config.ep_size
+        for rank, slots in enumerate(copies):
+            for expert, rows in slots.items():
+                owner = expert // config.home_experts
+                if owner != rank and rows:
+                    outgoing[owner] += 1
+                    incoming[rank] += 1
+        benefit = score(peak, max(max(incoming), max(outgoing)))
+        if benefit > best_score:
+            best, best_score = copies, benefit
+    return best
 
 
 def build_expert_replica_plan(

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from ..base_planner import ExpertPlacement
@@ -73,7 +75,7 @@ def _transfer_seconds(weight_bytes, gradient_bytes, ep_size, local_experts, repl
     return _A3_PLACEMENT_SECONDS + staging + peer
 
 
-def placement_is_profitable(
+def placement_benefit_seconds(
     maximum_received: int,
     target_load: int,
     hidden_size: int,
@@ -87,8 +89,8 @@ def placement_is_profitable(
     gradient_bytes: int | None = None,
     backward_prefetch_weight_bytes: int = 0,
     transfer_experts: int | None = None,
-) -> bool:
-    """Estimate critical compute saved against dtype-aware bank and peer traffic.
+) -> float:
+    """Estimate critical compute time saved minus dtype-aware bank and peer traffic.
 
     Include weight publication, FP32 home-gradient materialization, borrowed
     gradient publication, owner accumulation and the returned parameter store.
@@ -132,10 +134,15 @@ def placement_is_profitable(
     excess = max(0, maximum_received - target_load)
     saved_compute = projection_flops * excess * hidden_size * intermediate_size / (cube_cores * _A3_FLOPS_PER_CUBE)
     restore = 2 * backward_prefetch_weight_bytes / _A3_STAGING_BYTES_PER_SECOND
-    return saved_compute > restore + _transfer_seconds(
+    return saved_compute - (restore + _transfer_seconds(
         weight_bytes, gradient_bytes, ep_size, local_experts,
         backward_prefetch_weight_bytes, transfer_experts,
-    )
+    ))
+
+
+def placement_is_profitable(*args, **kwargs) -> bool:
+    """Admit placements with strictly positive estimated savings."""
+    return placement_benefit_seconds(*args, **kwargs) > 0
 
 
 def _token_order(hidden, ids, experts, supplied):
@@ -169,6 +176,8 @@ def build_placement(
     *,
     source_inverse: torch.Tensor | None = None,
     replica_slots_per_rank: int | None = None,
+    alternatives: tuple[int, ...] = (),
+    score: Callable[[int, int], float] | None = None,
 ) -> ExpertPlacement | None:
     """Borrow experts and render their virtual IDs without changing the router.
 
@@ -184,6 +193,8 @@ def build_placement(
         capacity: Positive target routed rows per rank for the allocator.
         rank: Rank within this ordered EP group.
         replica_slots_per_rank: Optional cap on guests, defaulting to the number of home experts.
+        alternatives: Additional receive targets for cost-based quota selection.
+        score: Estimated saving for the actual receive peak and transfer degree.
 
     Returns:
         A per-invocation placement, or None when no expert needs to be borrowed.
@@ -197,6 +208,7 @@ def build_placement(
         raise TypeError("HotReplica counts must use INT32 or INT64")
     plan = build_capacity_plan(
         counts_by_source.cpu().numpy(), capacity, replica_slots_per_rank=replica_slots_per_rank,
+        alternatives=alternatives, score=score,
     )
     if plan is None:
         return None

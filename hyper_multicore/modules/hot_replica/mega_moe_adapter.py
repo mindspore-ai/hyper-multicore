@@ -232,10 +232,10 @@ class PlacementResources:
                 if placement is not None and (self.pipeline_enabled or self.requires_fused_return):
                     placement = _bind_custom_copy_rows(spec, placement, fused_return=self.requires_fused_return)
             else:
-                def build(current, target):
+                def build(current, target, **options):
                     return self.bounded.select(
                         hidden, ids, current.counts_by_source, source_rows, inverse, 0, snapshot,
-                        capacity_target=target, host_rows=host_rows,
+                        capacity_target=target, host_rows=host_rows, **options,
                     )
 
                 placement = planner._plan_by_cost(request, build)
