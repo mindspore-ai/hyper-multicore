@@ -26,9 +26,8 @@ _PINNED_WIRE_MAX_BYTES = 32 * 1024
 
 
 def supports_bounded_placement(spec):
-    """The bounded planner builds per-expert A3 MTE Push descriptors."""
-    return (spec.architecture == 2201 and not spec.batch_experts
-            and spec.dispatch_mode == "push" and spec.transport_engine == "mte")
+    """A3 MTE Push can render the agreed quotas for either GMM schedule."""
+    return spec.architecture == 2201 and spec.dispatch_mode == "push" and spec.transport_engine == "mte"
 
 
 @dataclass

@@ -36,7 +36,7 @@ from hyper_multicore.modules.mega_moe.heap_manager import _HeapManager
 def test_serial_replica_widths_share_one_reservation_with_the_bank():
     """Keep one virtual reservation when the home counters cannot cover all widths."""
     spec = SimpleNamespace(local_experts=6, ep_size=32, top_k=8, initial_capacity_factor=1.25,
-                           partial_weight_grad_dtype=None,
+                           partial_weight_grad_dtype=None, batch_experts=False,
                            expert_weight_layout="EIO")
     owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
     owner.parent = SimpleNamespace(spec=spec, heap_manager=object())

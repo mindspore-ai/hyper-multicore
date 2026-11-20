@@ -583,10 +583,11 @@ def test_checkpoint_request_is_training_independently_of_reservation(bound):
 
 
 @pytest.mark.parametrize("bound", [None, 4096])
-def test_a3_saved_route_uses_shared_quota_geometry(bound):
+@pytest.mark.parametrize("batch_experts", [False, True])
+def test_a3_saved_route_uses_shared_quota_geometry(bound, batch_experts):
     """Share the built-in A3 renderer while preserving both capacity policies."""
     spec = SimpleNamespace(
-        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        architecture=2201, batch_experts=batch_experts, dispatch_mode="push", transport_engine="mte",
         ep_size=2, rank_id=0, num_experts=8, local_experts=4, hidden_size=32, intermediate_size=64,
         top_k=2, num_cube_cores=24, apply_probs_before_fc2=True, expert_weight_layout="EOI",
         partial_weight_grad_dtype=None,
@@ -603,12 +604,13 @@ def test_a3_saved_route_uses_shared_quota_geometry(bound):
     wire = torch.tensor([[1, 2048, 12, 2048, 2048, 0, 0, 0, 0, 0, 0]] * 2, dtype=torch.int32)
     hidden = torch.empty(2048, 32, dtype=torch.bfloat16)
     summary = route._RouteSummary(8192, 2048, 8192)
-    if bound is None:
+    if bound is None or batch_experts:
         inverse = ids.flatten().argsort(stable=True).argsort().view_as(ids)
         rows = wire.tolist()
         with (
             patch("hyper_multicore.modules.hot_replica.planner.placement_receive_limit", return_value=4096),
             patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable", return_value=True),
+            patch("hyper_multicore.modules.hot_replica.planner.bounded_move_pays", return_value=True),
             patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True),
             patch.object(resources, "bind") as bind,
         ):
@@ -616,7 +618,7 @@ def test_a3_saved_route_uses_shared_quota_geometry(bound):
             expected = planner.plan(request)
             with patch.object(planner, "plan", side_effect=AssertionError("generic planner called")):
                 resources.select(hidden, ids, wire, summary, [4096, 4096], inverse, 12, planner=planner,
-                                 checkpointing=True, host_rows=rows)
+                                 checkpointing=not batch_experts, host_rows=rows)
         actual = bind.call_args.args[1]
         assert actual is not None and expected is not None
         torch.testing.assert_close(actual.virtual_ids, expected.virtual_ids)
@@ -626,6 +628,7 @@ def test_a3_saved_route_uses_shared_quota_geometry(bound):
             expected.receive_capacity, expected.transfer_experts,
         )
         assert resources.bounded.geometry is None
+        assert bind.call_args.kwargs["fused"] is not batch_experts
         return
 
     with (

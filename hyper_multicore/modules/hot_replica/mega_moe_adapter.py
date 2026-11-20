@@ -177,7 +177,7 @@ class PlacementResources:
         self.bounded = BoundedPlacement(parent.spec) if supported else None
         spec = parent.spec
         self.reuses_parent_workspace = (
-            supported and self.source_bound is None
+            supported and not spec.batch_experts and self.source_bound is None
             and mega_moe_event_capacity(spec.num_experts, spec.ep_size)
             == mega_moe_event_capacity(2 * spec.num_experts, spec.ep_size)
         )
@@ -192,7 +192,8 @@ class PlacementResources:
 
     def uses_placement_wire(self, checkpointing: bool) -> bool:
         """Enable the bounded count readback where it also supplies Push descriptors."""
-        return self.bounded is not None and (self.source_bound is not None or not checkpointing)
+        return (self.bounded is not None and not self.parent.spec.batch_experts
+                and (self.source_bound is not None or not checkpointing))
 
     def select(
         self,
@@ -210,14 +211,15 @@ class PlacementResources:
         checkpointing: bool = False,
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Choose a virtual route only after the existing count exchange validates it."""
-        if self.bounded is None or self.source_bound is not None or checkpointing:
+        spec = self.parent.spec
+        if self.bounded is None or self.source_bound is not None or checkpointing or spec.batch_experts:
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
                                    host_rows=host_rows)
             if self.bounded is None:
                 placement = planner.plan(request)
             else:
                 def build(current, target):
-                    reserved = current.ordinary_receive_capacity
+                    reserved = None if spec.batch_experts else current.ordinary_receive_capacity
                     return self.bounded.select(
                         hidden, ids, current.counts_by_source, source_rows, inverse, 0, snapshot,
                         reserved=reserved, capacity_target=target if reserved is None else None, host_rows=host_rows,
@@ -230,7 +232,6 @@ class PlacementResources:
             return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
         self.statistics["invocations"] += 1
         peak = summary.maximum
-        spec = self.parent.spec
         average = (sum(source_rows) + spec.ep_size - 1) // spec.ep_size
         projections = 2 * bool(autograd_mask & 4) + bool(autograd_mask & 8) if autograd_mask & 1 else 0
         saved = peak - average
@@ -251,7 +252,7 @@ class PlacementResources:
         replay = is_checkpointing()
         # Replanning during recompute must not depend on an intervening heap growth.
         floor = self.parent.workspace.capacity_floor if bounded else None
-        if replay and self.bounded is not None:
+        if replay and self.bounded is not None and not spec.batch_experts:
             floor = self.initial_receive_floor
         key = (
             (autograd_mask, replay, tuple(tuple(row) for row in host_rows))
@@ -322,7 +323,7 @@ class PlacementResources:
                     workspace_growth=(self.parent.workspace, source, receive),
                 )
             return self.parent
-        shared_geometry = self.shared and self.bounded is not None
+        shared_geometry = self.shared and self.bounded is not None and not spec.batch_experts
         width = (spec.local_experts if self.source_bound is not None or shared_geometry else
                  placement.borrowed_capacity)
         if width in self.geometries:
@@ -361,7 +362,7 @@ class PlacementResources:
             bound = _align_capacity(self.source_bound)
             _, virtual = _bounded_receive(self.specification, bound, dtype, spec.num_cube_cores)
             source, receive = max(bound, source), max(virtual, receive)
-        elif self.shared and self.bounded is not None:
+        elif self.shared and self.bounded is not None and not spec.batch_experts:
             receive = max(receive, _resolve_receive_capacity(
                 spec.initial_capacity_factor, source * spec.top_k, spec.ep_size,
             ))

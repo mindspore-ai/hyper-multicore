@@ -39,7 +39,7 @@ def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):
     h, i = spec.hidden_size, spec.intermediate_size
     if bf16_partials and (h % 16 or i % 16):
         return 0
-    if supports_bounded_placement(spec) and h * i % 16 == 0 and all(
+    if supports_bounded_placement(spec) and not spec.batch_experts and h * i % 16 == 0 and all(
             _band_layout(shape)[1] <= _MAX_BANDS for shape in projection_shapes(h, i, spec.expert_weight_layout)):
         extent = 2 * spec.local_experts if bank_experts is None else bank_experts
         return min(spec.local_experts, extent // (2 if bf16_partials else 3))
