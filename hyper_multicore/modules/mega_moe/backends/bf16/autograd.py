@@ -335,19 +335,27 @@ def _save_forward_state(
     ctx: Any,
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
-    saved_dispatch: Any,
-    up_proj: Any,
-    activation: Any,
-    weight1: Any,
-    weight2: Any,
+    execution: _ForwardExecution,
+    owner_weights: tuple[Any, Any],
     metadata: RouteMetadata,
     permutation_inputs: tuple[Any, ...],
-    output: Any,
     topk_weights: torch.Tensor | None,
 ) -> Any:
     """Restore the owned output and save its backward state in the existing call."""
+    spec = plan.spec
+    output = execution.combine[:ctx.source_rows]
+    if not spec.apply_probs_before_fc2 and not ctx.defer_forward_copies:
+        output = output.clone()
+    intermediates = execution.intermediates
+    if spec.dispatch_mode == "pull":
+        saved_dispatch = execution.dispatch
+    elif ctx.defer_forward_copies:
+        saved_dispatch = _checkpoint_placeholder(intermediates.down_proj)
+    else:
+        # Combine has consumed down_proj before SHMEM dispatch is reused.
+        saved_dispatch = intermediates.down_proj
+        saved_dispatch.copy_(execution.dispatch[:metadata.expert_capacity])
     if ctx.has_unpermute:
-        spec = plan.spec
         if not spec.apply_probs_before_fc2:
             probs = topk_weights.float().contiguous()
             saved_output = _checkpoint_placeholder(output) if ctx.defer_forward_copies else output
@@ -366,10 +374,9 @@ def _save_forward_state(
     ctx.workspace = workspace
     ctx.save_for_backward(
         saved_dispatch,
-        up_proj,
-        activation,
-        weight1,
-        weight2,
+        intermediates.up_proj,
+        intermediates.activation,
+        *owner_weights,
         metadata.group_list,
         metadata.dispatch_src_off,
         metadata.dispatch_target_off,
@@ -686,27 +693,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 weight2,
                 execution, stream=workspace.lease_stream,
                 runtime_override=weight_binding.runtime(plan.fwd_runtime_config) if acquired else None)
-            output = execution.combine[:ctx.source_rows]
-            if not spec.apply_probs_before_fc2 and not ctx.defer_forward_copies:
-                output = output.clone()
-            if spec.dispatch_mode == "pull":
-                saved_dispatch = execution.dispatch
-            elif ctx.defer_forward_copies:
-                saved_dispatch = _checkpoint_placeholder(execution.intermediates.down_proj)
-            else:
-                # Combine has consumed down_proj before SHMEM dispatch is reused.
-                execution.intermediates.down_proj.copy_(execution.dispatch[:capacity])
-                saved_dispatch = execution.intermediates.down_proj
             return _save_forward_state(
-                ctx,
-                plan,
-                workspace,
-                saved_dispatch,
-                execution.intermediates.up_proj,
-                execution.intermediates.activation,
-                owner_weights[0],
-                owner_weights[1],
-                metadata, permutation_inputs, output, topk_weights,
+                ctx, plan, workspace, execution, owner_weights, metadata, permutation_inputs, topk_weights,
             )
         finally:
             if acquired:

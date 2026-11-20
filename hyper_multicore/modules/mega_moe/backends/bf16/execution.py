@@ -25,6 +25,17 @@ if TYPE_CHECKING:
     from .resources import BF16Resources
 
 
+def _checkpoint_replay(spec) -> bool | None:
+    """Select a checkpoint phase only for the validated A3 Push layout."""
+    replay = forward_copy_phase()
+    if replay is not None and (
+        spec.dispatch_mode == "push" and not spec.apply_probs_before_fc2 and spec.architecture == 2201
+        and spec.expert_weight_layout == "EOI" and spec.transport_engine == "mte"
+    ):
+        return replay
+    return None
+
+
 def forward(
     module: Any, hidden_states: torch.Tensor, hidden_flat: torch.Tensor,
     topk_ids: torch.Tensor, topk_weights: torch.Tensor,
@@ -75,13 +86,7 @@ def forward(
         ).reshape_as(hidden_states)
     # Replay may replan and have no route record. Keep the same saved-tensor
     # layout in F and R for this checkpoint independent of route cache hits.
-    spec = resources.spec
-    checkpoint_replay = forward_copy_phase()
-    if checkpoint_replay is not None and (
-        pull or before_fc2 or spec.architecture != 2201
-        or spec.expert_weight_layout != "EOI" or spec.transport_engine != "mte"
-    ):
-        checkpoint_replay = None
+    checkpoint_replay = _checkpoint_replay(resources.spec)
     if checkpoint_replay is not None:
         options["checkpoint_replay"] = checkpoint_replay
     integrated_unpermute = pull or before_fc2 or checkpoint_replay is not None
