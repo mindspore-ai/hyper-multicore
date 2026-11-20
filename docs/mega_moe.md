@@ -160,11 +160,9 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 
 - `ascend910_93` 支持 BF16 EIO 和 EOI。A3 MTE Push 在槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。
-  带显式 `source_token_bound` 的内置策略按接收容量准入，使用相同的配额规划和路由描述。
   Reentrant checkpoint 在初次前向保存放置。重算时，EP 各 rank 的 Top-K 顺序、Router 提供的精确计数和重放状态一致后复用该放置。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
-  显式 source bound 的放置沿用 FP32 partial。
   副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
 - `ascend950` 的 BF16 Push 和 Pull 使用 arch35 副本 bank 和独立的权重预取、梯度归并。
   Pull 将实际选中的路由发布到对称源区，由执行 rank 拉取 token。

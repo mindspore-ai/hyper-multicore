@@ -43,19 +43,6 @@ def forward(
         if resources.spec.architecture == 3510:
             # Preserve the precision of the owner and guest partials through the bank reduction.
             ordinary_options["weight_grad_dtype"] = torch.float32
-    if binding is not None and module_resources.placement.source_bound is not None:
-        home = module_resources.spec.local_experts
-        nominal = (not pull and resources.spec.architecture == 2201
-                   and home >= 2 * resources.spec.num_cube_cores
-                   and resources.spec.intermediate_size < 2048
-                   and resources.spec.lowering != "dense" and resources.spec.ready_depth is None)
-        ordinary_options.update(
-            weight_grad_dtype=torch.float32,
-            nominal_schedule=nominal,
-            batch_experts=nominal and route.metadata.plan_tokens * resources.spec.top_k <= 128 * home,
-        )
-        if ordinary_options["batch_experts"]:
-            binding.fused = False
     if binding is not None and binding.fused:
         plan = resources.plan_for_tokens(
             route.metadata.plan_tokens, hidden_flat.device,

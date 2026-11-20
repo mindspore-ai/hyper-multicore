@@ -301,7 +301,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         self.assertEqual(added, tuple(item[0] for item in reservations))
         self.assertIs(self.dist.all_gather_object.call_args.kwargs["group"], self.root_group)
         configuration, failure = self.dist.all_gather_object.call_args.args[1]
-        self.assertEqual(configuration, (None, str(self.reference.dtype), tuple(item[1] for item in reservations), 0))
+        self.assertEqual(configuration, (None, str(self.reference.dtype), tuple(item[1] for item in reservations)))
         self.assertIsNone(failure)
 
         first = {"shape": 1}

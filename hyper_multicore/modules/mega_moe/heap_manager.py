@@ -173,7 +173,6 @@ class _HeapManager:
         reservations: tuple[tuple[Mapping[str, Any], _WorkspaceLayout], ...],
         *,
         allow_resize: bool,
-        initial_headroom: int = 0,
         workspace_growth: tuple[MegaMoeWorkspace, int, int] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         """Add lazy reservations and resize an attached Runtime when required."""
@@ -194,9 +193,9 @@ class _HeapManager:
                 if not self._configured:
                     configured = os.getenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
                     self._run_and_check_consistency(
-                        lambda: self._configure(configured, initial_headroom),
+                        lambda: self._configure(configured),
                         stage="Configuration",
-                        value=(configured, str(self.dtype), tuple(layouts), initial_headroom),
+                        value=(configured, str(self.dtype), tuple(layouts)),
                     )
                     self._configured = True
                 else:
@@ -539,11 +538,11 @@ class _HeapManager:
         """Return the aggregate payload rounded once to physical Heap pages."""
         return _round_heap_bytes(sum(layout.required_bytes for layout in layouts))
 
-    def _configure(self, configured: str | None, headroom: int) -> None:
-        """Choose the first Heap size from the user seed or estimated headroom."""
+    def _configure(self, configured: str | None) -> None:
+        """Size the initial heap for the reserved layouts and any larger user seed."""
         required = sum(entry.layout.required_bytes for entry in self.entries)
         if configured is None:
-            self.heap_bytes = _round_heap_bytes(required + headroom)
+            self.heap_bytes = _round_heap_bytes(required)
             return
         try:
             initial_bytes = int(configured)

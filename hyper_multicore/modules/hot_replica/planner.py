@@ -21,27 +21,22 @@ from typing import Any
 import torch
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from .placement import (
-    bounded_move_pays, build_placement, placement_is_profitable, placement_receive_limit,
-)
+from .placement import build_placement, placement_is_profitable, placement_receive_limit
 
 
 class HotReplicaPlanner(BasePlanner):
     """Choose execution slots without allocating either backend's workspaces."""
 
-    def __init__(self, *, source_token_bound: int | None = None) -> None:
-        """Set the optional per-rank training row bound used for workspace reservation."""
-        super().__init__(source_token_bound=source_token_bound)
+    def __init__(self) -> None:
+        """Initialize the rejected-route cache."""
         self._rejected_routes: OrderedDict[tuple[Any, ...], None] = OrderedDict()
 
     @torch.no_grad()
     def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
-        """Return a placement if saved work repays movement or prevents heap growth."""
-        if request.ordinary_receive_capacity is not None:
-            return self._plan_reserved(request, self._build)
-        return self._plan_unreserved(request, self._build)
+        """Return a placement if saved work repays movement."""
+        return self._plan_by_cost(request, self._build)
 
-    def _plan_unreserved(self, request, build):
+    def _plan_by_cost(self, request, build):
         """Keep the observed movement break-even while sharing geometry preparation."""
         counts = request.counts_by_source
         ranks, experts = counts.shape
@@ -76,35 +71,6 @@ class HotReplicaPlanner(BasePlanner):
             self._rejected_routes[key] = None
             if len(self._rejected_routes) > 32:
                 self._rejected_routes.popitem(last=False)
-        return None
-
-    @staticmethod
-    def _plan_reserved(request, build):
-        """Maintain the reservation admission policy across quota implementations."""
-        maximum, floor = request.maximum_received, request.ordinary_receive_capacity
-        ranks, experts = request.counts_by_source.shape
-        target = (request.total_rows + ranks - 1) // ranks
-        if maximum <= target:
-            return None
-        local = experts // ranks
-        hidden, size = request.hidden.shape[-1], request.hidden.element_size()
-        receive_limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
-
-        def _worth_moving(after):
-            return bounded_move_pays(
-                maximum, after, hidden, request.intermediate_size, request.cube_cores, ranks, local, size,
-                training=request.training, replay=request.checkpointing,
-                apply_probs_before_fc2=request.apply_probs_before_fc2,
-            )
-
-        must_balance = maximum > floor
-        if not must_balance and (maximum <= receive_limit or not _worth_moving(target)):
-            return None
-        placement = build(request, target)
-        if placement is not None and (
-            (must_balance and placement.receive_capacity <= floor) or _worth_moving(placement.receive_capacity)
-        ):
-            return placement
         return None
 
     @staticmethod

@@ -48,7 +48,7 @@ def test_serial_replica_widths_share_one_reservation_with_the_bank():
     owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
     owner.parent = SimpleNamespace(spec=spec, heap_manager=object())
     owner.pool, owner.geometries = None, {}
-    owner.source_bound, owner.shared, owner.bounded, owner.specification = None, True, object(), {}
+    owner.shared, owner.bounded, owner.specification = True, object(), {}
     owner.reuses_parent_workspace = False
     owner.pipeline_enabled = True
     hidden = torch.empty(0, dtype=torch.bfloat16)
@@ -135,10 +135,10 @@ def test_replica_signal_extent_follows_the_physical_gradient_rows(layout, bands)
     )
 
 
-@pytest.mark.parametrize(("home", "layout", "bound", "partial_dtype"), [
-    (4, "EOI", None, None), (6, "EIO", 4096, None), (8, "EOI", None, "float32"),
+@pytest.mark.parametrize(("home", "layout", "partial_dtype", "dedicated"), [
+    (4, "EOI", None, True), (6, "EIO", "float32", False), (16, "EOI", "float32", True),
 ])
-def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layout, bound, partial_dtype):
+def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layout, partial_dtype, dedicated):
     """Register the replica workspace, weight bank and peer flags in one reserve."""
     spec = SimpleNamespace(
         ep_group=None, local_experts=home, hidden_size=256, intermediate_size=128,
@@ -148,10 +148,10 @@ def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layo
     manager = _HeapManager(None, hidden)
     parent = SimpleNamespace(spec=spec, heap_manager=manager)
     owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
-    owner.source_bound, owner.parent = bound, parent
-    owner.dedicated_pipeline = bound is None
+    owner.parent = parent
+    owner.dedicated_pipeline = dedicated
     virtual = ({}, mega_moe_adapter._WorkspaceLayout(128, (), 32768))
-    extent = 3 * home if bound is not None or partial_dtype == "float32" else 2 * home
+    extent = 3 * home if partial_dtype == "float32" else 2 * home
     with (patch("torch.distributed.get_rank", return_value=0),
           patch("torch.distributed.get_world_size", return_value=32),
           patch.object(manager, "reserve") as reserve, patch.object(manager, "bind"),
@@ -194,7 +194,7 @@ def test_optional_replica_banks_share_only_matching_partial_formats():
     assert pools[0].pipeline.shared_layouts
 
 
-@pytest.mark.parametrize("home", [4, 6, 8])
+@pytest.mark.parametrize("home", range(4, 17))
 @pytest.mark.parametrize("layout", ["EIO", "EOI"])
 def test_bf16_partial_return_only_replaces_wide_native_routes(home, layout):
     """Keep narrow FP32 fusion and a full-width path for each partial dtype."""

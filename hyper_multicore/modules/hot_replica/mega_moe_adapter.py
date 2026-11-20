@@ -16,10 +16,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from collections.abc import Mapping
-import math
+from dataclasses import replace
 import weakref
 from typing import Any, TYPE_CHECKING
 
@@ -32,10 +30,9 @@ from hyper_multicore.scheduler.config import mega_moe_event_capacity
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
 from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
 from .checkpoint import is_checkpointing
-from .placement import placement_receive_limit
 from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline, uses_wider_gradient_bands
 from .planner import HotReplicaPlanner
-from .shmem_transfer import ExpertWeightBinding, SharedExpertPool, _expert_bank_bytes
+from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
 
 if TYPE_CHECKING:
     from hyper_multicore.modules.mega_moe.backends.bf16.resources import BF16Resources
@@ -46,61 +43,6 @@ def _uses_builtin_planner(specification: Mapping[str, Any]) -> bool:
     """Identify the planner whose capacity checks the adapter owns."""
     planner_key = specification.get("planner_key")
     return planner_key is not None and planner_key[:2] == (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__)
-
-
-def _bounded_receive(
-    specification: Mapping[str, Any], source: int, dtype: torch.dtype, cube_cores: int,
-) -> tuple[int, int]:
-    """Size ordinary storage at the checkpoint movement break-even point."""
-    ep = specification["ep_size"]
-    local = specification["num_experts"] // ep
-    hidden = specification["hidden_size"]
-    intermediate = specification["intermediate_size"]
-    top_k = specification["top_k"]
-    average = source * top_k
-    element_size = dtype.itemsize
-    virtual = placement_receive_limit(average, ep, local, top_k, hidden, element_size)
-    weight = 3 * local * hidden * intermediate
-    weights = weight * element_size
-    gradients = weight * 4
-
-    def _excess(flops: int, gradient_bytes: int, restore_bytes: int = 0) -> int:
-        staging = (3 * weights + 2 * gradient_bytes + restore_bytes) / 4e11
-        peer = (ep - 1) * (weights + gradient_bytes) / (local * 2e11)
-        return math.ceil((8e-4 + staging + peer) * cube_cores * 4e12 / (flops * hidden * intermediate))
-
-    ordinary = average + max(_excess(12, gradients, 2 * weights), _excess(6, 0))
-    upper = source * ep * min(local, top_k)
-    return _align_capacity(min(upper, max(ordinary, virtual))), virtual
-
-
-def workspace_reservations(
-    specifications: tuple[Mapping[str, Any], ...], dtype: torch.dtype, cube_cores: int,
-) -> tuple[tuple[tuple[Mapping[str, Any], _WorkspaceLayout], ...], int]:
-    """Describe initial A3 workspace layouts and default replica headroom."""
-    reservations = []
-    banks = set()
-    headroom = 0
-    for specification in specifications:
-        bound = specification.get("source_token_bound")
-        if bound is None:
-            reservations.append((specification, _workspace_layout(specification, dtype)))
-            continue
-        source = _align_capacity(bound)
-        native, virtual = _bounded_receive(specification, source, dtype, cube_cores)
-        reservations.append((
-            specification, _workspace_layout(specification, dtype, native, source),
-        ))
-        virtual_spec = {**specification, "num_experts": 2 * specification["num_experts"],
-                        "hot_replica": False, "source_token_bound": None, "planner_key": None}
-        virtual_bytes = _workspace_layout(virtual_spec, dtype, virtual, source).required_bytes
-        headroom += virtual_bytes
-        local = specification["num_experts"] // specification["ep_size"]
-        bank = local, specification["hidden_size"], specification["intermediate_size"]
-        if bank not in banks:
-            banks.add(bank)
-            headroom += _expert_bank_bytes(*bank, dtype)
-    return tuple(reservations), headroom
 
 
 _SHARED_BANKS = weakref.WeakKeyDictionary()
@@ -196,8 +138,6 @@ class PlacementResources:
         self.shared = shared
         self.pool = None
         self.geometries = {}
-        self.source_bound = specification.get("source_token_bound")
-        self.initial_receive_floor = parent.workspace.capacity_floor if self.source_bound is not None else None
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
@@ -219,11 +159,9 @@ class PlacementResources:
             # Keep the default path's resident weights and share banks for
             # optional schedules, custom plans and larger projections.
             self.dedicated_pipeline = (
-                supported and not spec.batch_experts and self.source_bound is None
-                and not uses_wider_gradient_bands(spec)
+                supported and not spec.batch_experts and not uses_wider_gradient_bands(spec)
             )
-        share_push_workspace = ((self.pipeline_enabled or supported and not spec.batch_experts)
-                                and self.source_bound is None)
+        share_push_workspace = self.pipeline_enabled or (supported and not spec.batch_experts)
         self.reuses_parent_workspace = (
             (spec.dispatch_mode == "pull" or share_push_workspace)
             and mega_moe_event_capacity(spec.num_experts, spec.ep_size)
@@ -235,9 +173,8 @@ class PlacementResources:
         }
 
     def uses_placement_wire(self, checkpointing: bool) -> bool:
-        """Enable the bounded count readback where it also supplies Push descriptors."""
-        return (self.bounded is not None and not self.parent.spec.batch_experts
-                and (self.source_bound is not None or not checkpointing))
+        """Use the count wire for ordinary per-expert Push descriptors."""
+        return self.bounded is not None and not self.parent.spec.batch_experts and not checkpointing
 
     def select(
         self,
@@ -256,7 +193,7 @@ class PlacementResources:
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Choose a virtual route only after the existing count exchange validates it."""
         spec = self.parent.spec
-        if self.bounded is None or self.source_bound is not None or checkpointing or spec.batch_experts:
+        if self.bounded is None or checkpointing or spec.batch_experts:
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
                                    host_rows=host_rows)
             if self.bounded is None:
@@ -265,16 +202,12 @@ class PlacementResources:
                     placement = _bind_custom_copy_rows(spec, placement)
             else:
                 def build(current, target):
-                    reserved = None if spec.batch_experts else current.ordinary_receive_capacity
                     return self.bounded.select(
                         hidden, ids, current.counts_by_source, source_rows, inverse, 0, snapshot,
-                        reserved=reserved, capacity_target=target if reserved is None else None, host_rows=host_rows,
+                        capacity_target=target, host_rows=host_rows,
                     )
 
-                if request.ordinary_receive_capacity is None:
-                    placement = planner._plan_unreserved(request, build)
-                else:
-                    placement = HotReplicaPlanner._plan_reserved(request, build)
+                placement = planner._plan_by_cost(request, build)
             return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
         self.statistics["invocations"] += 1
         peak = summary.maximum
@@ -294,21 +227,15 @@ class PlacementResources:
         """Expose counts and available capacity from one validated MegaMoE route."""
         self.statistics["invocations"] += 1
         spec = self.parent.spec
-        bounded = self.source_bound is not None
         replay = is_checkpointing()
-        # Replanning during recompute must not depend on an intervening heap growth.
-        floor = self.parent.workspace.capacity_floor if bounded and spec.dispatch_mode == "push" else None
-        if replay and self.bounded is not None and not spec.batch_experts:
-            floor = self.initial_receive_floor
         key = (
             (autograd_mask, replay, tuple(tuple(row) for row in host_rows))
-            if host_rows is not None and not bounded else None
+            if host_rows is not None else None
         )
         return PlacementRequest(
             hidden, ids, gathered[:, 3:], inverse, summary.maximum, sum(source_rows), spec.rank_id,
             spec.intermediate_size, spec.num_cube_cores, replay or bool(autograd_mask & 1),
-            checkpointing=replay, ordinary_receive_capacity=floor,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2, count_key=key,
+            checkpointing=replay, apply_probs_before_fc2=spec.apply_probs_before_fc2, count_key=key,
         )
 
     def bind(
@@ -341,7 +268,7 @@ class PlacementResources:
 
     def _uses_fp32_partials(self):
         """Use the same partial-gradient dtype as the ordinary placed launch."""
-        return self.source_bound is not None or self.parent.spec.partial_weight_grad_dtype == "float32"
+        return self.parent.spec.partial_weight_grad_dtype == "float32"
 
     @property
     def bank_extent(self):
@@ -371,8 +298,7 @@ class PlacementResources:
                 )
             return self.parent
         shared_geometry = self.shared and self.bounded is not None and not spec.batch_experts
-        width = (spec.local_experts if self.source_bound is not None or shared_geometry else
-                 placement.borrowed_capacity)
+        width = spec.local_experts if shared_geometry else placement.borrowed_capacity
         if width in self.geometries:
             return self.geometries[width]
         specification, layout = self._virtual_reservation(hidden.dtype, tokens, placement.receive_capacity, width)
@@ -402,14 +328,10 @@ class PlacementResources:
         receive = _align_capacity(received)
         specification = {
             **self.specification,
-            "hot_replica": False, "source_token_bound": None, "planner_key": None,
+            "hot_replica": False, "planner_key": None,
             "num_experts": spec.ep_size * (spec.local_experts + width),
         }
-        if self.source_bound is not None:
-            bound = _align_capacity(self.source_bound)
-            _, virtual = _bounded_receive(self.specification, bound, dtype, spec.num_cube_cores)
-            source, receive = max(bound, source), max(virtual, receive)
-        elif self.shared and self.bounded is not None and not spec.batch_experts:
+        if self.shared and self.bounded is not None and not spec.batch_experts:
             receive = max(receive, _resolve_receive_capacity(
                 spec.initial_capacity_factor, source * spec.top_k, spec.ep_size,
             ))

@@ -30,7 +30,7 @@ class BF16Resources(_MegaMoeExecutionResources):
 
     def plan_for_tokens(
         self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
-        route_experts: int | None = None, batch_experts: bool = False, nominal_schedule: bool = False,
+        route_experts: int | None = None,
         replica_pipeline: bool = False, reserve_merge_workers: bool = False,
     ) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
@@ -60,12 +60,8 @@ class BF16Resources(_MegaMoeExecutionResources):
                 experts *= 2
             if not 0 < route_experts <= experts or route_experts % spec.ep_size:
                 raise ValueError("HotReplica route geometry exceeds the shared workspace")
-            spec = replace(
-                spec, num_experts=route_experts,
-                batch_experts=spec.batch_experts or batch_experts,
-                nominal_schedule=spec.nominal_schedule or nominal_schedule,
-            )
-            key = (key, route_experts, spec.batch_experts, spec.nominal_schedule)
+            spec = replace(spec, num_experts=route_experts)
+            key = (key, route_experts)
         if replica_pipeline:
             if spec.batch_experts:
                 spec = replace(spec, batch_experts=False)

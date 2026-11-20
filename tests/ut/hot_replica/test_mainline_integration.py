@@ -27,12 +27,11 @@ from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.mega_moe import route, resources as resource_module
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _plan_events
-from hyper_multicore.modules.mega_moe.heap_manager import _HeapManager, _workspace_layout
 from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
-    ExpertWeightBinding, PlacementResources, _bind_custom_copy_rows, _get_mega_bank, workspace_reservations,
+    ExpertWeightBinding, PlacementResources, _bind_custom_copy_rows, _get_mega_bank,
 )
 from hyper_multicore.modules.hot_replica.mx_gradient import GRADIENT_HELPERS, MXGradientPool
 
@@ -368,53 +367,6 @@ def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
     assert owner.pool is None and not owner.geometries
 
 
-def test_bailing_source_bound_reserves_ordinary_and_virtual_storage():
-    """Budget both layout variants and one shared expert bank."""
-    ordinary = {
-        "ep_size": 8, "hidden_size": 2560, "intermediate_size": 768,
-        "local_num_tokens": 128, "num_experts": 512, "top_k": 8,
-        "initial_capacity_factor": 1.25, "auto_tokens": True, "apply_probs_before_fc2": True,
-        "hot_replica": True, "source_token_bound": 4096,
-    }
-    entries, headroom = workspace_reservations(
-        (ordinary, dict(ordinary, swiglu_limit=1.0)), torch.bfloat16, 24,
-    )
-    assert [layout.receive_capacity for _, layout in entries] == [110208, 110208]
-    assert [layout.token_capacity for _, layout in entries] == [4096, 4096]
-    virtual = dict(ordinary, num_experts=1024, hot_replica=False, source_token_bound=None)
-    virtual_bytes = _workspace_layout(virtual, torch.bfloat16, 42624, 4096).required_bytes
-    bank_bytes = 6 * 64 * 2560 * 768 * torch.bfloat16.itemsize + 1024
-    assert headroom == 2 * virtual_bytes + bank_bytes
-
-
-@pytest.mark.parametrize("batch_experts", [False, True])
-def test_initial_heap_seed_defers_optional_replica_headroom(monkeypatch, batch_experts):
-    """A supplied seed is used at startup when it can fit the home layout."""
-    ordinary = {
-        "ep_size": 32, "hidden_size": 5120, "intermediate_size": 1792,
-        "local_num_tokens": 128, "num_experts": 192, "top_k": 8,
-        "initial_capacity_factor": 1.25, "auto_tokens": True, "apply_probs_before_fc2": False,
-        "hot_replica": True, "source_token_bound": 4096, "batch_experts": batch_experts,
-        "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__, ""),
-    }
-    entries, headroom = workspace_reservations((ordinary,), torch.bfloat16, 24)
-    cpu = torch.empty(0, dtype=torch.bfloat16)
-    mib = 1024**2
-    initial_bytes = 1536 * mib
-    monkeypatch.setenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE", str(initial_bytes))
-    manager = _HeapManager(None, cpu)
-    assert entries[0][1].required_bytes < initial_bytes < entries[0][1].required_bytes + headroom
-    options = dict(allow_resize=True, initial_headroom=headroom)
-    manager.reserve(entries, **options)
-    assert manager.heap_bytes == initial_bytes
-    assert manager._required_bytes([manager.entries[0].layout]) == 930 * mib
-
-    monkeypatch.delenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
-    automatic = _HeapManager(None, cpu)
-    automatic.reserve(entries, **options)
-    assert automatic.heap_bytes == 2296 * mib
-
-
 def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     """Reject stale parameters across ranks, even if the token route matches."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
@@ -549,7 +501,7 @@ def test_virtual_event_views_keep_the_ready_generation_at_the_physical_tail():
 
 
 def test_forward_uses_injected_planner_after_count_exchange():
-    """Use the injected instance and its row bound on the normal forward path."""
+    """Use the injected instance on the normal forward path."""
     from hyper_multicore.modules.mega_moe import invocation, module
 
     class RecordingPlanner(BasePlanner):
@@ -557,7 +509,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
             self.seen = request
             return None
 
-    planner = RecordingPlanner(source_token_bound=4096)
+    planner = RecordingPlanner()
     with patch.object(module, "_resolve_ep_size", return_value=2):
         options = MegaMoePlacementOptions(strategy="adaptive", planner=planner)
         expert = MegaMoeExperts(hidden_size=8, intermediate_size=4, num_experts=4, top_k=1, expert_placement=options)
@@ -591,7 +543,6 @@ def test_forward_uses_injected_planner_after_count_exchange():
             patch.object(expert._backend, "forward", return_value=hidden) as forward,
         ):
             assert expert(hidden, ids, probs, expert_weights=roots) is hidden
-        assert owner.placement.source_bound == 4096
         exchange.assert_called_once()
         read.assert_called_once()
         torch.testing.assert_close(planner.seen.counts_by_source, counts[:, 3:])
@@ -625,83 +576,64 @@ def test_custom_placement_derives_fused_rows_from_counts(guest_count):
         assert all(not result.copies_by_rank for result in bound)
 
 
-@pytest.mark.parametrize("bound", [None, 4096])
-def test_checkpoint_request_is_training_independently_of_reservation(bound):
-    """Keep the checkpoint state even when no initial capacity is supplied."""
+def test_checkpoint_request_is_training_with_automatic_capacity():
+    """Request a training plan even during the no-grad checkpoint forward."""
     spec = SimpleNamespace(architecture=0, rank_id=0, intermediate_size=4, num_cube_cores=24,
                            apply_probs_before_fc2=True, dispatch_mode="push")
-    owner = SimpleNamespace(spec=spec, workspace=SimpleNamespace(capacity_floor=128))
-    resources = PlacementResources(owner, {"source_token_bound": bound}, False)
+    owner = SimpleNamespace(spec=spec)
+    resources = PlacementResources(owner, {}, False)
     ids = torch.tensor([[0]])
     with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True):
         request = resources.request(torch.zeros(1, 4), ids, torch.zeros(2, 5), route._RouteSummary(1, 128, 1),
                                     [1, 1], ids, 0, host_rows=None)
     assert request.training and request.checkpointing
-    assert request.ordinary_receive_capacity == (128 if bound else None)
+    assert request.ordinary_receive_capacity is None
 
 
-@pytest.mark.parametrize("bound", [None, 4096])
+@pytest.mark.parametrize("home", [4, 5, 8, 12, 16])
 @pytest.mark.parametrize("batch_experts", [False, True])
-def test_a3_saved_route_uses_shared_quota_geometry(bound, batch_experts):
-    """Share the built-in A3 renderer while preserving both capacity policies."""
+def test_a3_saved_route_uses_shared_quota_geometry(home, batch_experts):
+    """Use the same quotas for the policy, checkpoint and batch lowering."""
     spec = SimpleNamespace(
         architecture=2201, batch_experts=batch_experts, dispatch_mode="push", transport_engine="mte",
-        ep_size=2, rank_id=0, num_experts=8, local_experts=4, hidden_size=32, intermediate_size=64,
+        ep_size=2, rank_id=0, num_experts=2 * home, local_experts=home, hidden_size=32, intermediate_size=64,
         top_k=2, num_cube_cores=24, apply_probs_before_fc2=True, expert_weight_layout="EOI",
         partial_weight_grad_dtype=None,
     )
-    owner = SimpleNamespace(
-        spec=spec, workspace=SimpleNamespace(capacity_floor=4096), heap_manager=object(),
-    )
-    planner = HotReplicaPlanner(source_token_bound=bound)
+    owner = SimpleNamespace(spec=spec)
+    planner = HotReplicaPlanner()
     resources = PlacementResources(owner, {
-        "source_token_bound": bound, "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__),
-    }, False)
+        "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__),
+    }, False, bf16_partials=True)
     resources.bounded.nodes = (0, 0)
     ids = torch.arange(2, dtype=torch.int32).expand(2048, 2).contiguous()
-    wire = torch.tensor([[1, 2048, 12, 2048, 2048, 0, 0, 0, 0, 0, 0]] * 2, dtype=torch.int32)
+    source_counts = [1, 2048, 12, 2048, 2048] + [0] * (2 * home - 2)
+    wire = torch.tensor([source_counts] * 2, dtype=torch.int32)
     hidden = torch.empty(2048, 32, dtype=torch.bfloat16)
     summary = route._RouteSummary(8192, 2048, 8192)
-    if bound is None or batch_experts:
-        inverse = ids.flatten().argsort(stable=True).argsort().view_as(ids)
-        rows = wire.tolist()
-        with (
-            patch("hyper_multicore.modules.hot_replica.planner.placement_receive_limit", return_value=4096),
-            patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable", return_value=True),
-            patch("hyper_multicore.modules.hot_replica.planner.bounded_move_pays", return_value=True),
-            patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True),
-            patch.object(resources, "bind") as bind,
-        ):
-            request = resources.request(hidden, ids, wire, summary, [4096, 4096], inverse, 12, host_rows=rows)
-            expected = planner.plan(request)
-            with patch.object(planner, "plan", side_effect=AssertionError("generic planner called")):
-                resources.select(hidden, ids, wire, summary, [4096, 4096], inverse, 12, planner=planner,
-                                 checkpointing=not batch_experts, host_rows=rows)
-        actual = bind.call_args.args[1]
-        assert actual is not None and expected is not None
-        torch.testing.assert_close(actual.virtual_ids, expected.virtual_ids)
-        torch.testing.assert_close(actual.counts_by_source, expected.counts_by_source)
-        torch.testing.assert_close(actual.copies, expected.copies)
-        assert (actual.receive_capacity, actual.transfer_experts) == (
-            expected.receive_capacity, expected.transfer_experts,
-        )
-        assert resources.bounded.geometry is None
-        assert bind.call_args.kwargs["fused"] == (not batch_experts or bound is not None)
-        return
-
+    inverse = ids.flatten().argsort(stable=True).argsort().view_as(ids)
+    rows = wire.tolist()
     with (
+        patch("hyper_multicore.modules.hot_replica.planner.placement_receive_limit", return_value=4096),
+        patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable", return_value=True),
         patch.object(resources, "bind") as bind,
         patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True),
     ):
-        resources.select(hidden, ids, wire, summary, [4096, 4096], None, 12, planner=planner, checkpointing=True)
-        owner.workspace.capacity_floor = 8192
-        resources.select(hidden, ids, wire, summary, [4096, 4096], None, 13, planner=planner, checkpointing=True)
-    before, after = (call.args[1] for call in bind.call_args_list)
-    assert before.receive_capacity == 4096
-    assert before.counts_by_source is after.counts_by_source
-    assert before.copies_by_rank == after.copies_by_rank
-    assert before.published_slots == sum(expert >= 0 for expert in before.copies_by_rank[0])
-    assert all(call.kwargs.get("fused") for call in bind.call_args_list)
+        request = resources.request(hidden, ids, wire, summary, [4096, 4096], inverse, 12, host_rows=rows)
+        expected = planner.plan(request)
+        with patch.object(planner, "plan", side_effect=AssertionError("generic planner called")):
+            resources.select(hidden, ids, wire, summary, [4096, 4096], inverse, 12, planner=planner,
+                             checkpointing=not batch_experts, host_rows=rows)
+    actual = bind.call_args.args[1]
+    assert actual is not None and expected is not None
+    torch.testing.assert_close(actual.virtual_ids, expected.virtual_ids)
+    torch.testing.assert_close(actual.counts_by_source, expected.counts_by_source)
+    torch.testing.assert_close(actual.copies, expected.copies)
+    assert (actual.receive_capacity, actual.transfer_experts) == (
+        expected.receive_capacity, expected.transfer_experts,
+    )
+    assert resources.bounded.geometry is None
+    assert bind.call_args.kwargs["fused"]
 
 
 def test_manifest_checks_custom_policy_settings():

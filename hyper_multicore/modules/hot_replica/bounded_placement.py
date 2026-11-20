@@ -164,7 +164,7 @@ class BoundedPlacement:
     def select(
         self, hidden: torch.Tensor, ids: torch.Tensor, counts: torch.Tensor, source_rows: list[int],
         inverse: torch.Tensor | None, projections: int, snapshot: PlacementWire | None = None,
-        *, reserved: int | None = None, capacity_target: int | None = None,
+        *, capacity_target: int | None = None,
         host_rows: list[list[int]] | None = None,
     ) -> ExpertPlacement | None:
         """Map the current route through reusable quotas for the agreed receive budget."""
@@ -189,9 +189,9 @@ class BoundedPlacement:
         else:
             capacity = maximum * spec.ep_size * min(spec.local_experts, spec.top_k)
             stream = torch.npu.current_stream(hidden.device) if hidden.device.type == "npu" else None
-            key = (capacity, projections, reserved, hidden.device, stream, torch.is_inference_mode_enabled())
+            key = (capacity, projections, hidden.device, stream, torch.is_inference_mode_enabled())
             if self.key != key or not np.array_equal(self.snapshot, wire):
-                self._build(hidden.device, wire, capacity, projections, key, maximum, reserved)
+                self._build(hidden.device, wire, capacity, projections, key, maximum)
             geometry = self.geometry
         if geometry is None:
             return None
@@ -215,23 +215,15 @@ class BoundedPlacement:
                                copies_by_rank=geometry.owners,
                                route_metadata=geometry.metadata, owner_rows=geometry.owner_rows)
 
-    def _build(self, device, wire, capacity, projections, key, maximum, reserved):
+    def _build(self, device, wire, capacity, projections, key, maximum):
         spec = self.spec
         if self.nodes is None:
             self.nodes = _rank_nodes(spec.ep_group, spec.ep_size)
-        if reserved is None:
-            plan = build_expert_replica_plan(
-                wire.tolist(), min(spec.local_experts, 6), minimum_replica_rows=1024,
-                minimum_load_reduction=0.25 if projections == 3 else 0.4,
-                capacity_limit=capacity, receive_capacity=capacity, rank_nodes=self.nodes,
-                transfer_row_credit=spec.intermediate_size * projections // 6,
-            )
-        else:
-            # The reserved capacity is the preferred peak, while the natural
-            # fan-in limit still permits the existing workspace-growth policy.
-            plan = build_expert_replica_plan(
-                wire.tolist(), spec.local_experts, capacity_limit=capacity,
-                receive_capacity=reserved, rank_nodes=self.nodes,
-            )
+        plan = build_expert_replica_plan(
+            wire.tolist(), min(spec.local_experts, 6), minimum_replica_rows=1024,
+            minimum_load_reduction=0.25 if projections == 3 else 0.4,
+            capacity_limit=capacity, receive_capacity=capacity, rank_nodes=self.nodes,
+            transfer_row_credit=spec.intermediate_size * projections // 6,
+        )
         geometry = _render_geometry(plan, spec, device, maximum) if plan.transfers else None
         self.key, self.snapshot, self.geometry = key, wire.copy(), geometry

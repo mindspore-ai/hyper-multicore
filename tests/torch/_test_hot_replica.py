@@ -62,7 +62,7 @@ def test_placement_checkpoint_and_close():
         ids = torch.arange(2, dtype=torch.int32, device=device).expand(tokens, 2).contiguous()
         upstream = sample(tokens, hidden)
         reference = None
-        for planner in (None, HotReplicaPlanner(source_token_bound=tokens), SkewPlanner()):
+        for planner in (None, HotReplicaPlanner(), SkewPlanner()):
             replica = planner is not None
             op = MegaMoeExperts(hidden_size=hidden, intermediate_size=intermediate, num_experts=8, top_k=2,
                                 ep_group=dist.group.WORLD,
@@ -82,7 +82,8 @@ def test_placement_checkpoint_and_close():
                 owner = op._resource_group.resources.placement  # pylint: disable=protected-access
                 assert owner.statistics["route_replays"] == 1
                 counts = owner.pool.statistics
-                assert counts["remote_prefetches"] > 0 and counts["remote_gradient_returns"] > 0, counts
+                assert counts["remote_prefetches"] + counts.get("fused_prefetches", 0) > 0, counts
+                assert counts["remote_gradient_returns"] + counts.get("fused_gradient_returns", 0) > 0, counts
                 for a, b in zip(observed, reference):
                     torch.testing.assert_close(a, b, rtol=.02, atol=.002)
             else:

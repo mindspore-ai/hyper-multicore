@@ -204,7 +204,6 @@ class MegaMoeExperts(MulticoreModule):
         """
         numerics, tuning, scheduler = _resolve_expert_options(precision, numerics_options, tuning_options)
         planner = _placement_planner(expert_placement)
-        source_bound = planner.source_token_bound if planner is not None else None
         planner_key = None
         if planner is not None:
             if precision == "mxfp8":
@@ -212,8 +211,8 @@ class MegaMoeExperts(MulticoreModule):
 
                 if tuning.dispatch_mode != "push":
                     raise ValueError("MXFP8 HotReplica requires push dispatch")
-                if type(planner) is not HotReplicaPlanner or source_bound is not None:
-                    raise ValueError("MXFP8 HotReplica requires the built-in planner without a source token bound")
+                if type(planner) is not HotReplicaPlanner:
+                    raise ValueError("MXFP8 HotReplica requires the built-in planner")
                 if numerics.partial_weight_grad_dtype != "float32":
                     raise ValueError("MXFP8 HotReplica requires float32 partial weight gradients")
             settings = planner.configuration_key()
@@ -240,7 +239,6 @@ class MegaMoeExperts(MulticoreModule):
             "precision": precision,
             "hot_replica": planner is not None,
             "planner_key": planner_key,
-            "source_token_bound": source_bound,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",
@@ -250,10 +248,6 @@ class MegaMoeExperts(MulticoreModule):
         }
         if planner is not None and specification["ep_size"] <= 1:
             raise ValueError("HotReplica requires an explicit EP group with more than one rank")
-        if source_bound is not None:
-            limit = (2**31 - 1) // max(hidden_size, top_k) // _COMMUNICATION_SPLIT * _COMMUNICATION_SPLIT
-            if source_bound > limit:
-                raise ValueError(f"HotReplica source_token_bound exceeds {limit} rows")
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(

@@ -57,15 +57,8 @@ class _MegaMoeExecutionResources:
                 tensor, specification["ep_group"], mx_cube_cores=self.spec.num_cube_cores if mx_placement else None,
                 architecture=self.spec.architecture, dispatch_mode=self.spec.dispatch_mode,
             )
-        initial_headroom = 0
         if workspace_layout is not None:
             reservations = ((specification, workspace_layout),)
-        elif placement and not mx_placement:
-            from hyper_multicore.modules.hot_replica.mega_moe_adapter import workspace_reservations  # pylint: disable=import-outside-toplevel
-
-            reservations, initial_headroom = workspace_reservations(
-                active_specifications, tensor.dtype, self.spec.num_cube_cores
-            )
         else:
             reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
@@ -73,7 +66,6 @@ class _MegaMoeExecutionResources:
             reservations,
             allow_resize=any(item.get("dispatch_mode", "push") == "push" or item.get("auto_tokens", False)
                              for item in active_specifications),
-            initial_headroom=initial_headroom,
         )
         attached = False
         self.plan = None
@@ -175,7 +167,7 @@ class _MegaMoeExecutionResources:
                   "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
-                  "batch_experts", "nominal_schedule", "hot_replica", "source_token_bound", "planner_key")
+                  "batch_experts", "nominal_schedule", "hot_replica", "planner_key")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))

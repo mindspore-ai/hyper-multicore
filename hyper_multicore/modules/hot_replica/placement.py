@@ -56,31 +56,6 @@ def placement_receive_limit(
     return (limit + tile - 1) // tile * tile
 
 
-def _bounded_transfer_seconds(
-    ranks: int, local: int, weight_bytes: int, gradient_bytes: int,
-) -> float:
-    """Estimate the leased bank traffic for a route with a configured source bound."""
-    staging = (3 * weight_bytes + 2 * gradient_bytes) / _A3_STAGING_BYTES_PER_SECOND
-    peer = (ranks - 1) * (weight_bytes + gradient_bytes) / (local * _A3_PEER_BYTES_PER_SECOND)
-    return _A3_PLACEMENT_SECONDS + staging + peer
-
-
-def bounded_move_pays(
-    maximum: int, after: int, hidden: int, intermediate: int, cube_cores: int,
-    ep_size: int, local_experts: int, element_size: int, *, training: bool, replay: bool,
-    apply_probs_before_fc2: bool,
-) -> bool:
-    """Compare placement work against the busiest rank's saved projection work."""
-    weights = 3 * local_experts * hidden * intermediate
-    gradient_bytes = weights * 4 if training else 0
-    transfer = _bounded_transfer_seconds(ep_size, local_experts, weights * element_size, gradient_bytes)
-    if replay:
-        transfer += 2 * weights * element_size / _A3_STAGING_BYTES_PER_SECOND
-    flops = 18 if replay and not apply_probs_before_fc2 else 12 if training else 6
-    compute = flops * max(0, maximum - after) * hidden * intermediate
-    return compute > transfer * cube_cores * 4e12
-
-
 def _transfer_seconds(weight_bytes, gradient_bytes, ep_size, local_experts, replay_bytes, transfer_experts):
     """Time to stage the shard and fetch/return one expert per peer."""
     copies = ep_size - 1 if transfer_experts is None else transfer_experts

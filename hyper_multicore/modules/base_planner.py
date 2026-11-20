@@ -126,24 +126,11 @@ class ExpertPlacement:
 class BasePlanner(ABC):
     """Choose expert placement from an EP group's already exchanged routing counts."""
 
-    def __init__(self, *, source_token_bound: int | None = None) -> None:
-        """Set an optional estimate of input rows per source rank for reservation."""
-        if source_token_bound is not None and (
-            not isinstance(source_token_bound, int) or isinstance(source_token_bound, bool) or source_token_bound <= 0
-        ):
-            raise ValueError("source_token_bound must be a positive integer")
-        self._source_token_bound = source_token_bound
-
-    @property
-    def source_token_bound(self) -> int | None:
-        """Expected maximum input rows per source rank, if known before routing."""
-        return self._source_token_bound
-
     def configuration_key(self) -> str:
         """Return a stable key for decision settings that must agree across EP ranks.
 
         Parameterized policies override this method. Exclude per-rank and mutable execution state.
-        The executor records the planner type and the source bound separately.
+        The executor records the planner type separately.
         """
         return ""
 
