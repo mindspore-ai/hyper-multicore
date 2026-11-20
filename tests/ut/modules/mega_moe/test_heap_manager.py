@@ -275,14 +275,30 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_automatic_growth_exceeds_explicit_initial_heap(self) -> None:
-        """Source growth and push receive growth may exceed the configured seed."""
+    def test_automatic_growth_respects_explicit_heap_limit(self) -> None:
+        """Reject oversized Push and Pull layouts before replacing their buffers."""
         for mode in ("push", "pull"):
             with self.subTest(mode=mode):
-                initial_bytes = 2 * 1024**2
-                with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(initial_bytes)}):
+                limit = 2 * 1024**2
+                with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(limit)}):
                     manager, workspace, spec = self._automatic_workspace(mode)
-                self.assertEqual(manager.heap_bytes, initial_bytes)
+                original = workspace.routed_buffer
+                with patch.object(shmem, "_restart") as restart:
+                    with self.assertRaisesRegex(RuntimeError, rf"HEAP_SIZE: required=\d+ bytes, limit={limit} bytes"):
+                        manager.ensure_token_capacity(workspace, 131072, 262144)
+                    restart.assert_not_called()
+                self.assertEqual(manager.heap_bytes, limit)
+                self.assertEqual(manager.epoch, 0)
+                self.assertEqual(manager.state, "ready")
+                self.assertIs(manager.workspace_spec(workspace), spec)
+                self.assertIs(workspace.routed_buffer, original)
+
+    def test_automatic_growth_without_an_explicit_limit(self) -> None:
+        """Keep automatic physical heap growth for Push and Pull with no explicit limit."""
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                manager, workspace, spec = self._automatic_workspace(mode)
+                initial_bytes = manager.heap_bytes
                 original = workspace.routed_buffer
                 with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
                     committed = manager.ensure_token_capacity(workspace, 131072, 262144)
@@ -294,6 +310,20 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 self.assertIsNot(workspace.routed_buffer, original)
                 if mode == "push":
                     self.assertEqual(workspace.capacity_floor, 262144)
+
+    def test_fixed_heap_retries_growth_without_geometric_headroom(self) -> None:
+        """Commit the same route when its exact aligned capacities fit inside the limit."""
+        limit = 2 * 1024**2
+        with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(limit)}):
+            manager, workspace, _ = self._automatic_workspace("push")
+        with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+            manager.ensure_token_capacity(workspace, 20480, 16384)
+            committed = manager.ensure_token_capacity(workspace, 21120, 16512)
+        self.assertEqual(restart.call_count, 2)
+        self.assertEqual(restart.call_args.kwargs["heap_size_bytes"], limit)
+        self.assertEqual(manager.heap_bytes, limit)
+        self.assertEqual(committed.local_num_tokens, 21120)
+        self.assertEqual(committed.receive_capacity, 16512)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -528,6 +558,35 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 self.assertFalse(manager._configured)
                 self.assertEqual(manager.heap_bytes, 0)
 
+    def test_explicit_limit_rolls_back_oversized_reservations(self) -> None:
+        """Reject initial and late owners without changing the configured runtime."""
+        manager = _HeapManager(self.root_group, self.reference)
+        limit = 2 * 1024**2
+        home, bank = {"kind": "home"}, {"kind": "expert_bank"}
+        home_layout = self._layout(1024, 128, "home")
+        bank_layout = self._layout(limit, 2, "bank")
+        error = rf"HEAP_SIZE: required={2 * limit} bytes, limit={limit} bytes"
+        with (
+            patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(limit)}),
+            patch.object(shmem, "acquire") as acquire,
+            patch.object(shmem, "_restart") as restart,
+        ):
+            with self.assertRaisesRegex(RuntimeError, error):
+                manager.reserve(((home, home_layout), (bank, bank_layout)), allow_resize=True)
+            self.assertEqual(manager.entries, [])
+            self.assertIsNone(manager.heap_limit)
+            acquire.assert_not_called()
+            manager.reserve(((home, home_layout),), allow_resize=True)
+            manager.attach_runtime()
+            acquire.assert_called_once_with(self.root_group, heap_size_bytes=limit)
+            with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(2 * limit)}):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    manager.reserve(((bank, bank_layout),), allow_resize=True)
+            restart.assert_not_called()
+        self.assertEqual([entry.specification for entry in manager.entries], [home])
+        self.assertEqual(manager.heap_bytes, limit)
+        self.assertEqual(manager.state, "ready")
+
     def test_manager_owns_and_reuses_one_retryable_runtime_reference(self) -> None:
         """Reuse an attached manager and commit detach only after its sole release succeeds."""
         manager = self._manager_with_reservation({"name": "runtime"}, self._layout(512, 1))
@@ -679,9 +738,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         access.assert_not_called()
 
         specification = {"shape": "dynamic"}
-        initial_bytes = 2 * 1024**2
-        with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(initial_bytes)}):
-            manager = self._manager_with_reservation(specification, self._layout(512, 1))
+        manager = self._manager_with_reservation(specification, self._layout(512, 1))
         workspace = Mock(capacity_floor=1)
         workspace.describe_restart_allocations.return_value = ()
         workspace.validate_restart_allocations.return_value = False

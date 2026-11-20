@@ -359,8 +359,10 @@ d_a = BF16(FP32(d_fc2_input) * p)
 
 即使 token 数固定，热点也可能触发 push 接收区扩容。扩容可能集体重启同一 SHMEM root 的 runtime，
 再恢复受管 workspace；外部专家参数不移动。
-`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 可设置初始容量（字节数，须为 2 MiB 的整数倍）。启动时取该值与
-已预留布局所需容量的较大值，后续按实际路由和新增资源继续扩容。堆分配失败或无法安全重启时会报错。
+`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 为每 rank 的 SHMEM 堆大小上限（字节数，须为 2 MiB 的整数倍）。
+设置后 MegaMoE 按该大小建立固定堆。路由和新增资源仍可在堆内调整布局。若本次布局的最小容量超过上限，
+执行器在申请或重建前报错，并报告所需字节数与配置值。未设置时，MegaMoE 根据实际布局选择堆大小并按需增长。
+堆分配失败或无法安全重启时同样会报错。
 容量策略和失败恢复见 [SHMEM runtime restart](shmem.md#runtime-restart)。
 
 ### 资源共享与关闭

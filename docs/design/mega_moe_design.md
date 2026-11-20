@@ -302,7 +302,8 @@ SHMEM Python 层通过进程级引用计数管理通信 runtime 的生命周期�
 单个资源组关闭时释放自己的 workspace，资源池完成全部集体清理后再调用一次 `shmem.release()`。
 
 因此，替换不同配置的孤儿 workspace 不会触发通信 runtime 反复关闭和初始化。
-更大模型首次绑定时，可以在这份独占引用内按实际 heap 容量重启 runtime。
+更大模型首次绑定时，Heap Manager 先核对布局能否满足显式堆上限，再在需要时使用独占引用重启 runtime。
+未设置堆上限时，目标堆大小按实际布局增长。
 其他组件直接使用 SHMEM 时持有各自的引用；存在其他使用者时，MegaMoE 不能独占并重启 runtime。
 
 ## 扩展与验证

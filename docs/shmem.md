@@ -261,8 +261,8 @@ Runtime初始化时冻结当前NPU设备。`empty`、`barrier`、`signal`、`wai
 
 ### 4.1 SHMEM restart机制
 
-MegaMoE 管理的堆可通过 `HYPER_MULTICORE_SHMEM_HEAP_SIZE` 设置初始容量。实际布局需要更多空间时，
-执行器继续增长堆，并使用同一套重建事务迁移受管分配。
+设置 `HYPER_MULTICORE_SHMEM_HEAP_SIZE` 后，MegaMoE 使用固定大小的堆。布局超出配置上限时在重建前报错。
+未设置时，MegaMoE 按布局自动选取堆大小，并在需要更多空间时使用重建事务迁移受管分配。
 
 SHMEM lifecycle负责进程级Runtime引用、Root一致性和安全restart。内部调用方提交目标heap字节数、完整的
 Allocation替换清单和只读业务状态预检钩子；lifecycle验证这些Allocation完整覆盖活动Runtime后，按以下顺序
@@ -401,7 +401,7 @@ flowchart TB
 
 | 变量 | 默认值 | 语义 |
 | --- | --- | --- |
-| `HYPER_MULTICORE_SHMEM_HEAP_SIZE` | 1073741824（1 GiB） | `acquire()`未显式指定heap大小时使用的默认字节数 |
+| `HYPER_MULTICORE_SHMEM_HEAP_SIZE` | `acquire()` 为 1073741824（1 GiB），MegaMoE 为自动选取 | 直接调用 `acquire()` 时提供默认堆大小。MegaMoE 在设置该变量时将它作为固定堆上限 |
 | `HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 普通WORLD或单进程初始化endpoint；子组及显式heap初始化使用独立unique ID |
 | `SHMEM_UID_SOCK_IFNAME` | CANN自动选择 | 子组UID bootstrap使用的Host网卡，所有group成员必须可达 |
 | `HYPER_MULTICORE_SHMEM_TIMEOUT_SEC` | 120 | Runtime超时秒数 |
