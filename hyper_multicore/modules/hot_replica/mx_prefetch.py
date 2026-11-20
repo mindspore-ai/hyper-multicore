@@ -9,17 +9,7 @@ import torch.distributed as dist
 from hyper_multicore.modules.mega_moe.route import _upload_route_tensor
 from hyper_multicore.torch.ops import _load_native
 
-from ._planner.plan import ExpertReplicaTransfer
-
-
-def _transfers(placement, home):
-    """Use the common target-rank/slot order for matching P2P submissions."""
-    return tuple(
-        ExpertReplicaTransfer(expert, expert // home, expert % home, rank, slot)
-        for rank, row in enumerate(placement.copies_by_rank)
-        for slot, expert in enumerate(row)
-        if expert >= 0
-    )
+from ._planner.plan import _replica_transfers
 
 
 class MXWeightPrefetch:
@@ -62,7 +52,7 @@ class MXWeightPrefetch:
                     value = originals[index][edge.owner_slot].view(torch.uint8)
                     requests.append(dist.P2POp(dist.isend, value, self.members[edge.target_rank], self.group))
                 elif edge.target_rank == self.rank:
-                    value = banks[index][edge.target_slot].view(torch.uint8)
+                    value = banks[index][edge.guest_slot(self.home_experts)].view(torch.uint8)
                     requests.append(dist.P2POp(dist.irecv, value, self.members[edge.owner_rank], self.group))
         if requests:
             submitted = dist.batch_isend_irecv(requests)
@@ -87,8 +77,8 @@ class MXWeightPrefetch:
         _load_native()
         publish_ready = torch.ops.hyper_multicore.hot_replica_publish_mx_projection_ready_
         banks = self._guest_banks(originals, backward)
-        transfers = _transfers(placement, self.home_experts)
-        active = tuple(edge.target_slot for edge in transfers if edge.target_rank == self.rank)
+        transfers = _replica_transfers(placement.copies_by_rank, self.home_experts)
+        active = tuple(edge.guest_slot(self.home_experts) for edge in transfers if edge.target_rank == self.rank)
         caller = torch.npu.current_stream(originals[0].device)
         self.epoch += 1
         ready = struct.pack("<5Q", self.epoch, self.ready[0].data_ptr(), self.ready[1].data_ptr(),

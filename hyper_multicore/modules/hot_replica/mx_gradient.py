@@ -12,7 +12,7 @@ import torch
 from hyper_multicore import shmem
 from hyper_multicore.modules.mega_moe.route import _upload_route_tensor
 
-from .mx_prefetch import _transfers
+from ._planner.plan import _replica_transfers
 from .shmem_transfer import SharedExpertPool
 
 
@@ -54,7 +54,7 @@ def pack_mx_gradient_return(placement, rank, home, events, elements, storage, ep
         raise ValueError("MX gradient return requires aligned, non-null buffer addresses")
     if any(address % 64 for address in addresses[2:]):
         raise ValueError("MX gradient flags and staging require cache-line alignment")
-    edges = _transfers(placement, home)
+    edges = _replica_transfers(placement.copies_by_rank, home)
     if any(edge.owner_rank >= ranks or edge.owner_rank == edge.target_rank for edge in edges):
         raise ValueError("MX gradient return requires a remote home expert for each active guest")
     incoming = tuple(edge for edge in edges if edge.target_rank == rank)
@@ -63,9 +63,9 @@ def pack_mx_gradient_return(placement, rank, home, events, elements, storage, ep
     values = [9, rank, slots, epoch, elements, *addresses[:5], len(incoming), len(owned),
               storage.staging, storage.chunk_elements, GRADIENT_HELPERS, qp_offset]
     for edge in incoming:
-        values.extend((edge.owner_rank, edge.target_slot, events[home + edge.target_slot]))
+        values.extend((edge.owner_rank, edge.guest_slot(home), events[edge.target_slot]))
     for edge in owned:
-        values.extend((edge.target_rank, edge.target_slot, edge.owner_slot, events[edge.owner_slot]))
+        values.extend((edge.target_rank, edge.guest_slot(home), edge.owner_slot, events[edge.owner_slot]))
     # The shared MX transport has one fixed token queue per peer, on QP0.
     # Never move its producers or share the gradient helpers' QP state.
     values.extend(tuple(range(1, GRADIENT_HELPERS + 1)) * ranks)

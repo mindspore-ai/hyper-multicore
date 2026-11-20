@@ -14,6 +14,7 @@
 # ============================================================================
 """Regression coverage for single-backend placement and original-route fallback."""
 
+import struct
 from typing import get_type_hints
 from types import SimpleNamespace
 from contextlib import nullcontext
@@ -29,13 +30,42 @@ from hyper_multicore.modules.mega_moe import route, resources as resource_module
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _plan_events
 from hyper_multicore.modules.hot_replica import capability, checkpoint as replay, mx_adapter
 from hyper_multicore.modules.hot_replica._planner import aligned
+from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica._planner.plan import ExpertExecutionPlan, _replica_transfers
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
     ExpertWeightBinding, PlacementResources, _bind_custom_copy_rows, _get_mega_bank,
 )
-from hyper_multicore.modules.hot_replica.mx_gradient import GRADIENT_HELPERS, MXGradientPool
+from hyper_multicore.modules.hot_replica.mx_gradient import (
+    GRADIENT_HELPERS, MXGradientPool, MXGradientStorage, pack_mx_gradient_return,
+)
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+
+
+def test_mx_transfer_slots_match_the_execution_plan_and_gradient_record():
+    """The wire record indexes guest banks while TN events index physical slots."""
+    config = ExpertReplicaConfig(num_experts=12, ep_size=2, replica_slots_per_rank=2)
+    home = config.home_experts
+    copies = ((-1, 8), (1, -1))
+    physical = (tuple(range(home)) + copies[0], tuple(range(home, 2 * home)) + copies[1])
+    counts = ((0,) * config.num_experts,) * config.ep_size
+    dispatch = ((0,) * config.physical_experts,) * config.ep_size
+    plan = ExpertExecutionPlan(config, counts, physical, dispatch)
+    plan.validate()
+    edges = _replica_transfers(copies, home)
+    assert edges == plan.transfers
+    assert [(edge.target_rank, edge.target_slot, edge.guest_slot(home)) for edge in edges] == [
+        (0, home + 1, 1), (1, home, 0),
+    ]
+
+    placement = SimpleNamespace(borrowed_capacity=2, copies_by_rank=copies)
+    storage = MXGradientStorage(256, 512, 768, 1024, 1280, 1536, 256)
+    events = tuple(range(100, 100 + config.slots_per_rank))
+    payload = pack_mx_gradient_return(placement, 0, home, events, 128, storage, 1, 16)
+    words = struct.unpack(f"<{len(payload) // 8}Q", payload)
+    assert words[16:19] == (1, 1, events[home + 1])  # Incoming owner, guest bank, TN event.
+    assert words[19:23] == (1, 0, 1, events[1])  # Target, guest bank, owner slot and event.
 
 
 @pytest.mark.parametrize("local_experts", (4, 6, 8))

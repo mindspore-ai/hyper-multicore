@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
@@ -37,13 +38,29 @@ def _destination_counts_from_dispatch(
 
 @dataclass(frozen=True)
 class ExpertReplicaTransfer:
-    """One original owner supplying one temporary physical expert slot."""
+    """An owner supplying a slot in the target rank's home-plus-guest layout."""
 
     logical_expert: int
     owner_rank: int
     owner_slot: int
     target_rank: int
     target_slot: int
+
+    def guest_slot(self, home_experts: int) -> int:
+        """Convert the physical execution slot to a guest-bank index."""
+        return self.target_slot - home_experts
+
+
+def _replica_transfers(
+    copies_by_rank: Iterable[tuple[int, ...]], home_experts: int,
+) -> tuple[ExpertReplicaTransfer, ...]:
+    """Build transfers in target-rank and physical-slot order for all transports."""
+    return tuple(
+        ExpertReplicaTransfer(expert, expert // home_experts, expert % home_experts, rank, slot)
+        for rank, row in enumerate(copies_by_rank)
+        for slot, expert in enumerate(row, start=home_experts)
+        if expert >= 0
+    )
 
 
 @dataclass(frozen=True)
@@ -107,9 +124,7 @@ class ExpertExecutionPlan:
     def transfers(self) -> tuple[ExpertReplicaTransfer, ...]:
         """Return transfers in globally identical target/slot order."""
         home = self.config.home_experts
-        return tuple(ExpertReplicaTransfer(expert, expert // home, expert % home, rank, slot)
-                     for rank, row in enumerate(self.slot_to_logical)
-                     for slot, expert in enumerate(row) if slot >= home and expert >= 0)
+        return _replica_transfers((row[home:] for row in self.slot_to_logical), home)
 
     @cached_property
     def maximum_transfer_degree(self) -> int:
