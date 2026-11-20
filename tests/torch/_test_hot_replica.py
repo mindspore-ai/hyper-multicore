@@ -52,7 +52,7 @@ def test_placement_checkpoint_and_close():
     try:
         torch.manual_seed(437 + rank)
         # This large hot route crosses the default cost gate without overriding policy.
-        tokens, hidden, intermediate = 8192, 5120, 1792
+        tokens, hidden, intermediate = 12288, 5120, 1792
         def sample(*dims: int) -> torch.Tensor:
             """Create deterministic BF16 samples on the local NPU."""
             return torch.randn(*dims, dtype=torch.bfloat16, device=device) * 0.02
@@ -81,6 +81,7 @@ def test_placement_checkpoint_and_close():
             if replica:
                 owner = op._resource_group.resources.placement  # pylint: disable=protected-access
                 assert owner.statistics["route_replays"] == 1
+                assert owner.pool is not None, "The hot route must admit a replica"
                 counts = owner.pool.statistics
                 assert counts["remote_prefetches"] + counts.get("fused_prefetches", 0) > 0, counts
                 assert counts["remote_gradient_returns"] + counts.get("fused_gradient_returns", 0) > 0, counts
