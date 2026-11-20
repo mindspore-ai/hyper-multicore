@@ -22,6 +22,7 @@
 namespace MulticoreRuntime {
 
 #if !defined(__DAV_CUBE__) && !defined(__DAV_C220_CUBE__)
+template <bool CopyOnly>
 __aicore__ inline void LoadReplicaGradientBlock(AscendC::LocalTensor<float> local,
                                                AscendC::LocalTensor<float> remote,
                                                AscendC::GlobalTensor<float> &home,
@@ -30,13 +31,13 @@ __aicore__ inline void LoadReplicaGradientBlock(AscendC::LocalTensor<float> loca
   AscendC::DataCopyExtParams params{1, count * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
   AscendC::DataCopyPadExtParams<float> padding{false, 0, 0, 0};
   AscendC::DataCopyPad(local, home[offset], params, padding);
-  AscendC::DataCopyPad(remote, guest[offset], params, padding);
+  if constexpr (!CopyOnly) AscendC::DataCopyPad(remote, guest[offset], params, padding);
   AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(event);
 }
 #endif
 
 // Every worker owns disjoint blocks; peers visit each block in the same FP32 order.
-template <bool FinalBf16 = false>
+template <bool FinalBf16 = false, bool CopyOnly = false>
 __aicore__ inline void AddReplicaGradient(GM_ADDR output, GM_ADDR source, int64_t elements,
                                          int32_t peer, int32_t worker, int32_t workers,
                                          GM_ADDR final_output = nullptr) {
@@ -47,15 +48,18 @@ __aicore__ inline void AddReplicaGradient(GM_ADDR output, GM_ADDR source, int64_
   AscendC::TBuf<AscendC::TPosition::VECCALC> buffer;
   pipe.InitBuffer(buffer, buffers * 2 * block_elements * sizeof(float));
   auto storage = buffer.Get<float>();
-  auto mapped = hyper_multicore::shmem::data_plane::remote_ptr(
-      reinterpret_cast<__gm__ void *>(source), peer);
   AscendC::GlobalTensor<float> home, guest;
   AscendC::GlobalTensor<bfloat16_t> final_home;
   if constexpr (FinalBf16) {
     final_home.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(final_output), elements);
   }
   home.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(output), elements);
-  guest.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(mapped), elements);
+  if constexpr (!CopyOnly) {
+    auto mapped = hyper_multicore::shmem::data_plane::remote_ptr(
+        reinterpret_cast<__gm__ void *>(source), peer);
+    if (mapped == nullptr) AscendC::Trap();
+    guest.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(mapped), elements);
+  }
   const int64_t stride = static_cast<int64_t>(workers) * block_elements;
   const int64_t first = static_cast<int64_t>(worker) * block_elements;
   for (int32_t slot = 0; slot < buffers; ++slot) {
@@ -63,8 +67,8 @@ __aicore__ inline void AddReplicaGradient(GM_ADDR output, GM_ADDR source, int64_
     if (offset < elements) {
       const uint32_t count = static_cast<uint32_t>(elements - offset < block_elements ? elements - offset
                                                                                      : block_elements);
-      LoadReplicaGradientBlock(storage[slot * 2 * block_elements], storage[(slot * 2 + 1) * block_elements],
-                               home, guest, offset, count, slot);
+      LoadReplicaGradientBlock<CopyOnly>(storage[slot * 2 * block_elements], storage[(slot * 2 + 1) * block_elements],
+                                         home, guest, offset, count, slot);
     }
   }
   int32_t slot = 0;
@@ -75,7 +79,7 @@ __aicore__ inline void AddReplicaGradient(GM_ADDR output, GM_ADDR source, int64_
     uint32_t count = static_cast<uint32_t>(elements - offset < block_elements ? elements - offset : block_elements);
     AscendC::DataCopyExtParams params{1, count * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(slot);
-    AscendC::Add(local, local, remote, count);
+    if constexpr (!CopyOnly) AscendC::Add(local, local, remote, count);
     if constexpr (FinalBf16) {
       // The guest tile is dead after Add, so its UB slot can hold the final BF16 tile.
       AscendC::PipeBarrier<PIPE_V>();
@@ -97,7 +101,7 @@ __aicore__ inline void AddReplicaGradient(GM_ADDR output, GM_ADDR source, int64_
     if (next < elements) {
       const uint32_t next_count = static_cast<uint32_t>(elements - next < block_elements ? elements - next
                                                                                        : block_elements);
-      LoadReplicaGradientBlock(local, remote, home, guest, next, next_count, slot);
+      LoadReplicaGradientBlock<CopyOnly>(local, remote, home, guest, next, next_count, slot);
     }
     slot = (slot + 1) % buffers;
   }

@@ -13,11 +13,18 @@ struct ReplicaGradientBandRecord {
   uint64_t home, slots, epoch, rows, columns, band_rows, bands;
   uint64_t owner, guest, owner_flags, guest_flags, owned;
   uint64_t scratch, rank, ack, done;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+  uint64_t guest_ready;
+#endif
 };
 struct ReplicaGradientBandEdge {
   uint64_t peer, slot, owner, last;
 };
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+static_assert(sizeof(ReplicaGradientBandRecord) == 136);
+#else
 static_assert(sizeof(ReplicaGradientBandRecord) == 128);
+#endif
 static_assert(sizeof(ReplicaGradientBandEdge) == 32);
 constexpr uint64_t kFp32ReplicaGradientTable = 2;
 constexpr uint64_t kBf16ReplicaGradientTable = 3;
@@ -68,6 +75,70 @@ __aicore__ inline void FinishReplicaBandReads(const __gm__ ReplicaGradientBandRe
     aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(record->ack + line * DATA_CACHE_LINE_SIZE),
                        record->epoch, ACLSHMEM_SIGNAL_SET, edges[index].peer);
   }
+}
+#endif
+
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+__aicore__ inline void PublishA5ReplicaGradientReady(const __gm__ ReplicaGradientBandRecord *record,
+                                                    uint32_t worker, uint32_t cubes, uint32_t ep) {
+  using namespace MulticoreRuntime;
+  if (record == nullptr || record->guest_ready == 0 || record->rank >= ep || record->slots > record->home ||
+      record->owned > ep * record->slots || record->bands != 1) AscendC::Trap();
+  const auto edges = reinterpret_cast<const __gm__ ReplicaGradientBandEdge *>(record + 1);
+  const auto owners = reinterpret_cast<const __gm__ uint64_t *>(edges + record->owned) + record->home;
+  for (uint32_t slot = worker; slot < record->slots; slot += kA5ReplicaHelpers) {
+    const uint64_t peer = owners[slot];
+    if (peer == UINT64_MAX) continue;
+    if (peer >= ep) AscendC::Trap();
+    const auto flags = GradientBandExpertFlags(record, record->home + slot, cubes);
+    for (uint32_t cube = 0; cube < cubes; ++cube) {
+      WaitReplicaEpoch<true>(flags + cube * DATA_CACHE_LINE_SIZE, record->epoch);
+    }
+    const uint64_t line = record->rank * record->home + slot;
+    aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(record->guest_ready + line * DATA_CACHE_LINE_SIZE),
+                       record->epoch, ACLSHMEM_SIGNAL_SET, peer);
+  }
+}
+
+__aicore__ inline void ReturnA5ReplicaGradientBands(const __gm__ ReplicaGradientBandRecord *record,
+                                                   uint32_t worker, uint32_t cubes, uint32_t ep) {
+  using namespace MulticoreRuntime;
+  if (record == nullptr || record->rows == 0 || record->columns == 0 || record->bands != 1 ||
+      record->band_rows != record->rows || record->scratch == 0 || record->owned > ep * record->slots) AscendC::Trap();
+  const auto edges = reinterpret_cast<const __gm__ ReplicaGradientBandEdge *>(record + 1);
+  const uint64_t elements = record->rows * record->columns;
+  constexpr uint32_t workers = kA5ReplicaHelpers;
+  for (uint32_t i = 0; i < record->owned; ++i) {
+    const auto peer = edges[i].peer, slot = edges[i].slot, owner = edges[i].owner;
+    if (peer >= ep || slot >= record->slots || owner >= record->home) AscendC::Trap();
+    const uint64_t line = peer * record->home + slot;
+    WaitReplicaEpoch<true>(record->guest_ready + line * DATA_CACHE_LINE_SIZE, record->epoch);
+    const auto flags = GradientBandExpertFlags(record, owner, cubes);
+    for (uint32_t cube = 0; cube < cubes; ++cube) {
+      WaitReplicaEpoch<true>(flags + cube * DATA_CACHE_LINE_SIZE, record->epoch);
+    }
+    auto dst = reinterpret_cast<GM_ADDR>(record->scratch + owner * elements * sizeof(float));
+    auto src = reinterpret_cast<GM_ADDR>(record->guest + slot * elements * sizeof(float));
+    if (edges[i].last != 0) {
+      auto final = reinterpret_cast<GM_ADDR>(record->owner + owner * elements * sizeof(bfloat16_t));
+      AddReplicaGradient<true>(dst, src, elements, peer, worker, workers, final);
+    } else {
+      AddReplicaGradient(dst, src, elements, peer, worker, workers);
+    }
+  }
+  for (uint32_t owner = 0; owner < record->home; ++owner) {
+    bool has_guest = false;
+    for (uint32_t i = 0; i < record->owned; ++i) has_guest |= edges[i].owner == owner;
+    if (has_guest) continue;
+    const auto flags = GradientBandExpertFlags(record, owner, cubes);
+    for (uint32_t cube = 0; cube < cubes; ++cube) {
+      WaitReplicaEpoch<true>(flags + cube * DATA_CACHE_LINE_SIZE, record->epoch);
+    }
+    auto src = reinterpret_cast<GM_ADDR>(record->scratch + owner * elements * sizeof(float));
+    auto dst = reinterpret_cast<GM_ADDR>(record->owner + owner * elements * sizeof(bfloat16_t));
+    AddReplicaGradient<true, true>(src, nullptr, elements, 0, worker, workers, dst);
+  }
+  FinishReplicaBandReads(record, edges, worker, workers);
 }
 #endif
 

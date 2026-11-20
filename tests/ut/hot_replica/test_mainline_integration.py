@@ -372,13 +372,15 @@ def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget):
     spec = SimpleNamespace(
         architecture=3510, dispatch_mode="push", ep_size=2, local_experts=6, top_k=6, hidden_size=5120,
         intermediate_size=1792, ep_group=object(), rank_id=0, num_cube_cores=32,
-        apply_probs_before_fc2=False, partial_weight_grad_dtype="float32",
+        apply_probs_before_fc2=False, partial_weight_grad_dtype="float32", batch_experts=False,
     )
     planner = HotReplicaPlanner(replica_slots_per_rank=budget)
     settings = {"planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__,
                                 planner.configuration_key()),
                 "replica_slots_per_rank": budget}
-    placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
+    with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline", return_value=False):
+        with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline", return_value=False):
+        placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
     placement.rank_nodes = (0, 1)
     hidden = torch.empty((1, 5120), dtype=torch.bfloat16).expand(4096, 5120)
     ids = torch.arange(6, dtype=torch.int32).repeat(4096, 1)

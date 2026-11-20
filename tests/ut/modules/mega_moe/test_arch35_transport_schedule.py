@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -75,6 +76,23 @@ def test_default_mte_pull_uses_available_lanes_and_coarser_fragments():
             by_peer.setdefault(peer, set()).add(worker)
     assert len(by_peer) == spec.ep_size
     assert all(len(owners) == 2 for peer, owners in by_peer.items() if peer != spec.rank_id)
+
+
+@pytest.mark.parametrize("ep,cubes", [(4, 28), (32, 32), (64, 36)])
+def test_bf16_replica_helpers_preserve_math_and_transport_work(ep, cubes):
+    spec = MegaMoeSpec(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
+                       num_experts=ep * 8, top_k=8, initial_capacity_factor=1.25,
+                       receive_capacity=40960, ep_size=ep, ep_group=None, rank_id=0,
+                       num_cube_cores=cubes, dispatch_mode="push", dispatch_split=512, combine_split=512,
+                       architecture=3510, transport_engine="udma", ready_depth=0)
+    ordinary = _build_runtime_artifacts(spec, torch.float32)
+    replica = _build_runtime_artifacts(spec, torch.float32, replica_pipeline=True, reserve_merge_workers=True)
+    for base, fused in zip(ordinary[1::2], replica[1::2], strict=True):
+        base_queues, fused_queues = (explain_schedule(cfg)["queues"] for cfg in (base, fused))
+        assert sorted(tid for queue in base_queues for tid in queue["tasks"]) == sorted(
+            tid for queue in fused_queues for tid in queue["tasks"])
+        assert all(fused_queues[cubes + worker]["tasks"] == [] for worker in range(0, 8, 2))
+        assert base.all_event_num_triggers[:] == fused.all_event_num_triggers[:]
 
 
 @pytest.mark.parametrize('ep,mode', [(4, 'push'), (8, 'pull'), (64, 'push'), (64, 'pull')])

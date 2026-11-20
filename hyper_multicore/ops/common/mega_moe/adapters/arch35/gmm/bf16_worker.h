@@ -3,6 +3,7 @@
 #pragma once
 #include "blaze/gemm/kernel/kernel_grouped_matmul.h"
 #include "common/mega_moe/gmm_logical_workers.h"
+#include "common/mega_moe/replica_gradient_bands.h"
 #include "bf16_problem.h"
 
 namespace MulticoreBf16 {
@@ -43,7 +44,10 @@ __aicore__ inline void RunStandardGmm(const Problem& p, GM_ADDR a, GM_ADDR b, GM
 
 template <class WeightOutput = bfloat16_t, class Task>
 __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_t cores,
-                                      const TCubeTiling& tiling) {
+                                      const TCubeTiling& tiling,
+                                      const __gm__ MulticoreMoE::ReplicaLaunch* replica = nullptr,
+                                      uint32_t weight_projection = 0,
+                                      const __gm__ MulticoreMoE::ReplicaGradientBandRecord* gradient = nullptr) {
   if ASCEND_IS_AIV { return; }
   const uint32_t expert = task.task_index / cores, lane = task.task_index % cores;
   AscendC::GlobalTensor<int64_t> groups;
@@ -55,10 +59,32 @@ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_
   const auto p = MakeProblem(tiling.M, tiling.N, tiling.Ka, expert, start, end - start, ta);
   auto a = inputs[task.inputs[0].input_position] + p.a * sizeof(bfloat16_t);
   auto b = inputs[task.inputs[1].input_position] + p.b * sizeof(bfloat16_t);
+  if (!ta && start != end) {
+    b = MulticoreMoE::ReplicaWeight(b, p.k * p.n * sizeof(bfloat16_t), expert, weight_projection, replica, true);
+  }
   // TN writes partial dW; NN/NT retain the activation output dtype.
   const uint32_t output_bytes = ta ? sizeof(WeightOutput) : sizeof(bfloat16_t);
   if (task.outputs[0].data_type != output_bytes) AscendC::Trap();
-  auto c = inputs[task.outputs[0].input_position] + p.c * output_bytes;
+  auto c = inputs[task.outputs[0].input_position];
+  GM_ADDR completion = nullptr;
+  if (ta && gradient != nullptr) {
+    if (output_bytes != sizeof(float) || gradient->bands != 1 ||
+        p.m * p.n != gradient->rows * gradient->columns) AscendC::Trap();
+    if (expert >= gradient->home) {
+      const uint32_t slot = expert - gradient->home;
+      if (slot >= gradient->slots) {
+        if (start != end) AscendC::Trap();
+        return;  // A wider shared graph can contain unused padding.
+      }
+      c = reinterpret_cast<GM_ADDR>(gradient->guest + slot * p.m * p.n * sizeof(float));
+    } else {
+      c += p.c * output_bytes;
+    }
+    const auto flags = MulticoreMoE::GradientBandExpertFlags(gradient, expert, cores);
+    completion = reinterpret_cast<GM_ADDR>(flags + lane * MulticoreRuntime::DATA_CACHE_LINE_SIZE);
+  } else {
+    c += p.c * output_bytes;
+  }
   if (start == end) {
     if (ta) {
       // Empty expert still owns a complete zero weight gradient. Cache lines are disjoint.
@@ -71,6 +97,7 @@ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_
                                          AscendC::DcciDst::CACHELINE_OUT>(output[line * 32]);
       }
     }
+    if (completion != nullptr) MulticoreRuntime::StoreReplicaCompletion(completion, gradient->epoch);
     return;
   }
   AscendC::AscendCUtils::SetOverflow(1);
@@ -82,5 +109,7 @@ __aicore__ inline void ExecuteGmmTask(const Task& task, GM_ADDR* inputs, uint32_
   } else {
     RunStandardGmm<asc::te::nd_ext_layout_ptn, asc::te::nd_ext_layout_ptn>(p, a, b, c, lane, cores, expert);
   }
+  // RunStandardGmm drains the GM stores before publishing this logical Cube's full-K result.
+  if (completion != nullptr) MulticoreRuntime::StoreReplicaCompletion(completion, gradient->epoch);
 }
 }  // namespace MulticoreBf16

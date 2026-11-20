@@ -408,6 +408,8 @@ class ExpertWeightBinding:
     token: object = field(default_factory=object)
     transfers: tuple = ()
     gradient_storage: tuple = ()
+    gradient_outputs: tuple = ()
+    prefetch_table: torch.Tensor | None = None
     fused_slots: InitVar[int | None] = None
 
     def __post_init__(self, fused_slots):
@@ -483,7 +485,7 @@ class ExpertWeightBinding:
         if self.fused_gradients:
             stats = self.pool.statistics
             stats["fused_gradient_returns"] = stats.get("fused_gradient_returns", 0) + 1
-            return gradients
+            return self.gradient_outputs if self.pool.pipeline.device_prefetch else gradients
         if self.fused:
             # Both dX projections for every populated guest have waited for
             # their incoming weights. Drain outgoing copies on the same

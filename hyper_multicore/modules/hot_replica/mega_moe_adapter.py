@@ -30,6 +30,7 @@ from hyper_multicore.scheduler.config import mega_moe_event_capacity
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
 from ._planner.planner import build_expert_replica_plan
 from .bounded_placement import BoundedPlacement, PlacementWire, _rank_nodes, supports_bounded_placement
+from .capability import has_a5_bf16_pipeline
 from .checkpoint import is_checkpointing
 from .placement import render_placement
 from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline, uses_wider_gradient_bands
@@ -56,6 +57,7 @@ def _get_mega_bank(
     """Register a HotReplica allocation in the existing MegaMoE heap transaction."""
     spec = parent.spec
     manager = parent.heap_manager
+    device_prefetch = spec.architecture == 3510
     dedicated = pipeline and owner.dedicated_pipeline
     owner_id = id(owner) if dedicated or pool_type is not SharedExpertPool else None
     extent = owner.bank_extent if pipeline else None
@@ -78,7 +80,7 @@ def _get_mega_bank(
             )
             if pipeline:
                 if not dedicated:
-                    pool.pipeline = ReplicaPipeline(pool, shared_layouts=True)
+                    pool.pipeline = ReplicaPipeline(pool, shared_layouts=True, device_prefetch=device_prefetch)
                 pool.bank_experts = extent
                 signature += (pool.bank_experts,)
             layout = _WorkspaceLayout(pool.allocation_bytes, signature, spec.local_experts)
@@ -151,7 +153,10 @@ class PlacementResources:
                         if supported else None)
         self.bf16_partials = False
         self.prefer_bf16_partials = False
-        self.pipeline_enabled = False
+        self.pipeline_enabled = (
+            self.uses_a5_quotas and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
+            and has_a5_bf16_pipeline()
+        )
         self.dedicated_pipeline = False
         if can_split_weights:
             fp32_partials = self._uses_fp32_partials()
@@ -298,7 +303,8 @@ class PlacementResources:
 
     def _uses_fp32_partials(self):
         """Use the same partial-gradient dtype as the ordinary placed launch."""
-        return self.parent.spec.partial_weight_grad_dtype == "float32"
+        spec = self.parent.spec
+        return spec.architecture == 3510 or spec.partial_weight_grad_dtype == "float32"
 
     @property
     def bank_extent(self):

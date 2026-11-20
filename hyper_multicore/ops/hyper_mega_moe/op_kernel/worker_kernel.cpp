@@ -29,6 +29,9 @@
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
 #include "common/mega_moe/replica_weight_ready.h"
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+#include "common/mega_moe/adapters/arch35/bf16_replica_prefetch.h"
+#endif
 
 using namespace AscendC;
 
@@ -57,8 +60,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
 
   __aicore__ inline void RunForward() {
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
     replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
+#endif
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+    MulticoreMoE::PrefetchA5ReplicaWeights(replica_launch_, worker_id_);
 #endif
     this->Process();
   }
@@ -236,7 +242,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
     if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
       GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
-      MulticoreBf16::ExecuteGmmTask<>(task_desc, input_list, this->core_num, task_tiling);
+      MulticoreBf16::ExecuteGmmTask<>(task_desc, input_list, this->core_num, task_tiling, replica_launch_,
+                                    task_desc.inputs[1].input_position == 5 ? 0 : 1);
       return;
     }
 #endif

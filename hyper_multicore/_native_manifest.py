@@ -30,6 +30,7 @@ SHMEM_DEPENDENCIES = (
 )
 SHMEM_RESOURCES = (*SHMEM_DEPENDENCIES,
                    "shmem/aclshmem_bootstrap_uid.so", "shmem/aclshmem_bootstrap_config_store.so")
+A5_BF16_KERNEL_PIPELINE_VERSION = 3
 HOT_REPLICA_BF16_TARGETS = {
     "arch22": ("ascend910_93", "hot_replica"),
     "arch35": ("ascend950", "hot_replica_bf16_arch35"),
@@ -142,7 +143,11 @@ def validate_adapter_paths(root: Path, variant: dict, backends: dict) -> None:
         # Accept manifests from wheels that still package the A3 allocator.
         if backend == "arch22" and isinstance(replica, dict) and "allocator" in replica:
             expected["allocator"] = f"adapters/{variant['id']}/shmem/arch22/hot_replica/_a3_allocator.so"
-        if replica != expected or soc not in backends.get(backend, {}).get("soc_list", []):
+        accepted = [expected]
+        if backend == "arch35":
+            accepted.extend({**expected, "kernel_pipeline": version}
+                            for version in (1, 2, A5_BF16_KERNEL_PIPELINE_VERSION))
+        if replica not in accepted or soc not in backends.get(backend, {}).get("soc_list", []):
             raise ValueError("Invalid HotReplica adapter capability or artifact paths")
         for key in (key for key in expected if key != "soc"):
             path = resource_path(root, replica[key])

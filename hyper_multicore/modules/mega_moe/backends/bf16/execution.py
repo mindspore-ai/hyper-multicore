@@ -49,7 +49,7 @@ def forward(
             weight_grad_dtype=(torch.float32 if binding.fused_gradients and not binding.bf16_partials
                                else ordinary_options.get("weight_grad_dtype")),
             route_experts=ordinary_options.get("route_experts"),
-            replica_pipeline=True, reserve_merge_workers=binding.owns_returns,
+            replica_pipeline=True, reserve_merge_workers=binding.owns_returns or resources.spec.architecture == 3510,
         )
         if plan.fwd_diagnostics.is_tensor_dump_active:
             binding.fused = False

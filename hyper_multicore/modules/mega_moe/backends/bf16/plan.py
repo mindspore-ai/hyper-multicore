@@ -241,8 +241,10 @@ def _build_runtime_artifacts(
         spec.num_cube_cores,
     )
     if explicit_queues:
-        forward_data = configure_expert_queues(forward_data, forward_graph, spec, forward=True)
-        backward_data = configure_expert_queues(backward_data, backward_graph, spec, forward=False)
+        forward_data = configure_expert_queues(
+            forward_data, forward_graph, spec, forward=True, bf16_replica_helpers=replica_pipeline)
+        backward_data = configure_expert_queues(
+            backward_data, backward_graph, spec, forward=False, bf16_replica_helpers=replica_pipeline)
         return forward_graph, forward_data, backward_graph, backward_data
     if not compact and spec.ready_depth not in (None, 0):
         raise ValueError("Ready lookahead on arch22 requires compact lowering")
@@ -318,8 +320,12 @@ def build_mega_moe_plan(
     """
     if weight_grad_dtype not in (None, torch.float32):
         raise ValueError("Partial expert gradients support only the native dtype or FP32")
-    if replica_pipeline and (spec.architecture != 2201 or spec.batch_experts):
-        raise ValueError("A3 replica pipeline requires per-expert GMMs")
+    if replica_pipeline and (spec.architecture not in (2201, 3510) or spec.batch_experts):
+        raise ValueError("BF16 replica pipeline requires per-expert GMMs")
+    if replica_pipeline and spec.architecture == 3510 and (
+        spec.dispatch_mode != "push" or weight_grad_dtype != torch.float32
+    ):
+        raise ValueError("Ascend950 replica pipeline requires Push and FP32 partial gradients")
     if reserve_merge_workers and not replica_pipeline:
         raise ValueError("A3 replica merge workers require a split-weight replica plan")
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(

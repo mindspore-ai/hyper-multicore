@@ -17,6 +17,13 @@ struct ReplicaLaunch {
 constexpr uint64_t kReplicaLaunch = 0x4d4f4f4e45505752ULL;
 static_assert(sizeof(ReplicaLaunch) == 80);
 
+constexpr uint32_t kA5ReplicaHelpers = 4;
+struct A5ReplicaLaunch {
+  ReplicaLaunch base;
+  uint64_t prefetch;
+};
+static_assert(sizeof(A5ReplicaLaunch) == 88);
+
 template <bool Producer = false>
 __aicore__ inline void WaitReplicaEpoch(uint64_t address, uint64_t epoch) {
   const auto word = reinterpret_cast<const __gm__ volatile int32_t *>(address);
@@ -36,7 +43,7 @@ __aicore__ inline void WaitReplicaEpoch(uint64_t address, uint64_t epoch) {
 }
 
 __aicore__ inline const __gm__ ReplicaLaunch *GetReplicaLaunch(GM_ADDR runtime, GM_ADDR tiling) {
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
   using namespace MulticoreRuntime;
   const auto header = reinterpret_cast<const __gm__ RuntimeHeader *>(runtime);
   uint64_t offset = getAtomicAddValuesOffset(runtime) + ATOMIC_ADD_VALUE_LEN * sizeof(int32_t);
@@ -44,7 +51,12 @@ __aicore__ inline const __gm__ ReplicaLaunch *GetReplicaLaunch(GM_ADDR runtime, 
     offset += (header->num_workers / 2 + header->num_workers) * sizeof(WorkerQueue);
   }
   offset = (offset + 7) & ~7ULL;
-  if (getExtraValueFromTiling(tiling, 6) == offset + sizeof(ReplicaLaunch)) {
+#if __NPU_ARCH__ == 3510
+  constexpr uint64_t replica_bytes = sizeof(A5ReplicaLaunch);
+#else
+  constexpr uint64_t replica_bytes = sizeof(ReplicaLaunch);
+#endif
+  if (getExtraValueFromTiling(tiling, 6) == offset + replica_bytes) {
     const auto record = reinterpret_cast<const __gm__ ReplicaLaunch *>(runtime + offset);
     if (record->magic == kReplicaLaunch) return record;
   }
@@ -61,7 +73,15 @@ __aicore__ inline GM_ADDR ReplicaWeight(GM_ADDR ordinary, uint64_t matrix_bytes,
     return reinterpret_cast<GM_ADDR>(launch->local[projection] + expert * matrix_bytes);
   }
   const uint32_t slot = expert - launch->home;
-  WaitReplicaEpoch(launch->ready[projection] + slot * MulticoreRuntime::DATA_CACHE_LINE_SIZE, launch->epoch);
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
+  const uint32_t parts = kA5ReplicaHelpers;
+#else
+  const uint32_t parts = 1;
+#endif
+  for (uint32_t part = 0; part < parts; ++part) {
+    WaitReplicaEpoch(launch->ready[projection] + (slot * parts + part) * MulticoreRuntime::DATA_CACHE_LINE_SIZE,
+                     launch->epoch);
+  }
   return reinterpret_cast<GM_ADDR>(launch->guest[projection] + slot * matrix_bytes);
 }
 

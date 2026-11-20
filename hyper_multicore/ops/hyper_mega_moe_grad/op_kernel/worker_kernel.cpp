@@ -30,11 +30,10 @@
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
 #include "common/mega_moe/replica_weight_ready.h"
-#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
 #include "common/mega_moe/replica_gradient_bands.h"
-#endif
 
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+#include "common/mega_moe/adapters/arch35/bf16_replica_prefetch.h"
 #include "common/mega_moe/adapters/arch35/swiglu/bf16_grad_worker.h"
 #endif
 
@@ -71,11 +70,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
 
   __aicore__ inline void RunBackward() {
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
     replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
     replica_bf16_partials_ = MulticoreMoE::UsesBf16ReplicaPartials(replica_launch_);
     gradient_bands_[0] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 0);
     gradient_bands_[1] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 1);
+#endif
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+    MulticoreMoE::PrefetchA5ReplicaWeights(replica_launch_, worker_id_);
 #endif
     // Reserved merge lanes still participate in the ordinary entry handshake.
     this->Process();
@@ -101,6 +103,22 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #pragma unroll 1
       for (uint32_t projection = 0; projection < 2; ++projection) {
         MulticoreMoE::WaitReplicaGradientAcks(gradient_bands_[projection]);
+      }
+    }
+#elif defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+    if (gradient_bands_[0] != nullptr && worker_id_ % 2 == 0 &&
+        worker_id_ / 2 < MulticoreMoE::kA5ReplicaHelpers) {
+      const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+#pragma unroll 1
+      for (uint32_t projection = 0; projection < 2; ++projection) {
+        MulticoreMoE::PublishA5ReplicaGradientReady(gradient_bands_[projection], worker_id_ / 2, core_num, ep);
+        MulticoreMoE::ReturnA5ReplicaGradientBands(gradient_bands_[projection], worker_id_ / 2, core_num, ep);
+      }
+      if (worker_id_ == 0) {
+#pragma unroll 1
+        for (uint32_t projection = 0; projection < 2; ++projection) {
+          MulticoreMoE::WaitReplicaGradientAcks(gradient_bands_[projection]);
+        }
       }
     }
 #endif
@@ -143,10 +161,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
  private:
   const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
-#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
   const __gm__ MulticoreMoE::ReplicaGradientBandRecord *gradient_bands_[2] = {nullptr, nullptr};
   bool replica_bf16_partials_ = false;
-#endif
 
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
@@ -324,7 +340,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
     if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
       GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
-      MulticoreBf16::ExecuteGmmTask<DTYPE_HIDDEN_DW>(task_desc, input_list, this->core_num, task_tiling);
+      const uint32_t output = task_desc.outputs[0].input_position;
+      const auto gradient = (output == 6 || output == 18) ? gradient_bands_[output == 6 ? 0 : 1] : nullptr;
+      MulticoreBf16::ExecuteGmmTask<DTYPE_HIDDEN_DW>(
+          task_desc, input_list, this->core_num, task_tiling, replica_launch_,
+          task_desc.inputs[1].input_position == 11 ? 0 : 1, gradient);
       return;
     }
 #endif

@@ -123,15 +123,24 @@ def _builder_order(stages):
     return [list(queue) for queue in stages.original_cubes], vectors
 
 
-def _reserve_mx_gradient_workers(vectors):
-    """Free four even AIVs while keeping projection producers in window order."""
+REPLICA_HELPERS = 4
+
+
+def _reserve_replica_workers(vectors, *, mx_gradient_helpers):
+    """Free four even AIVs and keep math producers ordered."""
     lanes = vectors[::2]
-    reserved = 4
-    if len(lanes) != MX_GRADIENT_CUBE_CORES or len({len(queue) for queue in lanes}) != 1:
-        raise ValueError(f"MX gradient helpers require {MX_GRADIENT_CUBE_CORES} equal logical math queues")
-    # Merge by window position before distributing. Appending displaced
-    # producers to the tail of existing queues can introduce a wait cycle.
-    work = [task for position in zip(*lanes) for task in position]
+    reserved = REPLICA_HELPERS
+    if len(lanes) <= reserved:
+        raise ValueError("Replica helpers require additional math workers")
+    if mx_gradient_helpers:
+        if len(lanes) != MX_GRADIENT_CUBE_CORES or len({len(queue) for queue in lanes}) != 1:
+            raise ValueError(f"MX gradient helpers require {MX_GRADIENT_CUBE_CORES} equal logical math queues")
+        # Keep MXFP8's producer window order when distributing its multiple stages.
+        work = [task for position in zip(*lanes) for task in position]
+    else:
+        # BF16 has one vector math stage per phase. Task IDs keep its expert
+        # order even when the logical math queues have unequal lengths.
+        work = sorted(task for lane in lanes for task in lane)
     active = len(lanes) - reserved
     for lane in range(len(lanes)):
         vectors[2 * lane] = [] if lane < reserved else work[lane - reserved::active]
@@ -155,7 +164,9 @@ def describe_schedule_policy(name):
             'architecture': 'arch35'}
 
 
-def configure_expert_queues(cfg, graph, spec, *, forward, mx_gradient_helpers=False, mx_activation_first=False):
+def configure_expert_queues(
+    cfg, graph, spec, *, forward, mx_gradient_helpers=False, mx_activation_first=False, bf16_replica_helpers=False,
+):
     """Compile a policy over fixed QP0 owners and serialize the existing queue ABI."""
     if spec.schedule_policy == 'auto':
         spec = replace(spec, schedule_policy=TWO_EXPERT_PIPELINE)
@@ -165,7 +176,8 @@ def configure_expert_queues(cfg, graph, spec, *, forward, mx_gradient_helpers=Fa
     if mx_gradient_helpers:
         if forward or spec.precision != 'mxfp8' or spec.transport_engine != 'udma':
             raise ValueError("MX gradient helpers require the backward UDMA graph")
-        _reserve_mx_gradient_workers(math)
+    if mx_gradient_helpers or bf16_replica_helpers:
+        _reserve_replica_workers(math, mx_gradient_helpers=mx_gradient_helpers)
     communication = [tid for tid in cfg.vector_task_indices[:cfg.task_index_num[1]]
                      if cfg.all_tasks[tid].task_type in (*TRANSPORT_TASKS, TaskType.TASK_TERMINATE)]
     vectors = transport_queues(cfg, spec, communication)

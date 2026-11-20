@@ -20,6 +20,7 @@ from pathlib import Path
 import torch
 from hyper_multicore import _collective
 from hyper_multicore._loader import load_torch_npu, query_npu_arch, validate_native_compatibility
+from hyper_multicore._native_manifest import A5_BF16_KERNEL_PIPELINE_VERSION
 
 
 def _require_a3(tensor):
@@ -80,6 +81,12 @@ def _require_a5_bf16(tensor):
     for key in ("bridge", "kernels"):
         if not (selected["root"] / artifacts[key]).is_file():
             raise RuntimeError(f"Selected Ascend950 BF16 HotReplica artifact is missing: {key}")
+
+
+def has_a5_bf16_pipeline() -> bool:
+    """Check the selected native wheel for the in-kernel BF16 protocol."""
+    variant = validate_native_compatibility()["variant"]
+    return variant.get("hot_replica_bf16_arch35", {}).get("kernel_pipeline") == A5_BF16_KERNEL_PIPELINE_VERSION
 
 
 def require_capability(

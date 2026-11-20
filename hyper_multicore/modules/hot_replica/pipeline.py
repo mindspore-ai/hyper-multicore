@@ -1,6 +1,6 @@
 # Copyright 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""A3 projection readiness and full-K gradient return on the HotReplica bank lease."""
+"""Projection readiness and full-K gradient return on the HotReplica bank lease."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import torch
 
 from hyper_multicore import shmem
 from hyper_multicore.modules.mega_moe.route import _upload_route_tensor
+from hyper_multicore.modules.mega_moe.schedule import REPLICA_HELPERS
 
 from .bounded_placement import supports_bounded_placement
 
@@ -48,9 +49,16 @@ def uses_wider_gradient_bands(spec):
 def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):
     """Limit guest weights and dW to disjoint bank spans."""
     h, i = spec.hidden_size, spec.intermediate_size
+    if h * i % 16:
+        return 0
+    if spec.architecture == 3510:
+        if bf16_partials or spec.dispatch_mode != "push" or spec.batch_experts or spec.num_cube_cores <= REPLICA_HELPERS:
+            return 0
+        extent = 3 * spec.local_experts if bank_experts is None else bank_experts
+        return min(spec.local_experts, extent // 3)
     if bf16_partials and (h % 16 or i % 16):
         return 0
-    if supports_bounded_placement(spec) and h * i % 16 == 0:
+    if supports_bounded_placement(spec):
         extent = 2 * spec.local_experts if bank_experts is None else bank_experts
         return min(spec.local_experts, extent // (2 if bf16_partials else 3))
     return 0
@@ -78,9 +86,11 @@ def _words_tensor(words, device, padding=0):
 class ReplicaPipeline:
     """Own persistent peer epochs and stream-ordered projections for one pool."""
 
-    def __init__(self, pool, *, shared_layouts=False):
+    def __init__(self, pool, *, shared_layouts=False, device_prefetch=False):
         self.pool = pool
         self.shared_layouts = shared_layouts
+        self.device_prefetch = device_prefetch
+        self.ready_parts = REPLICA_HELPERS if self.device_prefetch else 1
         self.storage = None
         self.epoch = 0
         self.resident = None
@@ -91,10 +101,12 @@ class ReplicaPipeline:
         """Return the same reserved extent on every member of a bank."""
         pool = self.pool
         layouts = ("EIO", "EOI") if self.shared_layouts else (pool.expert_weight_layout,)
-        band_count = max(sum(_band_layout(shape)[1]
-                             for shape in projection_shapes(pool.hidden, pool.intermediate, layout))
-                         for layout in layouts)
-        return (3 * pool.ranks + 2 + band_count * pool.blocks) * pool.local_experts * _LINE_WORDS
+        band_count = 2 if self.device_prefetch else max(
+            sum(_band_layout(shape)[1] for shape in projection_shapes(pool.hidden, pool.intermediate, layout))
+            for layout in layouts)
+        peer_planes = 5 if self.device_prefetch else 3
+        words = peer_planes * pool.ranks + 2 * self.ready_parts + band_count * pool.blocks
+        return words * pool.local_experts * _LINE_WORDS
 
     def invalidate(self):
         """Forget prepared weights after a generic bank write."""
@@ -143,12 +155,20 @@ class ReplicaPipeline:
         # checkpoint suffix staged between this binding's forward and backward.
         pool.generation += 1
         rank_lines = pool.ranks * pool.local_experts * _LINE_WORDS
-        ready = self.storage[3 * rank_lines:3 * rank_lines + 2 * pool.local_experts * _LINE_WORDS]
-        ready = ready.view(2, pool.local_experts, _LINE_WORDS)
+        ready = self.storage[3 * rank_lines:3 * rank_lines + 2 * pool.local_experts * self.ready_parts * _LINE_WORDS]
+        ready = ready.view(2, pool.local_experts, self.ready_parts * _LINE_WORDS)
         bank = pool.leased_banks
-        if not backward or self.resident is not binding.token:
+        binding.prefetch_table = None
+        if self.device_prefetch or not backward or self.resident is not binding.token:
             self.resident = None
-            if binding.snapshot is None:
+            if self.device_prefetch:
+                slots, received, owned = binding.edges
+                elements = tuple(w.numel() // pool.local_experts for w in weights)
+                edges = (value for edge in owned for value in edge)
+                binding.prefetch_table = _words_tensor(
+                    (slots, int(backward), pool.rank, pool.ranks, self.storage.data_ptr(),
+                     *elements, len(owned), *received, *edges), pool.device)
+            elif binding.snapshot is None:
                 self._publish_weights(weights, binding, ready, rank_lines, backward)
             else:
                 pool.restore_snapshot(binding.snapshot, 0)
@@ -210,13 +230,22 @@ class ReplicaPipeline:
             stream.wait_event(done)
         binding.transfers = ()
         binding.gradient_storage = ()
+        binding.gradient_outputs = ()
+        binding.prefetch_table = None
 
     def runtime(self, base, binding, gradients=None):
         """Encode the current projection addresses after the ordinary queue table."""
         gradients_address = 0
         if gradients is not None:
             gradients_address = self._gradient_table(binding, gradients).data_ptr()
-        extension = _words_tensor((*binding.launch, gradients_address), self.pool.device, -base.numel() % 8)
+        words = (*binding.launch, gradients_address)
+        if self.device_prefetch:
+            table = binding.prefetch_table
+            pointer = 0 if table is None else table.data_ptr()
+            if table is not None:
+                table.record_stream(torch.npu.current_stream(self.pool.device))
+            words = (*words, pointer)
+        extension = _words_tensor(words, self.pool.device, -base.numel() % 8)
         return torch.cat((base.view(torch.uint8), extension))
 
     def _gradient_table(self, binding, gradients):
@@ -227,20 +256,24 @@ class ReplicaPipeline:
         if bf16_partials:
             # Group owners while keeping their contributions in peer/slot order.
             owned = sorted(owned, key=lambda edge: edge[2])
-        touched = {expert: slot + 1 for slot, expert in enumerate(sorted({edge[2] for edge in owned}))}
+        owners = range(home) if self.device_prefetch else sorted({edge[2] for edge in owned})
+        touched = {expert: slot + 1 for slot, expert in enumerate(owners)}
         last = {edge[2]: index for index, edge in enumerate(owned)}
         edges = [value for i, edge in enumerate(owned) for value in (*edge, int(i == last[edge[2]]))]
         mapping = tuple(touched.get(expert, 0) for expert in range(home))
         bank = pool.leased_banks
         rank_lines = pool.ranks * home * _LINE_WORDS
-        bands_start = 3 * rank_lines + 2 * home * _LINE_WORDS
-        band_layouts = tuple(_band_layout(grad.shape[1:]) for grad in gradients)
+        bands_start = 3 * rank_lines + 2 * home * self.ready_parts * _LINE_WORDS
+        band_layouts = tuple((grad.shape[1], 1) if self.device_prefetch else _band_layout(grad.shape[1:])
+                             for grad in gradients)
         flags = tuple(home * bands * cubes * _LINE_WORDS for _, bands in band_layouts)
         offsets = (bands_start, bands_start + flags[0])
+        guest_ready_start = bands_start + sum(flags)
         done_words = cubes * _LINE_WORDS
         records, retained = [], []
         local_flags = None
-        if owned:
+        outputs = tuple(torch.empty_like(grad, dtype=torch.bfloat16) for grad in gradients) if self.device_prefetch else ()
+        if owned or self.device_prefetch:
             local_flags = torch.zeros(sum(flags) + 2 * done_words, dtype=torch.int32, device=pool.device)
             retained.append(local_flags)
         owner_rows = binding.placement.owner_rows
@@ -256,7 +289,10 @@ class ReplicaPipeline:
             if local_flags is not None:
                 local_address = local_flags[matrix * flags[0]:].data_ptr()
                 done_address = local_flags[sum(flags) + matrix * done_words:].data_ptr()
-                if not bf16_partials:
+                if self.device_prefetch:
+                    scratch_address = grad.data_ptr()
+                    retained.append(grad)
+                elif not bf16_partials:
                     scratch = grad.new_empty((len(touched), rows, columns), dtype=torch.float32)
                     if owner_rows is None:
                         scratch.zero_()
@@ -267,14 +303,20 @@ class ReplicaPipeline:
                     scratch_address = scratch.data_ptr()
                     retained.append(scratch)
             ack = self.storage[(1 + matrix) * rank_lines:]
-            records.append((home, slots, binding.gradient_epoch, rows, columns, per_band, bands,
-                            grad.data_ptr(), guest_address, local_address,
-                            self.storage[offsets[matrix]:].data_ptr(), len(owned), scratch_address,
-                            pool.rank, ack.data_ptr(), done_address, *edges, *mapping, *received))
+            destination = outputs[matrix] if self.device_prefetch else grad
+            header = (home, slots, binding.gradient_epoch, rows, columns, per_band, bands,
+                      destination.data_ptr(), guest_address, local_address,
+                      self.storage[offsets[matrix]:].data_ptr(), len(owned), scratch_address,
+                      pool.rank, ack.data_ptr(), done_address)
+            if self.device_prefetch:
+                arrival = self.storage[guest_ready_start + matrix * rank_lines:].data_ptr()
+                header = (*header, arrival)
+            records.append((*header, *edges, *mapping, *received))
         protocol = 3 if bf16_partials else 2
         metadata = _words_tensor((protocol, 3, 3 + len(records[0]), *records[0], *records[1]), pool.device)
         stream = torch.npu.current_stream(pool.device)
         for tensor in (*retained, metadata):
             tensor.record_stream(stream)
         binding.gradient_storage = (*retained, metadata)
+        binding.gradient_outputs = outputs
         return metadata

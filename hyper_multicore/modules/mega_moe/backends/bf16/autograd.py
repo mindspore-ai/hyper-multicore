@@ -297,7 +297,8 @@ def _prepare_backward_execution(
             grad_output,
             *weights,
             dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
-            weight_grad_dtype=plan.weight_grad_dtype if owner_weights is None else weights[0].dtype,
+            weight_grad_dtype=(plan.weight_grad_dtype if owner_weights is None or plan.spec.architecture == 3510
+                               else weights[0].dtype),
             group_list=groups,
             all_experts_active=all_experts_active,
         ),

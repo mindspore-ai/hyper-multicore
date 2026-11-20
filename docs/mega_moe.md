@@ -164,10 +164,10 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
   副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
-- `ascend950` 的 BF16 Push 和 Pull 使用 arch35 副本 bank 和独立的权重预取、梯度归并。
-  Pull 将实际选中的路由发布到对称源区，由执行 rank 拉取 token。
+- `ascend950` 的 BF16 Push 在带核内协议的制品上按投影预取权重，并在主算子内按固定 peer 和 slot 顺序归并梯度。
+  Pull 和不满足核内布局条件的 Push 调用使用独立预取和归并。Pull 的执行 rank 从对称源区拉取 token。
   激活副本时以 FP32 计算和归并原属专家及借用专家的局部权重梯度，写回时转换为公开参数类型。
-  Push 的内置策略按已交换的计数选择有界配额；BF16 可通过
+  Push 的内置策略按已交换的计数选择有界配额。BF16 可通过
   `HotReplicaPlanner(replica_slots_per_rank=2)` 设置每 rank 的借用上限。
   使用 FC2 后加权且堆内可以同时容纳新旧缓冲区时，动态增长只替换变大的 Push 缓冲区。
 - `ascend950` 支持 MXFP8 EIO Push，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
