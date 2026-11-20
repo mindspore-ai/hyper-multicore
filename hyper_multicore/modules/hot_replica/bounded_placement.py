@@ -153,9 +153,10 @@ def _render_geometry(plan, spec, device, maximum, *, prepare_metadata=True):
 class BoundedPlacement:
     """Reuse immutable geometry on the same complete count wire and stream."""
 
-    def __init__(self, spec: MegaMoeSpec) -> None:
+    def __init__(self, spec: MegaMoeSpec, *, replica_slots_per_rank: int | None = None) -> None:
         """Keep the most recent geometry for one EP execution owner."""
         self.spec = spec
+        self.replica_slots_per_rank = min(spec.local_experts, replica_slots_per_rank or spec.local_experts)
         self.nodes = None
         self.snapshot = None
         self.key = None
@@ -179,7 +180,7 @@ class BoundedPlacement:
 
         transfers = None
         if capacity_target is not None:
-            plan = build_capacity_plan(wire, capacity_target)
+            plan = build_capacity_plan(wire, capacity_target, replica_slots_per_rank=self.replica_slots_per_rank)
             if plan is None or not plan.transfers:
                 return None
             # The checkpoint owns this invocation's descriptors. Use the usual
@@ -220,7 +221,7 @@ class BoundedPlacement:
         if self.nodes is None:
             self.nodes = _rank_nodes(spec.ep_group, spec.ep_size)
         plan = build_expert_replica_plan(
-            wire.tolist(), min(spec.local_experts, 6), minimum_replica_rows=1024,
+            wire.tolist(), min(self.replica_slots_per_rank, 6), minimum_replica_rows=1024,
             minimum_load_reduction=0.25 if projections == 3 else 0.4,
             capacity_limit=capacity, receive_capacity=capacity, rank_nodes=self.nodes,
             transfer_row_credit=spec.intermediate_size * projections // 6,

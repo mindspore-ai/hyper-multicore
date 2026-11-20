@@ -138,11 +138,13 @@ class PlacementResources:
         self.shared = shared
         self.pool = None
         self.geometries = {}
+        self.replica_slots_per_rank = specification.get("replica_slots_per_rank")
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
         supported = built_in and can_split_weights
-        self.bounded = BoundedPlacement(parent.spec) if supported else None
+        self.bounded = (BoundedPlacement(spec, replica_slots_per_rank=self.replica_slots_per_rank)
+                        if supported else None)
         self.bf16_partials = False
         self.prefer_bf16_partials = False
         self.pipeline_enabled = False

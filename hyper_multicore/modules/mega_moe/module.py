@@ -205,10 +205,15 @@ class MegaMoeExperts(MulticoreModule):
         numerics, tuning, scheduler = _resolve_expert_options(precision, numerics_options, tuning_options)
         planner = _placement_planner(expert_placement)
         planner_key = None
+        replica_slots_per_rank = None
         if planner is not None:
-            if precision == "mxfp8":
-                from ..hot_replica.planner import HotReplicaPlanner  # pylint: disable=import-outside-toplevel
+            from ..hot_replica.planner import HotReplicaPlanner  # pylint: disable=import-outside-toplevel
 
+            if isinstance(planner, HotReplicaPlanner):
+                replica_slots_per_rank = planner.replica_slots_per_rank
+            if precision == "mxfp8":
+                if replica_slots_per_rank is not None:
+                    raise ValueError("An explicit HotReplica guest budget requires BF16")
                 if tuning.dispatch_mode != "push":
                     raise ValueError("MXFP8 HotReplica requires push dispatch")
                 if type(planner) is not HotReplicaPlanner:
@@ -239,6 +244,7 @@ class MegaMoeExperts(MulticoreModule):
             "precision": precision,
             "hot_replica": planner is not None,
             "planner_key": planner_key,
+            "replica_slots_per_rank": replica_slots_per_rank,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",

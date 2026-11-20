@@ -102,7 +102,7 @@ def _traffic_work_is_useful(copies, loads, config, resident, row_credit, minimum
 
 
 def build_capacity_plan(
-    counts_by_source: np.ndarray, target_load: int,
+    counts_by_source: np.ndarray, target_load: int, *, replica_slots_per_rank: int | None = None,
 ) -> ExpertExecutionPlan | None:
     """Keep capacity-based admission stable for the MegaMoE placement policies."""
     limit = 2**31 - 1
@@ -112,12 +112,13 @@ def build_capacity_plan(
         raise ValueError("HotReplica routed row count exceeds the INT32 planner limit")
     ranks, experts = counts_by_source.shape
     home = experts // ranks
-    config = ExpertReplicaConfig(experts, ranks, home)
+    budget = home if replica_slots_per_rank is None else min(home, replica_slots_per_rank)
+    config = ExpertReplicaConfig(experts, ranks, budget)
     _, loads, baseline = _home_layout(counts_by_source, config)
     target = max(1, target_load)
-    if max(loads) <= target or min(loads) >= target:
+    if not budget or max(loads) <= target or min(loads) >= target:
         return None
-    copies = _capacity_copies(loads, baseline, home, target)
+    copies = _capacity_copies(loads, baseline, config, target)
     return _materialize(counts_by_source, copies, config, source_locality=False)
 
 

@@ -63,8 +63,9 @@ def _balanced_edges(loads: list[int], expert_counts: list[int],
     return edges
 
 
-def _capacity_copies(loads, copies, home, target):
+def _capacity_copies(loads, copies, config: ExpertReplicaConfig, target):
     """Assign capacity transfers with the established rank and expert tie breaks."""
+    home, width = config.home_experts, config.slots_per_rank
     quotas = [[] for _ in loads]
     for donor, receiver, amount in _rank_transfers([load - target for load in loads]):
         quotas[donor].append((-amount, receiver))
@@ -76,6 +77,8 @@ def _capacity_copies(loads, copies, home, target):
         heapify(experts)
         while pending:
             quota, receiver = heappop(pending)
+            if len(copies[receiver]) >= width:
+                continue
             remaining, expert = heappop(experts)
             rows = min(-remaining, -quota)
             copies[donor][expert] -= rows

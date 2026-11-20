@@ -133,6 +133,20 @@ class TestHotReplicaPlacement(unittest.TestCase):
                 torch.testing.assert_close(result.copies, torch.tensor([[-1], [0]], dtype=torch.int32))
                 self.assertEqual((result.receive_capacity, result.published_slots), (3, 0))
 
+    def test_capacity_placement_honors_an_explicit_guest_budget(self) -> None:
+        counts = torch.tensor([[4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0],
+                               [4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0]], dtype=torch.int32)
+        ids = torch.arange(6, dtype=torch.int32).repeat_interleave(4).view(-1, 1)
+        hidden = torch.empty(24, 4)
+        inverse = torch.arange(24, dtype=torch.int32)
+        ordinary = placement.build_placement(hidden, ids, counts, 24, 1, source_inverse=inverse)
+        capped = placement.build_placement(
+            hidden, ids, counts, 24, 1, source_inverse=inverse, replica_slots_per_rank=2,
+        )
+        self.assertEqual((ordinary.published_slots, ordinary.receive_capacity), (3, 24))
+        self.assertEqual((capped.borrowed_capacity, capped.published_slots, capped.receive_capacity), (2, 2, 32))
+        self.assertEqual(capped.counts_by_source.sum().item(), ids.numel() * 2)
+
     def test_wide_counts_reject_overflow_before_allocator(self) -> None:
         """A large INT64 wire count must never wrap to a negative planner value."""
         counts = torch.tensor([[2**31, 0], [0, 0]], dtype=torch.int64)

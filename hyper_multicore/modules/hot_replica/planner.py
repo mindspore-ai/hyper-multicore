@@ -27,9 +27,24 @@ from .placement import build_placement, placement_is_profitable, placement_recei
 class HotReplicaPlanner(BasePlanner):
     """Choose execution slots without allocating either backend's workspaces."""
 
-    def __init__(self) -> None:
-        """Initialize the rejected-route cache."""
+    def __init__(self, *, replica_slots_per_rank: int | None = None) -> None:
+        """Initialize the guest budget and rejected-route cache."""
+        if replica_slots_per_rank is not None and (
+            type(replica_slots_per_rank) is not int or replica_slots_per_rank <= 0
+        ):
+            raise ValueError("replica_slots_per_rank must be a positive integer")
+        self._replica_slots_per_rank = replica_slots_per_rank
         self._rejected_routes: OrderedDict[tuple[Any, ...], None] = OrderedDict()
+
+    @property
+    def replica_slots_per_rank(self) -> int | None:
+        """Return the optional cap on active guest experts on each rank."""
+        return self._replica_slots_per_rank
+
+    def configuration_key(self) -> str:
+        """Include the guest budget in the configuration agreed by EP ranks."""
+        budget = self.replica_slots_per_rank
+        return "" if budget is None else f"replica_slots_per_rank={budget}"
 
     @torch.no_grad()
     def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
@@ -73,9 +88,9 @@ class HotReplicaPlanner(BasePlanner):
                 self._rejected_routes.popitem(last=False)
         return None
 
-    @staticmethod
-    def _build(request: PlacementRequest, target: int) -> ExpertPlacement | None:
+    def _build(self, request: PlacementRequest, target: int) -> ExpertPlacement | None:
         return build_placement(
             request.hidden, request.ids, request.counts_by_source,
             target, request.rank, source_inverse=request.source_inverse,
+            replica_slots_per_rank=self.replica_slots_per_rank,
         )

@@ -168,11 +168,12 @@ def build_placement(
     rank: int,
     *,
     source_inverse: torch.Tensor | None = None,
+    replica_slots_per_rank: int | None = None,
 ) -> ExpertPlacement | None:
     """Borrow experts and render their virtual IDs without changing the router.
 
-    Each virtual rank owns its home expert slots followed by equally many optional
-    borrowed slots. Original expert parameters and optimizer ownership stay unchanged.
+    Each virtual rank owns its home expert slots followed by optional borrowed slots.
+    Original expert parameters and optimizer ownership stay unchanged.
     The caller supplies its existing count table and load target; this function
     performs no additional count collective or expert computation.
 
@@ -182,6 +183,7 @@ def build_placement(
         counts_by_source: Current [EP, global experts] source-count table.
         capacity: Positive target routed rows per rank for the allocator.
         rank: Rank within this ordered EP group.
+        replica_slots_per_rank: Optional cap on guests, defaulting to the number of home experts.
 
     Returns:
         A per-invocation placement, or None when no expert needs to be borrowed.
@@ -193,7 +195,9 @@ def build_placement(
         raise ValueError("HotReplica counts must describe a valid ordered EP topology")
     if counts_by_source.dtype not in (torch.int32, torch.int64):
         raise TypeError("HotReplica counts must use INT32 or INT64")
-    plan = build_capacity_plan(counts_by_source.cpu().numpy(), capacity)
+    plan = build_capacity_plan(
+        counts_by_source.cpu().numpy(), capacity, replica_slots_per_rank=replica_slots_per_rank,
+    )
     if plan is None:
         return None
     return render_placement(hidden, topk_ids, plan, rank, source_inverse=source_inverse)
