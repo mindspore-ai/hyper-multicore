@@ -77,7 +77,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                              num_experts=384, top_k=8, ep_size=64, precision="mxfp8",
                              dispatch_mode="push", initial_capacity_factor=4.0, auto_tokens=True)
         layout = _workspace_layout(specification, torch.bfloat16, capacity=capacity)
-        with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_INITIAL_HEAP_SIZE": str(4 << 30)}):
+        with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(4 << 30)}):
             manager = self._manager_with_reservation(specification, layout)
         with patch.object(shmem, "acquire"):
             manager.attach_runtime()
