@@ -56,6 +56,7 @@ class _MegaMoeExecutionResources:
             replica_bf16_partials = require_capability(
                 tensor, specification["ep_group"], mx_cube_cores=self.spec.num_cube_cores if mx_placement else None,
                 architecture=self.spec.architecture, dispatch_mode=self.spec.dispatch_mode,
+                receive_capacity_percent=specification.get("receive_capacity_percent"),
             )
         if workspace_layout is not None:
             reservations = ((specification, workspace_layout),)

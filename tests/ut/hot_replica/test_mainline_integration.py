@@ -22,7 +22,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from hyper_multicore import BasePlanner, ExpertPlacement, MegaMoePlacementOptions, MegaMoeExperts
+from hyper_multicore import BasePlanner, ExpertPlacement, MegaMoePlacementOptions, MegaMoeExperts, PlacementRequest
 from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.mega_moe import route, resources as resource_module
@@ -111,6 +111,7 @@ def test_mx_gradient_bank_registers_with_the_virtual_workspace():
     "precision,mode,value,error",
     [
         ("bf16", "push", True, TypeError),
+        ("bf16", "pull", HotReplicaPlanner(receive_capacity_percent=102), ValueError),
         ("mxfp8", "push", HotReplicaPlanner(), ValueError),
         ("mxfp8", "pull", HotReplicaPlanner(), ValueError),
     ],
@@ -138,6 +139,37 @@ def test_unsupported_configuration_fails_before_binding(precision, mode, value, 
 def test_invalid_placement_strategy_fails_before_binding(options, error):
     with pytest.raises(error):
         MegaMoeExperts(hidden_size=128, intermediate_size=128, num_experts=4, top_k=2, expert_placement=options)
+
+
+@pytest.mark.parametrize("percent", (99, True, 102.5, "102"))
+def test_invalid_receive_capacity_percentage_fails_before_binding(percent):
+    with pytest.raises(ValueError, match="receive_capacity_percent"):
+        HotReplicaPlanner(receive_capacity_percent=percent)
+
+
+@pytest.mark.parametrize(("mean_rows", "percent", "expected"), [
+    (6400, 102, 6528), (6401, 102, 6656), (1024, 102, 1152), (0, 102, 0), (32768, 200, 42624),
+])
+def test_explicit_receive_limit_rounds_up_and_only_tightens(mean_rows, percent, expected):
+    request = PlacementRequest(
+        torch.empty(0, 2560, dtype=torch.bfloat16), torch.empty(0, 4), torch.empty(8, 128), None,
+        8 * mean_rows, 8 * mean_rows, 0, 1408, 24, True,
+    )
+    with patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable", return_value=False) as cost:
+        assert HotReplicaPlanner(receive_capacity_percent=percent).plan(request) is None
+    assert cost.call_args.args[:2] == (request.maximum_received, expected)
+
+
+def test_receive_capacity_percentage_is_agreed_before_a5_device_binding():
+    planner = HotReplicaPlanner(receive_capacity_percent=102, replica_slots_per_rank=3)
+    assert planner.configuration_key() == "replica_slots_per_rank=3,receive_capacity_percent=102"
+    with (
+        patch.object(capability._collective, "exchange", side_effect=lambda value, **_: [value, value]),
+        patch.object(capability, "_require_a5_bf16") as bind,
+        pytest.raises(RuntimeError, match="requires Ascend910_93"),
+    ):
+        capability.require_capability(None, None, architecture=3510, receive_capacity_percent=102)
+    bind.assert_not_called()
 
 
 def test_placement_requires_multiple_ranks():
@@ -722,6 +754,56 @@ def test_a3_saved_route_uses_shared_quota_geometry(home, batch_experts):
     )
     assert resources.bounded.geometry is None
     assert bind.call_args.kwargs["fused"]
+
+
+@pytest.mark.parametrize(("ep", "home", "top_k", "tokens", "checkpointing"), [
+    (2, 4, 2, 641, False),
+    (4, 6, 4, 4097, True),
+])
+@pytest.mark.parametrize("decision", ("admit", "reject_capacity", "reject_movement"))
+def test_a3_receive_capacity_uses_agreed_rows(ep, home, top_k, tokens, checkpointing, decision):
+    """Tight quotas govern the configured planner with and without the count wire."""
+    budget = 1 if decision == "reject_capacity" else None
+    percent = 100 if budget is not None else 102
+    if budget is not None:
+        top_k = home
+    planner = HotReplicaPlanner(receive_capacity_percent=percent, replica_slots_per_rank=budget)
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        ep_size=ep, rank_id=0, num_experts=ep * home, local_experts=home, hidden_size=32, intermediate_size=64,
+        top_k=top_k, num_cube_cores=24, apply_probs_before_fc2=False, expert_weight_layout="EOI",
+        partial_weight_grad_dtype=None,
+    )
+    resources = PlacementResources(SimpleNamespace(spec=spec), {
+        "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__, planner.configuration_key()),
+        "receive_capacity_percent": percent, "replica_slots_per_rank": budget,
+    }, False, bf16_partials=True)
+    ids = torch.arange(top_k, dtype=torch.int32).expand(tokens, top_k).contiguous()
+    source_tokens = [tokens] * (ep - 1) + [0]
+    wire = torch.tensor([[0, count, 13] + [count] * top_k + [0] * (ep * home - top_k)
+                         for count in source_tokens], dtype=torch.int32)
+    source_rows = [count * top_k for count in source_tokens]
+    peak = sum(source_rows)
+    average = (peak + ep - 1) // ep
+    limit = (average * percent + 12799) // 12800 * 128
+    summary = route._RouteSummary(peak, tokens, peak)
+    agreed = {"host_rows": wire.tolist()} if checkpointing else {"snapshot": SimpleNamespace(wire=wire.numpy())}
+    with (
+        patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable",
+              side_effect=[True, decision != "reject_movement"]) as cost,
+        patch.object(resources, "bind", side_effect=lambda _hidden, placement, **_: placement),
+    ):
+        placement = resources.select(torch.empty(tokens, 32, dtype=torch.bfloat16), ids, wire, summary, source_rows,
+                                     None, 13, planner=planner, checkpointing=checkpointing, **agreed)
+    assert cost.call_args_list[0].args[:2] == (peak, limit)
+    if decision == "reject_capacity":
+        assert placement is None and cost.call_count == 1
+    elif decision == "reject_movement":
+        assert placement is None and cost.call_args.kwargs["transfer_experts"] > 0
+    else:
+        assert placement.receive_capacity <= limit
+        assert placement.borrowed_capacity > 0 and cost.call_args.kwargs["transfer_experts"] > 0
+        assert placement.counts_by_source.sum(1).tolist() == source_rows
 
 
 def test_manifest_checks_custom_policy_settings():

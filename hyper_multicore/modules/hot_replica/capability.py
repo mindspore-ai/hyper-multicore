@@ -92,11 +92,14 @@ def has_a5_bf16_pipeline() -> bool:
 def require_capability(
     tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *,
     mx_cube_cores: int | None = None, architecture: int | None = None, dispatch_mode: str = "push",
+    receive_capacity_percent: int | None = None,
 ) -> bool:
     """Validate artifacts and agree on the A3 BF16 partial protocol before transfer."""
     local_error = None
     bf16_partials = False
     try:
+        if receive_capacity_percent is not None and architecture != 2201:
+            raise ValueError("An explicit HotReplica receive capacity percentage requires Ascend910_93")
         if mx_cube_cores is not None:
             _require_mx(tensor, mx_cube_cores)
         elif architecture == 3510:
