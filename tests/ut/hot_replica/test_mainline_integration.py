@@ -606,6 +606,20 @@ def test_custom_placement_derives_fused_rows_from_counts(guest_count):
         assert all(not result.copies_by_rank for result in bound)
 
 
+def test_a3_eio_custom_placement_keeps_active_local_slots_and_ignores_idle_guests():
+    """Only real guest producers contribute to the fused return schedule."""
+    copies = torch.tensor([[0, 3], [-1, -1]], dtype=torch.int32)
+    counts = torch.tensor([[3, 2, 3, 0, 4, 5, 0, 0], [1, 0, 0, 0, 2, 1, 0, 0]])
+    spec = SimpleNamespace(local_experts=2, ep_size=2, rank_id=0)
+    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 12)
+    bound = _bind_custom_copy_rows(spec, placement, fused_return=True)
+    assert bound.copies_by_rank == ((0, -1), (-1, -1))
+    assert bound.published_slots == 1
+    assert bound.owner_rows == (4, 2)
+    counts[0, 2] = 0
+    assert _bind_custom_copy_rows(spec, placement, fused_return=True) is None
+
+
 def test_checkpoint_request_is_training_with_automatic_capacity():
     """Request a training plan even during the no-grad checkpoint forward."""
     spec = SimpleNamespace(architecture=0, rank_id=0, intermediate_size=4, num_cube_cores=24,

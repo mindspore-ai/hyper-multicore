@@ -61,7 +61,9 @@ def _get_mega_bank(
     dedicated = pipeline and owner.dedicated_pipeline
     owner_id = id(owner) if dedicated or pool_type is not SharedExpertPool else None
     extent = owner.bank_extent if pipeline else None
-    key = (pool_type, spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id, extent)
+    cube_cores = spec.num_cube_cores if pipeline and spec.architecture == 2201 else None
+    key = (pool_type, spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id, extent,
+           cube_cores)
     with manager.access():
         banks = _SHARED_BANKS.setdefault(manager, weakref.WeakValueDictionary())
         pool = banks.get(key)
@@ -83,6 +85,8 @@ def _get_mega_bank(
                     pool.pipeline = ReplicaPipeline(pool, shared_layouts=True, device_prefetch=device_prefetch)
                 pool.bank_experts = extent
                 signature += (pool.bank_experts,)
+                if cube_cores is not None:
+                    signature += (cube_cores,)
             layout = _WorkspaceLayout(pool.allocation_bytes, signature, spec.local_experts)
             added = manager.reserve((*reservations, (reservation, layout)), allow_resize=True,
                                     workspace_growth=workspace_growth)
@@ -109,23 +113,34 @@ def _live_slot_extent(placement):
                default=0)
 
 
-def _bind_custom_copy_rows(spec, placement):
+def _bind_custom_copy_rows(spec, placement, *, fused_return=False):
     """Read the planner's authoritative copy IDs and producers in one compact transfer."""
     home, ranks = spec.local_experts, spec.ep_size
     borrowed = placement.borrowed_capacity
-    if not borrowed or tuple(placement.counts_by_source.shape) != (ranks, ranks * (home + borrowed)):
+    if not borrowed:
+        return replace(placement, copies_by_rank=())
+    if tuple(placement.counts_by_source.shape) != (ranks, ranks * (home + borrowed)):
+        if fused_return:
+            raise ValueError("A3 expert placement counts must match the EP group and borrowed capacity")
         return replace(placement, copies_by_rank=())
     loads = placement.counts_by_source.sum(dim=0).view(ranks, home + borrowed)
     rows = torch.cat((placement.copies, loads), dim=1).tolist()
-    copies = tuple(tuple(row[:borrowed]) for row in rows)
-    for rank, (owners, row) in enumerate(zip(copies, rows)):
-        for owner, count in zip(owners, row[borrowed + home:]):
-            if owner < 0 and count == 0:
+    for rank, row in enumerate(rows):
+        for slot, count in enumerate(row[borrowed + home:]):
+            owner = row[slot]
+            if count == 0 and (fused_return or owner < 0):
+                row[slot] = -1
                 continue
-            if not 0 <= owner < ranks * home or owner // home == rank or count <= 0:
-                # The pipeline waits for a producer in every published guest slot.
+            valid = 0 <= owner < ranks * home and count > 0
+            if fused_return:
+                if not valid:
+                    raise ValueError("A3 active guest must have a valid logical owner and positive routed rows")
+            elif not valid or owner // home == rank:
                 return replace(placement, copies_by_rank=())
+    copies = tuple(tuple(row[:borrowed]) for row in rows)
     if not any(owner >= 0 for row in copies for owner in row):
+        if fused_return:
+            return None
         return replace(placement, copies_by_rank=())
     published = max((i + 1 for i, owner in enumerate(copies[spec.rank_id]) if owner >= 0), default=0)
     local = tuple(rows[spec.rank_id][borrowed:borrowed + home])
@@ -148,6 +163,7 @@ class PlacementResources:
         self.rank_nodes = None
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
+        self.requires_fused_return = can_split_weights and spec.expert_weight_layout == "EIO"
         supported = built_in and can_split_weights
         self.bounded = (BoundedPlacement(spec, replica_slots_per_rank=self.replica_slots_per_rank)
                         if supported else None)
@@ -209,8 +225,8 @@ class PlacementResources:
                                    host_rows=host_rows)
             if self.bounded is None:
                 placement = self._plan_a5(request, host_rows) if self.uses_a5_quotas else planner.plan(request)
-                if placement is not None and self.pipeline_enabled:
-                    placement = _bind_custom_copy_rows(spec, placement)
+                if placement is not None and (self.pipeline_enabled or self.requires_fused_return):
+                    placement = _bind_custom_copy_rows(spec, placement, fused_return=self.requires_fused_return)
             else:
                 def build(current, target):
                     return self.bounded.select(
@@ -279,22 +295,35 @@ class PlacementResources:
         """Use a prepared placement to bind the existing BF16 runtime."""
         if placement is None:
             return None
+        if self.requires_fused_return and not placement.borrowed_capacity:
+            return None
         self.statistics["placements"] += 1
-        resources = self._geometry(hidden, placement, tokens)
         spec = self.parent.spec
-        pipeline = self.pool.pipeline
         slots = 0
-        return_in_kernel = False
         bf16_partials = False
-        if fused and pipeline is not None and placement.copies_by_rank and self.pool.blocks == spec.num_cube_cores:
+        if fused and placement.copies_by_rank:
             if not self.prefer_bf16_partials:
-                slots = fused_replica_slots(spec, placement, bank_experts=self.pool.bank_experts)
+                slots = fused_replica_slots(spec, placement, bank_experts=self.bank_extent)
             if not slots and self.bf16_partials:
-                slots = fused_replica_slots(spec, placement, bank_experts=self.pool.bank_experts, bf16_partials=True)
+                slots = fused_replica_slots(spec, placement, bank_experts=self.bank_extent, bf16_partials=True)
                 bf16_partials = bool(slots)
+        if self.requires_fused_return and not slots:
+            if spec.hidden_size * spec.intermediate_size % 16:
+                raise ValueError("A3 EIO HotReplica requires a 32-byte-aligned expert matrix stride")
+            if not self.bf16_partials and not self._uses_fp32_partials():
+                raise RuntimeError("A3 EIO HotReplica needs an A3 wheel with BF16 partial dW support for this placement")
+            raise RuntimeError("No fused dW protocol fits the active A3 EIO HotReplica placement")
+        resources = self._geometry(hidden, placement, tokens)
+        return_in_kernel = False
+        if fused and self.pool.pipeline is not None and placement.copies_by_rank and self.pool.blocks == spec.num_cube_cores:
             return_in_kernel = bool(slots)
             if not slots:
                 slots = placement.borrowed_capacity
+        else:
+            slots = 0
+            bf16_partials = False
+        if self.requires_fused_return and not return_in_kernel:
+            raise RuntimeError("A3 EIO HotReplica bank did not bind the selected fused dW plan")
         binding = ExpertWeightBinding(
             self.pool, placement, spec.expert_weight_layout, fused=bool(slots), fused_slots=slots,
             return_in_kernel=return_in_kernel, bf16_partials=bf16_partials,

@@ -163,6 +163,8 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   Reentrant checkpoint 在初次前向保存放置。重算时，EP 各 rank 的 Top-K 顺序、Router 提供的精确计数和重放状态一致后复用该放置。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
+  A3 EIO MTE Push 的活跃放置在发布权重前绑定核内 dW。专家矩阵的 BF16 字节跨度须按 32 字节对齐，行尾可由对齐的连续梯度带覆盖。
+  若放置需要 BF16 partial 协议，应加载支持该协议的 A3 制品。捕获实际张量的 tensor dump 使用其专用捕获路径。
   副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
 - `ascend950` 的 BF16 Push 在带核内协议的制品上按投影预取权重，并在主算子内按固定 peer 和 slot 顺序归并梯度。
   Pull 和不满足核内布局条件的 Push 调用使用独立预取和归并。Pull 的执行 rank 从对称源区拉取 token。

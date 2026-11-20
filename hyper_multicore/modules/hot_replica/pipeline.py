@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from math import gcd
 import struct
 
 import torch
@@ -35,7 +36,13 @@ def _target_band_rows(columns):
 
 def _band_layout(shape):
     rows, columns = shape
-    rows_per_band = min(rows, max((rows + _MAX_BANDS - 1) // _MAX_BANDS, _target_band_rows(columns)))
+    rows_per_band = max((rows + _MAX_BANDS - 1) // _MAX_BANDS, _target_band_rows(columns))
+    if columns % 16:
+        # The BF16 producer and peers share packed matrices. Keep band
+        # boundaries on 32-byte blocks even with a non-aligned row stride.
+        rows_per_block = 16 // gcd(columns, 16)
+        rows_per_band = (rows_per_band + rows_per_block - 1) // rows_per_block * rows_per_block
+    rows_per_band = min(rows, rows_per_band)
     return rows_per_band, (rows + rows_per_band - 1) // rows_per_band
 
 
@@ -56,7 +63,7 @@ def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):
             return 0
         extent = 3 * spec.local_experts if bank_experts is None else bank_experts
         return min(spec.local_experts, extent // 3)
-    if bf16_partials and (h % 16 or i % 16):
+    if bf16_partials and (h % 16 or i % 16) and spec.expert_weight_layout != "EIO":
         return 0
     if supports_bounded_placement(spec):
         extent = 2 * spec.local_experts if bank_experts is None else bank_experts
@@ -191,12 +198,13 @@ class ReplicaPipeline:
         _, received, owned = binding.edges
         credit = self.storage[:rank_lines].view(pool.ranks, pool.local_experts, _LINE_WORDS)
         for slot, owner in enumerate(received):
-            if owner != _NO_OWNER:
+            if owner != _NO_OWNER and owner != pool.rank:
                 shmem.signal(credit[pool.rank, slot, :1], self.epoch, owner)
         if not owned:
             return
         for peer, slot, _ in owned:
-            shmem.wait_signal(credit[peer, slot, :1], self.epoch, comparison="ge")
+            if peer != pool.rank:
+                shmem.wait_signal(credit[peer, slot, :1], self.epoch, comparison="ge")
         stream = torch.npu.current_stream(pool.device)
         value = _words_tensor((self.epoch,), pool.device)[:4].view(torch.int32)
         credit_ready = torch.npu.Event()
@@ -206,6 +214,11 @@ class ReplicaPipeline:
         bank = pool.leased_banks
         try:
             for peer, slot, owner in owned:
+                if peer == pool.rank:
+                    for matrix in order:
+                        bank[matrix][slot].copy_(weights[matrix][owner])
+                        ready[matrix, slot, :1].fill_(self.epoch)
+                    continue
                 if peer not in copies:
                     if peer not in self.streams:
                         self.streams[peer] = torch.npu.Stream(device=pool.device)

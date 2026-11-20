@@ -221,9 +221,28 @@ def test_bf16_partial_return_only_replaces_wide_native_routes(home, layout):
             for used, mode in ((1, (True, False)), (home, expected)):
                 incoming = tuple(range(home, home + used)) + empty[used:]
                 placement = SimpleNamespace(borrowed_capacity=home, copies_by_rank=(incoming, empty))
+                if used == home and layout == "EIO" and not capability:
+                    with pytest.raises(RuntimeError, match="wheel with BF16 partial dW"):
+                        owner.bind(hidden, placement, tokens=4096, fused=owner.pipeline_enabled)
+                    continue
                 _, _, binding = owner.bind(hidden, placement, tokens=4096, fused=owner.pipeline_enabled)
                 assert binding.fused
                 assert (binding.fused_gradients, binding.bf16_partials) == mode
+
+
+@pytest.mark.parametrize(("hidden", "intermediate"), [(5120, 1800), (5120, 1793), (5112, 1792)])
+def test_a3_eio_bf16_bands_keep_block_alignment_for_a_packed_expert(hidden, intermediate):
+    """A packed expert can have row tails without splitting a 32-byte band boundary."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        local_experts=6, hidden_size=hidden, intermediate_size=intermediate, expert_weight_layout="EIO",
+    )
+    assert supports_pipeline(spec, 6, bf16_partials=True)
+    for rows, columns in ((hidden, 2 * intermediate), (intermediate, hidden)):
+        band_rows, bands = _band_layout((rows, columns))
+        assert band_rows * columns % 16 == 0
+        assert (rows - (bands - 1) * band_rows) * columns % 16 == 0
+        assert bands <= 64
 
 
 def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident_weights():
