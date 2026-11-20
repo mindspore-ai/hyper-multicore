@@ -191,6 +191,7 @@ class MegaMoeWorkspace:
         return self.lease_owner.expert_buffer if self.borrows_receive_buffer else self.expert_buffer
 
     def _allocation_specs(self, spec, dtype, capacity, *, routed_only):
+        precision = getattr(spec, "precision", "bf16")
         allocations = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
             routed_slots=spec.routed_slots,
@@ -198,12 +199,15 @@ class MegaMoeWorkspace:
             hidden_size=spec.hidden_size,
             ep_size=spec.ep_size,
             num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
+            compute_stages=6 if precision == "mxfp8" else 3,
             dtype=dtype,
             apply_probs_before_fc2=spec.apply_probs_before_fc2,
         )
         if routed_only:
             return tuple(item for item in allocations if item[0] == "routed_buffer")
+        if precision == "mxfp8" and spec.dispatch_mode == "push" and not spec.apply_probs_before_fc2:
+            # Keep the long-lived routed and event buffers away from the growing receive allocation.
+            allocations = (*allocations[1:], allocations[0])
         return tuple(item for item in allocations
                      if item[0] != "routed_buffer" or self.routed_buffer_owner is None
                      if item[0] != "expert_buffer" or not self.borrows_receive_buffer)

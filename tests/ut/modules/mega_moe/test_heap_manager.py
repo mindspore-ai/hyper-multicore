@@ -71,6 +71,119 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         tensors = tuple(torch.empty(item.target.shape, dtype=item.target.dtype) for item in kwargs["replacements"])
         return _lifecycle._RestartResult(tensors, {})
 
+    def _mx_receive_workspace(self, capacity: int) -> tuple[_HeapManager, MegaMoeWorkspace, MegaMoeSpec]:
+        """Bind the 4 GiB EP64 layout without materializing GiBs of CPU tensors."""
+        specification = dict(local_num_tokens=4096, hidden_size=5120, intermediate_size=1792,
+                             num_experts=384, top_k=8, ep_size=64, precision="mxfp8",
+                             dispatch_mode="push", initial_capacity_factor=4.0, auto_tokens=True)
+        layout = _workspace_layout(specification, torch.bfloat16, capacity=capacity)
+        with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_INITIAL_HEAP_SIZE": str(4 << 30)}):
+            manager = self._manager_with_reservation(specification, layout)
+        with patch.object(shmem, "acquire"):
+            manager.attach_runtime()
+        spec = MegaMoeSpec(4096, 5120, 1792, 384, 8, 4.0, capacity, 64, None, 0, 32,
+                           architecture=3510, precision="mxfp8", auto_tokens=True, capacity_growth_factor=1.25)
+        workspace = MegaMoeWorkspace(shared=True)
+        workspace.capacity_floor = manager.bind(workspace, spec, specification)
+        workspace.expert_capacity = capacity
+        workspace.routed_slots = spec.routed_slots
+        for name, allocation in workspace._allocation_specs(spec, torch.bfloat16, capacity, routed_only=False):
+            setattr(workspace, name, torch.empty(allocation.shape, dtype=allocation.dtype, device="meta"))
+        workspace.completion_event = Mock()
+        workspace.used = True
+        return manager, workspace, spec
+
+    def test_mx_growth_releases_receive_first_when_both_allocations_cannot_fit(self) -> None:
+        """Grow the observed 4 GiB layout and keep borrowers on the same lease and flags."""
+        for old_rows, requested, expected, release_first in (
+                (163840, 180000, 204800, False), (204800, 230000, 256000, True)):
+            with self.subTest(old_rows=old_rows):
+                manager, home, spec = self._mx_receive_workspace(old_rows)
+                child = MegaMoeWorkspace(shared=True, routed_buffer_owner=home, borrows_receive_buffer=True)
+                old_receive = home.expert_buffer
+                routed, flags = home.routed_buffer, home.forward_event_counters
+                order = []
+                home.completion_event.synchronize.side_effect = lambda: order.append("wait")
+                allocations = home._allocation_specs(spec, torch.bfloat16, old_rows, routed_only=False)
+                self.assertEqual(allocations[-1][0], "expert_buffer")
+
+                def allocate(shape, *, dtype, alignment):
+                    self.assertEqual(alignment, 512)
+                    order.append("allocate")
+                    return torch.empty(shape, dtype=dtype, device="meta")
+
+                with (patch.object(shmem, "free", side_effect=lambda _: order.append("free")) as free,
+                      patch.object(shmem, "empty", side_effect=allocate),
+                      patch.object(shmem, "_restart") as restart):
+                    committed = manager.ensure_token_capacity(home, 4096, requested)
+                self.assertEqual(order, ["wait", "free", "allocate"] if release_first else ["wait", "allocate", "free"])
+                free.assert_called_once_with(old_receive)
+                restart.assert_not_called()
+                self.assertEqual((committed.receive_capacity, home.expert_buffer.shape[0]), (expected, expected))
+                self.assertEqual(manager.heap_bytes, 4 << 30)
+                self.assertEqual(manager.growth_records[-1]["release_first"], release_first)
+                self.assertIs(child.receive_buffer, home.expert_buffer)
+                self.assertIs(home.routed_buffer, routed)
+                self.assertIs(home.forward_event_counters, flags)
+
+    def test_mx_release_first_rejects_an_active_lease(self) -> None:
+        manager, home, spec = self._mx_receive_workspace(204800)
+        home.in_use = True
+        with (patch.object(shmem, "free") as free, patch.object(shmem, "empty") as allocate,
+              self.assertRaisesRegex(RuntimeError, "active workspace lease")):
+            manager.ensure_token_capacity(home, 4096, 230000)
+        free.assert_not_called()
+        allocate.assert_not_called()
+        self.assertIs(manager.workspace_spec(home), spec)
+
+    def test_mx_release_first_restores_old_receive_before_restart_on_allocator_miss(self) -> None:
+        manager, home, spec = self._mx_receive_workspace(204800)
+        old_receive = home.expert_buffer
+        allocation_error = RuntimeError(
+            "[HYPER_MULTICORE_SHMEM_ERROR] error_code=CANN_ERROR operation=Allocate phase=CannCall cann_error_code=None")
+
+        def allocate(shape, *, dtype, alignment):
+            if shape[0] == 256000:
+                raise allocation_error
+            return torch.empty(shape, dtype=dtype, device="meta")
+
+        def restart(layouts, heap_bytes):
+            self.assertEqual((heap_bytes, layouts[0].receive_capacity), (4 << 30, 256000))
+            self.assertEqual(home.expert_buffer.shape, old_receive.shape)
+            self.assertIsNot(home.expert_buffer, old_receive)
+            self.assertIs(manager.workspace_spec(home), spec)
+
+        with (patch.object(shmem, "free") as free, patch.object(shmem, "empty", side_effect=allocate) as empty,
+              patch.object(_lifecycle, "_runtime_is_healthy", return_value=True),
+              patch.object(manager, "_restart", side_effect=restart) as fallback):
+            manager.ensure_token_capacity(home, 4096, 230000)
+        free.assert_called_once_with(old_receive)
+        self.assertEqual([call.args[0][0] for call in empty.call_args_list], [256000, 204800])
+        fallback.assert_called_once()
+        self.assertEqual(manager.state, "ready")
+
+    def test_mx_release_first_does_not_restore_when_rank_results_disagree(self) -> None:
+        manager, home, spec = self._mx_receive_workspace(204800)
+        exchange = _collective.exchange
+
+        def peer_result(value, *, group, failure_prefix):
+            if failure_prefix.startswith("MX Push receive allocation failed"):
+                return [value, (("RuntimeError", "peer allocation failed"), True)]
+            return exchange(value, group=group, failure_prefix=failure_prefix)
+
+        replacement = torch.empty((256000, 5120), dtype=torch.bfloat16, device="meta")
+        with (patch.object(shmem, "free"), patch.object(shmem, "empty", return_value=replacement) as allocate,
+              patch.object(_collective, "exchange", side_effect=peer_result),
+              patch.object(manager, "_restart") as restart,
+              self.assertRaisesRegex(RuntimeError, "peer allocation failed")):
+            manager.ensure_token_capacity(home, 4096, 230000)
+        allocate.assert_called_once()
+        restart.assert_not_called()
+        self.assertIs(home.expert_buffer, replacement)
+        self.assertIs(manager.workspace_spec(home), spec)
+        self.assertEqual(home.expert_capacity, 204800)
+        self.assertEqual(manager.state, "failed")
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_automatic_source_and_receive_growth_commit_together_and_reuse(self) -> None:

@@ -450,7 +450,8 @@ class _HeapManager:
         changed = tuple((data_fields[id(item.current)], item) for item in replacements
                         if id(item.current) in data_fields and tuple(item.current.shape) != item.target.shape)
         temporary_bytes = sum(item.current.numel() * self.element_size for _, item in changed)
-        if required + temporary_bytes > self.heap_bytes:
+        release_first = required + temporary_bytes > self.heap_bytes
+        if release_first and tuple(name for name, _ in changed) != ("expert_buffer",):
             return False
 
         started = time.perf_counter()
@@ -462,12 +463,17 @@ class _HeapManager:
                 owner.completion_event.synchronize()
 
         owner_index = next(index for index, candidate in enumerate(self.entries) if candidate is entry)
-        signature = tuple((name, item.target) for name, item in changed)
+        signature = (release_first, tuple((name, item.target) for name, item in changed))
         self._run_and_check_consistency(
             prepare, stage="MX Push growth preflight", value=(owner_index, old_layout, layout, signature),
         )
         try:
-            stages_ms = self._replace_mx_push_buffers(workspace, changed)
+            if release_first:
+                stages_ms = self._replace_mx_push_receive(workspace, changed[0][1])
+                if stages_ms is None:
+                    return False
+            else:
+                stages_ms = self._replace_mx_push_buffers(workspace, changed)
         except Exception:
             self.state = "failed"
             raise
@@ -488,11 +494,55 @@ class _HeapManager:
             "old_source": spec.local_num_tokens,
             "source": new_spec.local_num_tokens,
             "replaced": [name for name, _ in changed],
+            "release_first": release_first,
             "total_ms": (time.perf_counter() - started) * 1000,
             "stages_ms": stages_ms,
             "capacities": [item.layout.receive_capacity for item in self.entries],
         })
         return True
+
+    @torch.inference_mode(False)
+    def _replace_mx_push_receive(
+        self, workspace: MegaMoeWorkspace, replacement: _lifecycle._AllocationReplacement,
+    ) -> dict[str, float] | None:
+        """Retire quiescent receive scratch before allocating its larger buffer."""
+        current, target = replacement.current, replacement.target
+        old_shape, old_dtype = tuple(current.shape), current.dtype
+
+        def release() -> None:
+            shmem.free(current)
+            workspace.expert_buffer = None
+
+        def allocate(shape: tuple[int, ...], dtype: torch.dtype) -> None:
+            workspace.expert_buffer = shmem.empty(shape, dtype=dtype, alignment=target.alignment_bytes)
+
+        started = time.perf_counter()
+        _collective.collective_call(release, stage="MX Push receive release", group=self.root_group)
+        released = time.perf_counter()
+        failure = None
+        recoverable = False
+        local_error = None
+        try:
+            allocate(target.shape, target.dtype)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            local_error = error
+            failure = _collective.failure_report(error)
+            # A null result from the native aligned allocator did not register a new Allocation.
+            recoverable = (failure[1].startswith(
+                "[HYPER_MULTICORE_SHMEM_ERROR] error_code=CANN_ERROR operation=Allocate phase=CannCall "
+            ) and _lifecycle._runtime_is_healthy())
+        peers = _collective.exchange((failure, recoverable), group=self.root_group,
+                                     failure_prefix="MX Push receive allocation failed while converging Root ranks")
+        if all(item[0] is None for item in peers):
+            return {"release_ms": (released - started) * 1000,
+                    "allocate_ms": (time.perf_counter() - released) * 1000}
+        if all(item[1] for item in peers):
+            # Restore the committed scratch shape before the usual whole-heap fallback.
+            _collective.collective_call(lambda: allocate(old_shape, old_dtype),
+                                        stage="MX Push receive restoration", group=self.root_group)
+            return None
+        failures = _collective.format_collective_failures([item[0] for item in peers])
+        raise RuntimeError(f"MX Push receive allocation failed on {failures}") from local_error
 
     @staticmethod
     def _replace_mx_push_buffers(
