@@ -160,8 +160,7 @@ class PlacementResources:
         self.replica_slots_per_rank = specification.get("replica_slots_per_rank")
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
-        self.uses_a5_quotas = (built_in and spec.architecture == 3510
-                               and (spec.dispatch_mode == "push" or spec.transport_engine == "udma"))
+        built_in_a5 = built_in and spec.architecture == 3510
         self.rank_nodes = None
         can_split_weights = supports_bounded_placement(spec)
         self.requires_fused_return = can_split_weights and spec.expert_weight_layout == "EIO"
@@ -171,9 +170,10 @@ class PlacementResources:
         self.bf16_partials = False
         self.prefer_bf16_partials = False
         self.pipeline_enabled = (
-            self.uses_a5_quotas and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
+            built_in_a5 and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
             and has_a5_bf16_pipeline()
         )
+        self.uses_a5_quotas = built_in_a5 and (spec.dispatch_mode == "push" or self.pipeline_enabled)
         self.dedicated_pipeline = False
         if can_split_weights:
             fp32_partials = self._uses_fp32_partials()

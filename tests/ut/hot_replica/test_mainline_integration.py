@@ -486,7 +486,8 @@ def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget, dispatch_mode)
     settings = {"planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__,
                                 planner.configuration_key()),
                 "replica_slots_per_rank": budget}
-    with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline", return_value=False):
+    with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline",
+               return_value=dispatch_mode == "pull"):
         placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
     placement.rank_nodes = (0, 1)
     hidden = torch.empty((1, 5120), dtype=torch.bfloat16).expand(4096, 5120)
@@ -505,12 +506,22 @@ def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget, dispatch_mode)
     assert sum(expert >= 0 for expert in selected.copies_by_rank[1]) == min(budget, 3)
 
 
-def test_a5_bf16_mte_pull_uses_the_generic_planner():
-    """Keep the MTE path on its existing admission and separate bank protocol."""
-    spec = SimpleNamespace(architecture=3510, dispatch_mode="pull", transport_engine="mte", num_experts=12, ep_size=2)
+@pytest.mark.parametrize(("transport", "kernel_pipeline", "batch_experts"), [
+    ("mte", True, False),
+    ("udma", False, False),
+    ("udma", True, True),
+])
+def test_a5_bf16_pull_without_fusion_uses_the_generic_planner(transport, kernel_pipeline, batch_experts):
+    """Keep Pull on its original admission when the fused path is unavailable."""
+    spec = SimpleNamespace(
+        architecture=3510, dispatch_mode="pull", transport_engine=transport, num_experts=12, ep_size=2,
+        local_experts=6, hidden_size=5120, intermediate_size=1792, num_cube_cores=32, batch_experts=batch_experts,
+    )
     planner = HotReplicaPlanner()
     settings = {"planner_key": (type(planner).__module__, type(planner).__qualname__, planner.configuration_key())}
-    placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
+    with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline",
+               return_value=kernel_pipeline):
+        placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
     assert not placement.uses_a5_quotas
     assert not placement.pipeline_enabled
 

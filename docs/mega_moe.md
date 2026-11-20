@@ -176,7 +176,7 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 - `ascend950` 的 BF16 Push 和 UDMA Pull 在带核内协议的制品上按投影预取权重，并在主算子内按固定 peer 和 slot 顺序归并梯度。
   MTE Pull 及其他不满足核内布局条件的调用使用独立预取和归并。Pull 的执行 rank 从对称源区拉取 token。
   激活副本时以 FP32 计算和归并原属专家及借用专家的局部权重梯度，写回时转换为公开参数类型。
-  Push 与 UDMA Pull 的内置策略按已交换的计数选择有界配额。BF16 可通过
+  Push 与满足核内条件的 UDMA Pull 按已交换的计数选择有界配额。其他 Pull 继续使用原有准入策略。BF16 可通过
   `HotReplicaPlanner(replica_slots_per_rank=2)` 设置每 rank 的借用上限。
   使用 FC2 后加权且堆内可以同时容纳新旧缓冲区时，动态增长只替换变大的 Push 缓冲区。
 - `ascend950` 支持 MXFP8 EIO Push，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
