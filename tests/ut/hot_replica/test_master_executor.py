@@ -230,9 +230,9 @@ def test_bf16_partial_return_only_replaces_wide_native_routes(home, layout):
                 assert (binding.fused_gradients, binding.bf16_partials) == mode
 
 
-@pytest.mark.parametrize(("hidden", "intermediate"), [(5120, 1800), (5120, 1793), (5112, 1792)])
-def test_a3_eio_bf16_bands_keep_block_alignment_for_a_packed_expert(hidden, intermediate):
-    """A packed expert can have row tails without splitting a 32-byte band boundary."""
+@pytest.mark.parametrize(("hidden", "intermediate"), [(5120, 1800), (5120, 1793), (5112, 1792), (5112, 1793)])
+def test_a3_eio_bf16_bands_preserve_unaligned_matrix_tails(hidden, intermediate):
+    """Interior bands use aligned lengths and the last band ends at the true size."""
     spec = SimpleNamespace(
         architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
         local_experts=6, hidden_size=hidden, intermediate_size=intermediate, expert_weight_layout="EIO",
@@ -240,8 +240,8 @@ def test_a3_eio_bf16_bands_keep_block_alignment_for_a_packed_expert(hidden, inte
     assert supports_pipeline(spec, 6, bf16_partials=True)
     for rows, columns in ((hidden, 2 * intermediate), (intermediate, hidden)):
         band_rows, bands = _band_layout((rows, columns))
-        assert band_rows * columns % 16 == 0
-        assert (rows - (bands - 1) * band_rows) * columns % 16 == 0
+        assert bands == 1 or band_rows * columns % 16 == 0
+        assert 0 < rows - (bands - 1) * band_rows <= band_rows
         assert bands <= 64
 
 

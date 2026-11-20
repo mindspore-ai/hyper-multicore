@@ -308,8 +308,6 @@ class PlacementResources:
                 slots = fused_replica_slots(spec, placement, bank_experts=self.bank_extent, bf16_partials=True)
                 bf16_partials = bool(slots)
         if self.requires_fused_return and not slots:
-            if spec.hidden_size * spec.intermediate_size % 16:
-                raise ValueError("A3 EIO HotReplica requires a 32-byte-aligned expert matrix stride")
             if not self.bf16_partials and not self._uses_fp32_partials():
                 raise RuntimeError("A3 EIO HotReplica needs an A3 wheel with BF16 partial dW support for this placement")
             raise RuntimeError("No fused dW protocol fits the active A3 EIO HotReplica placement")

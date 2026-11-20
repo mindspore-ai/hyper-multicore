@@ -56,16 +56,17 @@ def uses_wider_gradient_bands(spec):
 def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):
     """Limit guest weights and dW to disjoint bank spans."""
     h, i = spec.hidden_size, spec.intermediate_size
-    if h * i % 16:
-        return 0
     if spec.architecture == 3510:
-        if bf16_partials or spec.dispatch_mode != "push" or spec.batch_experts or spec.num_cube_cores <= REPLICA_HELPERS:
+        if (h * i % 16 or bf16_partials or spec.dispatch_mode != "push"
+                or spec.batch_experts or spec.num_cube_cores <= REPLICA_HELPERS):
             return 0
         extent = 3 * spec.local_experts if bank_experts is None else bank_experts
         return min(spec.local_experts, extent // 3)
-    if bf16_partials and (h % 16 or i % 16) and spec.expert_weight_layout != "EIO":
-        return 0
     if supports_bounded_placement(spec):
+        # A3 EIO copies exact GM byte spans, including matrix tails.
+        needs_tail = h * i % 16 or bf16_partials and (h % 16 or i % 16)
+        if needs_tail and spec.expert_weight_layout != "EIO":
+            return 0
         extent = 2 * spec.local_experts if bank_experts is None else bank_experts
         return min(spec.local_experts, extent // (2 if bf16_partials else 3))
     return 0
