@@ -159,6 +159,7 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 ```
 
 - `ascend910_93` 支持 BF16 EIO 和 EOI。A3 MTE Push 在槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
+  自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。
   带显式 `source_token_bound` 的内置策略按接收容量准入，使用相同的配额规划和路由描述。
   Reentrant checkpoint 在初次前向保存放置。重算时，EP 各 rank 的 Top-K 顺序、Router 提供的精确计数和重放状态一致后复用该放置。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
@@ -454,7 +455,7 @@ experts = MegaMoeExperts(
 | --- | --- | --- | --- |
 | `policy` | `None`（默认）、`"two_expert_pipeline"`、`"builder_order"` | 用 `None`，由 lowering 选择队列。指定策略名会报错。 | `None` 等同 `"two_expert_pipeline"`，交错相邻专家的数学阶段。`"builder_order"` 保留建图时的数学任务相对顺序。两者保持相同的任务覆盖、核归属和通信队列。 |
 | `queue_ready_lookahead` | `None`（默认）、整数 `0`、`1`、`8` | compact 的窗口只作用于 Vector 队列，`None` 保留默认 `256`，Cube 始终 FIFO。dense 使用 FIFO，接受 `None` 或 `0`。 | `None` 等同 `0`。窗口作用于 Cube 和数学 Vector 队列，通信 Vector 始终 FIFO。 |
-| `batch_experts` | `None`（默认）、`False`、`True` | `None` 等同 `False`。`True` 将每个 GMM 阶段的逐专家描述符合并为批处理，取消逐专家流水重排。dense 与 compact 均可用，compact 保留 Vector 就绪扫描。 | 接受 `None` 或 `False`。`True` 会报错。 |
+| `batch_experts` | `None`（默认）、`False`、`True` | `None` 等同 `False`。`True` 将每个 GMM 阶段的逐专家描述符合并为批处理，取消逐专家流水重排。dense 与 compact 均可用，compact 保留 Vector 就绪扫描。启用融合副本的 step 使用逐专家任务，以便独立预取各投影的权重。 | 接受 `None` 或 `False`。`True` 会报错。 |
 | `nominal_schedule` | `None`（默认）、`False`、`True` | `None` 等同 `False`。`True` 按名义均分行数限制 compact 的 lane 数，并跳过描述符压缩倍率门槛。要求 Push、`intermediate_size < 2048` 且 lowering 为 `"auto"` 或 `"compact"`。 | 接受 `None` 或 `False`。`True` 会报错。 |
 | `lowering` | `"auto"`（默认）、`"dense"`、`"compact"` | `"dense"` 保留固定分片。`"auto"` 在 Push、`intermediate_size < 2048` 且预计描述符数至少压缩四倍时选 compact，否则用 dense。显式 `"compact"` 要求满足这些条件，`nominal_schedule=True` 时免于倍率判定。 | `"auto"` 与 `"dense"` 都使用逐专家 dense。`"compact"` 会报错。 |
 

@@ -67,6 +67,8 @@ class BF16Resources(_MegaMoeExecutionResources):
             )
             key = (key, route_experts, spec.batch_experts, spec.nominal_schedule)
         if replica_pipeline:
+            if spec.batch_experts:
+                spec = replace(spec, batch_experts=False)
             key = (key, replica_pipeline, reserve_merge_workers)
         plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:

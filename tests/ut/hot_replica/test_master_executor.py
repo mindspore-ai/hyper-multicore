@@ -26,11 +26,18 @@ from hyper_multicore.modules.hot_replica._planner._dispatch import _materialize
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica.bounded_placement import _render_geometry, supports_bounded_placement
 from hyper_multicore.modules.hot_replica.pipeline import (
-    ReplicaPipeline, fused_replica_slots, supports_pipeline,
+    ReplicaPipeline, _band_layout, fused_replica_slots, supports_pipeline,
 )
 from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, SharedExpertPool
 from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16
 from hyper_multicore.modules.mega_moe.heap_manager import _HeapManager
+
+
+def test_wide_replica_projection_fits_the_kernel_band_table():
+    """Widen dW bands when a projection exceeds the normal 64-band span."""
+    assert _band_layout((8192, 3584)) == (292, 29)
+    assert _band_layout((8192, 9216)) == (128, 64)
+    assert _band_layout((9216, 8192)) == (144, 64)
 
 
 def test_serial_replica_widths_share_one_reservation_with_the_bank():
@@ -268,11 +275,9 @@ def test_fusion_accepts_an_empty_tail_in_the_padded_copy_table(layout, used, bat
     # the fused extent agreed by the whole EP group.
     placement = SimpleNamespace(published_slots=0, borrowed_capacity=geometry.width, copies_by_rank=geometry.owners)
     slots = fused_replica_slots(spec, placement)
-    assert slots == (used if not batch_experts and used <= 5 else 0)
+    assert slots == (used if used <= 5 else 0)
     assert mega_moe_adapter._live_slot_extent(placement) == used
-    assert fused_replica_slots(spec, placement, bank_experts=max(2 * home, 3 * used)) == (
-        used if not batch_experts else 0
-    )
+    assert fused_replica_slots(spec, placement, bank_experts=max(2 * home, 3 * used)) == used
     if slots:
         pipeline = ReplicaPipeline(SimpleNamespace(local_experts=home, rank=1))
         planned, received, owned = pipeline.plan(placement, slots)

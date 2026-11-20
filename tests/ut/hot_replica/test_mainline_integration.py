@@ -32,7 +32,7 @@ from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
-    ExpertWeightBinding, PlacementResources, _get_mega_bank, workspace_reservations,
+    ExpertWeightBinding, PlacementResources, _bind_custom_copy_rows, _get_mega_bank, workspace_reservations,
 )
 from hyper_multicore.modules.hot_replica.mx_gradient import GRADIENT_HELPERS, MXGradientPool
 
@@ -308,7 +308,7 @@ def test_configuration_mismatch_fails_before_optional_capability_collective():
 def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
     """Reuse negative cost decisions without caching routes or current weights."""
     spec = SimpleNamespace(
-        ep_size=2, local_experts=4, top_k=2, hidden_size=8,
+        architecture=0, ep_size=2, local_experts=4, top_k=2, hidden_size=8,
         intermediate_size=4, num_cube_cores=24, rank_id=0, apply_probs_before_fc2=True,
     )
     owner = PlacementResources(SimpleNamespace(spec=spec), {}, False)
@@ -524,7 +524,8 @@ def test_forward_uses_injected_planner_after_count_exchange():
         expert = MegaMoeExperts(hidden_size=8, intermediate_size=4, num_experts=4, top_k=1, expert_placement=options)
     hidden, ids = torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int32)
     probs, roots = torch.ones(2, 1), (torch.empty(2, 8, 8), torch.empty(2, 4, 8))
-    spec = SimpleNamespace(auto_tokens=True, dispatch_mode="push", precision="bf16", intermediate_size=4, rank_id=0,
+    spec = SimpleNamespace(architecture=0, auto_tokens=True, dispatch_mode="push", precision="bf16",
+                           intermediate_size=4, rank_id=0,
                            num_cube_cores=24, apply_probs_before_fc2=True)
     owner = SimpleNamespace(spec=spec, workspace=Mock(), prepare_auto_workspace=Mock())
     owner.placement = PlacementResources(owner, expert._resource_group.specification, False)
@@ -568,10 +569,28 @@ def test_public_placement_hints_and_omitted_local_capacity():
     assert [placement.received_rows(rank) for rank in range(2)] == [3, 7]
 
 
+@pytest.mark.parametrize("guest_count", [0, 3])
+def test_custom_placement_derives_fused_rows_from_counts(guest_count):
+    """Require a producer for every published guest on both EP ranks."""
+    copies = torch.tensor([[2, -1], [-1, -1]], dtype=torch.int32)
+    counts = torch.tensor([[3, 2, guest_count, 0, 4, 5, 0, 0], [1, 0, 0, 0, 2, 1, 0, 0]])
+    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 12)
+    bound = [
+        _bind_custom_copy_rows(SimpleNamespace(local_experts=2, ep_size=2, rank_id=rank), placement)
+        for rank in range(2)
+    ]
+    if guest_count:
+        assert [result.copies_by_rank for result in bound] == [((2, -1), (-1, -1))] * 2
+        assert [(result.owner_rows, result.published_slots) for result in bound] == [((4, 2), 1), ((6, 6), 0)]
+    else:
+        assert all(not result.copies_by_rank for result in bound)
+
+
 @pytest.mark.parametrize("bound", [None, 4096])
 def test_checkpoint_request_is_training_independently_of_reservation(bound):
     """Keep the checkpoint state even when no initial capacity is supplied."""
-    spec = SimpleNamespace(rank_id=0, intermediate_size=4, num_cube_cores=24, apply_probs_before_fc2=True)
+    spec = SimpleNamespace(architecture=0, rank_id=0, intermediate_size=4, num_cube_cores=24,
+                           apply_probs_before_fc2=True)
     owner = SimpleNamespace(spec=spec, workspace=SimpleNamespace(capacity_floor=128))
     resources = PlacementResources(owner, {"source_token_bound": bound}, False)
     ids = torch.tensor([[0]])
@@ -628,7 +647,7 @@ def test_a3_saved_route_uses_shared_quota_geometry(bound, batch_experts):
             expected.receive_capacity, expected.transfer_experts,
         )
         assert resources.bounded.geometry is None
-        assert bind.call_args.kwargs["fused"] is not batch_experts
+        assert bind.call_args.kwargs["fused"] == (not batch_experts or bound is not None)
         return
 
     with (

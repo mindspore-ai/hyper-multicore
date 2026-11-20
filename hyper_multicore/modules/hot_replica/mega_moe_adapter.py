@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from collections.abc import Mapping
 import math
 import weakref
@@ -160,6 +162,29 @@ def _live_slot_extent(placement):
                default=0)
 
 
+def _bind_custom_copy_rows(spec, placement):
+    """Read the planner's authoritative copy IDs and producers in one compact transfer."""
+    home, ranks = spec.local_experts, spec.ep_size
+    borrowed = placement.borrowed_capacity
+    if not borrowed or tuple(placement.counts_by_source.shape) != (ranks, ranks * (home + borrowed)):
+        return replace(placement, copies_by_rank=())
+    loads = placement.counts_by_source.sum(dim=0).view(ranks, home + borrowed)
+    rows = torch.cat((placement.copies, loads), dim=1).tolist()
+    copies = tuple(tuple(row[:borrowed]) for row in rows)
+    for rank, (owners, row) in enumerate(zip(copies, rows)):
+        for owner, count in zip(owners, row[borrowed + home:]):
+            if owner < 0 and count == 0:
+                continue
+            if not 0 <= owner < ranks * home or owner // home == rank or count <= 0:
+                # The pipeline waits for a producer in every published guest slot.
+                return replace(placement, copies_by_rank=())
+    if not any(owner >= 0 for row in copies for owner in row):
+        return replace(placement, copies_by_rank=())
+    published = max((i + 1 for i, owner in enumerate(copies[spec.rank_id]) if owner >= 0), default=0)
+    local = tuple(rows[spec.rank_id][borrowed:borrowed + home])
+    return replace(placement, copies_by_rank=copies, owner_rows=local, published_slots=published)
+
+
 class PlacementResources:
     """Own placement geometry and lazy banks under one BF16 resource owner."""
 
@@ -173,17 +198,26 @@ class PlacementResources:
         self.source_bound = specification.get("source_token_bound")
         self.initial_receive_floor = parent.workspace.capacity_floor if self.source_bound is not None else None
         built_in = _uses_builtin_planner(specification)
-        supported = built_in and supports_bounded_placement(parent.spec)
-        self.bounded = BoundedPlacement(parent.spec) if supported else None
         spec = parent.spec
+        can_split_weights = supports_bounded_placement(spec)
+        supported = built_in and can_split_weights
+        self.bounded = BoundedPlacement(parent.spec) if supported else None
+        self.bf16_partials = False
+        self.prefer_bf16_partials = False
+        self.pipeline_enabled = False
+        if can_split_weights:
+            fp32_partials = self._uses_fp32_partials()
+            self.bf16_partials = bf16_partials and not fp32_partials
+            # Preserve the former separate executor's partial dtype on these schedules.
+            self.prefer_bf16_partials = not fp32_partials and (not built_in or spec.batch_experts)
+            self.pipeline_enabled = (
+                self.bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent, bf16_partials=True)
+                or not self.prefer_bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
+            )
         self.reuses_parent_workspace = (
-            supported and not spec.batch_experts and self.source_bound is None
+            (self.pipeline_enabled or supported and not spec.batch_experts) and self.source_bound is None
             and mega_moe_event_capacity(spec.num_experts, spec.ep_size)
             == mega_moe_event_capacity(2 * spec.num_experts, spec.ep_size)
-        )
-        self.bf16_partials = bf16_partials and not self._uses_fp32_partials()
-        self.pipeline_enabled = built_in and supports_pipeline(
-            spec, 1, bank_experts=self.bank_extent, bf16_partials=self.bf16_partials,
         )
         self.statistics = {
             "invocations": 0, "placements": 0,
@@ -217,6 +251,8 @@ class PlacementResources:
                                    host_rows=host_rows)
             if self.bounded is None:
                 placement = planner.plan(request)
+                if placement is not None and self.pipeline_enabled:
+                    placement = _bind_custom_copy_rows(spec, placement)
             else:
                 def build(current, target):
                     reserved = None if spec.batch_experts else current.ordinary_receive_capacity
@@ -279,7 +315,8 @@ class PlacementResources:
         return_in_kernel = False
         bf16_partials = False
         if fused and pipeline is not None and placement.copies_by_rank and self.pool.blocks == spec.num_cube_cores:
-            slots = fused_replica_slots(spec, placement, bank_experts=self.pool.bank_experts)
+            if not self.prefer_bf16_partials:
+                slots = fused_replica_slots(spec, placement, bank_experts=self.pool.bank_experts)
             if not slots and self.bf16_partials:
                 slots = fused_replica_slots(spec, placement, bank_experts=self.pool.bank_experts, bf16_partials=True)
                 bf16_partials = bool(slots)

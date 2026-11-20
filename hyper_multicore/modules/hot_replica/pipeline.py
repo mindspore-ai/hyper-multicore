@@ -30,7 +30,7 @@ def projection_shapes(hidden, intermediate, layout):
 
 def _band_layout(shape):
     rows, columns = shape
-    rows_per_band = max(1, min(rows, _BAND_BYTES // (columns * 4)))
+    rows_per_band = max((rows + _MAX_BANDS - 1) // _MAX_BANDS, min(rows, _BAND_BYTES // (columns * 4)))
     return rows_per_band, (rows + rows_per_band - 1) // rows_per_band
 
 
@@ -39,19 +39,15 @@ def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):
     h, i = spec.hidden_size, spec.intermediate_size
     if bf16_partials and (h % 16 or i % 16):
         return 0
-    if supports_bounded_placement(spec) and not spec.batch_experts and h * i % 16 == 0 and all(
-            _band_layout(shape)[1] <= _MAX_BANDS for shape in projection_shapes(h, i, spec.expert_weight_layout)):
+    if supports_bounded_placement(spec) and h * i % 16 == 0:
         extent = 2 * spec.local_experts if bank_experts is None else bank_experts
         return min(spec.local_experts, extent // (2 if bf16_partials else 3))
     return 0
 
 
 def supports_pipeline(spec, borrowed, *, bank_experts=None, bf16_partials=False):
-    """Check whether either available gradient protocol fits the requested width."""
-    capacity = _pipeline_capacity(spec, bank_experts, bf16_partials=bf16_partials)
-    if not capacity and bf16_partials:
-        capacity = _pipeline_capacity(spec, bank_experts)
-    return 0 < borrowed <= capacity
+    """Check whether the selected gradient protocol fits the requested width."""
+    return 0 < borrowed <= _pipeline_capacity(spec, bank_experts, bf16_partials=bf16_partials)
 
 
 def fused_replica_slots(spec, placement, *, bank_experts=None, bf16_partials=False):
