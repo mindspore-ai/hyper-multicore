@@ -40,7 +40,7 @@ def test_mx_gradient_bank_registers_with_the_virtual_workspace():
     """Reserve the FP32 guest inbox and both projections in the route transaction."""
     hidden = torch.empty((0, 128), dtype=torch.bfloat16)
     spec = SimpleNamespace(local_experts=6, hidden_size=128, intermediate_size=64, num_cube_cores=24,
-                           ep_group=object(), expert_weight_layout="EIO")
+                           ep_group=object(), expert_weight_layout="EIO", architecture=3510)
     manager = Mock()
     manager.access.side_effect = nullcontext
     owner = Mock(bounded=None)
