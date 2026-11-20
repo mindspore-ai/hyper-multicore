@@ -61,6 +61,7 @@ class _CheckpointScope:
     replay: bool
     same_parameters: bool
     cursor: int = 0
+    defer_forward_copies: bool = False
 
 
 _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_checkpoint", default=None)
@@ -69,21 +70,35 @@ _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_check
 class ReplayCheckpoint:
     """Hold one checkpoint invocation's tape across original and replay contexts."""
 
-    def __init__(self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False) -> None:
-        """Register the caller's version lookup and opt in to early restoration."""
+    def __init__(
+        self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False,
+        defer_forward_copies: bool = False,
+    ) -> None:
+        """Register the caller's version lookup and optional checkpoint policies.
+
+        Copy deferral requires a non-reentrant checkpoint whose saved-tensor
+        hooks replace original placeholders with materialized replay values.
+        Use a separate tape per invocation and enter both corresponding scopes.
+        """
         self.parameter_version = parameter_version
         self.prepare_replay = prepare_replay
+        self.defer_forward_copies = defer_forward_copies
         self.records: list[ReplayRecord] = []
         self.forward_version = None
 
     @contextmanager
     def scope(self, replay: bool) -> Iterator[None]:
         """Enter the tape before running any operator of the checkpointed block."""
+        if self.defer_forward_copies and not torch.is_grad_enabled():
+            raise RuntimeError("Deferring forward copies requires a grad-enabled non-reentrant checkpoint")
         version = self.parameter_version()
         if not replay:
             self.records.clear()
             self.forward_version = version
-        state = _CheckpointScope(self.records, replay, version is not None and version == self.forward_version)
+        state = _CheckpointScope(
+            self.records, replay, version is not None and version == self.forward_version,
+            defer_forward_copies=self.defer_forward_copies,
+        )
         token = _ACTIVE.set(state)
         try:
             if replay and state.same_parameters and self.prepare_replay and len(self.records) == 1:
@@ -93,6 +108,12 @@ class ReplayCheckpoint:
             yield
         finally:
             _ACTIVE.reset(token)
+
+
+def forward_copy_phase() -> bool | None:
+    """Return the opted-in replay flag independently of route reuse."""
+    scope = _ACTIVE.get()
+    return scope.replay if scope is not None and scope.defer_forward_copies else None
 
 
 def wrap_checkpoint(

@@ -15,6 +15,8 @@
 """BF16 autograd launch and restoration over the common invocation lifecycle."""
 from typing import Any, TYPE_CHECKING
 import torch
+from hyper_multicore.modules.hot_replica.checkpoint import forward_copy_phase
+
 from ...route import PreparedTopKRoute, restore_topk_output
 
 from .autograd import _CheckpointedPushFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
@@ -71,11 +73,27 @@ def forward(
             hidden_flat, *weights, route.metadata, plan, resources.workspace,
             record.activation, topk_weights, False, route.weight_binding,
         ).reshape_as(hidden_states)
+    # Replay may replan and have no route record. Keep the same saved-tensor
+    # layout in F and R for this checkpoint independent of route cache hits.
+    spec = resources.spec
+    checkpoint_replay = forward_copy_phase()
+    if checkpoint_replay is not None and (
+        pull or before_fc2 or spec.architecture != 2201
+        or spec.expert_weight_layout != "EOI" or spec.transport_engine != "mte"
+    ):
+        checkpoint_replay = None
+    if checkpoint_replay is not None:
+        options["checkpoint_replay"] = checkpoint_replay
+    integrated_unpermute = pull or before_fc2 or checkpoint_replay is not None
     output = execute_mega_moe_with_permutation(
         hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
-        topk_weights=topk_weights if pull or before_fc2 else None,
+        topk_weights=topk_weights if integrated_unpermute else None,
         workspace_claimed=pull, **options)
-    if not pull and not before_fc2:
+    if checkpoint_replay is False and module_resources.placement is not None:
+        stats = module_resources.placement.statistics
+        for field in ("original_dispatch_copies_skipped", "original_combine_copies_skipped"):
+            stats[field] = stats.get(field, 0) + 1
+    if not integrated_unpermute:
         output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
     return output.reshape_as(hidden_states)
 

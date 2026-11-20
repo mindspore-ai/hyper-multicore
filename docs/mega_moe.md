@@ -378,6 +378,12 @@ A3 BF16 共用有界副本规划的串行层可在同一个物理 workspace 中�
 支持 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
 关闭。
 
+使用 A3 BF16 EOI MTE Push、FC2 后加权时，eager 非重入 checkpoint 的适配器可为单次调用创建
+`ReplayCheckpoint(parameter_version, defer_forward_copies=True)`，分别通过 `scope(False)` 和
+`scope(True)` 进入原始前向与重算。调用方需将两者绑定到同一次 checkpoint 调用，启用梯度，并以一次反向消费完整重算。
+原始前向在 workspace 租约内消费 Combine 结果。重算为反向保存完整的 dispatch 和 Combine 张量，
+包括重新规划路由的调用。需要直接使用原始前向保存张量的调用沿用默认策略。
+
 GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图引用仍会占用内存，heap 受显式预算或物理 HBM 容量约束。
 
 #### 自动清理
