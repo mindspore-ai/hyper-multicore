@@ -436,6 +436,13 @@ experts = MegaMoeExperts(
 参数、checkpoint 与优化器状态由外层模型管理，接入方式见
 [Checkpoint 与参数归属](../examples/README.md#checkpoint与参数归属)。
 
+### Ascend950 MXFP8 路由调优
+
+使用带对应原生算子的 wheel 后，可为同一 EP 组的所有进程设置下列实验选项。
+
+- `HYPER_MULTICORE_MX_ROUTE_SUMMARY=warp` 或 `nddma` 为实际进入独立摘要的大表选择设备归约。省略此变量时使用标准张量归约。
+- `HYPER_MULTICORE_MX_PACKED_SUMMARY=attached` 允许普通路由在 offset 已占满 AIV 且计数表满足 UB 预算时复用 offset worker 生成摘要。已有专用摘要槽时使用正常的合并提交。
+
 ### 调度选项
 
 `MegaMoeSchedulerOptions` 从 `hyper_multicore.experimental` 导入，通过

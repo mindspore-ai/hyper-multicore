@@ -20,7 +20,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -44,6 +44,7 @@ from hyper_multicore.modules.mega_moe.route import (
     _publish_staged_pull,
     _read_cached_route,
     _read_dynamic_route,
+    _read_packed_dynamic_route,
     _resolve_counts,
     _upload_route_tensor,
     _validate_dynamic_rows,
@@ -612,6 +613,58 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                         self.assertEqual(
                             _read_dynamic_route(payload, spec)[0], self._reference(payload, spec)
                         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_queued_summary_respects_mode_and_preserves_validation(self) -> None:
+        """Route only eligible MXFP8 tables through the queued summary."""
+        spec = replace(self._spec(768), architecture=3510, precision="mxfp8")
+        data = self._payload(spec.num_experts, torch.int32)
+        wire = MagicMock(spec=torch.Tensor)
+        wire.device = SimpleNamespace(type="npu")
+        wire.dtype = torch.int32
+        wire.is_contiguous.return_value = True
+        wire.__getitem__.side_effect = data.__getitem__
+        counts = data[:, 3:]
+        owner = counts.sum(0).reshape(spec.ep_size, spec.local_experts)
+        summary = torch.cat((data[:, :3], counts.sum(1, keepdim=True), counts.amin(1, keepdim=True),
+                             counts.amax(1, keepdim=True), owner.sum(1, keepdim=True), owner.amin(1, keepdim=True)), 1)
+        expected = self._reference(data, spec)
+        with patch.object(route_module.multicore_ops, "mx_route_summary", return_value=summary) as native:
+            with patch.dict("os.environ", {"HYPER_MULTICORE_MX_ROUTE_SUMMARY": ""}):
+                self.assertEqual(expected, _dynamic_summary(wire, spec))
+                native.assert_not_called()
+            for mode, nddma in (("warp", False), ("nddma", True)):
+                with self.subTest(mode=mode), patch.dict("os.environ", {"HYPER_MULTICORE_MX_ROUTE_SUMMARY": mode}):
+                    source_rows = []
+                    self.assertEqual(expected, _dynamic_summary(wire, spec, source_rows))
+                    self.assertEqual(counts.sum(1).tolist(), source_rows)
+                    native.assert_called_once_with(wire, nddma=nddma)
+                    native.reset_mock()
+                    self.assertEqual(expected, _dynamic_summary(wire, replace(spec, precision="bf16")))
+                    native.assert_not_called()
+            summary[1, 2] = 0
+            with (patch.dict("os.environ", {"HYPER_MULTICORE_MX_ROUTE_SUMMARY": "warp"}),
+                  self.assertRaisesRegex(RuntimeError, "autograd participation")):
+                _dynamic_summary(wire, spec)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_packed_summary_requests_offset_workers_only_when_enabled(self) -> None:
+        """Preserve the native declaration that a packed launch cannot fit."""
+        spec = replace(self._spec(768), architecture=3510, precision="mxfp8")
+        wire = self._payload(spec.num_experts, torch.int32)
+        with (patch.object(route_module, "_packed_route_ub", return_value=192 * 1024),
+              patch.object(route_module.multicore_ops, "route_offsets_and_summary", return_value=(None, None, None))
+              as prepare):
+            for mode, selected, reuse in (("", spec, False), ("attached", spec, True),
+                                          ("attached", replace(spec, precision="bf16"), False)):
+                with self.subTest(mode=mode, precision=selected.precision), patch.dict(
+                        "os.environ", {"HYPER_MULTICORE_MX_PACKED_SUMMARY": mode}):
+                    self.assertIsNone(_read_packed_dynamic_route(wire, selected, 0))
+                    prepare.assert_called_once_with(wire, selected.rank_id, 192 * 1024, selected.hidden_size,
+                                                    reuse_offset_aiv=reuse)
+                    prepare.reset_mock()
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"

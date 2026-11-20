@@ -678,7 +678,10 @@ def _read_packed_dynamic_route(
     ub = _packed_route_ub(payload, spec, header=3)
     if ub is None:
         return None
-    offsets, sizes, summary = multicore_ops.route_offsets_and_summary(payload, spec.rank_id, ub, spec.hidden_size)
+    reuse_offset_aiv = (spec.architecture == 3510 and spec.precision == 'mxfp8'
+                        and os.environ.get('HYPER_MULTICORE_MX_PACKED_SUMMARY') == 'attached')
+    offsets, sizes, summary = multicore_ops.route_offsets_and_summary(
+        payload, spec.rank_id, ub, spec.hidden_size, reuse_offset_aiv=reuse_offset_aiv)
     if summary is None:
         return None
     rows = summary.tolist()
