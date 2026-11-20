@@ -184,6 +184,16 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
 测量稳态性能前应覆盖代表性的路由和容量。
 
+### 从旧 HotReplica 配置迁移
+
+旧的独立 `HotReplica` 和 `plan_native()` 调用迁到 `MegaMoeExperts(expert_placement=placement)`。
+如需自定义策略，实现 `BasePlanner.plan(request)`，通过 `MegaMoePlacementOptions` 传入。
+权重和优化器状态仍由模型持有，同一批次的路由与权重通过 MegaMoE 的 forward 入口传递。
+
+构造 planner 时移除 `source_token_bound`，由 MegaMoE 根据实际 token 和路由安排工作区。
+`replica_slots_per_rank` 控制每 rank 的借槽数。固定 SHMEM 字节预算通过
+`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 设置。
+
 ## 精度支持
 
 | 配置 | BF16 | MXFP8 |

@@ -17,12 +17,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 import torch
 
-if TYPE_CHECKING:
-    from .mega_moe.route import RouteMetadata
+from .mega_moe.route_metadata import RouteMetadata
 
 
 @dataclass(frozen=True)

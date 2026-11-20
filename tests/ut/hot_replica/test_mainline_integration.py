@@ -640,6 +640,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
 def test_public_placement_hints_and_omitted_local_capacity():
     """Resolve public types and sum destination columns across all source ranks."""
     assert get_type_hints(MegaMoePlacementOptions)["planner"] == BasePlanner | None
+    assert get_type_hints(ExpertPlacement)["route_metadata"] == route.RouteMetadata | None
     placement = ExpertPlacement(torch.tensor([[0]]), torch.tensor([[2, 0, 1, 3], [1, 0, 2, 1]]),
                                 torch.tensor([[1], [0]], dtype=torch.int32), 1, 7)
     assert [placement.received_rows(rank) for rank in range(2)] == [3, 7]

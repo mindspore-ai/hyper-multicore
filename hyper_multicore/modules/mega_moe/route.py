@@ -30,6 +30,7 @@ import torch.distributed as dist
 from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
+from .route_metadata import RouteMetadata
 from .spec import MegaMoeSpec, _align_capacity
 
 if TYPE_CHECKING:
@@ -44,57 +45,6 @@ _ROUTE_CACHE_REPROBE_STEPS = 8
 _HOST_ROUTE_CACHE_ENTRIES = 8
 _METADATA_ALIGNMENT = 512
 _PULL_STAGING_MAX_BYTES = 64 * 1024 * 1024
-
-
-@dataclass(frozen=True)
-class RouteMetadata:
-    """Exact offsets and counts consumed by the low-level native ABI."""
-
-    dispatch_src_off: torch.Tensor
-    dispatch_target_off: torch.Tensor
-    dispatch_size: torch.Tensor
-    combine_src_off: torch.Tensor
-    combine_target_off: torch.Tensor
-    combine_size: torch.Tensor
-    group_list: torch.Tensor
-    expert_capacity: int
-    local_num_tokens: int | None = None
-    plan_tokens: int | None = None
-    all_experts_active: bool = False
-    _elements: tuple[int, RouteMetadata] | None = field(default=None, repr=False, compare=False)
-
-    def for_kernel(self, hidden_size: int) -> RouteMetadata:
-        """Convert row descriptors once; keep the public row-unit contract unchanged."""
-        if hidden_size == 1:
-            return self
-        if self._elements is not None and self._elements[0] == hidden_size:
-            return self._elements[1]
-        return replace(
-            self,
-            dispatch_src_off=self.dispatch_src_off * hidden_size,
-            dispatch_target_off=self.dispatch_target_off * hidden_size,
-            dispatch_size=self.dispatch_size * hidden_size,
-            combine_src_off=self.combine_src_off * hidden_size,
-            combine_target_off=self.combine_target_off * hidden_size,
-            combine_size=self.combine_size * hidden_size,
-            _elements=None,
-        )
-
-    def record_stream(self, stream: Any) -> None:
-        """Retain row descriptors and cached element descriptors on their consumer stream."""
-        views = (self,) if self._elements is None else (self, self._elements[1])
-        for view in views:
-            for value in vars(view).values():
-                if isinstance(value, torch.Tensor):
-                    value.record_stream(stream)
-
-    def with_active_experts(self, active: bool, tokens: int, plan_tokens: int) -> RouteMetadata:
-        """Bind source rows and activity to both immutable descriptor views."""
-        native = self._elements
-        return replace(
-            self, all_experts_active=active, local_num_tokens=tokens, plan_tokens=plan_tokens,
-            _elements=(native[0], replace(native[1], all_experts_active=active)) if native else None,
-        )
 
 
 @dataclass(frozen=True)
