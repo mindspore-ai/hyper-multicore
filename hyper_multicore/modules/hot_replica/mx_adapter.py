@@ -178,13 +178,7 @@ class MXPlacementResources(PlacementResources):
         if geometry is None:
             if metadata is not None and use_snapshot:
                 self.statistics["mx_packed_home_routes"] += 1
-            child = self.geometries.get(self.config.replica_slots_per_rank)
-            received = summary.maximum
-            if child is not None:
-                received = max(received, child.workspace.expert_capacity)
-            parent.prepare_auto_workspace(summary.plan_tokens, received, hidden)
-            if child is not None and not child.workspace.borrows_receive_buffer:
-                parent.heap_manager.borrow_mx_receive_buffer(child.workspace)
+            parent.prepare_auto_workspace(summary.plan_tokens, summary.maximum, hidden)
             permuted = route._permute_topk_input(hidden, ids)
             return route._finalize_dynamic_route(
                 permuted, counts, summary, raw, metadata, None, gathered, spec, workspace,
@@ -275,13 +269,14 @@ class MXPlacementResources(PlacementResources):
                                     owner_rows=geometry.rows)
         parent = self.parent
         workspace = parent.workspace
-        if workspace.routed_buffer is None or tokens * spec.top_k > workspace.routed_slots:
-            physical = parent.heap_manager.ensure_token_capacity(workspace, tokens, 0)
-            workspace.ensure_routed_buffer(physical, hidden.dtype, hidden.device)
+        # Materialize the child counters and FP32 bank before the shared receive allocation.
+        # At first use this leaves the growing receive buffer at the end of the heap.
         resources = self._virtual_resources(hidden, tokens, peak)
         resources.prepare_auto_workspace(tokens, peak, hidden)
-        if resources.workspace.borrows_receive_buffer and resources.workspace.expert_capacity > workspace.expert_capacity:
-            parent.prepare_auto_workspace(tokens, resources.workspace.expert_capacity, hidden)
+        receive_capacity = resources.workspace.expert_capacity
+        if (workspace.expert_buffer is None or receive_capacity > workspace.expert_capacity
+                or tokens * spec.top_k > workspace.routed_slots):
+            parent.prepare_auto_workspace(tokens, receive_capacity, hidden)
         permuted = route._permute_topk_input(hidden, virtual_ids)
         prepared = route._finalize_dynamic_route(
             permuted, geometry.counts[spec.rank_id], route._RouteSummary(max(1, local), tokens, peak), None,
@@ -300,11 +295,8 @@ class MXPlacementResources(PlacementResources):
         spec = parent.spec
         specification = {**self.specification, "hot_replica": False, "planner_key": None,
                          "num_experts": self.config.physical_experts, "_borrows_routed_buffer": True}
-        borrows_receive = parent.workspace.expert_buffer is not None
-        if borrows_receive and received > parent.workspace.expert_capacity:
-            parent.prepare_auto_workspace(tokens, _align_capacity(received), hidden)
         layout = _workspace_layout(specification, hidden.dtype, _align_capacity(received), tokens,
-                                   borrows_receive_buffer=borrows_receive)
+                                   borrows_receive_buffer=True)
         manager = parent.heap_manager
         pool = _get_mega_bank(hidden, parent, self, pool_type=MXGradientPool,
                               reservations=((specification, layout),))
