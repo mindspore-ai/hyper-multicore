@@ -169,6 +169,7 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   激活副本时以 FP32 计算和归并原属专家及借用专家的局部权重梯度，写回时转换为公开参数类型。
   Push 的内置策略按已交换的计数选择有界配额；BF16 可通过
   `HotReplicaPlanner(replica_slots_per_rank=2)` 设置每 rank 的借用上限。
+  使用 FC2 后加权且堆内可以同时容纳新旧缓冲区时，动态增长只替换变大的 Push 缓冲区。
 - `ascend950` 支持 MXFP8 EIO Push，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
   并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
   `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，

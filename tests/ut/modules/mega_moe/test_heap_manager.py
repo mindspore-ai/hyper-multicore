@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
@@ -212,6 +213,37 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                     self.assertIs(manager.ensure_token_capacity(workspace, 128, 1), committed)
                     self.assertEqual(restart.call_count, 1)
                 self.assertEqual(manager.epoch, 1)
+
+    def test_a5_bf16_push_growth_reuses_the_root_and_event_allocations(self) -> None:
+        manager, workspace, spec = self._automatic_workspace("push")
+        spec = replace(spec, architecture=3510)
+        manager.entries[0].bound_spec = spec
+        manager._runtime_attached = True
+        manager.heap_bytes = 4 * 1024**2
+        workspace.completion_event = Mock()
+        workspace.used = True
+        old_scratch = (workspace.expert_buffer, workspace.routed_buffer)
+        event_counters = workspace.forward_event_counters, workspace.backward_event_counters
+
+        def allocate(shape, *, dtype, alignment):
+            self.assertGreaterEqual(alignment, 1)
+            return torch.empty(shape, dtype=dtype)
+
+        with (
+            patch.object(shmem, "empty", side_effect=allocate),
+            patch.object(shmem, "free") as free,
+            patch.object(shmem, "_restart") as restart,
+        ):
+            result = manager.ensure_token_capacity(workspace, 512, 1700)
+        restart.assert_not_called()
+        workspace.completion_event.synchronize.assert_called_once()
+        self.assertEqual(tuple(id(call.args[0]) for call in free.call_args_list), tuple(map(id, old_scratch)))
+        self.assertEqual(result.local_num_tokens, 512)
+        self.assertGreaterEqual(workspace.expert_buffer.shape[0], 1700)
+        self.assertEqual(workspace.routed_buffer.shape, (1024, 16))
+        self.assertIs(workspace.forward_event_counters, event_counters[0])
+        self.assertIs(workspace.backward_event_counters, event_counters[1])
+        self.assertEqual(manager.growth_records[0]["mode"], "bf16_push_storage")
 
     def test_mx_shared_receive_retires_one_allocation_after_the_last_consumer(self) -> None:
         """Keep the home receive allocation and the virtual route's independent events."""

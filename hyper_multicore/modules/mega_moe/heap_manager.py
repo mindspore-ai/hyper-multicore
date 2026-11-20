@@ -367,7 +367,7 @@ class _HeapManager:
             layout, layouts = growth
             required = self._required_bytes(layouts)
             heap_bytes = max(self.heap_bytes, required)
-            if not self._grow_mx_push_storage(entry, layout, required, heap_bytes):
+            if not self._grow_a5_push_storage(entry, layout, required, heap_bytes):
                 self._restart(layouts, heap_bytes)
             return entry.bound_spec
 
@@ -430,28 +430,28 @@ class _HeapManager:
         layouts = [layout if item is entry else item.layout for item in self.entries]
         return layout, layouts
 
-    def _grow_mx_push_storage(
+    def _grow_a5_push_storage(
         self, entry: _HeapEntry, layout: _WorkspaceLayout, required: int, heap_bytes: int,
     ) -> bool:
-        """Grow MX Push scratch inside the attached heap without rebinding other owners."""
+        """Grow Ascend950 Push scratch inside the attached heap."""
         spec = entry.bound_spec
         workspace = entry.workspace
         if (not self._runtime_attached or heap_bytes != self.heap_bytes
-                or spec.architecture != 3510 or spec.precision != "mxfp8"
+                or spec.architecture != 3510 or spec.precision not in ("bf16", "mxfp8")
                 or spec.dispatch_mode != "push" or spec.apply_probs_before_fc2):
             return False
         new_spec = self._layout_spec(entry, layout)
         replacements = workspace.describe_restart_allocations(new_spec, self.dtype, layout.receive_capacity)
-        # MX Push saves owned activations and invocation metadata. Retained
-        # backward reads these two serial transport buffers from the workspace
-        # at launch. Event storage and the expert bank keep their identities.
+        # Push saves owned activations and reads current scratch when backward
+        # launches. Event storage and expert banks keep their allocations.
         old_layout = entry.layout
         data_fields = {id(workspace.expert_buffer): "expert_buffer", id(workspace.routed_buffer): "routed_buffer"}
         changed = tuple((data_fields[id(item.current)], item) for item in replacements
                         if id(item.current) in data_fields and tuple(item.current.shape) != item.target.shape)
         temporary_bytes = sum(item.current.numel() * self.element_size for _, item in changed)
         release_first = required + temporary_bytes > self.heap_bytes
-        if release_first and tuple(name for name, _ in changed) != ("expert_buffer",):
+        if release_first and (spec.precision != "mxfp8"
+                              or tuple(name for name, _ in changed) != ("expert_buffer",)):
             return False
 
         started = time.perf_counter()
@@ -465,7 +465,7 @@ class _HeapManager:
         owner_index = next(index for index, candidate in enumerate(self.entries) if candidate is entry)
         signature = (release_first, tuple((name, item.target) for name, item in changed))
         self._run_and_check_consistency(
-            prepare, stage="MX Push growth preflight", value=(owner_index, old_layout, layout, signature),
+            prepare, stage="Ascend950 Push growth preflight", value=(owner_index, old_layout, layout, signature),
         )
         try:
             if release_first:
@@ -473,7 +473,7 @@ class _HeapManager:
                 if stages_ms is None:
                     return False
             else:
-                stages_ms = self._replace_mx_push_buffers(workspace, changed)
+                stages_ms = self._replace_push_buffers(workspace, changed)
         except Exception:
             self.state = "failed"
             raise
@@ -486,7 +486,7 @@ class _HeapManager:
         self.epoch += 1
         self.growth_records.append({
             "epoch": self.epoch,
-            "mode": "mx_push_storage",
+            "mode": "mx_push_storage" if spec.precision == "mxfp8" else "bf16_push_storage",
             "old_heap_bytes": self.heap_bytes,
             "heap_bytes": self.heap_bytes,
             "old_receive": old_layout.receive_capacity,
@@ -545,7 +545,7 @@ class _HeapManager:
         raise RuntimeError(f"MX Push receive allocation failed on {failures}") from local_error
 
     @staticmethod
-    def _replace_mx_push_buffers(
+    def _replace_push_buffers(
         workspace: MegaMoeWorkspace, changed: tuple[tuple[str, _lifecycle._AllocationReplacement], ...],
     ) -> dict[str, float]:
         """Allocate replacements before releasing quiescent scratch tensors."""
