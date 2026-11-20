@@ -138,20 +138,20 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_explicit_heap_requires_sufficient_aligned_capacity(self) -> None:
-        """Feature: explicit heap requires sufficient aligned capacity.
-        Description: Configure aligned, undersized, partial-page and zero budgets.
-        Expectation: Accept page-aligned capacity while rejecting undersized and partial physical pages.
+    def test_explicit_initial_heap_is_aligned_and_fits_first_layout(self) -> None:
+        """Feature: Explicit initial heap capacity.
+        Description: Configure aligned, undersized, partial-page and zero seeds.
+        Expectation: Raise valid seeds to the first layout size and reject partial pages and zero.
         """
         spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
                 "ep_size": 4, "initial_capacity_factor": 4.0}
         reference = torch.empty(0, dtype=torch.bfloat16)
-        for mib, error in ((1602, None), (1664, None), (1600, RuntimeError), (1603, ValueError), (0, ValueError)):
+        for mib, error in ((1602, None), (1664, None), (2, None), (1603, ValueError), (0, ValueError)):
             with self.subTest(mib=mib), patch.dict(os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(mib * 1024**2)}):
                 if error is None:
                     manager = _HeapManager(None, reference)
                     manager.reserve(((spec, _workspace_layout(spec, reference.dtype)),), allow_resize=True)
-                    self.assertEqual(manager.heap_bytes, mib * 1024**2)
+                    self.assertEqual(manager.heap_bytes, max(1602, mib) * 1024**2)
                 else:
                     with self.assertRaises(error):
                         manager = _HeapManager(None, reference)

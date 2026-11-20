@@ -337,7 +337,7 @@ def test_bailing_source_bound_reserves_ordinary_and_virtual_storage():
         "initial_capacity_factor": 1.25, "auto_tokens": True, "apply_probs_before_fc2": True,
         "hot_replica": True, "source_token_bound": 4096,
     }
-    entries, headroom, fixed_headroom = workspace_reservations(
+    entries, headroom = workspace_reservations(
         (ordinary, dict(ordinary, swiglu_limit=1.0)), torch.bfloat16, 24,
     )
     assert [layout.receive_capacity for _, layout in entries] == [110208, 110208]
@@ -346,12 +346,11 @@ def test_bailing_source_bound_reserves_ordinary_and_virtual_storage():
     virtual_bytes = _workspace_layout(virtual, torch.bfloat16, 42624, 4096).required_bytes
     bank_bytes = 6 * 64 * 2560 * 768 * torch.bfloat16.itemsize + 1024
     assert headroom == 2 * virtual_bytes + bank_bytes
-    assert fixed_headroom == headroom
 
 
 @pytest.mark.parametrize("batch_experts", [False, True])
-def test_fixed_bound_initialization_defers_only_runtime_budgeted_replica_storage(monkeypatch, batch_experts):
-    """A fixed heap fits the home layout before any actual placement is selected."""
+def test_initial_heap_seed_defers_optional_replica_headroom(monkeypatch, batch_experts):
+    """A supplied seed is used at startup when it can fit the home layout."""
     ordinary = {
         "ep_size": 32, "hidden_size": 5120, "intermediate_size": 1792,
         "local_num_tokens": 128, "num_experts": 192, "top_k": 8,
@@ -359,22 +358,17 @@ def test_fixed_bound_initialization_defers_only_runtime_budgeted_replica_storage
         "hot_replica": True, "source_token_bound": 4096, "batch_experts": batch_experts,
         "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__, ""),
     }
-    entries, headroom, fixed_headroom = workspace_reservations((ordinary,), torch.bfloat16, 24)
+    entries, headroom = workspace_reservations((ordinary,), torch.bfloat16, 24)
     cpu = torch.empty(0, dtype=torch.bfloat16)
     mib = 1024**2
-    limit = 1536 * mib
-    monkeypatch.setenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE", str(limit))
+    initial_bytes = 1536 * mib
+    monkeypatch.setenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE", str(initial_bytes))
     manager = _HeapManager(None, cpu)
-    assert entries[0][1].required_bytes < limit < entries[0][1].required_bytes + headroom
-    options = dict(allow_resize=True, initial_headroom=headroom, fixed_heap_headroom=fixed_headroom)
-    if batch_experts:
-        with pytest.raises(RuntimeError, match="HEAP_SIZE is too small"):
-            manager.reserve(entries, **options)
-        assert not manager.entries
-    else:
-        manager.reserve(entries, **options)
-        assert manager.heap_bytes == limit
-        assert manager._required_bytes([manager.entries[0].layout]) == 930 * mib
+    assert entries[0][1].required_bytes < initial_bytes < entries[0][1].required_bytes + headroom
+    options = dict(allow_resize=True, initial_headroom=headroom)
+    manager.reserve(entries, **options)
+    assert manager.heap_bytes == initial_bytes
+    assert manager._required_bytes([manager.entries[0].layout]) == 930 * mib
 
     monkeypatch.delenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
     automatic = _HeapManager(None, cpu)
@@ -592,7 +586,7 @@ def test_a3_saved_route_uses_shared_quota_geometry(bound):
         top_k=2, num_cube_cores=24, apply_probs_before_fc2=True, expert_weight_layout="EOI",
     )
     owner = SimpleNamespace(
-        spec=spec, workspace=SimpleNamespace(capacity_floor=4096), heap_manager=SimpleNamespace(heap_limit=None),
+        spec=spec, workspace=SimpleNamespace(capacity_floor=4096), heap_manager=object(),
     )
     planner = HotReplicaPlanner(source_token_bound=bound)
     resources = PlacementResources(owner, {

@@ -25,128 +25,21 @@ from hyper_multicore.modules.hot_replica import mega_moe_adapter
 from hyper_multicore.modules.hot_replica._planner._dispatch import _materialize
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica.bounded_placement import _render_geometry, supports_bounded_placement
-from hyper_multicore.modules.hot_replica.pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
+from hyper_multicore.modules.hot_replica.pipeline import (
+    ReplicaPipeline, fused_replica_slots, supports_pipeline,
+)
 from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, SharedExpertPool
 from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16
-from hyper_multicore.modules.mega_moe.heap_manager import _HeapEntry, _HeapManager, _round_heap_bytes, _workspace_layout
-
-
-@pytest.mark.parametrize(("budget_mib", "peak", "fallback"), [
-    (1536, 95_000, None),
-    (1536, 139_025, None),
-    (1984, 786_432, 32_768),
-])
-def test_fixed_heap_placement_accounts_for_home_and_virtual_reservations(budget_mib, peak, fallback):
-    """Check current root bytes before choosing B0 or a capacity-required replica."""
-    from hyper_multicore.modules.base_planner import PlacementRequest
-
-    ep, home, tokens = 32, 6, 4096
-    hidden = torch.empty((0, 5120), dtype=torch.bfloat16)
-    spec = SimpleNamespace(local_experts=home, ep_size=ep, top_k=8, initial_capacity_factor=1.0,
-                           architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
-                           hidden_size=5120, intermediate_size=1792, expert_weight_layout="EIO",
-                           auto_tokens=True, local_num_tokens=tokens, capacity_growth_factor=None)
-    specification = {**vars(spec), "num_experts": ep * home, "apply_probs_before_fc2": True}
-    manager = _HeapManager(None, hidden)
-    manager.heap_limit = budget_mib * 1024**2
-    workspace = object()
-    layout = _workspace_layout(specification, hidden.dtype)
-    manager.entries.append(_HeapEntry(specification, layout, workspace, spec))
-    owner = mega_moe_adapter.PlacementResources(
-        SimpleNamespace(spec=spec, workspace=workspace, heap_manager=manager),
-        {**specification, "planner_key": (mega_moe_adapter.HotReplicaPlanner.__module__,
-                                         mega_moe_adapter.HotReplicaPlanner.__qualname__)}, shared=True,
-    )
-    owner.rank_nodes = (0,) * 16 + (1,) * 16
-    counts = torch.zeros((ep, ep * home), dtype=torch.int32)
-    counts[:, :8] = tokens
-    ids = torch.empty((0, 8), dtype=torch.int32)
-    request = PlacementRequest(hidden, ids, counts, None, peak, ep * tokens * 8,
-                               0, spec.intermediate_size, 24, True)
-    selected = SimpleNamespace(receive_capacity=42624, borrowed_capacity=2)
-    with (patch.object(owner, "bind", side_effect=lambda _, placement, **_kwargs: placement) as bind,
-          patch.object(mega_moe_adapter, "render_placement",
-                       side_effect=lambda _, __, plan, *_args, **_kwargs: max(plan.destination_loads))):
-        assert owner._bind_fixed(request, selected, tokens, None) == fallback
-    assert bind.call_count == (fallback is not None)
-    assert [entry.layout for entry in manager.entries] == [layout]
-
-
-def test_fixed_heap_check_includes_lazy_workspace_entries():
-    """An unbound layer still consumes its entry in the Root budget."""
-    manager = _HeapManager(None, torch.empty(0, dtype=torch.bfloat16))
-    manager.heap_limit = 2 * 1024**2
-    layout = mega_moe_adapter._WorkspaceLayout(manager.heap_limit // 2 + 1, (), 128)
-    assert manager.fits_fixed_heap((layout,))
-    manager.entries.append(_HeapEntry({}, layout))
-    assert not manager.fits_fixed_heap((layout,))
-    assert not manager.workspaces
-
-
-def test_fixed_heap_checkpoint_preflights_the_regular_admission_result():
-    """A checkpoint that must plan again applies the same physical budget."""
-    planner = mega_moe_adapter.HotReplicaPlanner
-    spec = SimpleNamespace(architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
-                           local_experts=4, hidden_size=5120, intermediate_size=1792, expert_weight_layout="EOI")
-    owner = mega_moe_adapter.PlacementResources(
-        SimpleNamespace(spec=spec, heap_manager=SimpleNamespace(heap_limit=1024**3)),
-        {"planner_key": (planner.__module__, planner.__qualname__)},
-        shared=True,
-    )
-    policy = Mock(spec=planner)
-    request = object()
-    with (patch.object(owner, "request", return_value=request),
-          patch.object(owner, "_bind_fixed") as budget):
-        assert owner.select(None, None, None, SimpleNamespace(plan_tokens=4096), [], None, 0,
-                            planner=policy, checkpointing=True) is budget.return_value
-    policy.plan.assert_called_once_with(request)
-    budget.assert_called_once_with(request, policy.plan.return_value, 4096, None)
-
-
-@pytest.mark.parametrize(("ep", "home", "matching_events"), [(32, 4, True), (32, 6, True), (32, 8, True), (64, 8, False)])
-@pytest.mark.parametrize("tight", [False, True])
-def test_bound_parent_workspace_reuse_requires_budget_pressure_and_matching_events(ep, home, matching_events, tight):
-    """Preserve the existing allocation when it fits and respect the event stride."""
-    planner = mega_moe_adapter.HotReplicaPlanner
-    spec = SimpleNamespace(
-        ep_size=ep, local_experts=home, num_experts=ep * home, top_k=8, local_num_tokens=4096,
-        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
-        hidden_size=5120, intermediate_size=1792, initial_capacity_factor=1.25, num_cube_cores=24,
-        expert_weight_layout="EIO", auto_tokens=True,
-    )
-    specification = dict(vars(spec), source_token_bound=4096, hot_replica=True,
-                         planner_key=(planner.__module__, planner.__qualname__))
-    hidden = torch.empty(0, 5120, dtype=torch.bfloat16)
-    entries, headroom, _ = mega_moe_adapter.workspace_reservations((specification,), hidden.dtype, 24)
-    _, layout = entries[0]
-    bank = mega_moe_adapter._expert_bank_bytes(home, spec.hidden_size, spec.intermediate_size, hidden.dtype)
-    manager = _HeapManager(None, hidden)
-    manager.heap_limit = _round_heap_bytes(layout.required_bytes + (bank if tight else headroom))
-    workspace = SimpleNamespace(capacity_floor=layout.receive_capacity)
-    manager.entries.append(_HeapEntry(specification, layout, workspace, spec))
-    owner = mega_moe_adapter.PlacementResources(SimpleNamespace(spec=spec, workspace=workspace, heap_manager=manager),
-                                               specification, shared=True)
-    assert not owner.reuses_parent_workspace
-    assert owner.can_share_fixed_workspace == matching_events
-    request = SimpleNamespace(hidden=hidden, maximum_received=32768)
-    placement = SimpleNamespace(borrowed_capacity=1, receive_capacity=32768)
-    with patch.object(owner, "bind") as bind:
-        result = owner._bind_fixed(request, placement, 4096, None)
-        if tight and not matching_events:
-            assert result is None
-            bind.assert_not_called()
-        else:
-            assert result is bind.return_value
-            bind.assert_called_once_with(hidden, placement, tokens=4096, fused=True)
-    assert owner.reuses_parent_workspace == (tight and matching_events)
+from hyper_multicore.modules.mega_moe.heap_manager import _HeapManager
 
 
 def test_serial_replica_widths_share_one_reservation_with_the_bank():
     """Keep one virtual reservation when the home counters cannot cover all widths."""
     spec = SimpleNamespace(local_experts=6, ep_size=32, top_k=8, initial_capacity_factor=1.25,
+                           partial_weight_grad_dtype=None,
                            expert_weight_layout="EIO")
     owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
-    owner.parent = SimpleNamespace(spec=spec, heap_manager=SimpleNamespace(heap_limit=None))
+    owner.parent = SimpleNamespace(spec=spec, heap_manager=object())
     owner.pool, owner.geometries = None, {}
     owner.source_bound, owner.shared, owner.bounded, owner.specification = None, True, object(), {}
     owner.reuses_parent_workspace = False
@@ -156,12 +49,14 @@ def test_serial_replica_widths_share_one_reservation_with_the_bank():
     with (patch.object(mega_moe_adapter, "_workspace_layout", return_value=layout) as sizing,
           patch.object(mega_moe_adapter, "_get_mega_bank") as bank,
           patch.object(bf16, "BF16Resources") as resource):
-        first = owner._geometry(hidden, SimpleNamespace(borrowed_capacity=1, receive_capacity=33280), 4096)
+        first = owner._geometry(hidden, SimpleNamespace(borrowed_capacity=1, receive_capacity=33280,
+                                                        copies_by_rank=((6,), (-1,))), 4096)
         second = owner._geometry(hidden, SimpleNamespace(borrowed_capacity=2, receive_capacity=34176), 4096)
     assert first is second
     specification, dtype, receive, source = sizing.call_args.args
     assert (specification["num_experts"], dtype, receive, source) == (384, torch.bfloat16, 40960, 4096)
-    bank.assert_called_once_with(hidden, owner.parent, owner, pipeline=True, reservations=((specification, layout),))
+    bank.assert_called_once_with(hidden, owner.parent, owner, pipeline=True,
+                                 reservations=((specification, layout),))
     resource.assert_called_once()
     assert resource.call_args.kwargs["workspace_layout"] is layout
 
@@ -173,7 +68,7 @@ def test_serial_replica_widths_reuse_home_when_event_capacity_matches():
         local_experts=6, num_experts=192, ep_size=32, top_k=8, initial_capacity_factor=1.25,
         expert_weight_layout="EOI", hidden_size=5120, intermediate_size=1792,
     )
-    parent = SimpleNamespace(spec=spec, workspace=object(), heap_manager=SimpleNamespace(heap_limit=None))
+    parent = SimpleNamespace(spec=spec, workspace=object(), heap_manager=object())
     planner = mega_moe_adapter.HotReplicaPlanner
     owner = mega_moe_adapter.PlacementResources(
         parent, {"planner_key": (planner.__module__, planner.__qualname__)}, shared=False,
@@ -181,7 +76,8 @@ def test_serial_replica_widths_reuse_home_when_event_capacity_matches():
     hidden = torch.empty(0, dtype=torch.bfloat16)
     with patch.object(mega_moe_adapter, "_get_mega_bank") as bank:
         for width in (1, 2, 6):
-            assert owner._geometry(hidden, SimpleNamespace(borrowed_capacity=width, receive_capacity=33792), 4096) is parent
+            placement = SimpleNamespace(borrowed_capacity=width, receive_capacity=33792, copies_by_rank=((6,), (-1,)))
+            assert owner._geometry(hidden, placement, 4096) is parent
     bank.assert_called_once_with(hidden, parent, owner, pipeline=True,
                                  workspace_growth=(parent.workspace, 4096, 33792))
     assert not owner.geometries
@@ -193,6 +89,7 @@ def test_bank_layout_views_follow_the_lease(first, second):
     """Reuse the same symmetric allocation for both supported weight layouts."""
     pool = SharedExpertPool.__new__(SharedExpertPool)
     pool.local_experts, pool.hidden, pool.intermediate = 2, 7, 3
+    pool.bank_experts = 3 * pool.local_experts
     pool.expert_weight_layout = first
     pool.weights = tuple(torch.zeros(shape) for shape in pool._bank_shapes())  # pylint: disable=protected-access
     pool._alternate_banks = pool.leased_banks = ()  # pylint: disable=protected-access
@@ -226,6 +123,39 @@ def test_replica_signal_extent_follows_the_physical_gradient_rows(layout, bands)
     assert not supports_pipeline(spec, 5)
     expected_words = (3 * pool.ranks + 2 + bands * pool.blocks) * pool.local_experts * 16
     assert ReplicaPipeline(pool).signal_words == expected_words
+    assert ReplicaPipeline(pool, shared_layouts=True).signal_words == (
+        (3 * pool.ranks + 2 + 42 * pool.blocks) * pool.local_experts * 16
+    )
+
+
+@pytest.mark.parametrize(("home", "layout", "bound", "partial_dtype"), [
+    (4, "EOI", None, None), (6, "EIO", 4096, None), (8, "EOI", None, "float32"),
+])
+def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layout, bound, partial_dtype):
+    """Register the replica workspace, weight bank and peer flags in one reserve."""
+    spec = SimpleNamespace(
+        ep_group=None, local_experts=home, hidden_size=256, intermediate_size=128,
+        num_cube_cores=24, expert_weight_layout=layout, partial_weight_grad_dtype=partial_dtype,
+    )
+    hidden = torch.empty((0, spec.hidden_size), dtype=torch.bfloat16)
+    manager = _HeapManager(None, hidden)
+    parent = SimpleNamespace(spec=spec, heap_manager=manager)
+    owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
+    owner.source_bound, owner.parent = bound, parent
+    virtual = ({}, mega_moe_adapter._WorkspaceLayout(128, (), 32768))
+    extent = 3 * home if bound is not None or partial_dtype == "float32" else 2 * home
+    with (patch("torch.distributed.get_rank", return_value=0),
+          patch("torch.distributed.get_world_size", return_value=32),
+          patch.object(manager, "reserve") as reserve, patch.object(manager, "bind"),
+          patch.object(SharedExpertPool, "allocate")):
+        pool = mega_moe_adapter._get_mega_bank(hidden, parent, owner, reservations=(virtual,), pipeline=True)
+    assert pool.bank_experts == extent
+    assert reserve.call_args.args[0][0] is virtual
+    bank_layout = reserve.call_args.args[0][1][1]
+    bank_bytes = 3 * extent * spec.hidden_size * spec.intermediate_size * hidden.element_size() + 1024
+    assert bank_layout.required_bytes == bank_bytes + 4 * pool.pipeline.signal_words + 512
+    pool.leased_banks = tuple(torch.empty(shape, device="meta") for shape in pool._bank_shapes())
+    assert all(bank.shape[0] == 2 * home for bank in pool._generic_banks())
 
 
 def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident_weights():
@@ -244,6 +174,39 @@ def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident
     pipeline.begin(bank, binding, backward=True)
     assert binding.weight_epoch == 1 and binding.gradient_epoch == 2
     assert pool.generation > staged
+
+
+@pytest.mark.parametrize(("home", "layout"), [(4, "EOI"), (6, "EIO"), (8, "EOI")])
+def test_fused_bank_rebuilds_flags_and_restores_a_retained_binding(home, layout):
+    """Restart gives the flags independent storage and the retained graph can republish weights."""
+    hidden = torch.empty((0, 16), dtype=torch.bfloat16)
+    manager = _HeapManager(None, hidden)
+    with (patch("torch.distributed.get_rank", return_value=0),
+          patch("torch.distributed.get_world_size", return_value=2)):
+        pool = SharedExpertPool(hidden, None, home, 16, 2, layout, root=manager,
+                                access=manager.access, pipeline=True)
+    pool.bank_experts = 3 * home
+    pool.weights = tuple(torch.full(shape, 2, dtype=hidden.dtype) for shape in pool._bank_shapes())
+    pool.pipeline.storage = torch.full((pool.pipeline.signal_words,), 5, dtype=torch.int32)
+    placement = SimpleNamespace(
+        borrowed_capacity=home, published_slots=home, copies_by_rank=((-1,) * home,) * 2,
+    )
+    binding = ExpertWeightBinding(pool, placement, layout, fused=True)
+    with (patch("torch.npu.Event"), patch("torch.npu.current_stream"), patch.object(torch.Tensor, "record_stream"),
+          patch("hyper_multicore.shmem.barrier") as barrier):
+        binding.save_snapshot(pool.weights)
+        old, specifications = pool._allocations(hidden.dtype)
+        assert old[-1] is pool.pipeline.storage
+        assert len(old) == len(specifications) == 3
+        replacement = tuple(torch.empty(shape, dtype=dtype) for shape, dtype in specifications)
+        pool.bind_restarted_allocations(None, hidden.dtype, hidden.device, 0, replacement)
+        barrier.assert_called_once_with(blocking=False)
+        assert pool.pipeline.epoch == 0
+        assert pool.pipeline.storage is replacement[-1] and not torch.count_nonzero(replacement[-1])
+        pool.leased_banks = pool.weights
+        pool.pipeline.begin(pool.weights, binding, backward=True)
+        assert all(torch.equal(tensor[:home], saved) for tensor, saved in zip(pool.weights, binding.snapshot[0]))
+        assert pool.pipeline.epoch == 1
 
 
 @pytest.mark.parametrize("layout", ["EIO", "EOI"])
@@ -274,49 +237,15 @@ def test_fusion_accepts_an_empty_tail_in_the_padded_copy_table(layout, used, bat
     placement = SimpleNamespace(published_slots=0, borrowed_capacity=geometry.width, copies_by_rank=geometry.owners)
     slots = fused_replica_slots(spec, placement)
     assert slots == (used if not batch_experts and used <= 5 else 0)
+    assert mega_moe_adapter._live_slot_extent(placement) == used
+    assert fused_replica_slots(spec, placement, bank_experts=max(2 * home, 3 * used)) == (
+        used if not batch_experts else 0
+    )
     if slots:
         pipeline = ReplicaPipeline(SimpleNamespace(local_experts=home, rank=1))
         planned, received, owned = pipeline.plan(placement, slots)
         assert planned == len(received) == used
         assert owned == tuple((0, j, j) for j in range(used))
-
-
-def test_inline_pipeline_fits_between_weight_gradient_and_checkpoint_views():
-    """Inline epochs have no extra allocations and clear after a generic write."""
-    home, hidden, inner = 6, 256, 128
-    bank = torch.ones((2*home, hidden, 2*inner), dtype=torch.bfloat16)
-    pool = SimpleNamespace(local_experts=home, rank=0, ranks=2, blocks=24, hidden=hidden, intermediate=inner,
-                           expert_weight_layout="EIO", leased_banks=(bank, bank), generation=0)
-    pipeline = ReplicaPipeline(pool, inline=True)
-    assert pipeline.slot_limit == 3
-    binding = SimpleNamespace(edges=(3, (), ()), token=object(), snapshot=None,
-                              placement=SimpleNamespace(borrowed_capacity=4))
-    with patch("hyper_multicore.modules.hot_replica.pipeline.shmem.barrier") as barrier:
-        pipeline.begin((bank, bank), binding, backward=False)
-        storage = pipeline.storage
-        assert storage.data_ptr() == bank[3].data_ptr()
-        dW_offset = (2*home-2*pipeline.slot_limit) * bank[0].numel() * bank.element_size()
-        end = storage.data_ptr() + storage.numel() * storage.element_size()
-        assert end <= bank.data_ptr() + dW_offset and end <= bank[home].data_ptr()
-        assert bool((storage == 0).all())
-        storage.fill_(123)
-        pipeline.invalidate()
-        assert pipeline.resident is None
-        pipeline.begin((bank, bank), binding, backward=True)
-        assert pipeline.storage.data_ptr() == storage.data_ptr()
-        assert bool((pipeline.storage == 0).all())
-        assert barrier.call_count == 2
-
-
-def test_inline_signal_capacity_cannot_admit_a_real_fourth_slot_for_six_home_experts():
-    """A full weight and dW bank leaves its occupied fourth slot on the generic path."""
-    placement = SimpleNamespace(borrowed_capacity=4, copies_by_rank=((6, 7, 8, 9), (-1,)*4))
-    spec = SimpleNamespace(architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
-                           expert_weight_layout="EOI", hidden_size=256, intermediate_size=128, local_experts=6)
-    assert fused_replica_slots(spec, placement) == 4
-    assert fused_replica_slots(spec, placement, slot_limit=3) == 0
-    placement.copies_by_rank = ((6, 7, 8, -1), (-1,)*4)
-    assert fused_replica_slots(spec, placement, slot_limit=3) == 3
 
 
 def test_fused_checkpoint_restores_locally_only_after_the_binding_is_selected():

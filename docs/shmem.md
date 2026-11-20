@@ -261,6 +261,9 @@ Runtime初始化时冻结当前NPU设备。`empty`、`barrier`、`signal`、`wai
 
 ### 4.1 SHMEM restart机制
 
+MegaMoE 管理的堆可通过 `HYPER_MULTICORE_SHMEM_HEAP_SIZE` 设置初始容量。实际布局需要更多空间时，
+执行器继续增长堆，并使用同一套重建事务迁移受管分配。
+
 SHMEM lifecycle负责进程级Runtime引用、Root一致性和安全restart。内部调用方提交目标heap字节数、完整的
 Allocation替换清单和只读业务状态预检钩子；lifecycle验证这些Allocation完整覆盖活动Runtime后，按以下顺序
 执行集体事务：

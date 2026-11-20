@@ -110,13 +110,13 @@ def _resolve_receive_capacity(
     return _align_capacity(requested)
 
 
-def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tuple[int, int]:
-    """Return geometric and minimum capacities without exceeding the lossless bound."""
+def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> int:
+    """Return geometric capacity without exceeding the lossless bound."""
     upper = _align_capacity(spec.ep_size * spec.routed_slots)
     if required > upper:
         raise ValueError("MegaMoe route exceeds the lossless token bound")
     requested = max(required, math.ceil(min(upper, current * spec.capacity_growth_factor)))
-    return min(upper, _align_capacity(requested)), _align_capacity(required)
+    return min(upper, _align_capacity(requested))
 
 
 def _resolve_capacity_factors(

@@ -56,9 +56,10 @@ def _ordered_transfers(pool: Any):
 _ROOT_TRANSFER_EVENTS = weakref.WeakKeyDictionary()
 
 
-def _expert_bank_bytes(local_experts, hidden, intermediate, dtype):
+def _expert_bank_bytes(local_experts, hidden, intermediate, dtype, *, bank_experts=None):
     """Size a combined expert bank before allocating independent signals."""
-    return 6 * local_experts * hidden * intermediate * dtype.itemsize + 1024
+    extent = 2 * local_experts if bank_experts is None else bank_experts
+    return 3 * extent * hidden * intermediate * dtype.itemsize + 1024
 
 
 class SharedExpertPool:
@@ -75,6 +76,7 @@ class SharedExpertPool:
         self.group = group
         self.rank, self.ranks = torch.distributed.get_rank(group), torch.distributed.get_world_size(group)
         self.local_experts = local_experts
+        self.bank_experts = 2 * local_experts
         self.hidden, self.intermediate = hidden.shape[-1], intermediate_size
         self.blocks = blocks
         self.device, self.dtype = hidden.device, hidden.dtype
@@ -103,8 +105,10 @@ class SharedExpertPool:
     @property
     def allocation_bytes(self) -> int:
         """Report the aligned combined bank and optional peer-event requirement."""
-        weights = _expert_bank_bytes(self.local_experts, self.hidden, self.intermediate, self.dtype)
-        signal_bytes = 0 if self.pipeline is None or self.pipeline.inline else 4 * self.pipeline.signal_words + 512
+        weights = _expert_bank_bytes(
+            self.local_experts, self.hidden, self.intermediate, self.dtype, bank_experts=self.bank_experts,
+        )
+        signal_bytes = 0 if self.pipeline is None else 4 * self.pipeline.signal_words + 512
         return weights + signal_bytes
 
     def allocate(self) -> None:
@@ -121,7 +125,7 @@ class SharedExpertPool:
                     allocated.append(shmem.empty(shape, dtype=self.dtype, alignment=512))
             finally:
                 self.weights = tuple(allocated)
-            if self.pipeline is not None and not self.pipeline.inline:
+            if self.pipeline is not None:
                 self.pipeline.allocate()
             if self.completion_event is None:
                 self.completion_event = torch.npu.Event()
@@ -139,13 +143,13 @@ class SharedExpertPool:
 
     def _bank_shapes(self, layout=None):
         return tuple(
-            (2 * self.local_experts, *shape)
+            (self.bank_experts, *shape)
             for shape in projection_shapes(self.hidden, self.intermediate, layout or self.expert_weight_layout)
         )
 
     def _allocations(self, dtype):
         specs = tuple((shape, dtype) for shape in self._bank_shapes())
-        if self.pipeline is None or self.pipeline.inline:
+        if self.pipeline is None:
             return self.weights, specs
         return (*self.weights, self.pipeline.storage), (*specs, ((self.pipeline.signal_words,), torch.int32))
 
@@ -213,13 +217,10 @@ class SharedExpertPool:
         """Bind new bank tensors after HMC replaces the symmetric heap."""
         del spec, dtype, device, receive_capacity
         self._alternate_banks = ()
-        if self.pipeline is None or self.pipeline.inline:
-            self.weights = tensors
-            if self.pipeline is not None:
-                self.pipeline.free()
-        else:
-            self.weights = tensors[:-1]
-            self.pipeline.bind(tensors[-1])
+        count = len(self._bank_shapes())
+        self.weights = tensors[:count]
+        if self.pipeline is not None:
+            self.pipeline.bind(tensors[count])
         self.generation += 1
         # The heap transaction retired the previous bank. Retain its completion
         # event as a conservative first-use dependency, but forget its stream.
@@ -268,6 +269,13 @@ class SharedExpertPool:
         """Return the logical prefix of the leased bank."""
         return tuple(bank[:self.local_experts + extra] for bank in self.leased_banks)
 
+    def _generic_banks(self):
+        """Expose the original 2L geometry to the two-stage transfer kernels."""
+        extent = 2 * self.local_experts
+        if self.bank_experts == extent:
+            return self.leased_banks
+        return tuple(bank[:extent] for bank in self.leased_banks)
+
     def stage_snapshot(self, layout: str, snapshot: tuple[tuple[torch.Tensor, ...], Any]) -> int | None:
         """Submit a local suffix restore and retire its lease on the copy stream."""
         tails, _ = snapshot
@@ -310,7 +318,7 @@ class SharedExpertPool:
             self.pipeline.invalidate()
         with _ordered_transfers(self):
             if snapshot is None:
-                prefetch_banks(weights, self.leased_banks, copies, self.rank, self.blocks)
+                prefetch_banks(weights, self._generic_banks(), copies, self.rank, self.blocks)
                 self.statistics["remote_prefetches"] += int(bool(extra))
             else:
                 for bank, home in zip(self.leased_banks, weights):
@@ -344,7 +352,7 @@ class SharedExpertPool:
         with _ordered_transfers(self):
             home = reduce_banks(
                 gradients,
-                self.leased_banks,
+                self._generic_banks(),
                 copies,
                 self.rank,
                 self.blocks,

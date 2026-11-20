@@ -162,10 +162,8 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   带显式 `source_token_bound` 的内置策略按接收容量准入，使用相同的配额规划和路由描述。
   Reentrant checkpoint 重算沿用已保存的放置，融合路径恢复已保存的借用权重。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
-  固定 SHMEM 堆下，A3 内置策略在建 bank 或增长前检查整个 root 的剩余容量。
-  带显式 bound 时，初始固定堆预算须容纳普通布局，副本空间在实际准入时校验和申请。
-  独立副本布局超预算且事件区容量匹配时，首次副本准入可复用普通工作区。
-  普通路由和副本路由各自核算，普通路由溢出时可尝试在固定堆内完成的副本配额。
+  配置显式 source bound 或 FP32 partial 时，使用可容纳满槽 FP32 回传的连续 bank。
+  副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
 - `ascend950` 支持 MXFP8 EIO，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
   并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
   `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，
@@ -351,8 +349,9 @@ d_a = BF16(FP32(d_fc2_input) * p)
 
 即使 token 数固定，热点也可能触发 push 接收区扩容。扩容可能集体重启同一 SHMEM root 的 runtime，
 再恢复受管 workspace；外部专家参数不移动。
-`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 可设置固定字节预算；预算不足或不能安全重启时明确失败。
-容量策略、固定预算和失败恢复的完整契约见 [SHMEM runtime restart](shmem.md#runtime-restart)。
+`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 可设置初始容量（字节数，须为 2 MiB 的整数倍）。启动时取该值与
+已预留布局所需容量的较大值，后续按实际路由和新增资源继续扩容。堆分配失败或无法安全重启时会报错。
+容量策略和失败恢复见 [SHMEM runtime restart](shmem.md#runtime-restart)。
 
 ### 资源共享与关闭
 
