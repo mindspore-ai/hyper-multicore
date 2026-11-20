@@ -595,6 +595,7 @@ def assemble_payload(
         ),
         "requested_target_ids": [v["id"] for v in records],
         "reference_cann": identities[0].get("reference_cann"),
+        "a3_replica_bf16_partials": "ascend910_93" in args.soc_list.split(","),
         "framework_lock_sha256": (
             MANIFEST.file_sha256(ROOT / "hyper_multicore/_build/frameworks.lock.json") if args.all else None
         ),

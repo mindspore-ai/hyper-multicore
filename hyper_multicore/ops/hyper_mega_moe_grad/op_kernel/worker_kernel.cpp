@@ -73,6 +73,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   __aicore__ inline void RunBackward() {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
     replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
+    replica_bf16_partials_ = MulticoreMoE::UsesBf16ReplicaPartials(replica_launch_);
     gradient_bands_[0] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 0);
     gradient_bands_[1] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 1);
 #endif
@@ -87,7 +88,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
       // Keep a single scalar frame for the two projections.
 #pragma unroll 1
       for (uint32_t projection = 0; projection < 2; ++projection) {
-        MulticoreMoE::ReturnReplicaGradientBands(gradient_bands_[projection], input_list[19], worker, core_num, ep);
+        if (replica_bf16_partials_) {
+          MulticoreMoE::ReturnBf16ReplicaGradientBands(
+              gradient_bands_[projection], input_list[19], worker, core_num, ep);
+        } else {
+          MulticoreMoE::ReturnReplicaGradientBands(
+              gradient_bands_[projection], input_list[19], worker, core_num, ep);
+        }
       }
     }
     if (first != nullptr && worker_id_ == 0) {
@@ -138,6 +145,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
 #if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
   const __gm__ MulticoreMoE::ReplicaGradientBandRecord *gradient_bands_[2] = {nullptr, nullptr};
+  bool replica_bf16_partials_ = false;
 #endif
 
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
@@ -354,7 +362,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         uint32_t band_rows = 0;
         const auto bands = (output == 6 || output == 18) ? gradient_bands_[output == 6 ? 0 : 1] : nullptr;
         if (bands != nullptr) {
-          if (!single_group || task_desc.outputs[0].data_type != sizeof(float)) AscendC::Trap();
+          const auto element_size = replica_bf16_partials_ ? sizeof(bfloat16_t) : sizeof(float);
+          if (!single_group || task_desc.outputs[0].data_type != element_size) AscendC::Trap();
           band_flags = reinterpret_cast<GM_ADDR>(MulticoreMoE::GradientBandExpertFlags(bands, data_index, core_num));
           band_epoch = bands->epoch;
           band_rows = bands->band_rows;
@@ -410,10 +419,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
           const uint64_t elements = bands->rows * bands->columns;
           if (data_index >= bands->home) {
             output_base = reinterpret_cast<GM_ADDR>(bands->guest);
-            output_0_offset = (data_index - bands->home) * elements * sizeof(float);
+            output_0_offset = (data_index - bands->home) * elements *
+                              (replica_bf16_partials_ ? sizeof(bfloat16_t) : sizeof(float));
           } else {
             const uint64_t scratch = MulticoreMoE::GradientBandOwnerScratch(bands, data_index);
-            if (scratch != 0) {
+            if (replica_bf16_partials_) {
+              output_0_offset = data_index * elements * sizeof(bfloat16_t);
+              if (scratch == 0) band_flags = nullptr;
+            } else if (scratch != 0) {
               if (bands->scratch == 0) AscendC::Trap();
               output_base = reinterpret_cast<GM_ADDR>(bands->scratch);
               output_0_offset = (scratch - 1) * elements * sizeof(float);
