@@ -16,7 +16,7 @@ from hyper_multicore.modules.mega_moe.route import (
 )
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
-from ._planner.planner import build_expert_replica_plan
+from ._planner.planner import build_capacity_plan, build_expert_replica_plan
 from .counts import route_summary
 from .placement import ExpertPlacement
 from .render import render_plan
@@ -128,12 +128,12 @@ class _Geometry:
     width: int
     peak: int
     local: int
-    metadata: RouteMetadata
+    metadata: RouteMetadata | None
     owner_rows: tuple[int, ...]
     published_slots: int
 
 
-def _render_geometry(plan, spec, device, maximum):
+def _render_geometry(plan, spec, device, maximum, *, prepare_metadata=True):
     """Pack count rows and only active guest columns in the common route format."""
     config = plan.config
     rank = spec.rank_id
@@ -143,8 +143,10 @@ def _render_geometry(plan, spec, device, maximum):
     items = (sorted_ids, table, np.asarray(owners, dtype=np.int32))
     ids, counts, copies = (_upload_route_tensor(torch.from_numpy(item), device) for item in items)
     receive = plan.destination_loads
-    metadata = _push_metadata(table, rank, spec.hidden_size, max(1, receive[rank]),
-                              max(128, ((maximum + 127) // 128) * 128), len(items[0]) // spec.top_k, device)
+    metadata = None
+    if prepare_metadata:
+        metadata = _push_metadata(table, rank, spec.hidden_size, max(1, receive[rank]),
+                                  max(128, ((maximum + 127) // 128) * 128), len(items[0]) // spec.top_k, device)
     return _Geometry(ids, counts, copies, owners, borrowed, max(receive), receive[rank], metadata,
                      plan.destination_counts[rank][:config.home_experts], plan.replica_slots_used[rank])
 
@@ -163,18 +165,35 @@ class BoundedPlacement:
     def select(
         self, hidden: torch.Tensor, ids: torch.Tensor, counts: torch.Tensor, source_rows: list[int],
         inverse: torch.Tensor | None, projections: int, snapshot: PlacementWire | None = None,
-        *, reserved: int | None = None,
+        *, reserved: int | None = None, capacity_target: int | None = None,
+        host_rows: list[list[int]] | None = None,
     ) -> ExpertPlacement | None:
         """Map the current route through reusable quotas for the agreed receive budget."""
         spec = self.spec
         maximum = max(source_rows) // spec.top_k
-        capacity = maximum * spec.ep_size * min(spec.local_experts, spec.top_k)
-        stream = torch.npu.current_stream(hidden.device) if hidden.device.type == "npu" else None
-        key = (capacity, projections, reserved, hidden.device, stream, torch.is_inference_mode_enabled())
-        wire = counts.cpu().numpy() if snapshot is None else snapshot.wire[:, 3:]
-        if self.key != key or not np.array_equal(self.snapshot, wire):
-            self._build(hidden.device, wire, capacity, projections, key, maximum, reserved)
-        geometry = self.geometry
+        if snapshot is not None:
+            wire = snapshot.wire[:, 3:]
+        elif host_rows is not None:
+            wire = np.asarray(host_rows, dtype=np.int32)[:, 3:]
+        else:
+            wire = counts.cpu().numpy()
+
+        transfers = None
+        if capacity_target is not None:
+            plan = build_capacity_plan(wire, capacity_target)
+            if plan is None or not plan.transfers:
+                return None
+            # The checkpoint owns this invocation's descriptors. Use the usual
+            # Push lowering and avoid a second persistent device geometry cache.
+            geometry = _render_geometry(plan, spec, hidden.device, maximum, prepare_metadata=False)
+            transfers = plan.maximum_transfer_degree
+        else:
+            capacity = maximum * spec.ep_size * min(spec.local_experts, spec.top_k)
+            stream = torch.npu.current_stream(hidden.device) if hidden.device.type == "npu" else None
+            key = (capacity, projections, reserved, hidden.device, stream, torch.is_inference_mode_enabled())
+            if self.key != key or not np.array_equal(self.snapshot, wire):
+                self._build(hidden.device, wire, capacity, projections, key, maximum, reserved)
+            geometry = self.geometry
         if geometry is None:
             return None
         if (inverse is None and hidden.device.type == "npu" and spec.architecture == 2201
@@ -192,7 +211,8 @@ class BoundedPlacement:
             remapped = geometry.sorted_ids.index_select(0, inverse.flatten())
         remapped = remapped.view_as(ids)
         return ExpertPlacement(remapped, geometry.counts, geometry.copies, geometry.width,
-                               geometry.peak, geometry.local, published_slots=geometry.published_slots,
+                               geometry.peak, geometry.local, transfer_experts=transfers,
+                               published_slots=geometry.published_slots,
                                copies_by_rank=geometry.owners,
                                route_metadata=geometry.metadata, owner_rows=geometry.owner_rows)
 

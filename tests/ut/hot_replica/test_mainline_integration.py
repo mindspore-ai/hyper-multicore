@@ -412,6 +412,45 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     binding.prepare_replay.assert_called_once_with()
 
 
+def test_checkpoint_with_supplied_counts_requires_the_original_order_and_histogram(monkeypatch):
+    """A replay hit requires the actual Router inputs on every EP rank."""
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
+    peer_matches = [True]
+
+    def gather(out, local, **_):
+        out[:] = local
+        if not peer_matches[0]:
+            out[1] = 0
+
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    spec = SimpleNamespace(ep_size=2, ep_group=object())
+    hidden, probabilities = torch.ones((2, 4)), torch.ones((2, 1))
+    ids = torch.arange(4, dtype=torch.int64)[::2].view(2, 1)
+    counts = torch.tensor([1, 9, 0, 9, 1, 9, 0, 9], dtype=torch.int64)[::2]
+    owner = object()
+
+    def invocation(current_ids, current_counts):
+        record, recomputing = replay.route_record(owner)
+        if recomputing:
+            return replay.agree_replay(
+                record, hidden, current_ids, probabilities, current_counts, spec, 15, weight_error=False,
+            )
+        record.stream = "s"
+        with record.save_supplied_route(current_ids, current_counts):
+            record.route = object()
+        return None
+
+    wrapped = replay.wrap_checkpoint(invocation, lambda: 0)
+    with torch.no_grad():
+        wrapped(ids, counts)
+    assert wrapped(ids.clone(), counts.clone())
+    assert not wrapped(ids.flip(0), counts)
+    assert not wrapped(ids, counts.roll(1))
+    assert not wrapped(ids, None)
+    peer_matches[0] = False
+    assert not wrapped(ids, counts)
+
+
 def test_early_weight_restore_uses_bank_generation(monkeypatch):
     """A copy can be consumed after its stream event or recovered if the bank changed."""
     monkeypatch.setattr(torch.distributed, "get_rank", lambda _: 0)
@@ -521,40 +560,6 @@ def test_forward_uses_injected_planner_after_count_exchange():
         expert.close()
 
 
-def test_borrowed_fp32_targets_keep_partials_and_restore_owner_dtype():
-    """Return the FP32 partial without converting it to the compute dtype."""
-    from hyper_multicore.modules.hot_replica.runtime import _BorrowedExpertWeights
-
-    first = torch.ones((1, 1, 2), requires_grad=True)
-    second = torch.ones((1, 1, 1), dtype=torch.bfloat16, requires_grad=True)
-    binding = Mock()
-    binding.pool.local_experts = 1
-    binding.acquire.return_value = (
-        torch.ones((2, 1, 2), dtype=torch.bfloat16),
-        torch.ones((2, 1, 1), dtype=torch.bfloat16),
-    )
-
-    def reduce(gradients, copies, *, output_dtypes, published_slots):
-        del copies, published_slots
-        return tuple(grad[:1].to(dtype) for grad, dtype in zip(gradients, output_dtypes))
-
-    binding.pool.return_generated_gradients.side_effect = reduce
-    w1, w2, target1, target2 = _BorrowedExpertWeights.apply(
-        first, second, binding, None, torch.bfloat16, True,
-    )
-    assert w1.dtype == w2.dtype == torch.bfloat16
-    assert not w1.requires_grad and not w2.requires_grad
-    assert target1.dtype == target2.dtype == torch.float32
-    first_partial = torch.full_like(target1, 1.003)
-    torch.autograd.backward(target1, first_partial)
-
-    sent = binding.pool.return_generated_gradients.call_args.args[0]
-    torch.testing.assert_close(sent[0], first_partial, rtol=0, atol=0)
-    assert sent[1].dtype == torch.float32 and torch.count_nonzero(sent[1]) == 0
-    torch.testing.assert_close(first.grad, first_partial[:1], rtol=0, atol=0)
-    assert second.grad.dtype == torch.bfloat16 and torch.count_nonzero(second.grad) == 0
-
-
 def test_public_placement_hints_and_omitted_local_capacity():
     """Resolve public types and sum destination columns across all source ranks."""
     assert get_type_hints(MegaMoePlacementOptions)["planner"] == BasePlanner | None
@@ -579,11 +584,12 @@ def test_checkpoint_request_is_training_independently_of_reservation(bound):
 
 @pytest.mark.parametrize("bound", [None, 4096])
 def test_a3_saved_route_uses_shared_quota_geometry(bound):
-    """Use the reserved quotas across F and R, retaining unreserved bank admission."""
+    """Share the built-in A3 renderer while preserving both capacity policies."""
     spec = SimpleNamespace(
         architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
         ep_size=2, rank_id=0, num_experts=8, local_experts=4, hidden_size=32, intermediate_size=64,
         top_k=2, num_cube_cores=24, apply_probs_before_fc2=True, expert_weight_layout="EOI",
+        partial_weight_grad_dtype=None,
     )
     owner = SimpleNamespace(
         spec=spec, workspace=SimpleNamespace(capacity_floor=4096), heap_manager=object(),
@@ -598,11 +604,27 @@ def test_a3_saved_route_uses_shared_quota_geometry(bound):
     hidden = torch.empty(2048, 32, dtype=torch.bfloat16)
     summary = route._RouteSummary(8192, 2048, 8192)
     if bound is None:
-        with patch.object(planner, "plan", return_value=None) as plan:
-            assert resources.select(
-                hidden, ids, wire, summary, [4096, 4096], None, 12, planner=planner, checkpointing=True,
-            ) is None
-        plan.assert_called_once()
+        inverse = ids.flatten().argsort(stable=True).argsort().view_as(ids)
+        rows = wire.tolist()
+        with (
+            patch("hyper_multicore.modules.hot_replica.planner.placement_receive_limit", return_value=4096),
+            patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable", return_value=True),
+            patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True),
+            patch.object(resources, "bind") as bind,
+        ):
+            request = resources.request(hidden, ids, wire, summary, [4096, 4096], inverse, 12, host_rows=rows)
+            expected = planner.plan(request)
+            with patch.object(planner, "plan", side_effect=AssertionError("generic planner called")):
+                resources.select(hidden, ids, wire, summary, [4096, 4096], inverse, 12, planner=planner,
+                                 checkpointing=True, host_rows=rows)
+        actual = bind.call_args.args[1]
+        assert actual is not None and expected is not None
+        torch.testing.assert_close(actual.virtual_ids, expected.virtual_ids)
+        torch.testing.assert_close(actual.counts_by_source, expected.counts_by_source)
+        torch.testing.assert_close(actual.copies, expected.copies)
+        assert (actual.receive_capacity, actual.transfer_experts) == (
+            expected.receive_capacity, expected.transfer_experts,
+        )
         assert resources.bounded.geometry is None
         return
 

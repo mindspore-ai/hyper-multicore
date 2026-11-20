@@ -308,8 +308,8 @@ def build_mega_moe_plan(
         raise ValueError("Partial expert gradients support only the native dtype or FP32")
     if replica_pipeline and (spec.architecture != 2201 or spec.batch_experts):
         raise ValueError("A3 replica pipeline requires per-expert GMMs")
-    if reserve_merge_workers and (not replica_pipeline or weight_grad_dtype != torch.float32):
-        raise ValueError("A3 replica merge workers require FP32 partial gradients")
+    if reserve_merge_workers and not replica_pipeline:
+        raise ValueError("A3 replica merge workers require a split-weight replica plan")
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(
         spec, weight_grad_dtype, replica_pipeline=replica_pipeline, reserve_merge_workers=reserve_merge_workers)
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(

@@ -233,7 +233,7 @@ def render_placement(
     source_inverse: torch.Tensor | None = None,
 ) -> ExpertPlacement:
     """Render the admitted source quotas using the existing device permutation."""
-    ranks, experts = plan.config.ep_size, plan.config.num_experts
+    experts = plan.config.num_experts
     used = max(plan.replica_slots_used)
     borrowed = min(plan.config.replica_slots_per_rank, 1 << (used - 1).bit_length())
     device = topk_ids.device
@@ -246,11 +246,7 @@ def render_placement(
     ).reshape_as(topk_ids)
     copies = _upload_route_tensor(torch.tensor(owners, dtype=torch.int32), device)
     table = _upload_route_tensor(torch.from_numpy(table), device)
-    outgoing = [0] * ranks
-    for transfer in plan.transfers:
-        outgoing[transfer.owner_rank] += 1
-    transfers = max(used, max(outgoing))
     loads = plan.destination_loads
     return ExpertPlacement(ids, table, copies, borrowed, max(loads), loads[rank],
-                           transfers, plan.replica_slots_used[rank], copies_by_rank=owners,
+                           plan.maximum_transfer_degree, plan.replica_slots_used[rank], copies_by_rank=owners,
                            owner_rows=plan.destination_counts[rank][:plan.config.home_experts])

@@ -40,6 +40,7 @@ def _require_a3(tensor):
     for key in ("bridge", "kernels"):
         if not (selected["root"] / artifacts[key]).is_file():
             raise RuntimeError(f"Selected HotReplica artifact is missing: {key}")
+    return bool(selected["build_info"].get("a3_replica_bf16_partials", False))
 
 
 def _require_mx(tensor, cube_cores: int):
@@ -70,12 +71,23 @@ def _require_mx(tensor, cube_cores: int):
 
 def require_capability(
     tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *, mx_cube_cores: int | None = None,
-) -> None:
-    """Converge capability failures before any rank allocates a bank or enters transfer."""
-    def check() -> None:
+) -> bool:
+    """Validate artifacts and agree on the A3 BF16 partial protocol before transfer."""
+    local_error = None
+    bf16_partials = False
+    try:
         if mx_cube_cores is None:
-            _require_a3(tensor)
+            bf16_partials = _require_a3(tensor)
         else:
             _require_mx(tensor, mx_cube_cores)
-
-    _collective.collective_call(check, stage="HotReplica capability", group=group)
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        local_error = error
+    failure = None if local_error is None else _collective.failure_report(local_error)
+    reports = _collective.exchange(
+        (bf16_partials, failure), group=group, failure_prefix="HotReplica capability failed while converging ranks",
+    )
+    capabilities, failures = zip(*reports)
+    if any(failure is not None for failure in failures):
+        details = _collective.format_collective_failures(failures)
+        raise RuntimeError(f"HotReplica capability failed on {details}") from local_error
+    return all(capabilities)

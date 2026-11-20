@@ -53,7 +53,8 @@ def forward(
     if binding is not None and binding.fused:
         plan = resources.plan_for_tokens(
             route.metadata.plan_tokens, hidden_flat.device,
-            weight_grad_dtype=torch.float32 if binding.fused_gradients else ordinary_options.get("weight_grad_dtype"),
+            weight_grad_dtype=(torch.float32 if binding.fused_gradients and not binding.bf16_partials
+                               else ordinary_options.get("weight_grad_dtype")),
             route_experts=ordinary_options.get("route_experts"),
             replica_pipeline=True, reserve_merge_workers=binding.owns_returns,
         )

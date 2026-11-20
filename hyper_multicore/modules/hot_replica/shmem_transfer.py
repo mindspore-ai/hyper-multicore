@@ -404,6 +404,7 @@ class ExpertWeightBinding:
     staged_generation: int | None = None
     fused: bool = False
     return_in_kernel: bool = True
+    bf16_partials: bool = False
     token: object = field(default_factory=object)
     transfers: tuple = ()
     gradient_storage: tuple = ()

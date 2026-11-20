@@ -50,10 +50,12 @@ class _MegaMoeExecutionResources:
         # Agree on optional stages before any HotReplica-only collective.
         placement = specification.get("hot_replica", False)
         mx_placement = placement and self.spec.precision == "mxfp8"
+        replica_bf16_partials = False
         if placement:
             from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
-            require_capability(tensor, specification["ep_group"],
-                               mx_cube_cores=self.spec.num_cube_cores if mx_placement else None)
+            replica_bf16_partials = require_capability(
+                tensor, specification["ep_group"], mx_cube_cores=self.spec.num_cube_cores if mx_placement else None,
+            )
         initial_headroom = 0
         if workspace_layout is not None:
             reservations = ((specification, workspace_layout),)
@@ -120,7 +122,7 @@ class _MegaMoeExecutionResources:
             self.placement = MXPlacementResources(self, specification, shared)
         elif placement:
             from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources  # pylint: disable=import-outside-toplevel
-            self.placement = PlacementResources(self, specification, shared)
+            self.placement = PlacementResources(self, specification, shared, bf16_partials=replica_bf16_partials)
 
     def ensure_capacity(self, maximum_received_slots: int) -> None:
         """Submit a larger layout for the validated route.

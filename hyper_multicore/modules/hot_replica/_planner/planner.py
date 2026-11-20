@@ -104,7 +104,7 @@ def _traffic_work_is_useful(copies, loads, config, resident, row_credit, minimum
 def build_capacity_plan(
     counts_by_source: np.ndarray, target_load: int,
 ) -> ExpertExecutionPlan | None:
-    """Keep capacity-based admission stable for the generic and Native EP executors."""
+    """Keep capacity-based admission stable for the MegaMoE placement policies."""
     limit = 2**31 - 1
     if counts_by_source.min() < 0:
         raise ValueError("HotReplica routed row counts must be nonnegative")

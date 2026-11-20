@@ -34,25 +34,30 @@ def _band_layout(shape):
     return rows_per_band, (rows + rows_per_band - 1) // rows_per_band
 
 
-def _pipeline_capacity(spec, bank_experts=None):
-    """Limit BF16 guest weights and FP32 guest dW to disjoint bank spans."""
+def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):
+    """Limit guest weights and dW to disjoint bank spans."""
     h, i = spec.hidden_size, spec.intermediate_size
+    if bf16_partials and (h % 16 or i % 16):
+        return 0
     if supports_bounded_placement(spec) and h * i % 16 == 0 and all(
             _band_layout(shape)[1] <= _MAX_BANDS for shape in projection_shapes(h, i, spec.expert_weight_layout)):
         extent = 2 * spec.local_experts if bank_experts is None else bank_experts
-        return min(spec.local_experts, extent // 3)
+        return min(spec.local_experts, extent // (2 if bf16_partials else 3))
     return 0
 
 
-def supports_pipeline(spec, borrowed):
-    """Check whether the requested width fits the fused bank."""
-    return 0 < borrowed <= _pipeline_capacity(spec)
+def supports_pipeline(spec, borrowed, *, bank_experts=None, bf16_partials=False):
+    """Check whether either available gradient protocol fits the requested width."""
+    capacity = _pipeline_capacity(spec, bank_experts, bf16_partials=bf16_partials)
+    if not capacity and bf16_partials:
+        capacity = _pipeline_capacity(spec, bank_experts)
+    return 0 < borrowed <= capacity
 
 
-def fused_replica_slots(spec, placement, *, bank_experts=None):
+def fused_replica_slots(spec, placement, *, bank_experts=None, bf16_partials=False):
     """Keep the physical stride and exclude padding from the fused bank extent."""
     width = placement.borrowed_capacity
-    slots = min(width, _pipeline_capacity(spec, bank_experts))
+    slots = min(width, _pipeline_capacity(spec, bank_experts, bf16_partials=bf16_partials))
     if slots and slots < width and any(owner >= 0 for row in placement.copies_by_rank for owner in row[slots:]):
         return 0
     return slots
@@ -211,6 +216,10 @@ class ReplicaPipeline:
         pool = self.pool
         home, cubes = pool.local_experts, pool.blocks
         slots, received, owned = binding.edges
+        bf16_partials = binding.bf16_partials
+        if bf16_partials:
+            # Group owners while keeping their contributions in peer/slot order.
+            owned = sorted(owned, key=lambda edge: edge[2])
         touched = {expert: slot + 1 for slot, expert in enumerate(sorted({edge[2] for edge in owned}))}
         last = {edge[2]: index for index, edge in enumerate(owned)}
         edges = [value for i, edge in enumerate(owned) for value in (*edge, int(i == last[edge[2]]))]
@@ -228,32 +237,35 @@ class ReplicaPipeline:
             local_flags = torch.zeros(sum(flags) + 2 * done_words, dtype=torch.int32, device=pool.device)
             retained.append(local_flags)
         owner_rows = binding.placement.owner_rows
+        element_size = torch.bfloat16.itemsize if bf16_partials else torch.float32.itemsize
         for matrix in (1, 0):
             grad = gradients[matrix]
             rows, columns = grad.shape[1:]
             per_band, bands = band_layouts[matrix]
-            # The bank lease keeps the contiguous FP32 suffix alive for remote readers.
-            guest_bytes = slots * rows * columns * torch.float32.itemsize
+            # The bank lease keeps the contiguous dW suffix alive for remote readers.
+            guest_bytes = slots * rows * columns * element_size
             guest_address = bank[matrix].data_ptr() + bank[matrix].nbytes - guest_bytes
             local_address = done_address = scratch_address = 0
             if local_flags is not None:
                 local_address = local_flags[matrix * flags[0]:].data_ptr()
                 done_address = local_flags[sum(flags) + matrix * done_words:].data_ptr()
-                scratch = grad.new_empty((len(touched), rows, columns), dtype=torch.float32)
-                if owner_rows is None:
-                    scratch.zero_()
-                else:
-                    for expert, slot in touched.items():
-                        if not owner_rows[expert]:
-                            scratch[slot - 1].zero_()
-                scratch_address = scratch.data_ptr()
-                retained.append(scratch)
+                if not bf16_partials:
+                    scratch = grad.new_empty((len(touched), rows, columns), dtype=torch.float32)
+                    if owner_rows is None:
+                        scratch.zero_()
+                    else:
+                        for expert, slot in touched.items():
+                            if not owner_rows[expert]:
+                                scratch[slot - 1].zero_()
+                    scratch_address = scratch.data_ptr()
+                    retained.append(scratch)
             ack = self.storage[(1 + matrix) * rank_lines:]
             records.append((home, slots, binding.gradient_epoch, rows, columns, per_band, bands,
                             grad.data_ptr(), guest_address, local_address,
                             self.storage[offsets[matrix]:].data_ptr(), len(owned), scratch_address,
                             pool.rank, ack.data_ptr(), done_address, *edges, *mapping, *received))
-        metadata = _words_tensor((2, 3, 3 + len(records[0]), *records[0], *records[1]), pool.device)
+        protocol = 3 if bf16_partials else 2
+        metadata = _words_tensor((protocol, 3, 3 + len(records[0]), *records[0], *records[1]), pool.device)
         stream = torch.npu.current_stream(pool.device)
         for tensor in (*retained, metadata):
             tensor.record_stream(stream)

@@ -111,6 +111,14 @@ class ExpertExecutionPlan:
                      for rank, row in enumerate(self.slot_to_logical)
                      for slot, expert in enumerate(row) if slot >= home and expert >= 0)
 
+    @cached_property
+    def maximum_transfer_degree(self) -> int:
+        """Count the busiest rank's hosted or published expert copies."""
+        outgoing = [0] * self.config.ep_size
+        for transfer in self.transfers:
+            outgoing[transfer.owner_rank] += 1
+        return max(max(self.replica_slots_used), max(outgoing))
+
     def validate(self) -> None:
         """Check per-source conservation and physical ownership invariants."""
         config = self.config

@@ -39,6 +39,10 @@ class HotReplicaPlanner(BasePlanner):
         """Return a placement if saved work repays movement or prevents heap growth."""
         if request.ordinary_receive_capacity is not None:
             return self._plan_reserved(request, self._build)
+        return self._plan_unreserved(request, self._build)
+
+    def _plan_unreserved(self, request, build):
+        """Keep the observed movement break-even while sharing geometry preparation."""
         counts = request.counts_by_source
         ranks, experts = counts.shape
         local = experts // ranks
@@ -65,7 +69,7 @@ class HotReplicaPlanner(BasePlanner):
 
         if not _pays(receive_limit):
             return None
-        placement = self._build(request, receive_limit)
+        placement = build(request, receive_limit)
         if placement is None or _pays(placement.receive_capacity, placement.transfer_experts):
             return placement
         if key is not None:
@@ -102,25 +106,6 @@ class HotReplicaPlanner(BasePlanner):
         ):
             return placement
         return None
-
-    @torch.no_grad()
-    def plan_native(self, request: PlacementRequest) -> ExpertPlacement | None:
-        """Use the average receive load as the target for framework grouped GEMMs."""
-        ranks, experts = request.counts_by_source.shape
-        local = experts // ranks
-        hidden, size = request.hidden.shape[-1], request.hidden.element_size()
-        target = (request.total_rows + ranks - 1) // ranks
-        limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
-        if request.maximum_received <= limit:
-            return None
-        # Native autograd owns the borrowed operands. Replay restores a local
-        # snapshot, so do not charge a second remote fetch before backward.
-        if not bounded_move_pays(
-            request.maximum_received, target, hidden, request.intermediate_size, request.cube_cores,
-            ranks, local, size, training=request.training, replay=False, apply_probs_before_fc2=True,
-        ):
-            return None
-        return self._build(request, target)
 
     @staticmethod
     def _build(request: PlacementRequest, target: int) -> ExpertPlacement | None:

@@ -66,7 +66,7 @@ def test_serial_replica_widths_reuse_home_when_event_capacity_matches():
     spec = SimpleNamespace(
         architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
         local_experts=6, num_experts=192, ep_size=32, top_k=8, initial_capacity_factor=1.25,
-        expert_weight_layout="EOI", hidden_size=5120, intermediate_size=1792,
+        expert_weight_layout="EOI", hidden_size=5120, intermediate_size=1792, partial_weight_grad_dtype=None,
     )
     parent = SimpleNamespace(spec=spec, workspace=object(), heap_manager=object())
     planner = mega_moe_adapter.HotReplicaPlanner
@@ -156,6 +156,38 @@ def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layo
     assert bank_layout.required_bytes == bank_bytes + 4 * pool.pipeline.signal_words + 512
     pool.leased_banks = tuple(torch.empty(shape, device="meta") for shape in pool._bank_shapes())
     assert all(bank.shape[0] == 2 * home for bank in pool._generic_banks())
+
+
+@pytest.mark.parametrize("home", [4, 6, 8])
+@pytest.mark.parametrize("layout", ["EIO", "EOI"])
+def test_bf16_partial_return_only_replaces_wide_native_routes(home, layout):
+    """Keep narrow FP32 fusion and a full-width path for each partial dtype."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        local_experts=home, num_experts=2 * home, ep_size=2, top_k=4, num_cube_cores=24,
+        expert_weight_layout=layout, hidden_size=5120, intermediate_size=1792,
+        partial_weight_grad_dtype=None,
+    )
+    parent = SimpleNamespace(spec=spec)
+    planner = mega_moe_adapter.HotReplicaPlanner
+    configuration = {"planner_key": (planner.__module__, planner.__qualname__)}
+    empty = (-1,) * home
+    hidden = torch.empty((0, spec.hidden_size), dtype=torch.bfloat16)
+    for dtype, capability, expected in ((None, False, (False, False)),
+                                        (None, True, (True, True)),
+                                        ("float32", True, (True, False))):
+        spec.partial_weight_grad_dtype = dtype
+        owner = mega_moe_adapter.PlacementResources(parent, configuration, False, bf16_partials=capability)
+        pool = SimpleNamespace(local_experts=home, rank=0, blocks=spec.num_cube_cores, bank_experts=owner.bank_extent)
+        pool.pipeline = ReplicaPipeline(pool)
+        owner.pool = pool
+        with patch.object(owner, "_geometry", return_value=parent):
+            for used, mode in ((1, (True, False)), (home, expected)):
+                incoming = tuple(range(home, home + used)) + empty[used:]
+                placement = SimpleNamespace(borrowed_capacity=home, copies_by_rank=(incoming, empty))
+                _, _, binding = owner.bind(hidden, placement, tokens=4096, fused=owner.pipeline_enabled)
+                assert binding.fused
+                assert (binding.fused_gradients, binding.bf16_partials) == mode
 
 
 def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident_weights():

@@ -132,10 +132,7 @@ def _get_mega_bank(
             if pipeline:
                 if not dedicated:
                     pool.pipeline = ReplicaPipeline(pool, shared_layouts=True)
-                if owner._uses_fp32_partials():
-                    # Future placements can fill every slot. Keep the weight
-                    # prefix separate from the FP32 dW suffix for that width.
-                    pool.bank_experts = 3 * spec.local_experts
+                pool.bank_experts = owner.bank_extent
                 signature += (pool.bank_experts,)
             layout = _WorkspaceLayout(pool.allocation_bytes, signature, spec.local_experts)
             added = manager.reserve((*reservations, (reservation, layout)), allow_resize=True,
@@ -166,7 +163,7 @@ def _live_slot_extent(placement):
 class PlacementResources:
     """Own placement geometry and lazy banks under one BF16 resource owner."""
 
-    def __init__(self, parent: Any, specification: dict[str, Any], shared: bool) -> None:
+    def __init__(self, parent: Any, specification: dict[str, Any], shared: bool, *, bf16_partials: bool = False) -> None:
         """Attach lazy placement resources to one existing BF16 owner."""
         self.parent = parent
         self.specification = specification
@@ -184,14 +181,17 @@ class PlacementResources:
             and mega_moe_event_capacity(spec.num_experts, spec.ep_size)
             == mega_moe_event_capacity(2 * spec.num_experts, spec.ep_size)
         )
-        self.pipeline_enabled = built_in and supports_pipeline(parent.spec, 1)
+        self.bf16_partials = bf16_partials and not self._uses_fp32_partials()
+        self.pipeline_enabled = built_in and supports_pipeline(
+            spec, 1, bank_experts=self.bank_extent, bf16_partials=self.bf16_partials,
+        )
         self.statistics = {
             "invocations": 0, "placements": 0,
             "route_replays": 0, "route_replay_misses": 0, "skipped_recomputes": 0,
         }
 
-    def uses_shared_quotas(self, checkpointing: bool) -> bool:
-        """Keep unreserved checkpoint admission tied to the generic allocator."""
+    def uses_placement_wire(self, checkpointing: bool) -> bool:
+        """Enable the bounded count readback where it also supplies Push descriptors."""
         return self.bounded is not None and (self.source_bound is not None or not checkpointing)
 
     def select(
@@ -210,26 +210,24 @@ class PlacementResources:
         checkpointing: bool = False,
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Choose a virtual route only after the existing count exchange validates it."""
-        shared_quotas = self.uses_shared_quotas(checkpointing)
-        if not shared_quotas or self.source_bound is not None:
+        if self.bounded is None or self.source_bound is not None or checkpointing:
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
                                    host_rows=host_rows)
-            if not shared_quotas:
-                # Keep the unreserved admission policy while reusing the
-                # agreed copies for the fused bank, including replay.
+            if self.bounded is None:
                 placement = planner.plan(request)
-                return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
+            else:
+                def build(current, target):
+                    reserved = current.ordinary_receive_capacity
+                    return self.bounded.select(
+                        hidden, ids, current.counts_by_source, source_rows, inverse, 0, snapshot,
+                        reserved=reserved, capacity_target=target if reserved is None else None, host_rows=host_rows,
+                    )
 
-            def _build_reserved(current, _target):
-                return self.bounded.select(
-                    hidden, ids, current.counts_by_source, source_rows, inverse, 0, snapshot,
-                    reserved=current.ordinary_receive_capacity,
-                )
-
-            # At the full home-slot budget the quota search can attain the
-            # group average; a reservation below that bound requires growth.
-            selected = HotReplicaPlanner._plan_reserved(request, _build_reserved)
-            return self.bind(hidden, selected, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
+                if request.ordinary_receive_capacity is None:
+                    placement = planner._plan_unreserved(request, build)
+                else:
+                    placement = HotReplicaPlanner._plan_reserved(request, build)
+            return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
         self.statistics["invocations"] += 1
         peak = summary.maximum
         spec = self.parent.spec
@@ -278,20 +276,29 @@ class PlacementResources:
         pipeline = self.pool.pipeline
         slots = 0
         return_in_kernel = False
+        bf16_partials = False
         if fused and pipeline is not None and placement.copies_by_rank and self.pool.blocks == spec.num_cube_cores:
             slots = fused_replica_slots(spec, placement, bank_experts=self.pool.bank_experts)
+            if not slots and self.bf16_partials:
+                slots = fused_replica_slots(spec, placement, bank_experts=self.pool.bank_experts, bf16_partials=True)
+                bf16_partials = bool(slots)
             return_in_kernel = bool(slots)
             if not slots:
                 slots = placement.borrowed_capacity
         binding = ExpertWeightBinding(
             self.pool, placement, spec.expert_weight_layout, fused=bool(slots), fused_slots=slots,
-            return_in_kernel=return_in_kernel,
+            return_in_kernel=return_in_kernel, bf16_partials=bf16_partials,
         )
         return resources, placement, binding
 
     def _uses_fp32_partials(self):
         """Use the same partial-gradient dtype as the ordinary placed launch."""
         return self.source_bound is not None or self.parent.spec.partial_weight_grad_dtype == "float32"
+
+    @property
+    def bank_extent(self):
+        """Keep one weight and one partial-gradient record per possible guest."""
+        return (3 if self._uses_fp32_partials() else 2) * self.parent.spec.local_experts
 
     def _geometry(self, hidden, placement, tokens):
         """Cache only static BF16 geometry; retain mainline scheduling choices."""
