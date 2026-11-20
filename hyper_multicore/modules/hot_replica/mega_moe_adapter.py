@@ -177,8 +177,9 @@ class PlacementResources:
         if can_split_weights:
             fp32_partials = self._uses_fp32_partials()
             self.bf16_partials = bf16_partials and not fp32_partials
-            # Preserve the former separate executor's partial dtype on these schedules.
-            self.prefer_bf16_partials = not fp32_partials and (not built_in or spec.batch_experts)
+            # Preserve the rounding of routes that used separate BF16 partials.
+            unaligned_eio = self.requires_fused_return and spec.hidden_size * spec.intermediate_size % 16 != 0
+            self.prefer_bf16_partials = not fp32_partials and (not built_in or spec.batch_experts or unaligned_eio)
             self.pipeline_enabled = (
                 self.bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent, bf16_partials=True)
                 or not self.prefer_bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent)

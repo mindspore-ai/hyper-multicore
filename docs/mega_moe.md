@@ -164,6 +164,7 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
   A3 EIO MTE Push 的活跃放置在发布权重前绑定核内 dW。中间梯度带长度取 32 字节的倍数，末带按实际元素数读写。
+  单专家矩阵元素数无法按 16 元素对齐时，原独立回传使用的默认 BF16 partial 在窄槽也继续使用。
   显式 FP32 partial 在专家矩阵元素数和本地专家数均为奇数时补一个 BF16 bank 记录，以保持 FP32 尾区地址对齐。
   若放置需要 BF16 partial 协议，应加载支持该协议的 A3 制品。捕获实际张量的 tensor dump 使用其专用捕获路径。
   副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。

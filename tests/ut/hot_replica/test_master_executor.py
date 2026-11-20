@@ -245,6 +245,27 @@ def test_a3_eio_bf16_bands_preserve_unaligned_matrix_tails(hidden, intermediate)
         assert bands <= 64
 
 
+def test_a3_eio_unaligned_narrow_bank_preserves_bf16_partial_rounding():
+    """A formerly separate narrow route retains BF16 partials in the fused plan."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        local_experts=5, num_experts=10, ep_size=2, hidden_size=5113, intermediate_size=1793,
+        num_cube_cores=24, expert_weight_layout="EIO", partial_weight_grad_dtype=None,
+    )
+    parent = SimpleNamespace(spec=spec)
+    planner = mega_moe_adapter.HotReplicaPlanner
+    configuration = {"planner_key": (planner.__module__, planner.__qualname__)}
+    owner = mega_moe_adapter.PlacementResources(parent, configuration, False, bf16_partials=True)
+    pool = SimpleNamespace(local_experts=5, rank=0, blocks=24, bank_experts=owner.bank_extent)
+    pool.pipeline = ReplicaPipeline(pool)
+    owner.pool = pool
+    placement = SimpleNamespace(borrowed_capacity=1, copies_by_rank=((5,), (-1,)))
+    hidden = torch.empty((0, spec.hidden_size), dtype=torch.bfloat16)
+    with patch.object(owner, "_geometry", return_value=parent):
+        _, _, binding = owner.bind(hidden, placement, tokens=4096, fused=owner.pipeline_enabled)
+    assert binding.fused_gradients and binding.bf16_partials
+
+
 def test_a3_eio_full_fp32_bank_aligns_its_suffix_for_odd_expert_strides():
     """The first FP32 partial begins past the last weight at a valid float address."""
     spec = SimpleNamespace(
