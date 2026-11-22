@@ -124,13 +124,18 @@ def _resolve_expert_options(precision, numerics_options, tuning_options):
     numerics = MegaMoeNumericsOptions() if numerics_options is None else numerics_options
     tuning = MegaMoeTuningOptions() if tuning_options is None else tuning_options
     for name, value in (("apply_probs_before_fc2", numerics.apply_probs_before_fc2),
-                        ("clamp_after_silu", numerics.clamp_after_silu)):
+                        ("clamp_after_silu", numerics.clamp_after_silu),
+                        ("swiglu_hf_bf16", numerics.swiglu_hf_bf16)):
         if not isinstance(value, bool):
             raise TypeError(f"{name} must be a boolean")
     if precision not in ("bf16", "mxfp8"):
         raise ValueError("MegaMoE precision must be bf16 or mxfp8")
-    if precision == "mxfp8" and (numerics.swiglu_limit is not None or numerics.apply_probs_before_fc2):
-        raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
+    if precision == "mxfp8" and (
+        numerics.swiglu_limit is not None or numerics.apply_probs_before_fc2 or numerics.swiglu_hf_bf16
+    ):
+        raise ValueError("MXFP8 does not support clamp, swiglu_hf_bf16 or before-FC2 probability weighting")
+    if numerics.swiglu_hf_bf16 and numerics.swiglu_limit is not None:
+        raise ValueError("swiglu_hf_bf16 cannot be combined with swiglu_limit")
     if numerics.partial_weight_grad_dtype not in (None, "native", "float32"):
         raise ValueError("partial_weight_grad_dtype must be native, float32 or None")
     scheduler = validate_schedule_options(tuning.scheduler)
@@ -221,6 +226,7 @@ class MegaMoeExperts(MulticoreModule):
             "partial_weight_grad_dtype": numerics.partial_weight_grad_dtype,
             "swiglu_limit": numerics.swiglu_limit,
             "clamp_after_activation": numerics.clamp_after_silu,
+            "swiglu_hf_bf16": numerics.swiglu_hf_bf16,
             "apply_probs_before_fc2": numerics.apply_probs_before_fc2,
             "ep_size": _resolve_ep_size(ep_group),
             "ep_group": ep_group,

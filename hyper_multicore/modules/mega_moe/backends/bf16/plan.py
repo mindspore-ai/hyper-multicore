@@ -185,6 +185,7 @@ def _build_runtime_artifacts(
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
         clamp_after_activation=spec.clamp_after_activation,
+        swiglu_hf_bf16=spec.swiglu_hf_bf16,
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
     )
@@ -211,6 +212,7 @@ def _build_runtime_artifacts(
         num_cube_cores=spec.num_cube_cores,
         swiglu_limit=spec.swiglu_limit,
         clamp_after_activation=spec.clamp_after_activation,
+        swiglu_hf_bf16=spec.swiglu_hf_bf16,
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
     )

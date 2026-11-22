@@ -171,7 +171,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
                                                                        sizeof(DTYPE_DISPATCH_TARGET);
       // Recompute only a worker tile, not a per-graph activation tensor.
       swi_glu(input, activation, nullptr, tiling, GetSwiGluClampLimit(task),
-              GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+              GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU,
+              GetSwiGluHfBf16(task));
       {
         RoutingProbabilityTile<DTYPE_DISPATCH_TARGET> operation;
         operation.Backward(
@@ -184,14 +185,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     }
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
     if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
-      if (GetSwiGluClampLimit(task) == 0.0f && task.inputs[1].dim[1] % 64 == 0) {
+      if (GetSwiGluClampLimit(task) == 0.0f && !GetSwiGluHfBf16(task) && task.inputs[1].dim[1] % 64 == 0) {
         MulticoreBf16::ExecuteSwiGluGrad(gradient, input, output, rows, task.inputs[1].dim[1] / 2);
         return;
       }
     }
 #endif
     swi_glu_grad(gradient, input, output, input_list[SWIGLU_GRAD_WORKSPACE_IDX], tiling,
-                 GetSwiGluClampLimit(task), GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+                 GetSwiGluClampLimit(task), GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU,
+                 GetSwiGluHfBf16(task));
   }
 
   __aicore__ inline void ExecuteSwiGluGradLegacy(const TaskDesc &task_desc) {

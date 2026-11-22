@@ -122,7 +122,8 @@ class _MegaMoeExecutionResources:
             "mega_moe", self.placement is not None, self.spec.local_num_tokens, self.spec.hidden_size,
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
-            self.spec.expert_weight_layout, self.spec.apply_probs_before_fc2, self.spec.partial_weight_grad_dtype,
+            self.spec.expert_weight_layout, self.spec.apply_probs_before_fc2, self.spec.swiglu_hf_bf16,
+            self.spec.partial_weight_grad_dtype,
             self.spec.precision, self.spec.transport_engine, self.spec.ready_depth,
             self.spec.schedule_policy, self.spec.lowering,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
@@ -155,7 +156,7 @@ class _MegaMoeExecutionResources:
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "swiglu_limit", "clamp_after_activation",
-                  "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
+                  "swiglu_hf_bf16", "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
                   "batch_experts", "nominal_schedule", "hot_replica", "source_token_bound", "planner_key")

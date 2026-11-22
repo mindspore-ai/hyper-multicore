@@ -48,3 +48,4 @@ class MegaMoeNumericsOptions:
     swiglu_limit: float | None = None
     clamp_after_silu: bool = False
     apply_probs_before_fc2: bool = False
+    swiglu_hf_bf16: bool = False

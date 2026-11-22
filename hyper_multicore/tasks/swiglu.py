@@ -48,6 +48,13 @@ class SwiGluTaskIteration(IntEnum):
     PERSISTENT_LANES = 2
 
 
+class SwiGluPrecision(IntEnum):
+    """SwiGLU intermediate rounding semantics."""
+
+    FUSED = 0
+    HF_BF16 = 16
+
+
 def _encode_clamp_limit(clamp_limit: float | None) -> int:
     """Encode a positive float32 clamp limit, reserving zero for no clamp."""
     if clamp_limit is None:
@@ -82,6 +89,7 @@ class SwiGLUFillConfig(FillConfig):
 
     clamp_limit: float | None = None
     clamp_after_activation: bool = False
+    hf_bf16: bool = False
 
     def fill(
         self,
@@ -99,6 +107,8 @@ class SwiGLUFillConfig(FillConfig):
         task_type = (TaskType.TASK_SWI_GLU if op.op_type == OpType.SWIGLU
                      else TaskType.TASK_SWI_GLU_GRAD)
         clamp_bits = _encode_clamp_limit(self.clamp_limit)
+        if self.hf_bf16 and clamp_bits:
+            raise ValueError("hf_bf16 SwiGLU does not support clamp_limit")
 
         num_triggers = getattr(op, "compact_lanes", tsv.per_expert_seq // op.split_value)
         task_num     = op.task_num
@@ -146,6 +156,8 @@ class SwiGLUFillConfig(FillConfig):
                                         if self.clamp_after_activation and clamp_bits else 0)
             if hasattr(op, "compact_lanes"):
                 task.extra_value_1 |= SwiGluTaskIteration.PERSISTENT_LANES
+            if self.hf_bf16:
+                task.extra_value_1 |= SwiGluPrecision.HF_BF16
             task.tiling_data_position = op.tiling_position
 
             cfg.all_tasks[tsv.pre_task_num + i]               = task
