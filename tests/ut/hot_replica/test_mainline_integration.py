@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -33,6 +34,7 @@ from hyper_multicore.modules.hot_replica._planner import aligned
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.plan import ExpertExecutionPlan, _replica_transfers
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
+from hyper_multicore.modules.hot_replica.bounded_placement import _placement_metadata
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
     ExpertWeightBinding, PlacementResources, _bind_custom_copy_rows, _get_mega_bank,
@@ -230,13 +232,44 @@ def test_bf16_pull_accepts_adaptive_placement():
         expert.close()
 
 
-def test_a3_bf16_pull_keeps_replica_capability_guard():
-    """Reject an unqualified replica transport before allocating its banks."""
+@pytest.mark.parametrize("runtime_rows", [False, True])
+def test_a3_bf16_pull_requires_runtime_row_get(tmp_path, runtime_rows):
+    """Check capability agreement against both legacy and current A3 wheels."""
+    tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=0), dtype=torch.bfloat16)
+    artifacts = {"soc": "ascend910_93", "bridge": "bridge.so", "kernels": "kernels.so"}
+    (tmp_path / artifacts["bridge"]).touch()
+    (tmp_path / artifacts["kernels"]).touch()
+    build_info = {"a3_replica_bf16_partials": True}
+    if runtime_rows:
+        build_info["a3_bf16_pull_runtime_rows"] = True
+    selected = {"root": tmp_path, "variant": {"hot_replica": artifacts}, "build_info": build_info}
     with (
+        patch.object(capability, "load_torch_npu"),
+        patch.object(capability, "query_npu_arch", return_value=2201),
+        patch.object(torch.npu, "get_device_name", return_value="Ascend910_9391"),
+        patch.object(capability, "validate_native_compatibility", return_value=selected),
         patch.object(capability._collective, "exchange", side_effect=lambda value, **_: [value, value]),
-        pytest.raises(RuntimeError, match="BF16 HotReplica Pull requires Ascend950"),
     ):
-        capability.require_capability(None, None, architecture=2201, dispatch_mode="pull")
+        assert capability.require_capability(tensor, None, architecture=2201)
+        expected = nullcontext() if runtime_rows else pytest.raises(RuntimeError, match="runtime-row GET support")
+        with expected:
+            assert capability.require_capability(tensor, None, architecture=2201, dispatch_mode="pull")
+
+
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+@pytest.mark.parametrize("rank", range(3))
+def test_a3_bounded_metadata_matches_the_ordinary_route(dispatch_mode, rank):
+    """The quota route packs each source and destination in the ordinary descriptor order."""
+    counts = np.array([[2, 0, 3, 1, 4, 2], [0, 1, 0, 2, 6, 3], [2, 8, 0, 1, 0, 1]], dtype=np.int32)
+    spec = MegaMoeSpec(12, 64, 128, 6, 1, None, 128, 3, None, rank, 24, dispatch_mode=dispatch_mode)
+    wire = [[12, 0, 0, *row] for row in counts.tolist()]
+    expected = route._host_route_metadata(wire, spec, 128, torch.device("cpu"))
+    observed = _placement_metadata(counts, spec, 128, 128, 12, torch.device("cpu"))
+    assert (observed.local_num_tokens, observed.plan_tokens) == (12, 128)
+    for name in ("dispatch_src_off", "dispatch_target_off", "dispatch_size", "combine_src_off",
+                 "combine_target_off", "combine_size", "group_list"):
+        assert torch.equal(getattr(observed, name), getattr(expected, name))
+        assert torch.equal(getattr(observed.for_kernel(64), name), getattr(expected.for_kernel(64), name))
 
 
 @pytest.mark.parametrize("options", [None, MegaMoePlacementOptions(strategy="none")])

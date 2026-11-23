@@ -114,6 +114,7 @@ def main() -> None:
     dist.init_process_group("hccl")
     device = torch.device("npu", rank)
     records = []
+    dispatch_mode = os.environ.get("EDGE_DISPATCH_MODE", "push")
     try:
         torch.manual_seed(91 + rank)
         tokens, h, i, local_experts, k = 257, 256, 128, 4, 2
@@ -145,6 +146,7 @@ def main() -> None:
                     ),
                     expert_placement=MegaMoePlacementOptions("adaptive", HotReplicaPlanner()) if enabled else None,
                     tuning_options=MegaMoeTuningOptions(
+                        dispatch_mode=dispatch_mode if enabled else "push",
                         dispatch_split=split, combine_split=split,
                     ),
                 )

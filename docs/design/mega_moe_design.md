@@ -153,6 +153,8 @@ worker 的队列选择、依赖等待和完成发布见[运行时模型](../arch
 normal、profile 和支持 L1 dump 的路径复用队列执行逻辑；采集开销仍可能改变运行中实际观察到的就绪顺序。
 
 arch22 BF16 支持 compact、nominal 和专家批处理；compact 的粒度变化先于队列编排。
+A3 BF16 HotReplica 的 compact Pull 由执行 rank 按实际行数切分每个 peer 和专家的 GET。
+空分片也发布本地完成事件。连续 token 分片达到 4 MiB 时，MTE 单次搬运上限为 32 KiB。
 arch35 BF16 与 MXFP8 将各自数学阶段映射到共享专家调度策略，通信采用固定 owner 和 FIFO 队列，
 数学队列可以进行独立就绪选择。
 

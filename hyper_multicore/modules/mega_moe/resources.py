@@ -58,6 +58,8 @@ class _MegaMoeExecutionResources:
                 architecture=self.spec.architecture, dispatch_mode=self.spec.dispatch_mode,
                 receive_capacity_percent=specification.get("receive_capacity_percent"),
             )
+            if self.spec.architecture == 2201 and self.spec.dispatch_mode == "pull":
+                self.spec = replace(self.spec, compact_pull=True)
         if workspace_layout is not None:
             reservations = ((specification, workspace_layout),)
         else:

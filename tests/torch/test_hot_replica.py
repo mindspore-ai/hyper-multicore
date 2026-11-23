@@ -15,6 +15,7 @@
 """Launch the HotReplica two-rank device regression."""
 from pathlib import Path
 
+import pytest
 
 from tests.common.mark_utils import arg_mark
 
@@ -33,10 +34,12 @@ def test_placement_checkpoint_and_close(monkeypatch):
 
 
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_placement_edge_cases(monkeypatch, tmp_path):
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_placement_edge_cases(monkeypatch, tmp_path, dispatch_mode):
     """Exercise both layouts, probability positions, splits and graph lifetimes."""
     prepare_multicore_test_environment()
     monkeypatch.setenv("EDGE_OUT", str(tmp_path / "edge-results"))
+    monkeypatch.setenv("EDGE_DISPATCH_MODE", dispatch_mode)
     monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         run_multicore_case(str(Path(__file__).with_name("_test_hot_replica_edge_cases.py")),

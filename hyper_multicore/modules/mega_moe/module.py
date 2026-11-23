@@ -192,7 +192,8 @@ class MegaMoeExperts(MulticoreModule):
                 to SiLU, plus the probability position relative to FC2. The before-FC2
                 path rounds activations to BF16 both before and after FP32 weighting.
             expert_placement: Placement strategy and planner for multi-rank execution.
-                Adaptive placement supports BF16 Push on Ascend910_93 and BF16 Push and Pull on Ascend950.
+                Adaptive placement supports BF16 Push and Pull on Ascend910_93 and Ascend950.
+                Ascend910_93 Pull requires MTE and a wheel with runtime-row GET support.
                 Ascend950 MXFP8 requires Push, the built-in planner and FP32 partial weight gradients.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.

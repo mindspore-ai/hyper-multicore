@@ -202,7 +202,7 @@ class PlacementResources:
         }
 
     def uses_placement_wire(self, checkpointing: bool) -> bool:
-        """Use the count wire for ordinary per-expert Push descriptors."""
+        """Use the count wire for ordinary per-expert dispatch descriptors."""
         return self.bounded is not None and not self.parent.spec.batch_experts and not checkpointing
 
     def select(
@@ -403,6 +403,7 @@ class PlacementResources:
         specification = {
             **self.specification,
             "hot_replica": False, "planner_key": None,
+            "compact_pull": spec.compact_pull,
             "num_experts": spec.ep_size * (spec.local_experts + width),
         }
         if self.shared and self.bounded is not None and not spec.batch_experts:

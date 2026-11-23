@@ -24,7 +24,7 @@ from hyper_multicore._loader import load_torch_npu, query_npu_arch, validate_nat
 from hyper_multicore._native_manifest import A5_BF16_KERNEL_PIPELINE_VERSION
 
 
-def _require_a3(tensor):
+def _require_a3(tensor, *, dispatch_mode: str = "push") -> bool:
     """Reject devices sharing arch22 unless their actual SOC is Atlas A3."""
     if tensor.device.type != "npu" or tensor.dtype != torch.bfloat16:
         raise ValueError("HotReplica requires BF16 input on an Atlas A3 NPU")
@@ -42,7 +42,10 @@ def _require_a3(tensor):
     for key in ("bridge", "kernels"):
         if not (selected["root"] / artifacts[key]).is_file():
             raise RuntimeError(f"Selected HotReplica artifact is missing: {key}")
-    return bool(selected["build_info"].get("a3_replica_bf16_partials", False))
+    build_info = selected["build_info"]
+    if dispatch_mode == "pull" and not build_info.get("a3_bf16_pull_runtime_rows", False):
+        raise RuntimeError("BF16 HotReplica Pull on Ascend910_93 requires an A3 wheel with runtime-row GET support")
+    return bool(build_info.get("a3_replica_bf16_partials", False))
 
 
 def _require_mx(tensor, cube_cores: int):
@@ -105,10 +108,8 @@ def require_capability(
             _require_mx(tensor, mx_cube_cores)
         elif architecture == 3510:
             _require_a5_bf16(tensor)
-        elif dispatch_mode == "pull":
-            raise ValueError("BF16 HotReplica Pull requires Ascend950")
         else:
-            bf16_partials = _require_a3(tensor)
+            bf16_partials = _require_a3(tensor, dispatch_mode=dispatch_mode)
     except Exception as error:  # pylint: disable=broad-exception-caught
         local_error = error
     failure = None if local_error is None else _collective.failure_report(local_error)

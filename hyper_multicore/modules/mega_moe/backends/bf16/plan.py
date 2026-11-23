@@ -202,7 +202,8 @@ def _build_runtime_artifacts(
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
     )
-    compact = (not explicit_queues and spec.lowering != "dense" and spec.dispatch_mode == "push"
+    compact_dispatch = spec.dispatch_mode == "push" or spec.compact_pull
+    compact = (not explicit_queues and spec.lowering != "dense" and compact_dispatch
                and spec.intermediate_size < 2048
                and compact_graph(forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule))
     if not compact and (spec.lowering == "compact" or spec.nominal_schedule):

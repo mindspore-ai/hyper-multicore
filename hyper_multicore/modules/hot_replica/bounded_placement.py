@@ -26,8 +26,8 @@ _PINNED_WIRE_MAX_BYTES = 32 * 1024
 
 
 def supports_bounded_placement(spec):
-    """A3 MTE Push can render the agreed quotas for either GMM schedule."""
-    return spec.architecture == 2201 and spec.dispatch_mode == "push" and spec.transport_engine == "mte"
+    """A3 MTE Push and Pull use the same agreed quota plan."""
+    return spec.architecture == 2201 and spec.transport_engine == "mte"
 
 
 @dataclass
@@ -44,9 +44,8 @@ class PlacementWire:
     def ordinary_metadata(self, spec, hidden):
         """Build the home descriptor only when the planner keeps the home layout."""
         if self.metadata is None:
-            self.metadata = _push_metadata(self.wire[:, 3:], spec.rank_id, spec.hidden_size,
-                                           self.summary.capacity, self.summary.plan_tokens,
-                                           hidden.shape[0], hidden.device)
+            self.metadata = _placement_metadata(self.wire[:, 3:], spec, self.summary.capacity,
+                                                self.summary.plan_tokens, hidden.shape[0], hidden.device)
         return self.metadata
 
 
@@ -89,8 +88,9 @@ def read_placement_wire(payload, spec, workspace, stream):
     return snapshot
 
 
-def _push_metadata(counts, rank, hidden, capacity, plan_tokens, tokens, device):
-    """Build the mainline Push descriptor from immutable host count geometry."""
+def _placement_metadata(counts, spec, capacity, plan_tokens, tokens, device):
+    """Build offsets and row counts in the selected dispatch direction's order."""
+    rank = spec.rank_id
     ranks, experts = counts.shape
     local = experts // ranks
     columns = slice(rank * local, (rank + 1) * local)
@@ -98,11 +98,17 @@ def _push_metadata(counts, rank, hidden, capacity, plan_tokens, tokens, device):
     destinations = counts.reshape(ranks, ranks, local).transpose(1, 2, 0).reshape(ranks, -1)
     ends = destinations.cumsum(axis=1, dtype=np.int64)
     targets = (ends - destinations).reshape(ranks, local, ranks)
-    wide = (source[rank], targets[:, :, rank].reshape(-1), targets[rank].T.reshape(-1),
-            source[:, columns].reshape(-1), ends[rank, ranks - 1::ranks])
-    sizes = (counts[rank], counts[:, columns].reshape(-1))
+    receive_source = source[:, columns].reshape(-1)
+    receive_target = targets[rank].T.reshape(-1)
+    receive_sizes = counts[:, columns].reshape(-1)
+    if spec.dispatch_mode == "pull":
+        dispatch_source, dispatch_target, dispatch_sizes = receive_source, receive_target, receive_sizes
+    else:
+        dispatch_source, dispatch_target, dispatch_sizes = source[rank], targets[:, :, rank].reshape(-1), counts[rank]
+    wide = (dispatch_source, dispatch_target, receive_target, receive_source, ends[rank, ranks - 1::ranks])
+    sizes = (dispatch_sizes, receive_sizes)
     metadata = _pack_host_route(tuple(a.tolist() for a in wide), tuple(a.tolist() for a in sizes),
-                                capacity, device, hidden)
+                                capacity, device, spec.hidden_size)
     return replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
 
 
@@ -144,8 +150,8 @@ def _render_geometry(plan, spec, device, maximum, *, prepare_metadata=True):
     receive = plan.destination_loads
     metadata = None
     if prepare_metadata:
-        metadata = _push_metadata(table, rank, spec.hidden_size, max(1, receive[rank]),
-                                  max(128, ((maximum + 127) // 128) * 128), len(items[0]) // spec.top_k, device)
+        metadata = _placement_metadata(table, spec, max(1, receive[rank]),
+                                       max(128, ((maximum + 127) // 128) * 128), len(items[0]) // spec.top_k, device)
     return _Geometry(ids, counts, copies, owners, borrowed, max(receive), receive[rank], metadata,
                      plan.destination_counts[rank][:config.home_experts], plan.replica_slots_used[rank])
 

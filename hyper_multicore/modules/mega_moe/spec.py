@@ -68,6 +68,7 @@ class MegaMoeSpec:
     ready_depth: int | None = None
     schedule_policy: str = "auto"
     lowering: str = "auto"
+    compact_pull: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -242,4 +243,5 @@ def bind_mega_moe_spec(
         ready_depth=specification.get("ready_depth"),
         schedule_policy=specification.get("schedule_policy", "auto"),
         lowering=specification.get("lowering", "auto"),
+        compact_pull=specification.get("compact_pull", False),
     )
