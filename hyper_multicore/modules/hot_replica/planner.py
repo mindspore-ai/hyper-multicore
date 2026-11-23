@@ -44,7 +44,8 @@ class HotReplicaPlanner(BasePlanner):
         size = request.hidden.element_size()
         target = (request.total_rows + ranks - 1) // ranks
         maximum = request.maximum_received
-        receive_limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
+        effective_top_k = request.top_k if request.top_k is not None else request.ids.shape[-1]
+        receive_limit = placement_receive_limit(target, ranks, local, effective_top_k, hidden, size)
         floor = request.ordinary_receive_capacity
         if floor is not None:
             if maximum <= target:
@@ -99,7 +100,8 @@ class HotReplicaPlanner(BasePlanner):
         local = experts // ranks
         hidden, size = request.hidden.shape[-1], request.hidden.element_size()
         target = (request.total_rows + ranks - 1) // ranks
-        limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
+        effective_top_k = request.top_k if request.top_k is not None else request.ids.shape[-1]
+        limit = placement_receive_limit(target, ranks, local, effective_top_k, hidden, size)
         if request.maximum_received <= limit:
             return None
         # Native autograd owns the borrowed operands. Replay restores a local

@@ -40,6 +40,7 @@ class PlacementRequest:
     ordinary_receive_capacity: int | None = None
     apply_probs_before_fc2: bool = True
     count_key: tuple[Any, ...] | None = None
+    top_k: int | None = None
 
 
 @dataclass(frozen=True)

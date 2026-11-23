@@ -35,3 +35,18 @@ torchrun --standalone --nproc_per_node=4 examples/longcat_flash/validate.py \
   --ep 4 --tokens 2048 --hidden 6144 --intermediate 2048 --real 32 --zero 16 --top-k 12 \
   --warmup 10 --samples 50 --output /tmp/longcat_bench_hot_replica
 ```
+
+### MoonEP (HotReplica) Validation & Benchmark (Atlas A3)
+
+```bash
+# Accuracy across normal / hot / empty_source / identity steps (forced SkewPlanner or HotReplicaPlanner)
+torchrun --nproc_per_node=4 examples/longcat_flash/validate_moonep.py \
+  --check accuracy --planner skew --real 32 --zero 16 \
+  --exercise-edge-routes --updates 4 --output /tmp/longcat_moonep_acc
+
+# Benchmark MoonEP vs baseline under hot skew
+torchrun --nproc_per_node=4 examples/longcat_flash/validate_moonep.py \
+  --check benchmark --planner hot_replica --source-token-bound 2048 \
+  --real 32 --zero 16 --route-fixture hot --compare-baseline \
+  --warmup 10 --samples 50 --output /tmp/longcat_moonep_bench
+```

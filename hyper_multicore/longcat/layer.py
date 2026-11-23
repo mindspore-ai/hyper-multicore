@@ -41,8 +41,11 @@ from hyper_multicore.modules.mega_moe.backends.bf16.autograd import (
     _native_weight_operand,
     _prepare_forward_execution,
 )
+from hyper_multicore.modules.base_planner import BasePlanner, ExpertPlacement
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import MegaMoePlan
 from hyper_multicore.modules.mega_moe.backends.bf16.resources import BF16Resources
+from hyper_multicore.modules.mega_moe.module import _placement_planner
+from hyper_multicore.modules.mega_moe.placement_options import MegaMoePlacementOptions
 from hyper_multicore.modules.mega_moe.route import (
     _HOST_ROUTE_MAX_COUNTS,
     RouteMetadata,
@@ -324,6 +327,7 @@ class LongcatFlashExperts(MulticoreModule):
         replica_granularity: ReplicaGranularity = "expert",
         replica_min_rows: int = 1024,
         replica_minimum_load_reduction: float | None = None,
+        expert_placement: MegaMoePlacementOptions | None = None,
     ) -> None:
         """Initialize an isolated, parameterless lazy LongCat Flash expert executor."""
         resolved_ep = _resolve_ep_size(ep_size, ep_group)
@@ -346,11 +350,32 @@ class LongcatFlashExperts(MulticoreModule):
             replica_min_rows=replica_min_rows,
             replica_minimum_load_reduction=replica_minimum_load_reduction,
         )
+        planner = _placement_planner(expert_placement)
+        if planner is not None:
+            if replica_slots_per_rank > 0:
+                raise ValueError("expert_placement cannot be combined with replica_slots_per_rank > 0.")
+            if dispatch_mode != "push":
+                raise ValueError("HotReplica requires BF16 precision and push dispatch.")
+            if resolved_ep <= 1:
+                raise ValueError("HotReplica requires an explicit EP group with more than one rank.")
+        source_bound = planner.source_token_bound if planner is not None else None
+        planner_key = None
+        if planner is not None:
+            settings = planner.configuration_key()
+            if not isinstance(settings, str):
+                raise TypeError("Planner configuration_key() must return a string.")
+            planner_key = (type(planner).__module__, type(planner).__qualname__, settings)
         init_factor, growth_factor = _resolve_capacity_factors(
             dispatch_mode, initial_capacity_factor, capacity_growth_factor
         )
         scheduler = validate_schedule_options(None)
         effective_real_top_k = min(top_k, num_experts)
+        if source_bound is not None:
+            limit = (
+                (2**31 - 1) // max(hidden_size, effective_real_top_k) // _COMMUNICATION_SPLIT * _COMMUNICATION_SPLIT
+            )
+            if source_bound > limit:
+                raise ValueError(f"HotReplica source_token_bound exceeds {limit} rows.")
         physical_experts = num_experts + resolved_ep * replica_slots_per_rank
         initial_tokens = (
             _COMMUNICATION_SPLIT
@@ -376,9 +401,9 @@ class LongcatFlashExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
             "precision": "bf16",
-            "hot_replica": False,
-            "planner_key": None,
-            "source_token_bound": None,
+            "hot_replica": planner is not None,
+            "planner_key": planner_key,
+            "source_token_bound": source_bound,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",
@@ -421,10 +446,12 @@ class LongcatFlashExperts(MulticoreModule):
         self.replica_minimum_load_reduction = (
             None if replica_minimum_load_reduction is None else float(replica_minimum_load_reduction)
         )
+        self._planner: BasePlanner | None = planner
         self._replica_pool = LongcatReplicaPool()
         self._invocation_counter = 0
         self._last_plan: MegaMoePlan | None = None
         self._last_replica_plan: LongcatReplicaPlan | None = None
+        self._last_placement: ExpertPlacement | None = None
 
         gate_experts = self.local_experts + (self.local_zero_experts if gate_up_padded else 0)
         self._weight_shapes = {
@@ -693,6 +720,7 @@ class LongcatFlashExperts(MulticoreModule):
 
         if total_real_across_ep == 0:
             self._last_replica_plan = None
+            self._last_placement = None
             if grad_enabled:
                 out = _IdentityOnlyFunction.apply(hidden_flat, router_weights, all_permuted, mapping)
                 return out.reshape_as(hidden)
@@ -718,9 +746,12 @@ class LongcatFlashExperts(MulticoreModule):
         use_replicas = replica_plan is not None and not replica_plan.home_only
 
         resources = self._get_execution_resources(hidden_flat)
+        active_resources = resources
         pull = resources.spec.dispatch_mode == "pull"
         claimed = False
-        weight_binding: LongcatReplicaBinding | None = None
+        weight_binding: Any = None
+        placement: ExpertPlacement | None = None
+        self._last_placement = None
 
         if local_real_rows == total_slots:
             real_x = all_permuted
@@ -731,7 +762,80 @@ class LongcatFlashExperts(MulticoreModule):
 
         try:
             with torch.inference_mode(False), torch.no_grad():
-                if use_replicas:
+                slot_ids_for_permute: torch.Tensor | None = None
+                if self._planner is not None:
+                    assert resources.placement is not None
+                    autograd_mask = (
+                        int(grad_enabled)
+                        | (int(hidden_flat.requires_grad) << 1)
+                        | (int(real_gate_up.requires_grad) << 2)
+                        | (int(down.requires_grad) << 3)
+                        | (int(router_weights.requires_grad) << 4)
+                    )
+                    source_rows = (
+                        [sum(row) for row in counts_host]
+                        if counts_host is not None
+                        else [local_real_rows]
+                    )
+                    real_ids_placeholder = torch.empty(
+                        (local_real_rows, 1), dtype=torch.int32, device=hidden_flat.device
+                    )
+                    real_inverse = torch.arange(
+                        local_real_rows, dtype=torch.int32, device=hidden_flat.device
+                    )
+                    header = torch.zeros(
+                        (self.ep_size, 3), dtype=counts_by_source.dtype, device=counts_by_source.device
+                    )
+                    gathered_for_placement = torch.cat((header, counts_by_source), dim=1)
+                    selected = resources.placement.select(
+                        hidden_flat,
+                        real_ids_placeholder,
+                        gathered_for_placement,
+                        (expert_capacity, plan_tokens, max_received),
+                        source_rows,
+                        real_inverse,
+                        autograd_mask,
+                        planner=self._planner,
+                        host_rows=counts_host,
+                        top_k=self.effective_real_top_k,
+                    )
+                    if selected is not None:
+                        active_resources, placement, weight_binding = selected
+                        self._last_placement = placement
+                        table = placement.counts_by_source.to(torch.int32).contiguous()
+                        virtual_experts = int(table.shape[1])
+                        active_counts_by_source = table
+                        active_counts = table[rank_id].contiguous()
+                        route_spec = replace(active_resources.spec, num_experts=virtual_experts)
+                        route_experts = (
+                            virtual_experts
+                            if virtual_experts != active_resources.spec.num_experts
+                            else None
+                        )
+                        expert_capacity = max(1, placement.received_rows(rank_id))
+                        max_received = placement.receive_capacity
+                        max_per_expert = int(table.max().item()) if table.numel() else 0
+                        required_tokens = max(
+                            max_tokens,
+                            max_per_expert,
+                            (max_source_real + self.effective_real_top_k - 1) // self.effective_real_top_k,
+                        )
+                        plan_tokens = max(_COMMUNICATION_SPLIT, _align_capacity(required_tokens))
+                        virt_per_rank = virtual_experts // self.ep_size
+                        start = rank_id * virt_per_rank
+                        all_experts_active = bool(
+                            (table[:, start : start + virt_per_rank].sum(dim=0) > 0).all().item()
+                        )
+                        if local_real_rows > 0:
+                            slot_ids_for_permute = (
+                                placement.virtual_ids.reshape(-1, 1).to(torch.int64).contiguous()
+                            )
+                    else:
+                        route_experts = None
+                        route_spec = resources.spec
+                        active_counts = real_counts
+                        active_counts_by_source = counts_by_source
+                elif use_replicas:
                     assert replica_plan is not None
                     phys_counts_by_source = torch.tensor(
                         replica_plan.dispatch_counts, dtype=torch.int32, device=hidden_flat.device
@@ -765,6 +869,10 @@ class LongcatFlashExperts(MulticoreModule):
                         self._ep_group,
                         self._invocation_counter,
                     )
+                    if local_real_rows > 0:
+                        slot_ids_for_permute = self._build_physical_slot_ids(
+                            replica_plan.source_quotas[rank_id], hidden_flat.device
+                        )
                 else:
                     route_experts = self.num_experts if self.replica_slots_per_rank > 0 else None
                     route_spec = (
@@ -776,10 +884,10 @@ class LongcatFlashExperts(MulticoreModule):
                     active_counts_by_source = counts_by_source
 
                 if not pull:
-                    resources.workspace.wait_for_reuse()
-                resources.prepare_auto_workspace(plan_tokens, max_received, hidden_flat)
+                    active_resources.workspace.wait_for_reuse()
+                active_resources.prepare_auto_workspace(plan_tokens, max_received, hidden_flat)
                 claimed = pull
-                plan = resources.plan_for_tokens(
+                plan = active_resources.plan_for_tokens(
                     plan_tokens, hidden_flat.device, route_experts=route_experts
                 )
                 metadata = _compute_route_metadata(
@@ -788,14 +896,10 @@ class LongcatFlashExperts(MulticoreModule):
                 metadata = metadata.with_active_experts(all_experts_active, tokens, plan_tokens)
             self._last_plan = plan
 
-            if use_replicas and local_real_rows > 0:
-                assert replica_plan is not None
+            if slot_ids_for_permute is not None and local_real_rows > 0:
                 with torch.no_grad():
-                    phys_slot_ids = self._build_physical_slot_ids(
-                        replica_plan.source_quotas[rank_id], hidden_flat.device
-                    )
                     phys_real_x, real_to_phys_map = load_torch_npu().npu_moe_token_permute(
-                        real_x.contiguous(), phys_slot_ids
+                        real_x.contiguous(), slot_ids_for_permute
                     )
                     real_to_phys_map = real_to_phys_map.reshape(-1).to(torch.int32).contiguous()
                     if local_real_rows == total_slots:
@@ -832,7 +936,7 @@ class LongcatFlashExperts(MulticoreModule):
                     _native_weight_operand(down, plan),
                     metadata,
                     plan,
-                    resources.workspace,
+                    active_resources.workspace,
                     None,
                     router_weights,
                     claimed,
@@ -847,7 +951,7 @@ class LongcatFlashExperts(MulticoreModule):
                     down,
                     metadata,
                     plan,
-                    resources.workspace,
+                    active_resources.workspace,
                     output_context,
                     router_weights,
                     workspace_claimed=claimed,
@@ -855,6 +959,6 @@ class LongcatFlashExperts(MulticoreModule):
                 )
         finally:
             if claimed:
-                resources.workspace.release()
+                active_resources.workspace.release()
 
         return output.reshape_as(hidden)

@@ -148,16 +148,18 @@ class PlacementResources:
         source_rows: list[int],
         inverse: torch.Tensor,
         autograd_mask: int,
-        *, planner: BasePlanner, host_rows: list[list[int]] | None = None,
+        *, planner: BasePlanner, host_rows: list[list[int]] | None = None, top_k: int | None = None,
     ) -> tuple[BF16Resources, ExpertPlacement, ExpertWeightBinding] | None:
         """Choose a virtual route only after the existing count exchange validates it."""
-        request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, host_rows=host_rows)
+        request = self.request(
+            hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, host_rows=host_rows, top_k=top_k
+        )
         return self.bind(hidden, planner.plan(request))
 
     def request(
         self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: tuple[int, ...],
         source_rows: list[int], inverse: torch.Tensor, autograd_mask: int, *,
-        host_rows: list[list[int]] | None,
+        host_rows: list[list[int]] | None, top_k: int | None = None,
     ) -> PlacementRequest:
         """Expose counts and available capacity from one validated MegaMoE route."""
         self.statistics["invocations"] += 1
@@ -172,7 +174,7 @@ class PlacementResources:
             hidden, ids, gathered[:, 3:], inverse, summary[2], sum(source_rows), spec.rank_id,
             spec.intermediate_size, spec.num_cube_cores, replay or bool(autograd_mask & 1),
             checkpointing=replay, ordinary_receive_capacity=self.parent.workspace.capacity_floor if bounded else None,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2, count_key=key,
+            apply_probs_before_fc2=spec.apply_probs_before_fc2, count_key=key, top_k=top_k,
         )
 
     def bind(
