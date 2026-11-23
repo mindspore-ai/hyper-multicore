@@ -28,6 +28,7 @@
 #endif
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
+#include "common/mega_moe/replica_weight_ready.h"
 
 using namespace AscendC;
 
@@ -54,6 +55,13 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, M));
   static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
     offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
+
+  __aicore__ inline void RunForward() {
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
+#endif
+    this->Process();
+  }
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     if (!IsMoeTaskOptionsValid(task_desc, WORKSPACE_IDX)) AscendC::Trap();
@@ -91,6 +99,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   }
 
  private:
+  const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
+
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
       uint32_t bits;
@@ -242,9 +252,6 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        GM_ADDR grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
-        GlobalTensor<int64_t> grouped_list_tensor_real;
-        grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
         const bool batched = IsBatchedGroupedMatmulTask(task_desc);
         if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
@@ -252,47 +259,65 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
             this->WaitForDependency(task_desc.dependent_event + expert, task_desc.dependency_poll_interval_us);
           }
         }
-        int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index);
-        int64_t start = 0;
-        if (data_index != 0) {
-          value = value - grouped_list_tensor.GetValue(data_index - 1);
-          start = grouped_list_tensor.GetValue(data_index - 1);
-        }
+        const int64_t start = data_index == 0 ? 0 : grouped_list_tensor.GetValue(data_index - 1);
+        const int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index) - start;
         if (value == 0) {
           return;
         }
+        const uint32_t weight = task_desc.inputs[1].input_position;
         const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
-        if (single_group) {
-          grouped_list_tensor_real.SetValue(0, value);
-          cacheWriteThrough(grouped_list_real, sizeof(int64_t));
-        } else {
-          for (uint32_t i = 0; i < expert_num_single_rank; ++i) {
-            grouped_list_tensor_real.SetValue(
-                i, batched ? grouped_list_tensor.GetValue(i) : (i >= data_index ? value : 0));
-          }
-          cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
-        }
-
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+        const bool explicit_split = !batched && value > 0 && value <= INT32_MAX;
+#else
+        constexpr bool explicit_split = false;
+#endif
+        GM_ADDR grouped_list_real = nullptr;
         GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
-        __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
-        tilingdata_data->gmmBaseParams.m = value;
-        tilingdata_data->mmTilingData.M = value;
-        tilingdata_data->mmTilingData.singleCoreM = value;
-        cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
-        cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
-        PipeBarrier<PIPE_ALL>();
+        if (!explicit_split) {
+          grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
+          GlobalTensor<int64_t> grouped_list_tensor_real;
+          grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
+          if (single_group) {
+            grouped_list_tensor_real.SetValue(0, value);
+            cacheWriteThrough(grouped_list_real, sizeof(int64_t));
+          } else {
+            for (uint32_t i = 0; i < expert_num_single_rank; ++i) {
+              grouped_list_tensor_real.SetValue(
+                  i, batched ? grouped_list_tensor.GetValue(i) : (i >= data_index ? value : 0));
+            }
+            cacheWriteThrough(grouped_list_real, expert_num_single_rank * sizeof(int64_t));
+          }
+
+          __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
+          tilingdata_data->gmmBaseParams.m = value;
+          tilingdata_data->mmTilingData.M = value;
+          tilingdata_data->mmTilingData.singleCoreM = value;
+          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+          PipeBarrier<PIPE_ALL>();
+        }
 
         int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
         int64_t output_0_offset = GmmRowOffset(task_desc.outputs[0], start);
-        const int64_t weight_offset = single_group ?
-            static_cast<int64_t>(data_index) * task_desc.inputs[1].dim[1] *
-                task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type : 0;
+        const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+            task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+        const int64_t weight_offset = single_group ? data_index * matrix_bytes : 0;
+        GM_ADDR weight_base = input_list[weight] + weight_offset;
+        if (weight == 5 || weight == 9) {
+          weight_base = MulticoreMoE::ReplicaWeight(weight_base, matrix_bytes, data_index, weight == 5 ? 0 : 1,
+              replica_launch_, single_group);
+        }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + weight_offset, nullptr, nullptr, nullptr,
+                       weight_base, nullptr, nullptr, nullptr,
                        nullptr, nullptr, grouped_list_real, nullptr,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, task_desc.inputs[0].transpose_flag == 1,
-                       task_desc.inputs[1].transpose_flag == 1);
+                       task_desc.inputs[1].transpose_flag == 1
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+                       , false, nullptr, 0, 0, explicit_split ? static_cast<int32_t>(value) : 0,
+                       single_group, single_group ? 0 : data_index
+#endif
+        );
       }
       return;
     }
@@ -372,5 +397,5 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
                                                 GM_ADDR *input_list) {
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
-  worker.Process();
+  worker.RunForward();
 }

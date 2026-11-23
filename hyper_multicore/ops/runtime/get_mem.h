@@ -20,8 +20,9 @@
 #include "data_plane/rma.h"
 
 template <typename T>
-__aicore__ inline void PullToLocal(GM_ADDR destination, GM_ADDR source, int64_t elements, int source_pe) {
-  hyper_multicore::shmem::data_plane::get_pipelined<T>(destination, source, elements, source_pe);
+__aicore__ inline void PullToLocal(GM_ADDR destination, GM_ADDR source, int64_t elements, int source_pe,
+                                  uint64_t max_block_bytes = 4 * 1024) {
+  hyper_multicore::shmem::data_plane::get_pipelined<T>(destination, source, elements, source_pe, max_block_bytes);
 }
 
 #endif  // HYPER_MULTICORE_MULTICORE_GET_MEM_H

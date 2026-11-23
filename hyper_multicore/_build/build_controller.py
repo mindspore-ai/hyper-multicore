@@ -125,29 +125,27 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
                         [f"-DSHMEM_OPS_LIB={common / sdk['shmem_root'] / 'libhyper_multicore_shmem_ops.so'}",
                          f"-DHP_SHMEM_SOC_TYPE={sdk['sdk_soc_type']}"],
                         args, run, selected_env, identifier + "-" + backend)
-        if backend == "arch22" and "ascend910_93" in args.soc_list.split(","):
+        replica_target = MANIFEST.HOT_REPLICA_BF16_TARGETS.get(backend)
+        if replica_target is not None and replica_target[0] in args.soc_list.split(","):
             with run.commands.scope("HotReplica"):
                 replica_output = output / "hot_replica"
+                device_root = common / f"shmem/lib/{backend}/hot_replica"
                 standard = (directory / "torch/torch_cxx_standard.txt").read_text().strip()
                 run.commands(
                     [str(python), str(ROOT / "hyper_multicore/modules/hot_replica/build.py"), "--phase", "adapter",
-                     "--device-root", str(common / "shmem/lib/arch22/hot_replica"),
+                     "--device-root", str(device_root),
                      "--sdk-root", str(Path(sdk["install_root"]) / "shmem"), "--cxx-standard", standard,
-                     "--output-dir", str(replica_output)], label=f"compile-{identifier}-hot_replica", env=selected_env)
+                     "--output-dir", str(replica_output)],
+                    label=f"compile-{identifier}-hot_replica-{backend}", env=selected_env)
                 link_env = {**selected_env, "LD_LIBRARY_PATH": os.pathsep.join(
-                    [str(replica_output), str(common / "shmem/lib/arch22/hot_replica"),
+                    [str(replica_output), str(device_root),
                      selected_env.get("LD_LIBRARY_PATH", "")])}
-                for name in ("_a3_allocator.so", "_hot_replica_shared_bridge.so"):
-                    validate_elf(replica_output / name, identity["host_arch"], run.commands, link_env)
+                validate_elf(replica_output / "_hot_replica_shared_bridge.so", identity["host_arch"],
+                             run.commands, link_env)
+                paths[replica_target[1]] = MANIFEST.hot_replica_bf16_paths(identifier, backend)
         with run.commands.scope("Load"):
             load_backend(python, payload, common, sdk, backend, run, selected_env, identifier)
         validate_elf(output / "hyper_multicore_shmem_torch.so", identity["host_arch"], run.commands, selected_env)
-    if "ascend910_93" in args.soc_list.split(","):
-        paths["hot_replica"] = {
-            "soc": "ascend910_93", "kernels": "shmem/lib/arch22/hot_replica/libhmc_hot_replica_kernels.so",
-            "allocator": f"adapters/{identifier}/shmem/arch22/hot_replica/_a3_allocator.so",
-            "bridge": f"adapters/{identifier}/shmem/arch22/hot_replica/_hot_replica_shared_bridge.so",
-        }
     record = {**identity, **paths, "id": identifier,
               "native_build_identity": {k: identity[k] for k in ("build_commit", "source_sha256", "build_fingerprint")}}
     write_json(directory / "identity.json", record)
@@ -410,13 +408,17 @@ def build_common(args: argparse.Namespace, run: BuildContext, python: Path) -> t
     for request in run.vendor_requests:
         run.events.append({"stage": "vendor", **{k: request[k] for k in
                           ("soc", "reused", "lookup_seconds", "compile_seconds") if k in request}})
-    if "ascend910_93" in args.soc_list.split(","):
-        sdk = sdks["arch22"]
-        replica_output = common / "shmem/lib/arch22/hot_replica"
+    for backend, (soc, _) in MANIFEST.HOT_REPLICA_BF16_TARGETS.items():
+        if soc not in args.soc_list.split(","):
+            continue
+        sdk = sdks[backend]
+        replica_output = common / f"shmem/lib/{backend}/hot_replica"
         replica_env = shmem_environment(env, common, sdk)
         run.commands([str(python), str(ROOT / "hyper_multicore/modules/hot_replica/build.py"), "--phase", "common",
+                      "--npu-arch", str(sdk["npu_arch"]),
                       "--sdk-root", str(Path(sdk["install_root"]) / "shmem"),
-                      "--output-dir", str(replica_output)], label="compile-hot_replica-device", env=replica_env)
+                      "--output-dir", str(replica_output)],
+                     label=f"compile-hot_replica-device-{backend}", env=replica_env)
         validate_elf(replica_output / "libhmc_hot_replica_kernels.so", platform.machine(), run.commands, replica_env)
     run.events.append({"stage": "common", "compiled": True, "socs": args.soc_list})
     return common, sdks
@@ -579,14 +581,15 @@ def assemble_payload(
         "host_arch": identities[0]["host_arch"],
         "variants": [
             {k: record[k] for k in
-             ("id", "torch_release", "pta_release", "torch_cxx11_abi", "torch_so", "shmem_so", "hot_replica")
-             if k in record}
+             ("id", "torch_release", "pta_release", "torch_cxx11_abi", "torch_so", "shmem_so",
+              *(key for _, key in MANIFEST.HOT_REPLICA_BF16_TARGETS.values())) if k in record}
             for record in records
         ],
         "validated_runtime_pairs": [],
         "known_runtime_issues": [],
     }
     write_json(payload / "adapters/manifest.json", manifest)
+    builds_a3 = "ascend910_93" in args.soc_list.split(",")
     info = {
         **identities[0],
         "schema_version": 3,
@@ -598,6 +601,8 @@ def assemble_payload(
         ),
         "requested_target_ids": [v["id"] for v in records],
         "reference_cann": identities[0].get("reference_cann"),
+        "a3_replica_bf16_partials": builds_a3,
+        "a3_bf16_pull_runtime_rows": builds_a3,
         "framework_lock_sha256": (
             MANIFEST.file_sha256(ROOT / "hyper_multicore/_build/frameworks.lock.json") if args.all else None
         ),

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Checkpoint-owned routing and replica state for reentrant BF16 push."""
+"""Checkpoint-owned routing and replica state for BF16 Push."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ class ReplayRecord:
 
     owner: Any
     ids: torch.Tensor | None = None
+    counts: torch.Tensor | None = None
     route: Any = None
     stream: Any = None
     inputs: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -42,6 +43,16 @@ class ReplayRecord:
     activation: Any = None
     allow_activation: bool = False
     weight_binding: Any = None
+
+    @contextmanager
+    def save_supplied_route(self, ids: torch.Tensor, counts: torch.Tensor) -> Iterator[None]:
+        """Read the Router inputs before staging permutations on the same stream."""
+        self.ids, self.counts, ready = _stage_router_inputs(ids, counts, self.stream)
+        try:
+            yield
+        finally:
+            if ready is not None:
+                ready.synchronize()
 
 
 @dataclass
@@ -59,7 +70,7 @@ class ReplayCheckpoint:
     """Hold one checkpoint invocation's tape across original and replay contexts."""
 
     def __init__(self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False) -> None:
-        """Register the caller's version lookup and opt in to early restoration."""
+        """Register the caller's parameter version lookup."""
         self.parameter_version = parameter_version
         self.prepare_replay = prepare_replay
         self.records: list[ReplayRecord] = []
@@ -72,7 +83,9 @@ class ReplayCheckpoint:
         if not replay:
             self.records.clear()
             self.forward_version = version
-        state = _CheckpointScope(self.records, replay, version is not None and version == self.forward_version)
+        state = _CheckpointScope(
+            self.records, replay, version is not None and version == self.forward_version,
+        )
         token = _ACTIVE.set(state)
         try:
             if replay and state.same_parameters and self.prepare_replay and len(self.records) == 1:
@@ -106,7 +119,7 @@ def wrap_checkpoint(
 
 
 def is_checkpointing() -> bool:
-    """Report whether route selection is in a reentrant checkpoint call."""
+    """Report whether route selection is in a checkpoint call."""
     return _ACTIVE.get() is not None
 
 
@@ -126,6 +139,19 @@ def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
     return None, True
 
 
+def _stage_router_inputs(ids: torch.Tensor, counts: torch.Tensor, stream: Any):
+    """Return both host tensors and the completion point for their copies."""
+    pinned = ids.device.type == "npu"
+    host_ids = torch.empty(ids.shape, dtype=ids.dtype, device="cpu", pin_memory=pinned)
+    host_counts = torch.empty(counts.shape, dtype=counts.dtype, device="cpu", pin_memory=pinned)
+    host_ids.copy_(ids, non_blocking=pinned)
+    host_counts.copy_(counts, non_blocking=pinned)
+    ready = torch.npu.Event() if pinned else None
+    if ready is not None:
+        ready.record(stream)
+    return host_ids, host_counts, ready
+
+
 def agree_replay(
     record: ReplayRecord | None, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
     counts: torch.Tensor | None, spec: Any, mask: int, *, weight_error: bool,
@@ -133,13 +159,21 @@ def agree_replay(
     """Agree across EP on exact routing and independent activation validity."""
     scope = _ACTIVE.get()
     valid = (
-        record is not None and record.route is not None and counts is None
+        record is not None and record.ids is not None and record.route is not None
         and not weight_error and record.ids.shape == ids.shape and record.ids.dtype == ids.dtype
         and record.stream == torch.npu.current_stream(hidden.device)
         and scope is not None and scope.same_parameters
     )
     with torch.no_grad():
-        if valid:
+        if valid and counts is not None and record.counts is not None and (
+                counts.device == ids.device and counts.shape == record.counts.shape
+                and counts.dtype == record.counts.dtype):
+            host_ids, host_counts, ready = _stage_router_inputs(ids, counts, record.stream)
+            if ready is not None:
+                ready.synchronize()
+            same_route = torch.equal(host_ids, record.ids) and torch.equal(host_counts, record.counts)
+            flag = torch.full((1,), mask if same_route else 0, dtype=torch.int32, device=hidden.device)
+        elif valid and counts is None and record.counts is None:
             same_ids = (ids == record.ids).all()
             flag = same_ids.to(torch.int32).reshape(1) * mask
             if record.activation is not None and record.inputs is not None:
@@ -156,7 +190,7 @@ def agree_replay(
     first = flags[0] % 32
     reuse = first != 0 and all(value % 32 == first for value in flags)
     if record is not None:
-        record.allow_activation = reuse and all(value >= 32 for value in flags)
+        record.allow_activation = reuse and all(value & 32 for value in flags)
     return reuse
 
 
@@ -171,13 +205,12 @@ class ActivationReservation:
 
     @classmethod
     def reserve(
-        cls, flat: torch.Tensor, required: int, group: dist.ProcessGroup, *, native: bool = False,
+        cls, flat: torch.Tensor, required: int, group: dist.ProcessGroup,
     ) -> ActivationReservation | None:
         """Charge a local snapshot while retaining headroom for FSDP."""
         device = flat.device
         key = (device, id(group))
         with cls.lock:
-            key = (*key, native)
             if key not in cls.limits:
                 total = torch.npu.get_device_properties(device).total_memory
                 free = torch.npu.mem_get_info(device)[0]
@@ -186,7 +219,7 @@ class ActivationReservation:
                 # heap. Leave headroom for transient allocations. Admission can
                 # differ by rank, and the existing replay consensus handles
                 # a local miss without introducing a conditional collective.
-                default_limit = total // (4 if native else 6)
+                default_limit = total // 6
                 limit = default_limit if configured is None else max(0, int(configured))
                 local_limit = min(limit, max(0, free - total // 3))
                 cls.limits[key] = local_limit, free

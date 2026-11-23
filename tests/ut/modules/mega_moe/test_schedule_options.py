@@ -18,7 +18,9 @@ from hyper_multicore.modules.mega_moe.schedule import (
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
 from hyper_multicore.modules.mega_moe.backends.bf16 import resources as bf16
+from hyper_multicore.scheduler.config import TaskType
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
+from hyper_multicore.tasks.alltoall import ShmemTaskPartition
 
 
 def test_only_implemented_policies_are_available():
@@ -71,6 +73,19 @@ def test_arch22_rejects_ineffective_explicit_options():
         _build_runtime_artifacts(replace(spec, lowering='compact', dispatch_mode='pull'))
 
 
+@pytest.mark.parametrize("compact_pull", [False, True])
+def test_arch22_compact_get_descriptors_require_bound_pull_support(compact_pull):
+    """Use runtime GET rows only for the qualified A3 Pull schedule."""
+    spec = MegaMoeSpec(4096, 5120, 1792, 192, 8, None, 8192, 32, None, 0, 24,
+                       dispatch_mode="pull", compact_pull=compact_pull)
+    _, forward, _, backward = _build_runtime_artifacts(spec)
+    partition = ShmemTaskPartition.RUNTIME_ROWS if compact_pull else ShmemTaskPartition.FIXED_ROWS
+    for config in (forward, backward):
+        transfers = [task for task in config.all_tasks[:config.task_num] if task.task_type == TaskType.TASK_SHMEM_GET_MEM]
+        assert transfers
+        assert all((task.extra_value_1 & ShmemTaskPartition.RUNTIME_ROWS) == partition for task in transfers)
+
+
 def test_bf16_token_bucket_preserves_bound_lowering_options():
     """Keep BF16 lowering options when selecting a token bucket."""
     resources = bf16.BF16Resources.__new__(bf16.BF16Resources)
@@ -78,9 +93,13 @@ def test_bf16_token_bucket_preserves_bound_lowering_options():
                                  batch_experts=True, nominal_schedule=True)
     resources._token_capacity = 512
     resources._plans = {}
-    with patch.object(bf16, 'build_mega_moe_plan', side_effect=lambda spec, _: SimpleNamespace(spec=spec)):
+    with patch.object(bf16, 'build_mega_moe_plan', side_effect=lambda spec, _, **kwargs: SimpleNamespace(spec=spec)):
         plan = resources.plan_for_tokens(384, 'cpu')
         assert plan.spec.batch_experts and plan.spec.nominal_schedule
+        assert resources.plan_for_tokens(384, 'cpu') is plan
+        fused = resources.plan_for_tokens(384, 'cpu', replica_pipeline=True)
+        assert not fused.spec.batch_experts and fused.spec.nominal_schedule
+        assert resources.plan_for_tokens(384, 'cpu', replica_pipeline=True) is fused
         assert resources.plan_for_tokens(384, 'cpu') is plan
 
 

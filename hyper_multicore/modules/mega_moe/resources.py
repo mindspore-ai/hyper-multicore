@@ -20,9 +20,9 @@ import torch
 import torch.distributed as dist
 from hyper_multicore import _collective, shmem
 from . import transport as moe_transport
-from .heap_manager import _WorkspaceLayout, _get_heap_manager, _workspace_layout
-from .spec import bind_mega_moe_spec
-from .workspace import MegaMoeWorkspace
+from .heap_manager import _get_heap_manager, _workspace_layout
+from .spec import MegaMoeSpec, bind_mega_moe_spec
+from .workspace import MegaMoeWorkspace, _workspace_event_experts
 
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
@@ -36,7 +36,6 @@ class _MegaMoeExecutionResources:
         expert_weight_layout: str,
         shared: bool,
         active_specifications: tuple[Mapping[str, Any], ...],
-        workspace_layout: _WorkspaceLayout | None = None,
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         bound_specification = {**specification, "expert_weight_layout": expert_weight_layout}
@@ -46,26 +45,22 @@ class _MegaMoeExecutionResources:
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
         # Agree on optional stages before any HotReplica-only collective.
-        if specification.get("hot_replica"):
+        placement = specification.get("hot_replica", False)
+        replica_bf16_partials = False
+        if placement:
             from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
-            require_capability(tensor, specification["ep_group"])
-        initial_headroom = 0
-        if workspace_layout is not None:
-            reservations = ((specification, workspace_layout),)
-        elif specification.get("hot_replica"):
-            from hyper_multicore.modules.hot_replica.mega_moe_adapter import workspace_reservations  # pylint: disable=import-outside-toplevel
-
-            reservations, initial_headroom = workspace_reservations(
-                active_specifications, tensor.dtype, self.spec.num_cube_cores
+            replica_bf16_partials = require_capability(
+                tensor, specification["ep_group"],
+                dispatch_mode=self.spec.dispatch_mode,
             )
-        else:
-            reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
+            if self.spec.architecture == 2201 and self.spec.dispatch_mode == "pull":
+                self.spec = replace(self.spec, compact_pull=True)
+        reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         added_specifications = self.heap_manager.reserve(
             reservations,
             allow_resize=any(item.get("dispatch_mode", "push") == "push" or item.get("auto_tokens", False)
                              for item in active_specifications),
-            initial_headroom=initial_headroom,
         )
         attached = False
         self.plan = None
@@ -77,7 +72,8 @@ class _MegaMoeExecutionResources:
                 """Build and bind local resources before converging construction results."""
                 transport = self.spec.transport_engine
                 if transport in (None, "udma"):
-                    active_udma = shmem.debug_state()["config"]["data_engine"] == "mte_udma"
+                    config = shmem.debug_state()["config"]
+                    active_udma = config["data_engine"] == "mte_udma"
                     if transport == "udma" and not active_udma:
                         raise ValueError("UDMA tasks require SHMEM initialized with mte_udma")
                     if transport is None:
@@ -86,7 +82,9 @@ class _MegaMoeExecutionResources:
                 if transport == "udma":
                     moe_transport.require_queue_backend()
                 self.plan = self._initial_plan(tensor)
-                self.workspace = MegaMoeWorkspace(shared=shared)
+                self.workspace = MegaMoeWorkspace(
+                    shared=shared, event_experts=_workspace_event_experts(specification) if placement else None,
+                )
                 self.workspace.transport_engine = self.spec.transport_engine
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
@@ -104,12 +102,22 @@ class _MegaMoeExecutionResources:
         self._closed = False
         self._workspace_closed = False
         self.placement = None
-        if specification.get("hot_replica"):
+        if placement:
             from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources  # pylint: disable=import-outside-toplevel
-            self.placement = PlacementResources(self, specification, shared)
+            self.placement = PlacementResources(self, specification, shared, bf16_partials=replica_bf16_partials)
+
+    def _route_spec(self, experts: int | None) -> MegaMoeSpec:
+        """Change the graph's logical width within the same physical workspace."""
+        spec = self.spec
+        if experts is None or experts == spec.num_experts:
+            return spec
+        limit = self.workspace.event_experts or spec.num_experts
+        if not spec.num_experts < experts <= limit or experts % spec.ep_size:
+            raise ValueError("HotReplica route geometry exceeds the shared workspace")
+        return replace(spec, num_experts=experts)
 
     def ensure_capacity(self, maximum_received_slots: int) -> None:
-        """Submit a larger layout, falling back to minimum capacity within an explicit budget.
+        """Submit a larger layout for the validated route.
 
         Args:
             maximum_received_slots: Maximum destination load from the root count exchange.
@@ -159,7 +167,7 @@ class _MegaMoeExecutionResources:
                   "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
-                  "batch_experts", "nominal_schedule", "hot_replica", "source_token_bound", "planner_key")
+                  "batch_experts", "nominal_schedule", "hot_replica", "planner_key")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))

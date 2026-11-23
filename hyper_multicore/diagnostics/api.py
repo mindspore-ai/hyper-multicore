@@ -48,6 +48,12 @@ class MegaKernelDiagnostics:
         return session is not None and session.is_capture_enabled()
 
     @property
+    def is_tensor_dump_active(self) -> bool:
+        """Report whether the tool captures the actual tensor operand bindings."""
+        session = _get_active_session("tensor_dump")
+        return session is not None and session.is_capture_enabled()
+
+    @property
     def metadata(self) -> GraphDiagnosticMetadata:
         """Resolve shared graph metadata explicitly for diagnostics or inspection."""
         return self._runtime.metadata

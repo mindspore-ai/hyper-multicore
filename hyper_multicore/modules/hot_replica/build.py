@@ -49,8 +49,8 @@ def cann_includes(cann: Path, source: Path, sdk: Path) -> list[str]:
     return [f"-I{path}" for path in paths if path.is_dir()]
 
 
-def build_kernels(output: Path, sdk: Path) -> None:
-    """Compile framework-independent AscendC code once per selected A3 backend."""
+def build_kernels(output: Path, sdk: Path, npu_arch: int) -> None:
+    """Compile framework-independent AscendC code for the selected SHMEM backend."""
     source = Path(__file__).parent / "csrc"
     cann = Path(os.environ["ASCEND_HOME_PATH"])
     output.mkdir(parents=True, exist_ok=True)
@@ -58,7 +58,7 @@ def build_kernels(output: Path, sdk: Path) -> None:
         "bisheng",
         "-x",
         "asc",
-        "--npu-arch=dav-2201",
+        f"--npu-arch=dav-{npu_arch}",
         "--cce-auto-sync=off",
         "--cce-fatobj-link",
         "-shared",
@@ -68,7 +68,8 @@ def build_kernels(output: Path, sdk: Path) -> None:
         "-Wl,-z,relro,-z,now,-z,noexecstack",
         *[
             str(source / name)
-            for name in ("a3_allocator.asc", "hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp")
+            for name in ("hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp",
+                         "replica_counts.cpp")
         ],
         "-o",
         str(output / "libhmc_hot_replica_kernels.so"),
@@ -126,22 +127,18 @@ def build_adapters(output: Path, sdk: Path, device_root: Path, standard: int) ->
         "-lruntime",
         "-ldl",
     ]
-    for name, filename in (
-        ("_a3_allocator", "allocator_bridge.cpp"),
-        ("_hot_replica_shared_bridge", "hot_replica_shared_bridge.cpp"),
-    ):
-        subprocess.run(
-            [
-                *common,
-                f"-DTORCH_EXTENSION_NAME={name}",
-                str(source / filename),
-                "-o",
-                str(output / (name + ".so")),
-                *includes,
-                *libraries,
-            ],
-            check=True,
-        )
+    subprocess.run(
+        [
+            *common,
+            "-DTORCH_EXTENSION_NAME=_hot_replica_shared_bridge",
+            str(source / "hot_replica_shared_bridge.cpp"),
+            "-o",
+            str(output / "_hot_replica_shared_bridge.so"),
+            *includes,
+            *libraries,
+        ],
+        check=True,
+    )
 
 
 def main() -> None:
@@ -149,12 +146,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("common", "adapter"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--sdk-root", type=Path, required=True)
+    parser.add_argument("--sdk-root", type=Path)
     parser.add_argument("--device-root", type=Path)
     parser.add_argument("--cxx-standard", type=int, default=17)
+    parser.add_argument("--npu-arch", type=int, choices=(2201,), default=2201)
     args = parser.parse_args()
+    if args.sdk_root is None:
+        parser.error("--sdk-root is required for BF16 HotReplica builds")
     if args.phase == "common":
-        build_kernels(args.output_dir, args.sdk_root)
+        build_kernels(args.output_dir, args.sdk_root, args.npu_arch)
     else:
         if args.device_root is None:
             parser.error("--device-root is required for adapter builds")

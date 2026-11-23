@@ -174,8 +174,8 @@ class MegaMoeExperts(MulticoreModule):
                 Passing SiTUGLUParameters raises NotImplementedError at construction.
             numerics_options: Probability placement and partial-gradient precision.
                 None uses after-FC2 probability weighting and native partial dW.
-            expert_placement: Placement strategy and planner. Adaptive placement
-                requires A3 BF16 push execution and a multi-rank EP group.
+            expert_placement: Adaptive placement supports Ascend910_93 BF16 Push and MTE Pull
+                with a multi-rank EP group. Pull requires a wheel with runtime-row GET support.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.
                 Options are validated and copied into the instance configuration;
@@ -188,11 +188,19 @@ class MegaMoeExperts(MulticoreModule):
             precision, activation, numerics_options, tuning_options,
         )
         planner = _placement_planner(expert_placement)
-        if planner is not None and (precision != "bf16" or tuning.dispatch_mode != "push"):
-            raise ValueError("HotReplica requires BF16 precision and push dispatch")
-        source_bound = planner.source_token_bound if planner is not None else None
         planner_key = None
+        replica_slots_per_rank = None
+        cross_node_cost = None
         if planner is not None:
+            if precision != "bf16":
+                raise ValueError("HotReplica requires BF16 precision")
+            from ..hot_replica.planner import HotReplicaPlanner  # pylint: disable=import-outside-toplevel
+
+            if isinstance(planner, HotReplicaPlanner):
+                replica_slots_per_rank = planner.replica_slots_per_rank
+                cross_node_cost = planner.cross_node_cost
+            if cross_node_cost is not None and tuning.dispatch_mode != "push":
+                raise ValueError("An explicit HotReplica cross_node_cost requires Push")
             settings = planner.configuration_key()
             if not isinstance(settings, str):
                 raise TypeError("Planner configuration_key() must return a string")
@@ -216,7 +224,8 @@ class MegaMoeExperts(MulticoreModule):
             "precision": precision,
             "hot_replica": planner is not None,
             "planner_key": planner_key,
-            "source_token_bound": source_bound,
+            "replica_slots_per_rank": replica_slots_per_rank,
+            "cross_node_cost": cross_node_cost,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",
@@ -226,10 +235,6 @@ class MegaMoeExperts(MulticoreModule):
         }
         if planner is not None and specification["ep_size"] <= 1:
             raise ValueError("HotReplica requires an explicit EP group with more than one rank")
-        if source_bound is not None:
-            limit = (2**31 - 1) // max(hidden_size, top_k) // _COMMUNICATION_SPLIT * _COMMUNICATION_SPLIT
-            if source_bound > limit:
-                raise ValueError(f"HotReplica source_token_bound exceeds {limit} rows")
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
@@ -502,8 +507,10 @@ class MegaMoeExperts(MulticoreModule):
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
-        with prepare_expert_invocation(hidden_flat, topk_ids, topk_weights, tokens_per_expert,
-                                       weights, resources, weight_error=weight_error, planner=self._planner) as route:
+        with prepare_expert_invocation(
+            hidden_flat, topk_ids, topk_weights, tokens_per_expert, weights, resources,
+            weight_error=weight_error, planner=self._planner,
+        ) as route:
             return self._backend.forward(
                 self, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route,
             )

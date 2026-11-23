@@ -131,7 +131,7 @@ def main() -> int:
         _OPS_TRANSFORMER_MHC_PATHS,
     )
     _apply_locked_adapters(ops_nn_copy, lock["ops_nn"], architecture=args.architecture)
-    _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"])
+    _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"], architecture=args.architecture)
     _apply_locked_adapters(transformer_mhc_copy, transformer_revisions["mhc"])
 
     source_root = work_dir / "source"

@@ -138,15 +138,15 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_explicit_heap_requires_sufficient_aligned_capacity(self) -> None:
-        """Feature: explicit heap requires sufficient aligned capacity.
-        Description: Configure aligned, undersized, partial-page and zero budgets.
-        Expectation: Accept page-aligned capacity while rejecting undersized and partial physical pages.
+    def test_explicit_heap_limit_is_aligned_and_fits_first_layout(self) -> None:
+        """Feature: Explicit heap capacity limit.
+        Description: Configure fitting, undersized, partial-page and zero limits.
+        Expectation: Preserve fitting limits and reject insufficient or malformed limits.
         """
         spec = {"local_num_tokens": 4096, "hidden_size": 5120, "top_k": 8, "num_experts": 48,
                 "ep_size": 4, "initial_capacity_factor": 4.0}
         reference = torch.empty(0, dtype=torch.bfloat16)
-        for mib, error in ((1602, None), (1664, None), (1600, RuntimeError), (1603, ValueError), (0, ValueError)):
+        for mib, error in ((1602, None), (1664, None), (2, RuntimeError), (1603, ValueError), (0, ValueError)):
             with self.subTest(mib=mib), patch.dict(os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(mib * 1024**2)}):
                 if error is None:
                     manager = _HeapManager(None, reference)
@@ -221,11 +221,13 @@ class TestReadyEventWorkspace(unittest.TestCase):
             with self.subTest(forward=forward):
                 self.assertIs(workspace.prepare_event_counters(forward=forward), tensor)
                 self.assertEqual(torch.count_nonzero(tensor).item(), 0)
-                tensor[:workspace.event_counter_bytes].fill_(51)
                 tensor[workspace.event_counter_bytes:].fill_(7)
-                workspace.prepare_event_counters(forward=forward)
-                self.assertEqual(torch.count_nonzero(tensor[:workspace.event_counter_bytes]).item(), 0)
-                self.assertTrue(torch.all(tensor[workspace.event_counter_bytes:] == 7))
+                for logical in (4096, 4352, workspace.event_counter_bytes, 4096):
+                    tensor[:workspace.event_counter_bytes].fill_(51)
+                    view = workspace.prepare_event_counters(forward=forward, counter_bytes=logical)
+                    self.assertEqual(view[logical].data_ptr(), tensor[workspace.event_counter_bytes].data_ptr())
+                    self.assertEqual(torch.count_nonzero(view[:logical]).item(), 0)
+                    self.assertTrue(torch.all(view[logical:] == 7))
         self.assertEqual(mock_barrier.call_count, 2)
         workspace._free_symmetric_tensors()  # pylint: disable=protected-access
         self.assertFalse(workspace.forward_ready_initialized)

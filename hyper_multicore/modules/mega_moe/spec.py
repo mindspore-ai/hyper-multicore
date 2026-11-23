@@ -68,6 +68,7 @@ class MegaMoeSpec:
     ready_depth: int | None = None
     schedule_policy: str = "auto"
     lowering: str = "auto"
+    compact_pull: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -110,13 +111,13 @@ def _resolve_receive_capacity(
     return _align_capacity(requested)
 
 
-def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tuple[int, int]:
-    """Return geometric and minimum capacities without exceeding the lossless bound."""
+def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> int:
+    """Return geometric capacity without exceeding the lossless bound."""
     upper = _align_capacity(spec.ep_size * spec.routed_slots)
     if required > upper:
         raise ValueError("MegaMoe route exceeds the lossless token bound")
     requested = max(required, math.ceil(min(upper, current * spec.capacity_growth_factor)))
-    return min(upper, _align_capacity(requested)), _align_capacity(required)
+    return min(upper, _align_capacity(requested))
 
 
 def _resolve_capacity_factors(
@@ -240,4 +241,5 @@ def bind_mega_moe_spec(
         ready_depth=specification.get("ready_depth"),
         schedule_policy=specification.get("schedule_policy", "auto"),
         lowering=specification.get("lowering", "auto"),
+        compact_pull=specification.get("compact_pull", False),
     )

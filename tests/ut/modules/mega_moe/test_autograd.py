@@ -42,7 +42,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         for tensor in (forward, backward, tiling, diagnostic):
             tensor.device = device
         plan = function_module.MegaMoePlan(
-            spec=None, forward_graph=None,
+            spec=None, forward_graph=None, event_counter_bytes=4096,
             fwd_diagnostics=SimpleNamespace(runtime_config=forward),
             up_proj_tiling=tiling, swiglu_tiling=None, down_proj_tiling=None,
             backward_graph=None, bwd_diagnostics=SimpleNamespace(runtime_config=backward),
@@ -160,6 +160,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         tensors = tuple(torch.ones(1) for _ in range(13))
         context = Mock()
         context.weight_binding = None
+        context.has_unpermute = False
         context.needs_input_grad = (False,) * 9
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
@@ -221,7 +222,9 @@ class TestMegaMoeFunction(unittest.TestCase):
         # CPU-only inputs must not select an installed accelerator for autocast replay.
         self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
         DefaultDeviceType.set_device_type("cpu")
-        self._check_deferred_backward(permuted=False, replay=True)
+        for permuted in (False, True):
+            with self.subTest(permuted=permuted):
+                self._check_deferred_backward(permuted=permuted, replay=True)
 
     def _check_deferred_forward(
         self, source: Any, weight1: Any, weight2: Any, route: Any, plan: Any, workspace: Any,
@@ -232,20 +235,21 @@ class TestMegaMoeFunction(unittest.TestCase):
         tokens = source.shape[0]
         if permuted:
             ids = torch.tensor([[0, 1]] * tokens, dtype=torch.int32)
-            prepared = SimpleNamespace(
-                routed_tokens=source.detach().repeat_interleave(2, dim=0),
-                metadata=route,
-                unpermute_mapping=(torch.arange(tokens * 2, dtype=torch.int32) if vary_tokens
-                                   else torch.tensor([0, 2, 1, 3], dtype=torch.int32)),
-            )
-            output = function_module.execute_mega_moe_with_permutation(
-                source, ids, weight1, weight2, prepared, plan, workspace
-            )
-        elif replay:
-            operation = partial(function_module.execute_mega_moe, route=route, plan=plan, workspace=workspace)
-            output = checkpoint(operation, source, weight1, weight2, use_reentrant=False)
+            mapping = (torch.arange(tokens * 2, dtype=torch.int32) if vary_tokens
+                       else torch.tensor([0, 2, 1, 3], dtype=torch.int32))
+
+            def operation(values: Any, first: Any, second: Any) -> Any:
+                prepared = SimpleNamespace(
+                    routed_tokens=values.detach().repeat_interleave(2, dim=0),
+                    metadata=route, unpermute_mapping=mapping,
+                )
+                return function_module.execute_mega_moe_with_permutation(
+                    values, ids, first, second, prepared, plan, workspace,
+                )
         else:
-            output = function_module.execute_mega_moe(source, weight1, weight2, route, plan, workspace)
+            operation = partial(function_module.execute_mega_moe, route=route, plan=plan, workspace=workspace)
+        output = (checkpoint(operation, source, weight1, weight2, use_reentrant=False)
+                  if replay else operation(source, weight1, weight2))
         if not replay:
             saved = output.grad_fn.saved_tensors
             self.assertEqual(len(saved), 13 if permuted and source.requires_grad else 12)

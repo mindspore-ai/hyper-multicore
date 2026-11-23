@@ -45,6 +45,11 @@ _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
 
 
+def _workspace_event_experts(specification: Mapping[str, Any]) -> int:
+    """Reserve counter space for the widest route that can use this workspace."""
+    return specification["num_experts"] * (2 if specification.get("hot_replica") else 1)
+
+
 def _workspace_allocation_specs(
     *,
     dispatch_mode: str,
@@ -96,16 +101,12 @@ def _spec_workspace_bytes(
         receive_capacity=capacity,
         hidden_size=specification["hidden_size"],
         ep_size=specification["ep_size"],
-        num_experts=specification["num_experts"],
+        num_experts=_workspace_event_experts(specification),
         compute_stages=6 if specification.get("precision") == 'mxfp8' else 3,
         dtype=dtype,
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
     )
-    return sum(
-        spec.dtype.itemsize * math.prod(spec.shape)
-        + spec.alignment_bytes - 1
-        for _, spec in allocations
-    )
+    return sum(spec.dtype.itemsize * math.prod(spec.shape) + spec.alignment_bytes - 1 for _, spec in allocations)
 
 
 class ProbabilityWorkspace:
@@ -161,6 +162,7 @@ class MegaMoeWorkspace:
     in_use: bool = False
     closing: bool = False
     used: bool = False
+    event_experts: int | None = None
     event_counter_bytes: int = MIN_EVENT_CAPACITY * 4
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
@@ -168,9 +170,26 @@ class MegaMoeWorkspace:
     heap_manager: Any | None = field(default=None, repr=False)
     route_cache: Any | None = field(default=None, repr=False)
     route_header_cache: Any | None = field(default=None, repr=False)
+    placement_wire: Any | None = field(default=None, repr=False)
+    placement_readback: Any | None = field(default=None, repr=False)
     route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+
+    def _allocation_specs(self, spec, dtype, capacity):
+        precision = getattr(spec, "precision", "bf16")
+        allocations = _workspace_allocation_specs(
+            dispatch_mode=spec.dispatch_mode,
+            routed_slots=spec.routed_slots,
+            receive_capacity=capacity,
+            hidden_size=spec.hidden_size,
+            ep_size=spec.ep_size,
+            num_experts=self.event_experts or spec.num_experts,
+            compute_stages=6 if precision == "mxfp8" else 3,
+            dtype=dtype,
+            apply_probs_before_fc2=spec.apply_probs_before_fc2,
+        )
+        return allocations
 
     def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:
         """Rebind aliases when heap storage or a retained plan's stride changes."""
@@ -193,17 +212,7 @@ class MegaMoeWorkspace:
         """Project materialized symmetric fields into ordered restart replacements."""
         if self.completion_event is None:
             return ()
-        targets = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=receive_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        targets = self._allocation_specs(spec, dtype, receive_capacity)
         replacement = _lifecycle._AllocationReplacement  # pylint: disable=protected-access
         return tuple(replacement(getattr(self, field_name), target) for field_name, target in targets)
 
@@ -224,17 +233,7 @@ class MegaMoeWorkspace:
             if replacements:
                 raise RuntimeError("lazy workspace must not describe restart Allocations")
             return False
-        expected = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=current_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        expected = self._allocation_specs(spec, dtype, current_capacity)
         if len(replacements) != len(expected):
             raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
         for (field_name, current_spec), replacement in zip(expected, replacements):
@@ -254,17 +253,7 @@ class MegaMoeWorkspace:
         tensors: tuple[torch.Tensor, ...],
     ) -> None:
         """Bind validated replacement Tensors without allocating or running collectives."""
-        targets = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=receive_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        targets = self._allocation_specs(spec, dtype, receive_capacity)
         self.probability_views = None
         self.source_buffer = None
         self.expert_buffer = None
@@ -277,7 +266,7 @@ class MegaMoeWorkspace:
         self.expert_capacity = receive_capacity
         self.routed_slots = spec.routed_slots
         stages = 6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size, stages) * 4
+        self.event_counter_bytes = mega_moe_event_capacity(self.event_experts or spec.num_experts, spec.ep_size, stages) * 4
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
 
@@ -289,17 +278,7 @@ class MegaMoeWorkspace:
         tensors: tuple[torch.Tensor, ...],
     ) -> None:
         """Validate a complete replacement slice without modifying workspace state."""
-        targets = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=receive_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        targets = self._allocation_specs(spec, dtype, receive_capacity)
         if len(tensors) != len(targets):
             raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
         for tensor, (_, target) in zip(tensors, targets):
@@ -346,7 +325,7 @@ class MegaMoeWorkspace:
         if self.closing:
             raise RuntimeError("cannot allocate a closing MegaMoe workspace.")
         requested_capacity = max(spec.receive_capacity, self.capacity_floor)
-        if self.expert_buffer is not None or self.source_buffer is not None:
+        if self.completion_event is not None:
             compatible = (
                 self.dispatch_mode == spec.dispatch_mode
                 and self.dtype == dtype
@@ -363,24 +342,15 @@ class MegaMoeWorkspace:
     @torch.inference_mode(False)
     def _allocate_buffers(self, spec, dtype, device, requested_capacity):
         """Create mutable persistent buffers even after an inference-only first call."""
-        allocations = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=requested_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        allocations = self._allocation_specs(spec, dtype, requested_capacity)
         self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
         stages = 6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3
-        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size, stages) * 4
+        self.event_counter_bytes = mega_moe_event_capacity(self.event_experts or spec.num_experts, spec.ep_size, stages) * 4
+        created = []
         try:
             for field_name, allocation in allocations:
                 setattr(self, field_name, shmem.empty(
@@ -388,6 +358,8 @@ class MegaMoeWorkspace:
                     dtype=allocation.dtype,
                     alignment=allocation.alignment_bytes,
                 ))
+                created.append(field_name)
+            self.completion_event = torch.npu.Event()
             self.gmm_workspace = torch.empty(
                 (_GMM_WORKSPACE_BYTES,),
                 dtype=torch.uint8,
@@ -399,15 +371,16 @@ class MegaMoeWorkspace:
                 dtype=torch.uint8,
                 device=device,
             )
-            self.completion_event = torch.npu.Event()
-            self.completion_stream = None
         except Exception:
-            self._free_symmetric_tensors()
+            for field_name in created:
+                shmem.free(getattr(self, field_name))
+                setattr(self, field_name, None)
             self._free_local_tensors()
+            self.completion_event = None
             raise
 
-    def prepare_event_counters(self, *, forward: bool) -> Any:
-        """Reset per-call counters while preserving the ready generation."""
+    def prepare_event_counters(self, *, forward: bool, counter_bytes: int | None = None) -> Any:
+        """Give each graph its counter prefix ending at the same ready state."""
         if forward:
             field_name = "forward_event_counters"
             events = self.forward_event_counters
@@ -418,9 +391,13 @@ class MegaMoeWorkspace:
             ready_initialized = self.backward_ready_initialized
         if events is None:
             raise RuntimeError(f"MegaMoe workspace {field_name} is not initialized.")
-        events[:self.event_counter_bytes].zero_()
+        offset = 0 if counter_bytes is None else self.event_counter_bytes - counter_bytes
+        if not 0 <= offset < self.event_counter_bytes:
+            raise ValueError("MegaMoe event counters are outside the reserved workspace")
+        events[offset:self.event_counter_bytes].zero_()
+        view = events[offset:] if offset else events
         if events.numel() == self.event_counter_bytes or ready_initialized:
-            return events
+            return view
 
         # Initialize the persistent generation before any peer can signal it.
         events[self.event_counter_bytes:].zero_()
@@ -429,7 +406,7 @@ class MegaMoeWorkspace:
             self.forward_ready_initialized = True
         else:
             self.backward_ready_initialized = True
-        return events
+        return view
 
     def _wait_for_completion(self, stream: Any = None) -> None:
         """FIFO orders the producer stream; another stream still needs its event."""
@@ -538,6 +515,8 @@ class MegaMoeWorkspace:
             self.closing = True
             self.route_cache = None
             self.route_header_cache = None
+            self.placement_wire = None
+            self.placement_readback = None
             self.planned_route_cache = None
             self.route_cache_probe_after = 0
         # An empty rank must still participate when peers retain buffers after a failure.

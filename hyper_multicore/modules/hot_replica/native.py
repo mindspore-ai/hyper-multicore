@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Load the HotReplica placement kernels independently of expert execution."""
+"""Load the private HotReplica communication and count kernels."""
 
 import ctypes
 import importlib
@@ -22,35 +22,37 @@ from pathlib import Path
 import sys
 from types import ModuleType
 
-import torch
-from hyper_multicore._loader import validate_native_compatibility
-from hyper_multicore._native_manifest import SHMEM_DEPENDENCIES
+from hyper_multicore._loader import select_native_shmem, validate_native_compatibility
+from hyper_multicore._native_manifest import HOT_REPLICA_BF16_TARGETS, SHMEM_DEPENDENCIES
 
-# Public enum from CANN's acl/acl_platform.h; the capacity itself is queried.
-from hyper_multicore._device import device_ub_bytes as _device_ub_bytes
+
+@lru_cache(maxsize=1)
+def _selection():
+    selected = validate_native_compatibility()
+    backend, sdk = select_native_shmem(selected)
+    _, key = HOT_REPLICA_BF16_TARGETS[backend]
+    artifacts = selected["variant"].get(key)
+    if artifacts is None:
+        raise RuntimeError(f"Selected HMC adapter has no {backend} BF16 HotReplica capability")
+    return selected["root"], sdk["shmem_root"], artifacts
 
 
 def native_library_path(filename: str) -> Path:
-    """Resolve HotReplica only from the selected, integrity-validated framework artifact."""
-
-    selected = validate_native_compatibility()
-    artifacts = selected["variant"].get("hot_replica")
-    if artifacts is None:
-        raise RuntimeError("Selected HMC adapter has no Atlas A3 HotReplica capability")
+    """Resolve HotReplica from the framework variant and active SHMEM backend."""
+    root, _, artifacts = _selection()
     key = {
-        "_a3_allocator.so": "allocator",
         "_hot_replica_shared_bridge.so": "bridge",
         "libhmc_hot_replica_kernels.so": "kernels",
     }[filename]
-    return selected["root"] / artifacts[key]
+    return root / artifacts[key]
 
 
 @lru_cache(maxsize=1)
 def _load_kernels():
     """Load the selected private dependencies without initializing a SHMEM root."""
 
-    selected = validate_native_compatibility()
-    root = selected["root"] / selected["manifest"]["architectures"]["arch22"]["shmem_root"]
+    root, sdk, _ = _selection()
+    root = root / sdk
     handles = tuple(ctypes.CDLL(str(root / name), mode=ctypes.RTLD_LOCAL) for name in SHMEM_DEPENDENCIES)
     return handles, ctypes.CDLL(str(native_library_path("libhmc_hot_replica_kernels.so")), mode=ctypes.RTLD_GLOBAL)
 
@@ -72,16 +74,3 @@ def load_native_extension(name: str) -> ModuleType:
     spec.loader.exec_module(module)
     sys.modules[module_name] = module
     return module
-
-
-@lru_cache(maxsize=1)
-def load_allocator() -> ModuleType:
-    """Load the device allocator without initializing another SHMEM runtime."""
-    return load_native_extension("_a3_allocator")
-
-
-def allocate_experts(counts: torch.Tensor, capacity: int) -> list[torch.Tensor]:
-    """Run expert placement with the current device's CANN-reported UB budget."""
-    if counts.device.type != "npu":
-        raise ValueError("HotReplica placement requires counts on an Ascend NPU")
-    return load_allocator().allocate(counts, capacity, _device_ub_bytes(counts.device.index))

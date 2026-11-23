@@ -14,6 +14,10 @@
 # ============================================================================
 """Validate placement transfer cost accounting."""
 
+import pytest
+
+from hyper_multicore.modules.hot_replica._planner.planner import build_expert_replica_plan
+from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.hot_replica.placement import placement_is_profitable
 
 
@@ -54,24 +58,43 @@ def test_actual_copy_count_and_backward_fetch_change_profitability(monkeypatch):
     assert placement_is_profitable(**geometry, transfer_experts=2, backward_prefetch_weight_bytes=0)
 
 
-def test_native_plans_to_average_when_grouped_gemms_repay_transfer(monkeypatch):
-    """The receive limit and the native target serve separate purposes."""
-    from unittest.mock import Mock  # pylint: disable=import-outside-toplevel
+@pytest.mark.parametrize("value", [True, 0, -1, float("nan"), float("inf"), "1"])
+def test_cross_node_cost_requires_a_finite_positive_multiplier(value):
+    """Reject invalid or ambiguous values before EP resource binding."""
+    with pytest.raises(ValueError, match="finite positive multiplier"):
+        HotReplicaPlanner(cross_node_cost=value)
 
-    import torch  # pylint: disable=import-outside-toplevel
 
-    from hyper_multicore.modules.hot_replica.planner import (  # pylint: disable=import-outside-toplevel
-        HotReplicaPlanner, PlacementRequest,
-    )
+def test_cross_node_cost_is_part_of_ep_planner_identity():
+    """Two EP members may only share a planner configuration with the same charge."""
+    assert HotReplicaPlanner(cross_node_cost=1).configuration_key() == "cross_node_cost=1.0"
+    assert HotReplicaPlanner(cross_node_cost=0.75).configuration_key() != HotReplicaPlanner().configuration_key()
 
-    planner = HotReplicaPlanner()
-    result = object()
-    builder = Mock(return_value=result)
-    monkeypatch.setattr(planner, "_build", builder)
-    request = PlacementRequest(
-        torch.empty((0, 2560), dtype=torch.bfloat16), torch.empty((0, 8), dtype=torch.int64),
-        torch.zeros((8, 512), dtype=torch.int64), None, 123419, 262080, 0, 768, 24, True,
-    )
-    assert planner.plan(request) is None
-    assert planner.plan_native(request) is result
-    builder.assert_called_once_with(request, 32760)
+
+def test_cross_node_cost_does_not_veto_mandatory_receive_capacity():
+    """A required BF16 capacity plan still has to satisfy the actual row limit."""
+    counts = [[1024, 1024, 0, 0]] * 4
+    plan = build_expert_replica_plan(counts, 1, minimum_load_reduction=0.25, minimum_replica_rows=256,
+                                     capacity_limit=2048, receive_capacity=2048, rank_nodes=(0, 0, 1, 1),
+                                     transfer_row_credit=1024, cross_node_cost=2.0)
+    assert max(plan.destination_loads) <= 2048
+    plan.validate()
+
+
+def test_equal_replica_cost_prefers_fewer_cross_node_token_rows():
+    """Use source quotas for a tie even when every whole-matrix edge costs 1.0."""
+    replicas = 6
+    counts = []
+    for rank in range(16):
+        row = [0] * 96
+        for position in range(4096 * 8):
+            expert = (position + 13 * rank) % 24 + 48 * (rank // 8)
+            row[expert] += 1
+        counts.append(row)
+    options = dict(minimum_replica_rows=1024, minimum_load_reduction=0.25, capacity_limit=393216,
+                   receive_capacity=393216, rank_nodes=(0,) * 8 + (1,) * 8, transfer_row_credit=896)
+    neutral = build_expert_replica_plan(counts, replicas, **options, cross_node_cost=1.0)
+    expensive = build_expert_replica_plan(counts, replicas, **options, cross_node_cost=2.0)
+    assert neutral.transfers and neutral == expensive
+    assert all(edge.owner_rank // 8 == edge.target_rank // 8 for edge in neutral.transfers)
+    neutral.validate()

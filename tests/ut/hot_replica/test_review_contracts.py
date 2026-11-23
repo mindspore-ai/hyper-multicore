@@ -23,7 +23,7 @@ from hyper_multicore.modules.hot_replica import shmem_transfer
 
 
 def test_retry_free_skips_an_already_released_symmetric_allocation(monkeypatch):
-    pool = SimpleNamespace(weights=("first", "second"))
+    pool = SimpleNamespace(weights=("first", "second"), pipeline=None)
     free = Mock(side_effect=[None, RuntimeError("busy"), None])
     monkeypatch.setattr(shmem_transfer.shmem, "free", free)
     with pytest.raises(RuntimeError, match="busy"):
