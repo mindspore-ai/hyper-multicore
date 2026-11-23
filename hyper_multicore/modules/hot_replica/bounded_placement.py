@@ -228,8 +228,11 @@ class BoundedPlacement:
         spec = self.spec
         if self.nodes is None:
             self.nodes = _rank_nodes(spec.ep_group, spec.ep_size)
+        budget = self.replica_slots_per_rank
+        if spec.dispatch_mode == "pull":
+            budget = min(budget, 6)
         plan = build_expert_replica_plan(
-            wire.tolist(), min(self.replica_slots_per_rank, 6), minimum_replica_rows=1024,
+            wire.tolist(), budget, minimum_replica_rows=1024,
             minimum_load_reduction=0.25 if projections == 3 else 0.4,
             capacity_limit=capacity, receive_capacity=capacity, rank_nodes=self.nodes,
             transfer_row_credit=spec.intermediate_size * projections // 6,

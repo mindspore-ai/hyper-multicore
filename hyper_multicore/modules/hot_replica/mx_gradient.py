@@ -16,9 +16,6 @@ from ._planner.plan import _replica_transfers
 from .shmem_transfer import SharedExpertPool
 
 
-MAX_MX_GUEST_SLOTS = 2
-
-
 GRADIENT_HELPERS = 4
 
 
@@ -97,7 +94,7 @@ class MXGradientPool(SharedExpertPool):
 
     @property
     def guest_slots(self):
-        return min(MAX_MX_GUEST_SLOTS, self.local_experts)
+        return self.local_experts
 
     @property
     def flag_words(self):

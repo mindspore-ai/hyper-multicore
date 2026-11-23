@@ -21,7 +21,7 @@ from ._planner.mx_peak_planner import (
 )
 from .bounded_placement import _rank_nodes
 from .mega_moe_adapter import PlacementResources, _get_mega_bank
-from .mx_gradient import MAX_MX_GUEST_SLOTS, MXGradientPool
+from .mx_gradient import MXGradientPool
 from .mx_prefetch import MXWeightPrefetch
 from .placement import ExpertPlacement
 
@@ -127,7 +127,7 @@ class MXPlacementResources(PlacementResources):
     def __init__(self, parent, specification, shared):
         super().__init__(parent, specification, shared)
         spec = parent.spec
-        self.config = ExpertReplicaConfig(spec.num_experts, spec.ep_size, min(MAX_MX_GUEST_SLOTS, spec.local_experts))
+        self.config = ExpertReplicaConfig(spec.num_experts, spec.ep_size, spec.local_experts)
         self.nodes = None
         self.prefetch = None
         self._cache_key = None

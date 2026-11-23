@@ -34,6 +34,7 @@ from hyper_multicore.modules.hot_replica._planner import aligned
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.plan import ExpertExecutionPlan, _replica_transfers
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
+from hyper_multicore.modules.hot_replica import bounded_placement
 from hyper_multicore.modules.hot_replica.bounded_placement import _placement_metadata
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
@@ -79,6 +80,7 @@ def test_mx_snapshot_reuses_validated_totals_in_the_active_plan(local_experts):
                        receive_capacity=ep * tokens * top_k, ep_size=ep, ep_group=None,
                        rank_id=0, num_cube_cores=32, auto_tokens=True, architecture=3510, precision="mxfp8")
     resource = mx_adapter.MXPlacementResources(SimpleNamespace(spec=spec, workspace=object()), {}, True)
+    assert resource.config.replica_slots_per_rank == local_experts
     resource.nodes = tuple(rank // 8 for rank in range(ep))
     resource._previous_active = True
     wire = torch.zeros((ep, spec.num_experts + 3), dtype=torch.int32)
@@ -130,7 +132,8 @@ def test_mx_gradient_bank_registers_with_the_virtual_workspace():
     assert reservations[0] is virtual_reservation and len(reservations) == 2
     key, layout = reservations[1]
     assert key["kind"] == "hot_replica_mx_gradients"
-    fp32_guests = 2 * 3 * spec.hidden_size * spec.intermediate_size * 4
+    assert pool.guest_slots == spec.local_experts
+    fp32_guests = spec.local_experts * 3 * spec.hidden_size * spec.intermediate_size * 4
     flags = (3 * pool.flag_words + GRADIENT_HELPERS * 16) * 4
     scratch = GRADIENT_HELPERS * 2 * pool.chunk_elements * 4
     assert layout.required_bytes == fp32_guests + flags + scratch + 1024
@@ -506,7 +509,7 @@ def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
     assert owner.pool is None and not owner.geometries
 
 
-@pytest.mark.parametrize("budget", [2, 6])
+@pytest.mark.parametrize("budget", [None, 2, 6])
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
 def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget, dispatch_mode):
     spec = SimpleNamespace(
@@ -535,8 +538,25 @@ def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget, dispatch_mode)
             hidden, ids, gathered, route._RouteSummary(4096, 4096, 49152), [24576, 24576], inverse,
             13, planner=planner, host_rows=gathered.tolist(),
         )
-    assert 1 <= selected.borrowed_capacity <= budget
-    assert sum(expert >= 0 for expert in selected.copies_by_rank[1]) == min(budget, 3)
+    effective_budget = spec.local_experts if budget is None else budget
+    assert 1 <= selected.borrowed_capacity <= effective_budget
+    assert sum(expert >= 0 for expert in selected.copies_by_rank[1]) == min(effective_budget, 3)
+
+
+@pytest.mark.parametrize(("mode", "requested", "expected"), [
+    ("push", None, 12), ("push", 8, 8), ("push", 2, 2), ("pull", None, 6),
+])
+def test_a3_bounded_planning_uses_the_configured_push_slot_budget(mode, requested, expected):
+    """Check the budget passed into the actual A3 bounded planner."""
+    spec = MegaMoeSpec(512, 5120, 1792, 192, 8, 1.25, 8192, 16, None, 0, 24,
+                       dispatch_mode=mode)
+    placement = bounded_placement.BoundedPlacement(spec, replica_slots_per_rank=requested)
+    placement.nodes = (0,) * 8 + (1,) * 8
+    counts = np.zeros((16, 192), dtype=np.int32)
+    with patch.object(bounded_placement, "build_expert_replica_plan",
+                      return_value=SimpleNamespace(transfers=())) as build:
+        placement._build("cpu", counts, 8192, 3, None, 512)
+    assert build.call_args.args[1] == expected
 
 
 @pytest.mark.parametrize(("transport", "kernel_pipeline", "batch_experts"), [

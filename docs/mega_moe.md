@@ -158,6 +158,7 @@ from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner())
 ```
 
+- Push 的默认副本槽上限等于每 rank 的原属专家数 `num_experts / ep_size`。实际借用数量由路由、接收容量和放置代价决定。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   Pull 需要支持按实际行数切分 GET 的 A3 制品。默认放置策略沿用 Push 的配额计算，由执行 rank 从对称源区拉取 token。
   自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。
