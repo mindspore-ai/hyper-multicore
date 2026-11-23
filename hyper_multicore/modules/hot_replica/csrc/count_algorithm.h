@@ -23,8 +23,8 @@
 #endif
 
 namespace hot {
-template <int TopK, typename InputT>
-HOT_COUNT_DEVICE void CountFixedRow(const HOT_COUNT_LOCAL InputT *ids, HOT_COUNT_LOCAL int64_t *counts,
+template <int TopK, typename InputT, typename CountT>
+HOT_COUNT_DEVICE void CountFixedRow(const HOT_COUNT_LOCAL InputT *ids, HOT_COUNT_LOCAL CountT *counts,
                                     int experts) {
   static_assert(TopK >= 1 && TopK <= 8, "fixed replica count width must be between one and eight");
   InputT selected[TopK];

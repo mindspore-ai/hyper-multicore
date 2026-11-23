@@ -16,6 +16,8 @@
 from typing import Any, TYPE_CHECKING
 import torch
 
+from hyper_multicore.modules.hot_replica.checkpoint import forward_copy_phase, guest_weight_replay
+
 from ...route import PreparedTopKRoute, restore_topk_output
 
 from .autograd import _CheckpointedPushFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
@@ -67,11 +69,32 @@ def forward(
             hidden_flat, *weights, route.metadata, plan, resources.workspace,
             record.activation, topk_weights, False, route.weight_binding,
         ).reshape_as(hidden_states)
-    integrated_unpermute = pull or before_fc2
+    # F and a replay fallback must save the same ordered tensor tuple.
+    checkpoint_replay = forward_copy_phase()
+    if checkpoint_replay is not None:
+        if (not pull and not before_fc2 and resources.spec.architecture == 2201
+                and resources.spec.transport_engine == "mte" and resources.spec.expert_weight_layout == "EOI"):
+            options["checkpoint_replay"] = checkpoint_replay
+        else:
+            checkpoint_replay = None
+    if binding is not None and binding.fused and resources.spec.architecture == 2201:
+        replay_weights = guest_weight_replay(record)
+        if replay_weights is not None:
+            options["guest_weights"] = replay_weights
+    integrated_unpermute = pull or before_fc2 or checkpoint_replay is not None
     output = execute_mega_moe_with_permutation(
         hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
         topk_weights=topk_weights if integrated_unpermute else None,
         workspace_claimed=pull, **options)
+    if route.indexed_dispatch_offsets is not None:
+        stats = resources.placement.statistics
+        stats["indexed_push_calls"] = stats.get("indexed_push_calls", 0) + 1
+        if route.count_fence is not None:
+            stats["indexed_count_fences"] = stats.get("indexed_count_fences", 0) + 1
+    if checkpoint_replay is False and resources.placement is not None:
+        stats = resources.placement.statistics
+        for field in ("original_dispatch_copies_skipped", "original_combine_copies_skipped"):
+            stats[field] = stats.get(field, 0) + 1
     if not integrated_unpermute:
         output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
     return output.reshape_as(hidden_states)

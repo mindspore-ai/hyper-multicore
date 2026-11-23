@@ -30,6 +30,7 @@ from hyper_multicore.modules.mega_moe.numerics import (
 )
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
+from . import a3_indexed
 from ..module import MulticoreModule
 from .backends import get_backend
 from .invocation import prepare_expert_invocation
@@ -191,6 +192,8 @@ class MegaMoeExperts(MulticoreModule):
         planner_key = None
         replica_slots_per_rank = None
         cross_node_cost = None
+        receive_capacity_percent = None
+        indexed_push = False
         if planner is not None:
             if precision != "bf16":
                 raise ValueError("HotReplica requires BF16 precision")
@@ -199,8 +202,12 @@ class MegaMoeExperts(MulticoreModule):
             if isinstance(planner, HotReplicaPlanner):
                 replica_slots_per_rank = planner.replica_slots_per_rank
                 cross_node_cost = planner.cross_node_cost
+                receive_capacity_percent = planner.receive_capacity_percent
+                indexed_push = (type(planner) is HotReplicaPlanner and a3_indexed.requested())
             if cross_node_cost is not None and tuning.dispatch_mode != "push":
                 raise ValueError("An explicit HotReplica cross_node_cost requires Push")
+            if receive_capacity_percent is not None and tuning.dispatch_mode != "push":
+                raise ValueError("An explicit HotReplica receive capacity percentage requires BF16 Push")
             settings = planner.configuration_key()
             if not isinstance(settings, str):
                 raise TypeError("Planner configuration_key() must return a string")
@@ -226,6 +233,8 @@ class MegaMoeExperts(MulticoreModule):
             "planner_key": planner_key,
             "replica_slots_per_rank": replica_slots_per_rank,
             "cross_node_cost": cross_node_cost,
+            "receive_capacity_percent": receive_capacity_percent,
+            "indexed_push": indexed_push,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",

@@ -160,6 +160,10 @@ class MegaMoeWorkspace:
     completion_stream: Any | None = field(default=None, repr=False)
     lease_stream: Any | None = field(default=None, repr=False)
     in_use: bool = False
+    lease_generation: int = field(default=0, init=False, repr=False)
+    indexed_count_stream: Any | None = field(default=None, init=False, repr=False)
+    replay_copy_stream: Any | None = field(default=None, init=False, repr=False)
+    replay_copy_done: Any | None = field(default=None, init=False, repr=False)
     closing: bool = False
     used: bool = False
     event_experts: int | None = None
@@ -408,6 +412,27 @@ class MegaMoeWorkspace:
             self.backward_ready_initialized = True
         return view
 
+    def stage_replay_saves(self, pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...]) -> None:
+        """Copy checkpoint-owned state while the caller restores token order."""
+        with self._access(), self.lock:
+            if not self.in_use or self.lease_stream is None or self.replay_copy_done is not None:
+                raise RuntimeError("MegaMoE replay saves require the current workspace lease")
+            if self.replay_copy_stream is None:
+                self.replay_copy_stream = torch.npu.Stream(device=self.device)
+            stream = self.replay_copy_stream
+            available = torch.npu.Event()
+            available.record(self.lease_stream)
+            stream.wait_event(available)
+            done = torch.npu.Event()
+            with torch.npu.stream(stream):
+                try:
+                    for destination, source in pairs:
+                        destination.record_stream(stream)
+                        destination.copy_(source, non_blocking=True)
+                finally:
+                    done.record(stream)
+                    self.replay_copy_done = done
+
     def _wait_for_completion(self, stream: Any = None) -> None:
         """FIFO orders the producer stream; another stream still needs its event."""
         if self.used:
@@ -415,6 +440,8 @@ class MegaMoeWorkspace:
                 stream = torch.npu.current_stream(self.device)
             if self.completion_stream is None or stream != self.completion_stream:
                 stream.wait_event(self.completion_event)
+            if self.replay_copy_done is not None:
+                stream.wait_event(self.replay_copy_done)
 
     def wait_for_reuse(self, *, stream: Any = None) -> None:
         """Order count exchange after the previous workspace lease."""
@@ -431,6 +458,8 @@ class MegaMoeWorkspace:
             self.lease_stream = (torch.npu.current_stream(self.device)
                                  if getattr(self.device, "type", None) == "npu" else None)
             self._wait_for_completion(self.lease_stream)
+            self.replay_copy_done = None
+            self.lease_generation += 1
             self.in_use = True
 
     def release(self, *, stream: Any = None) -> None:

@@ -23,6 +23,14 @@ def render_plan(
     plan: ExpertExecutionPlan, rank: int, borrowed: int,
 ) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, ...], ...]]:
     """Trim empty tails and retain the source's stable logical expert order."""
+    slots, table, owners = _render_slots(plan, borrowed)
+    return np.repeat(slots, table[rank, slots]), table, owners
+
+
+def _render_slots(
+    plan: ExpertExecutionPlan, borrowed: int,
+) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, ...], ...]]:
+    """Return physical slots in stable logical order without expanding row runs."""
     config = plan.config
     home, ranks, full = config.home_experts, config.ep_size, config.slots_per_rank
     width = home + borrowed
@@ -31,4 +39,4 @@ def render_plan(
     table = table[:, :, :width].copy().reshape(ranks, -1)
     logical = np.asarray(plan.slot_to_logical, dtype=np.int32)[:, :width].reshape(-1)
     slots = np.argsort(logical, kind="stable").astype(np.int32, copy=False)
-    return np.repeat(slots, table[rank, slots]), table, owners
+    return slots, table, owners

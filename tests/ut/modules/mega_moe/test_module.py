@@ -739,7 +739,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                                          apply_probs_before_fc2=False),
                                     plan=object(), workspace=object(), ensure_capacity=Mock(), placement=None,
                                     plan_for_tokens=Mock())
-        route = SimpleNamespace(execution_resources=None, weight_binding=None, checkpoint_record=None,
+        route = SimpleNamespace(weight_binding=None, checkpoint_record=None, indexed_dispatch_offsets=None,
             routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
             unpermute_mapping=object(), maximum_received_slots=512
         )
@@ -809,7 +809,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
         weights = torch.ones(2, 2)
         route = SimpleNamespace(
-            execution_resources=None, weight_binding=None, checkpoint_record=None,
+            weight_binding=None, checkpoint_record=None, indexed_dispatch_offsets=None,
             metadata=SimpleNamespace(plan_tokens=128),
         )
         workspace = Mock()
@@ -856,7 +856,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         expert_weights = (torch.empty(4, 16, 16, dtype=torch.bfloat16),
                           torch.empty(4, 8, 16, dtype=torch.bfloat16))
         route = SimpleNamespace(
-            execution_resources=None, weight_binding=None, checkpoint_record=None,
+            weight_binding=None, checkpoint_record=None, indexed_dispatch_offsets=None,
             metadata=SimpleNamespace(plan_tokens=128), maximum_received_slots=4,
         )
         resources = SimpleNamespace(

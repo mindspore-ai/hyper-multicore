@@ -28,6 +28,8 @@ from typing import Any, ClassVar
 import torch
 import torch.distributed as dist
 
+from ..mega_moe import a3_indexed
+
 
 @dataclass
 class ReplayRecord:
@@ -43,6 +45,10 @@ class ReplayRecord:
     activation: Any = None
     allow_activation: bool = False
     weight_binding: Any = None
+    guest_snapshot_bytes: int = 0
+    guest_weight_snapshot: Any = None
+    allow_guest_restore: bool = False
+    replay_count_fence: a3_indexed.CountFence | None = None
 
     @contextmanager
     def save_supplied_route(self, ids: torch.Tensor, counts: torch.Tensor) -> Iterator[None]:
@@ -61,6 +67,8 @@ class _CheckpointScope:
     replay: bool
     same_parameters: bool
     cursor: int = 0
+    defer_forward_copies: bool = False
+    guest_snapshot_bytes: int = 0
 
 
 _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_checkpoint", default=None)
@@ -69,22 +77,42 @@ _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_check
 class ReplayCheckpoint:
     """Hold one checkpoint invocation's tape across original and replay contexts."""
 
-    def __init__(self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False) -> None:
-        """Register the caller's parameter version lookup."""
+    def __init__(
+        self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False,
+        defer_forward_copies: bool = False, guest_snapshot_bytes: int = 0,
+    ) -> None:
+        """Register the caller's version lookup and optional checkpoint policies.
+
+        Copy deferral requires a non-reentrant checkpoint whose saved-tensor
+        hooks replace original placeholders with materialized replay values.
+        A positive guest_snapshot_bytes bounds each invocation's private guest
+        weight copy per rank and requires a grad-enabled non-reentrant checkpoint.
+        Use a separate tape per invocation and enter both corresponding scopes.
+        """
+        if type(guest_snapshot_bytes) is not int or guest_snapshot_bytes < 0:
+            raise ValueError("guest_snapshot_bytes must be a nonnegative integer")
         self.parameter_version = parameter_version
         self.prepare_replay = prepare_replay
+        self.defer_forward_copies = defer_forward_copies
+        self.guest_snapshot_bytes = guest_snapshot_bytes
         self.records: list[ReplayRecord] = []
         self.forward_version = None
 
     @contextmanager
     def scope(self, replay: bool) -> Iterator[None]:
         """Enter the tape before running any operator of the checkpointed block."""
+        if self.defer_forward_copies and not torch.is_grad_enabled():
+            raise RuntimeError("Deferring forward copies requires a grad-enabled non-reentrant checkpoint")
+        if self.guest_snapshot_bytes and not torch.is_grad_enabled():
+            raise RuntimeError("Guest weight snapshots require a grad-enabled non-reentrant checkpoint")
         version = self.parameter_version()
         if not replay:
             self.records.clear()
             self.forward_version = version
         state = _CheckpointScope(
             self.records, replay, version is not None and version == self.forward_version,
+            defer_forward_copies=self.defer_forward_copies,
+            guest_snapshot_bytes=self.guest_snapshot_bytes,
         )
         token = _ACTIVE.set(state)
         try:
@@ -95,6 +123,22 @@ class ReplayCheckpoint:
             yield
         finally:
             _ACTIVE.reset(token)
+
+
+def forward_copy_phase() -> bool | None:
+    """Return the opted-in replay flag independently of route reuse."""
+    scope = _ACTIVE.get()
+    return scope.replay if scope is not None and scope.defer_forward_copies else None
+
+
+def guest_weight_replay(record: ReplayRecord | None) -> tuple[ReplayRecord, bool] | None:
+    """Use the original call's budget or its collectively approved snapshot."""
+    scope = _ACTIVE.get()
+    if record is None or not record.guest_snapshot_bytes or scope is None:
+        return None
+    if scope.replay and not record.allow_guest_restore:
+        return None
+    return record, scope.replay
 
 
 def wrap_checkpoint(
@@ -129,7 +173,7 @@ def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
     if scope is None:
         return None, False
     if not scope.replay:
-        record = ReplayRecord(owner)
+        record = ReplayRecord(owner, guest_snapshot_bytes=scope.guest_snapshot_bytes if scope.same_parameters else 0)
         scope.records.append(record)
         return record, False
     index = scope.cursor
@@ -158,6 +202,8 @@ def agree_replay(
 ) -> bool:
     """Agree across EP on exact routing and independent activation validity."""
     scope = _ACTIVE.get()
+    if record is not None:
+        record.replay_count_fence = None
     valid = (
         record is not None and record.ids is not None and record.route is not None
         and not weight_error and record.ids.shape == ids.shape and record.ids.dtype == ids.dtype
@@ -184,6 +230,15 @@ def agree_replay(
                     flag += same_values.to(torch.int32).reshape(1) * 32
         else:
             flag = torch.zeros(1, dtype=torch.int32, device=hidden.device)
+        if valid and record.guest_weight_snapshot is not None:
+            flag += 64
+        replay_fence = None
+        if (valid and counts is None
+                and record.route.indexed_dispatch_offsets is not None):
+            workspace = record.owner.workspace
+            replay_fence = a3_indexed.CountFence.before_gather(workspace, record.stream)
+            if replay_fence is not None:
+                flag += a3_indexed.REPLAY_FENCE_BIT
         gathered = flag.new_empty(spec.ep_size)
         dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
         flags = gathered.tolist()
@@ -191,6 +246,9 @@ def agree_replay(
     reuse = first != 0 and all(value % 32 == first for value in flags)
     if record is not None:
         record.allow_activation = reuse and all(value & 32 for value in flags)
+        record.allow_guest_restore = reuse and all(value & 64 for value in flags)
+        if reuse and all(value & a3_indexed.REPLAY_FENCE_BIT for value in flags):
+            record.replay_count_fence = replay_fence
     return reuse
 
 

@@ -398,7 +398,8 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
                 record, hidden, ids, probabilities, counts, spec, 15, weight_error=False,
             )
             return route_matches, record.allow_activation
-        record.ids, record.stream, record.route = ids.clone(), "s", object()
+        record.ids, record.stream = ids.clone(), "s"
+        record.route = SimpleNamespace(indexed_dispatch_offsets=None)
         record.weight_binding = binding
         record.inputs = hidden.detach(), probabilities.detach()
         record.input_versions = (0, 0)

@@ -54,6 +54,9 @@ def build_kernels(output: Path, sdk: Path, npu_arch: int) -> None:
     source = Path(__file__).parent / "csrc"
     cann = Path(os.environ["ASCEND_HOME_PATH"])
     output.mkdir(parents=True, exist_ok=True)
+    names = ["hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp", "replica_counts.cpp"]
+    if npu_arch == 2201:
+        names.append("ordered_route.cpp")
     command = [
         "bisheng",
         "-x",
@@ -66,11 +69,7 @@ def build_kernels(output: Path, sdk: Path, npu_arch: int) -> None:
         "-O2",
         "-std=c++17",
         "-Wl,-z,relro,-z,now,-z,noexecstack",
-        *[
-            str(source / name)
-            for name in ("hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp",
-                         "replica_counts.cpp")
-        ],
+        *[str(source / name) for name in names],
         "-o",
         str(output / "libhmc_hot_replica_kernels.so"),
         "-Wl,-soname,libhmc_hot_replica_kernels.so",

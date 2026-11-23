@@ -22,6 +22,7 @@ from typing import Any
 import torch
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
+from ._planner.capacity import align_capacity
 from .placement import build_placement, placement_is_profitable, placement_receive_limit
 
 
@@ -31,8 +32,9 @@ class HotReplicaPlanner(BasePlanner):
     def __init__(
         self, *, replica_slots_per_rank: int | None = None,
         cross_node_cost: float | None = None,
+        receive_capacity_percent: int | None = None,
     ) -> None:
-        """Set the guest slot budget and relative inter-node replica charge."""
+        """Set optional guest, receive-capacity and inter-node cost constraints."""
         if replica_slots_per_rank is not None and (
             type(replica_slots_per_rank) is not int or replica_slots_per_rank <= 0
         ):
@@ -41,6 +43,10 @@ class HotReplicaPlanner(BasePlanner):
             if type(cross_node_cost) not in (int, float) or not 0 < cross_node_cost <= float_info.max:
                 raise ValueError("cross_node_cost must be a finite positive multiplier")
             cross_node_cost = float(cross_node_cost)
+        if receive_capacity_percent is not None and (
+                type(receive_capacity_percent) is not int or receive_capacity_percent < 100):
+            raise ValueError("receive_capacity_percent must be an integer at least 100")
+        self._receive_capacity_percent = receive_capacity_percent
         self._replica_slots_per_rank = replica_slots_per_rank
         self._cross_node_cost = cross_node_cost
         self._rejected_routes: OrderedDict[tuple[Any, ...], None] = OrderedDict()
@@ -55,6 +61,11 @@ class HotReplicaPlanner(BasePlanner):
         """Return the optional cross-node replica transfer multiplier."""
         return self._cross_node_cost
 
+    @property
+    def receive_capacity_percent(self) -> int | None:
+        """Return the explicit percentage of the average routed rows."""
+        return self._receive_capacity_percent
+
     def configuration_key(self) -> str:
         """Include the explicit limits in the configuration agreed by EP ranks."""
         settings = []
@@ -62,6 +73,8 @@ class HotReplicaPlanner(BasePlanner):
             settings.append(f"replica_slots_per_rank={self.replica_slots_per_rank}")
         if self.cross_node_cost is not None:
             settings.append(f"cross_node_cost={self.cross_node_cost}")
+        if self.receive_capacity_percent is not None:
+            settings.append(f"receive_capacity_percent={self.receive_capacity_percent}")
         return ",".join(settings)
 
     @torch.no_grad()
@@ -79,6 +92,9 @@ class HotReplicaPlanner(BasePlanner):
         target = (request.total_rows + ranks - 1) // ranks
         maximum = request.maximum_received
         receive_limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
+        percent = self.receive_capacity_percent
+        if percent is not None:
+            receive_limit = min(receive_limit, align_capacity((target * percent + 99) // 100))
         key = request.count_key
         if key is not None and key in self._rejected_routes:
             self._rejected_routes.move_to_end(key)
@@ -99,7 +115,8 @@ class HotReplicaPlanner(BasePlanner):
         placement = build(request, receive_limit)
         if placement is None:
             return None
-        if estimate(placement_is_profitable, placement.receive_capacity, placement.transfer_experts):
+        within_limit = percent is None or placement.receive_capacity <= receive_limit
+        if within_limit and estimate(placement_is_profitable, placement.receive_capacity, placement.transfer_experts):
             return placement
         if key is not None:
             self._rejected_routes[key] = None

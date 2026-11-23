@@ -23,6 +23,7 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 
+from hyper_multicore.modules.mega_moe import a3_indexed
 from hyper_multicore.modules.mega_moe.heap_manager import _WorkspaceLayout
 from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_capacity, _resolve_receive_capacity
 
@@ -166,6 +167,8 @@ class PlacementResources:
         self.pool = None
         self.replica_slots_per_rank = specification.get("replica_slots_per_rank")
         self.cross_node_cost = specification.get("cross_node_cost")
+        self.receive_capacity_percent = specification.get("receive_capacity_percent")
+        self.indexed_push = a3_indexed.qualify(parent.spec, specification.get("indexed_push", False))
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
@@ -215,10 +218,12 @@ class PlacementResources:
         host_rows: list[list[int]] | None = None,
         snapshot: PlacementWire | None = None,
         checkpointing: bool = False,
+        indexed: bool = False,
     ) -> ExpertWeightBinding | None:
         """Choose a virtual route only after the existing count exchange validates it."""
         spec = self.parent.spec
-        if self.bounded is None or checkpointing or spec.batch_experts:
+        if (self.bounded is None or checkpointing or spec.batch_experts
+                or self.receive_capacity_percent is not None):
             if snapshot is not None:
                 host_rows = snapshot.wire.tolist()
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
@@ -231,7 +236,7 @@ class PlacementResources:
                 def build(current, target, **options):
                     return self.bounded.select(
                         hidden, ids, current.counts_by_source, source_rows, inverse, 0, snapshot,
-                        capacity_target=target, host_rows=host_rows, **options,
+                        capacity_target=target, host_rows=host_rows, indexed=indexed, **options,
                     )
 
                 placement = planner._plan_by_cost(request, build)

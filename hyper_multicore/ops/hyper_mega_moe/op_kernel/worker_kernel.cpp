@@ -21,6 +21,7 @@
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
 #include "runtime/worker_kernel.h"
 #include "common/mega_moe/invocation_protocol.h"
+#include "common/mega_moe/a3_indexed_push.h"
 #include "common/mega_moe/transport.h"
 #include "common/mega_moe/transport_task.h"
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
@@ -59,8 +60,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   __aicore__ inline void RunForward() {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
     replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
-#endif
+    this->Process(getExtraValueFromTiling(input_list[TILING_IDX], MulticoreMoE::A3_INDEXED_TILING_ROUTE_FENCED) != 0);
+#else
     this->Process();
+#endif
   }
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
@@ -362,6 +365,25 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     src_offset_ = src_offset_ + static_cast<int64_t>(start);
     send_data_size_ = static_cast<int64_t>(send_data_size_);
 
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    const int64_t input_rows = getExtraValueFromTiling(input_list[TILING_IDX], MulticoreMoE::A3_INDEXED_TILING_SOURCE_ROWS);
+    if (input_rows != 0 && task_desc.inputs[1].input_position == 2) {
+      if (GetMegaMoeTransportPayload(task_desc) != MegaMoeTransportPayload::TOKENS ||
+          task_desc.inputs[1].base_ptr_offset != 0 || task_desc.outputs[0].base_ptr_offset != 0 ||
+          target_offset_ < 0 || src_offset_ < 0 ||
+          (target_offset_ % hidden_size) || (src_offset_ % hidden_size) || (send_data_size_ % hidden_size) ||
+          (src_offset_ + send_data_size_) / hidden_size > input_rows * MulticoreMoE::A3_INDEXED_TOP_K) {
+        AscendC::Trap();
+      }
+      const auto index = reinterpret_cast<__gm__ const int32_t *>(
+          input_list[task_desc.inputs[2].input_position] + expert_num * sizeof(int64_t));
+      hyper_multicore::PutIndexedRows<DTYPE_DISPATCH_TARGET>(
+          input_list[task_desc.outputs[0].input_position], target_offset_, input_list[2],
+          index, src_offset_ / hidden_size, send_data_size_ / hidden_size,
+          input_rows, target_pe, reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event);
+      return;
+    }
+#endif
     if (GetMegaMoeTransportPayload(task_desc) != MegaMoeTransportPayload::TOKENS) {
       const auto &aux = task_desc.outputs[task_desc.num_outputs - 1];
       GM_ADDR buffer = input_list[aux.input_position];

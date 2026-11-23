@@ -161,6 +161,7 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 - Push 的默认副本槽上限等于每 rank 的原属专家数 `num_experts / ep_size`。实际借用数量由路由、接收容量和放置代价决定。
 - `HotReplicaPlanner(cross_node_cost=1.0)` 将 A3 BF16 常规有界 Push 的跨节点与同节点副本按相同代价计入。
   EP 组内须使用相同值，省略时沿用原策略。
+- `HotReplicaPlanner(receive_capacity_percent=102)` 将 BF16 Push 的目标接收行数限制为实际 EP 均值的 102%，向上对齐 128 行。EP 组内须使用相同值，原成本准入仍生效。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   Pull 需要支持按实际行数切分 GET 的 A3 制品。默认放置策略沿用 Push 的配额计算，由执行 rank 从对称源区拉取 token。
   自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。
@@ -176,6 +177,22 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 每次正向按实际路由决定是否启用副本。模型继续持有原属专家参数、优化器状态和 checkpoint，
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
 测量稳态性能前应覆盖代表性的路由和容量。
+
+#### A3 的原行 Indexed Push 与 non-reentrant 重算
+
+在单机 `ascend910_93` EP16/E128、H4096/I1408/K8 的 BF16 EOI MTE Push 上，可以在构造执行器前为组内所有进程设置
+`HMC_A3_INDEXED_PUSH=1`。符合条件的 checkpoint 原前向使用随包构建的有序计数，并从原始输入行发送 token。
+重算沿用已确认的索引和同代际事件。声明的有序计数能力、老库兼容判断及拓扑确认在执行资源初始化时完成。
+普通路由、超出容量场景、重算未命中和 SHMEM 改绑沿用各自的常规路径。
+
+应用可以在最终 Top-K ID 的生产流上，调用 `hyper_multicore.modules.mega_moe.a3_indexed.note_source_ready(topk_ids)`，
+并将同一个张量交给执行器。有这个事件且调用满足 Indexed Push 条件时，原前向可以在旁流上提交计数和交换，
+与主流的权重物化并行。
+
+应用使用 non-reentrant checkpoint 时可以给每个 checkpoint 调用创建一个 `ReplayCheckpoint`，通过
+`context_fn` 分别返回该对象的 `scope(False)` 和 `scope(True)`，并提供真实的参数代际回调。
+`defer_forward_copies=True` 在 A3 BF16 EOI Push 上将两份反向保存延后至重算，同时保持输出的概率加权位置。
+`guest_snapshot_bytes` 设置每 rank 每次调用的 guest 权重快照字节预算，EP 全员通过同次参数代际和完整路由检查后才复用。
 
 ### 从旧 HotReplica 配置迁移
 

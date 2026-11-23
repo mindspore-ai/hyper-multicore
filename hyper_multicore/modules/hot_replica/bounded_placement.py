@@ -18,7 +18,7 @@ from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
 from ._planner.planner import build_capacity_plan, build_expert_replica_plan
 from .placement import ExpertPlacement
-from .render import render_plan
+from .render import _render_slots, render_plan
 
 
 _PINNED_WIRE_MAX_BYTES = 32 * 1024
@@ -107,14 +107,18 @@ def _placement_metadata(counts, spec, capacity, plan_tokens, tokens, device):
     return replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
 
 
+def _node_identity():
+    """Identify a host even when its containers have different names."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip() or socket.gethostname()
+    except OSError:
+        return socket.gethostname()
+
+
 def _rank_nodes(group, ranks):
     """Use actual node identity in the agreed EP rank order."""
-    try:
-        node = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-    except OSError:
-        node = ""
     identities = [None] * ranks
-    dist.all_gather_object(identities, node or socket.gethostname(), group=group)
+    dist.all_gather_object(identities, _node_identity(), group=group)
     labels = {identity: index for index, identity in enumerate(dict.fromkeys(identities))}
     return tuple(labels[identity] for identity in identities)
 
@@ -151,6 +155,57 @@ def _render_geometry(plan, spec, device, maximum, *, prepare_metadata=True):
                      plan.destination_counts[rank][:config.home_experts], plan.replica_slots_used[rank])
 
 
+@dataclass(frozen=True)
+class _IndexedPlacement:
+    """Private placement with physical maps in place of remapped expert IDs."""
+
+    counts_by_source: torch.Tensor
+    copies: torch.Tensor
+    borrowed_capacity: int
+    receive_capacity: int
+    local_receive_capacity: int
+    transfer_experts: int
+    published_slots: int
+    copies_by_rank: tuple[tuple[int, ...], ...]
+    owner_rows: tuple[int, ...]
+    physical_inverse: torch.Tensor
+    physical_to_logical: torch.Tensor
+
+
+def _indexed_maps(slots: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Lower contiguous logical runs into both physical row maps."""
+    lengths = counts[slots]
+    active = lengths != 0
+    slots, lengths = slots[active], lengths[active]
+    starts = lengths.cumsum(dtype=np.int32) - lengths
+    offsets = counts.cumsum(dtype=np.int32) - counts
+    logical_starts = np.zeros_like(offsets)
+    logical_starts[slots] = starts
+    positions = np.arange(int(lengths.sum()), dtype=np.int32)
+    maps = np.empty((2, positions.size), dtype=np.int32)
+    np.add(positions, np.repeat(offsets[slots] - starts, lengths), out=maps[0])
+    np.add(positions, np.repeat(logical_starts - offsets, counts), out=maps[1])
+    return maps
+
+
+def _render_indexed_placement(plan, spec, inverse, device):
+    """Keep logical ordering and physical row selection without an ID tensor."""
+    rank = spec.rank_id
+    used = max(plan.replica_slots_used)
+    width = min(plan.config.replica_slots_per_rank, 1 << (used - 1).bit_length())
+    slots, table, owners = _render_slots(plan, width)
+    maps = _upload_route_tensor(torch.from_numpy(_indexed_maps(slots, table[rank])), device)
+    logical_to_physical, physical_to_logical = maps.unbind(0)
+    counts = _upload_route_tensor(torch.from_numpy(table), device)
+    copies = _upload_route_tensor(torch.from_numpy(np.asarray(owners, dtype=np.int32)), device)
+    receive = plan.destination_loads
+    return _IndexedPlacement(
+        counts, copies, width, max(receive), receive[rank], plan.maximum_transfer_degree,
+        plan.replica_slots_used[rank], owners, plan.destination_counts[rank][:plan.config.home_experts],
+        logical_to_physical.index_select(0, inverse.reshape(-1)), physical_to_logical,
+    )
+
+
 class BoundedPlacement:
     """Reuse immutable geometry on the same complete count wire and stream."""
 
@@ -169,8 +224,8 @@ class BoundedPlacement:
         self, hidden: torch.Tensor, ids: torch.Tensor, counts: torch.Tensor, source_rows: list[int],
         inverse: torch.Tensor | None, projections: int, snapshot: PlacementWire | None = None,
         *, capacity_target: int | None = None,
-        host_rows: list[list[int]] | None = None,
-    ) -> ExpertPlacement | None:
+        host_rows: list[list[int]] | None = None, indexed: bool = False,
+    ) -> ExpertPlacement | _IndexedPlacement | None:
         """Map the current route through reusable quotas for the agreed receive budget."""
         spec = self.spec
         maximum = max(source_rows) // spec.top_k
@@ -186,6 +241,8 @@ class BoundedPlacement:
             plan = build_capacity_plan(wire, capacity_target, replica_slots_per_rank=self.replica_slots_per_rank)
             if plan is None or not plan.transfers:
                 return None
+            if indexed:
+                return _render_indexed_placement(plan, spec, inverse, hidden.device)
             # The checkpoint owns this invocation's descriptors. Use the usual
             # Push lowering and avoid a second persistent device geometry cache.
             geometry = _render_geometry(plan, spec, hidden.device, maximum, prepare_metadata=False)
