@@ -185,7 +185,6 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
   `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，
   `HYPER_MULTICORE_SHMEM_UDMA_QP_NUM` 设置为 8、16 或 32。
-  每 rank 可借用的槽位上限为两个，且不超过本地专家数。
 
 每次正向按实际路由决定是否启用副本。模型继续持有原属专家参数、优化器状态和 checkpoint，
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
