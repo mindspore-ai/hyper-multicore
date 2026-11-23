@@ -94,6 +94,28 @@ class _BackwardExecution:
     intermediates: _BackwardIntermediates
 
 
+@dataclass(frozen=True)
+class TokenContext:
+    """Input token-routing context for integrated gradient restoration."""
+
+    routed_tokens: torch.Tensor | None
+    unpermute_mapping: torch.Tensor
+    token_rows: int
+    top_k: int
+    real_rows: int
+    total_rows: int
+
+
+@dataclass(frozen=True)
+class OutputContext:
+    """Output weighting and identity-passthrough context for integrated restoration."""
+
+    unpermute_mapping: torch.Tensor
+    real_rows: int
+    total_rows: int
+    identity_tokens: torch.Tensor | None = None
+
+
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
     """Return an initialized workspace tensor or raise an invariant error."""
     if tensor is None:
@@ -135,8 +157,77 @@ def _restore_unweighted_output(rows: torch.Tensor, mapping: torch.Tensor, top_k:
     return multicore_ops.moe_token_permute_grad(rows, mapping, rows.shape[0] // top_k, top_k)
 
 
+def _assemble_context_output(combine: torch.Tensor, output_context: OutputContext) -> torch.Tensor:
+    """Build the owned [total_rows, hidden] buffer from SHMEM combine and optional identity suffix."""
+    real_rows = output_context.real_rows
+    total_rows = output_context.total_rows
+    if total_rows == 0:
+        return combine[:0].clone()
+    identity = output_context.identity_tokens
+    if real_rows == 0:
+        if identity is None:
+            raise ValueError("OutputContext requires identity_tokens when real_rows == 0 and total_rows > 0.")
+        return identity.contiguous()
+    if identity is None or real_rows == total_rows:
+        return combine[:real_rows].clone()
+    assembled = combine.new_empty((total_rows, combine.shape[1]))
+    assembled[:real_rows].copy_(combine[:real_rows])
+    assembled[real_rows:].copy_(identity)
+    return assembled
+
+
+def _stage_output_context_backward(
+    ctx: Any,
+    grad_output: Any,
+    permutation_inputs: tuple[Any, ...],
+    output_ctx: OutputContext,
+) -> tuple[Any, Any]:
+    """Run fused unpermute backward and stage real gradients directly into kernel source storage."""
+    mapping, expert_output, probs = permutation_inputs
+    real_rows = output_ctx.real_rows
+    total_rows = output_ctx.total_rows
+    zero_rows = total_rows - real_rows
+    pull = getattr(ctx.plan.spec, "dispatch_mode", "push") == "pull"
+    grad_probs = torch.empty_like(probs)
+    if total_rows == 0:
+        source = (
+            _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")[:0]
+            if pull else grad_output.new_empty((0, grad_output.shape[1]))
+        )
+        ctx._backward_identity_grad = None
+    elif pull:
+        source_buf = _workspace_tensor(ctx.workspace.source_buffer, "source_buffer")
+        if source_buf.shape[0] >= total_rows:
+            grad_all = source_buf[:total_rows]
+            multicore_ops.mega_moe_unpermute_grad_out(
+                expert_output, grad_output, mapping, probs, grad_all, grad_probs
+            )
+            source = grad_all[:real_rows]
+            ctx._backward_identity_grad = grad_all[real_rows:] if zero_rows > 0 else None
+        else:
+            grad_all = grad_output.new_empty((total_rows, grad_output.shape[1]))
+            multicore_ops.mega_moe_unpermute_grad_out(
+                expert_output, grad_output, mapping, probs, grad_all, grad_probs
+            )
+            source = source_buf[:real_rows]
+            if real_rows > 0:
+                source.copy_(grad_all[:real_rows])
+            ctx._backward_identity_grad = grad_all[real_rows:] if zero_rows > 0 else None
+    else:
+        grad_all = grad_output.new_empty((total_rows, grad_output.shape[1]))
+        multicore_ops.mega_moe_unpermute_grad_out(
+            expert_output, grad_output, mapping, probs, grad_all, grad_probs
+        )
+        source = grad_all[:real_rows]
+        ctx._backward_identity_grad = grad_all[real_rows:] if zero_rows > 0 else None
+    return source, grad_probs.to(ctx.topk_dtype) if ctx.needs_input_grad[7] else None
+
+
 def _stage_backward_source(ctx: Any, grad_output: Any, permutation_inputs: tuple[Any, ...]) -> tuple[Any, Any]:
     """Stage backward tokens and probabilities before expert scratch allocation."""
+    output_ctx = getattr(ctx, "output_context", None)
+    if isinstance(output_ctx, OutputContext):
+        return _stage_output_context_backward(ctx, grad_output, permutation_inputs, output_ctx)
     if ctx.plan.spec.apply_probs_before_fc2:
         mapping, probs = permutation_inputs
         source = (ctx.workspace.source_buffer[:ctx.source_rows]
@@ -305,6 +396,36 @@ def _prepare_backward_execution(
 
 def _restore_input_gradient(ctx: Any, grad_x: Any, permutation_inputs: tuple[Any, ...]) -> Any:
     """Return an owned input gradient while the workspace lease is held."""
+    token_ctx = getattr(ctx, "token_context", None)
+    if isinstance(token_ctx, TokenContext):
+        grad_zero = getattr(ctx, "_backward_identity_grad", None)
+        ctx._backward_identity_grad = None
+        if not ctx.needs_input_grad[0]:
+            return None
+        if token_ctx.token_rows == 0:
+            return grad_x[:0].clone()
+        (unpermute_mapping,) = permutation_inputs
+        real_rows = token_ctx.real_rows
+        total_rows = token_ctx.total_rows
+        if real_rows == 0:
+            if grad_zero is None:
+                raise ValueError("TokenContext requires identity gradients when real_rows == 0.")
+            return multicore_ops.moe_token_permute_grad(
+                grad_zero.contiguous(), unpermute_mapping, token_ctx.token_rows, token_ctx.top_k
+            )
+        if grad_zero is None or real_rows == total_rows:
+            return multicore_ops.moe_token_permute_grad(
+                grad_x[:real_rows], unpermute_mapping, token_ctx.token_rows, token_ctx.top_k
+            )
+        if grad_x.shape[0] >= total_rows:
+            grad_x[real_rows:total_rows].copy_(grad_zero)
+            return multicore_ops.moe_token_permute_grad(
+                grad_x[:total_rows], unpermute_mapping, token_ctx.token_rows, token_ctx.top_k
+            )
+        grad_all = torch.cat((grad_x[:real_rows], grad_zero), dim=0)
+        return multicore_ops.moe_token_permute_grad(
+            grad_all, unpermute_mapping, token_ctx.token_rows, token_ctx.top_k
+        )
     if not ctx.needs_input_grad[0]:
         return None
     grad_x = grad_x[:ctx.source_rows]
@@ -345,8 +466,10 @@ def _save_forward_state(
         if spec.apply_probs_before_fc2:
             output = _restore_unweighted_output(output, permutation_inputs[0], spec.top_k)
         else:
+            output_ctx = getattr(ctx, "output_context", None)
+            unpermute_rows = output_ctx.total_rows if isinstance(output_ctx, OutputContext) else ctx.source_rows
             output = (load_torch_npu().npu_moe_token_unpermute(output, permutation_inputs[0], probs=probs)
-                      if ctx.source_rows else output[:0])
+                      if unpermute_rows else output[:0])
     ctx.plan = plan
     ctx.all_experts_active = metadata.all_experts_active
     ctx.workspace = workspace
@@ -559,8 +682,14 @@ def _native_source(tensor: torch.Tensor) -> torch.Tensor:
 
 
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
-def _validate_forward_probabilities(spec, permutation, topk_weights):
+def _validate_forward_probabilities(spec, permutation, topk_weights, output_context=None):
     """Check the selected probability placement before leasing a workspace."""
+    if isinstance(output_context, OutputContext):
+        if topk_weights is None:
+            raise ValueError("OutputContext requires router topk_weights.")
+        if spec.apply_probs_before_fc2:
+            raise ValueError("OutputContext does not support apply_probs_before_fc2.")
+        return
     if topk_weights is not None and (
         permutation is None or (spec.dispatch_mode != "pull" and not spec.apply_probs_before_fc2)
     ):
@@ -587,6 +716,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         topk_weights: torch.Tensor | None,
         workspace_claimed: bool,
         weight_binding: Any = None,
+        token_context: TokenContext | None = None,
+        output_context: OutputContext | None = None,
     ) -> Any:
         """Launch the BF16 forward op and save owned backward inputs.
 
@@ -607,17 +738,40 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             Owned token-major rows with integrated unpermutation, otherwise expert-major rows.
         """
         spec = plan.spec
-        _validate_forward_probabilities(spec, permutation, topk_weights)
+        if (token_context is not None or output_context is not None) and permutation is not None:
+            raise ValueError("token_context/output_context cannot be combined with legacy permutation.")
+        _validate_forward_probabilities(spec, permutation, topk_weights, output_context)
         metadata = route.for_kernel(spec.hidden_size)
         permutation_inputs = ()
-        if permutation is not None:
-            routed_tokens, _, unpermute_mapping = permutation
-            if ctx.needs_input_grad[0] or topk_weights is not None:
-                permutation_inputs = (unpermute_mapping,)
-        ctx.source_rows = routed_tokens.shape[0]
-        ctx.token_rows = ctx.source_rows // spec.top_k
-        ctx.has_permutation = permutation is not None
-        ctx.has_unpermute = topk_weights is not None
+        ctx.token_context = None
+        ctx.output_context = None
+        ctx._backward_identity_grad = None
+        if isinstance(token_context, TokenContext):
+            if token_context.routed_tokens is None:
+                raise ValueError("TokenContext.routed_tokens is required in forward.")
+            routed_tokens = token_context.routed_tokens
+            ctx.source_rows = token_context.real_rows
+            ctx.token_rows = token_context.token_rows
+            ctx.has_permutation = True
+            # Strip large forward tensor references before storing lightweight metadata on ctx.
+            ctx.token_context = replace(token_context, routed_tokens=None)
+            if ctx.needs_input_grad[0] or isinstance(output_context, OutputContext):
+                permutation_inputs = (token_context.unpermute_mapping,)
+        else:
+            if permutation is not None:
+                routed_tokens, _, unpermute_mapping = permutation
+                if ctx.needs_input_grad[0] or topk_weights is not None:
+                    permutation_inputs = (unpermute_mapping,)
+            ctx.source_rows = routed_tokens.shape[0]
+            ctx.token_rows = ctx.source_rows // spec.top_k
+            ctx.has_permutation = permutation is not None
+        if isinstance(output_context, OutputContext):
+            ctx.has_unpermute = True
+            ctx.output_context = replace(output_context, identity_tokens=None)
+            if not permutation_inputs:
+                permutation_inputs = (output_context.unpermute_mapping,)
+        else:
+            ctx.has_unpermute = topk_weights is not None
         if workspace_claimed:
             if not workspace.in_use:
                 raise RuntimeError("MegaMoe forward requires the caller-held workspace lease.")
@@ -652,9 +806,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 weight1,
                 weight2,
                 execution, stream=workspace.lease_stream)
-            output = execution.combine[:ctx.source_rows]
-            if not spec.apply_probs_before_fc2:
-                output = output.clone()
+            if isinstance(output_context, OutputContext):
+                output = _assemble_context_output(execution.combine, output_context)
+            else:
+                output = execution.combine[:ctx.source_rows]
+                if not spec.apply_probs_before_fc2:
+                    output = output.clone()
             if spec.dispatch_mode == "pull":
                 saved_dispatch = execution.dispatch
             else:
@@ -756,7 +913,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_topk_weights,
                 None,
             )
-            return gradients + (None,) if len(ctx.needs_input_grad) == 10 else gradients
+            extra = max(0, len(ctx.needs_input_grad) - len(gradients))
+            return gradients + (None,) * extra
         finally:
             if acquired:
                 binding.release()

@@ -34,6 +34,8 @@ from hyper_multicore.longcat._replica import (
     plan_longcat_replicas,
 )
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import (
+    OutputContext,
+    TokenContext,
     _MegaMoeFunction,
     _launch_forward_kernel,
     _native_weight_operand,
@@ -149,63 +151,44 @@ def _validate_configuration(
         )
 
 
-class _PermuteAllFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
-    """One-shot permute + histogram across real and identity experts."""
+class _IdentityOnlyFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
+    """Fused unpermute/weighted passthrough when every EP rank routes strictly to zero experts."""
 
     @staticmethod
     def forward(
         ctx: Any,
         hidden_flat: torch.Tensor,
-        expert_ids_i32: torch.Tensor,
-        total_experts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sort all token slots by global expert ID so real experts form a contiguous prefix."""
+        router_weights: torch.Tensor,
+        all_permuted: torch.Tensor,
+        mapping: torch.Tensor,
+    ) -> torch.Tensor:
         tokens = hidden_flat.shape[0]
-        top_k = expert_ids_i32.shape[1]
-        if tokens == 0:
-            rows = hidden_flat.new_empty((0, hidden_flat.shape[1]))
-            mapping = torch.empty((0,), dtype=torch.int32, device=hidden_flat.device)
-            counts = torch.zeros((total_experts,), dtype=torch.int32, device=hidden_flat.device)
-        else:
-            rows, mapping, counts, _ = load_torch_npu().npu_moe_init_routing_v2(
-                hidden_flat.contiguous(),
-                expert_ids_i32,
-                active_num=tokens * top_k,
-                expert_num=total_experts,
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                active_expert_range=[0, total_experts],
-                quant_mode=-1,
-                row_idx_type=0,
-            )
-            mapping = mapping.reshape(-1).to(torch.int32).contiguous()
-            counts = counts.to(torch.int32).contiguous()
+        top_k = router_weights.shape[1]
         ctx.token_rows = tokens
         ctx.top_k = top_k
-        ctx.save_for_backward(mapping)
-        ctx.mark_non_differentiable(mapping, counts)
-        return rows, mapping, counts
+        ctx.topk_dtype = router_weights.dtype
+        probs = router_weights.float().contiguous()
+        ctx.save_for_backward(all_permuted, mapping, probs)
+        if tokens == 0:
+            return hidden_flat.new_empty((0, hidden_flat.shape[1]))
+        return load_torch_npu().npu_moe_token_unpermute(all_permuted, mapping, probs=probs)
 
     @staticmethod
-    def backward(
-        ctx: Any,
-        grad_rows: torch.Tensor,
-        _grad_mapping: Any,
-        _grad_counts: Any,
-    ) -> tuple[torch.Tensor | None, None, None]:
-        """Reduce permuted gradients from both real and identity slots back to [T, H]."""
-        if not ctx.needs_input_grad[0]:
-            return None, None, None
-        (mapping,) = ctx.saved_tensors
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None]:
+        all_permuted, mapping, probs = ctx.saved_tensors
         if ctx.token_rows == 0:
-            return grad_rows.new_empty((0, grad_rows.shape[1])), None, None
-        grad_hidden = multicore_ops.moe_token_permute_grad(
-            grad_rows.contiguous(),
-            mapping,
-            ctx.token_rows,
-            ctx.top_k,
+            grad_hidden = grad_output.new_empty((0, grad_output.shape[1])) if ctx.needs_input_grad[0] else None
+            grad_weights = probs.new_empty((0, ctx.top_k), dtype=ctx.topk_dtype) if ctx.needs_input_grad[1] else None
+            return grad_hidden, grad_weights, None, None
+        grad_all = grad_output.new_empty(all_permuted.shape)
+        grad_probs = torch.empty_like(probs)
+        multicore_ops.mega_moe_unpermute_grad_out(all_permuted, grad_output, mapping, probs, grad_all, grad_probs)
+        grad_hidden = (
+            multicore_ops.moe_token_permute_grad(grad_all, mapping, ctx.token_rows, ctx.top_k)
+            if ctx.needs_input_grad[0] else None
         )
-        return grad_hidden, None, None
+        grad_weights = grad_probs.to(ctx.topk_dtype) if ctx.needs_input_grad[1] else None
+        return grad_hidden, grad_weights, None, None
 
 
 def _permute_all_nograd(
@@ -213,7 +196,7 @@ def _permute_all_nograd(
     expert_ids_i32: torch.Tensor,
     total_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Inference-only one-shot permute + histogram."""
+    """One-shot permute + histogram across real and identity experts."""
     tokens = hidden_flat.shape[0]
     top_k = expert_ids_i32.shape[1]
     if tokens == 0:
@@ -243,11 +226,13 @@ def _execute_real_without_autograd(
     metadata: RouteMetadata,
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
+    output_context: OutputContext,
+    router_weights: torch.Tensor,
     *,
     workspace_claimed: bool = False,
     weight_binding: LongcatReplicaBinding | None = None,
 ) -> torch.Tensor:
-    """Launch the BF16 forward kernel for pre-permuted real tokens without saving backward state."""
+    """Launch BF16 forward and restore weighted real+identity output directly while holding the workspace lease."""
     if workspace_claimed:
         if not workspace.in_use:
             raise RuntimeError("LongCat inference requires the caller-held workspace lease.")
@@ -272,10 +257,24 @@ def _execute_real_without_autograd(
             execution,
             stream=workspace.lease_stream,
         )
-        rows = real_tokens.shape[0]
-        if rows == 0:
+        real_rows = output_context.real_rows
+        total_rows = output_context.total_rows
+        if total_rows == 0:
             return real_tokens.new_empty((0, plan.spec.hidden_size))
-        return execution.combine[:rows].clone()
+        identity = output_context.identity_tokens
+        mapping = output_context.unpermute_mapping
+        if real_rows == 0:
+            assert identity is not None
+            return restore_topk_output(identity.contiguous(), mapping, router_weights)
+        if identity is None or real_rows == total_rows:
+            return restore_topk_output(execution.combine[:real_rows], mapping, router_weights)
+        if execution.combine.shape[0] >= total_rows:
+            execution.combine[real_rows:total_rows].copy_(identity)
+            return restore_topk_output(execution.combine[:total_rows], mapping, router_weights)
+        assembled = execution.combine.new_empty((total_rows, plan.spec.hidden_size))
+        assembled[:real_rows].copy_(execution.combine[:real_rows])
+        assembled[real_rows:].copy_(identity)
+        return restore_topk_output(assembled, mapping, router_weights)
     finally:
         if acquired and weight_binding is not None:
             weight_binding.release()
@@ -668,11 +667,7 @@ class LongcatFlashExperts(MulticoreModule):
         real_gate_up, down = self._validate_and_slice_weights(hidden_flat, expert_weights)
 
         grad_enabled = torch.is_grad_enabled()
-        if grad_enabled:
-            all_permuted, mapping, all_counts = _PermuteAllFunction.apply(
-                hidden_flat, expert_ids_i32, self.total_experts
-            )
-        else:
+        with torch.no_grad():
             all_permuted, mapping, all_counts = _permute_all_nograd(
                 hidden_flat, expert_ids_i32, self.total_experts
             )
@@ -698,6 +693,9 @@ class LongcatFlashExperts(MulticoreModule):
 
         if total_real_across_ep == 0:
             self._last_replica_plan = None
+            if grad_enabled:
+                out = _IdentityOnlyFunction.apply(hidden_flat, router_weights, all_permuted, mapping)
+                return out.reshape_as(hidden)
             return restore_topk_output(all_permuted, mapping, router_weights).reshape_as(hidden)
 
         replica_plan: LongcatReplicaPlan | None = None
@@ -722,16 +720,14 @@ class LongcatFlashExperts(MulticoreModule):
         resources = self._get_execution_resources(hidden_flat)
         pull = resources.spec.dispatch_mode == "pull"
         claimed = False
-        real_to_phys_map: torch.Tensor | None = None
         weight_binding: LongcatReplicaBinding | None = None
 
         if local_real_rows == total_slots:
             real_x = all_permuted
             zero_x = None
         else:
-            real_x, zero_x = torch.split(
-                all_permuted, [local_real_rows, total_slots - local_real_rows], dim=0
-            )
+            real_x = all_permuted[:local_real_rows]
+            zero_x = all_permuted[local_real_rows:]
 
         try:
             with torch.inference_mode(False), torch.no_grad():
@@ -798,34 +794,62 @@ class LongcatFlashExperts(MulticoreModule):
                     phys_slot_ids = self._build_physical_slot_ids(
                         replica_plan.source_quotas[rank_id], hidden_flat.device
                     )
-                phys_real_x, real_to_phys_map = load_torch_npu().npu_moe_token_permute(
-                    real_x.contiguous(), phys_slot_ids
-                )
-                real_to_phys_map = real_to_phys_map.reshape(-1).to(torch.int32).contiguous()
+                    phys_real_x, real_to_phys_map = load_torch_npu().npu_moe_token_permute(
+                        real_x.contiguous(), phys_slot_ids
+                    )
+                    real_to_phys_map = real_to_phys_map.reshape(-1).to(torch.int32).contiguous()
+                    if local_real_rows == total_slots:
+                        active_mapping = real_to_phys_map.index_select(0, mapping)
+                    else:
+                        zero_ids = torch.arange(
+                            local_real_rows, total_slots, dtype=torch.int32, device=hidden_flat.device
+                        )
+                        full_remap = torch.cat((real_to_phys_map, zero_ids), dim=0)
+                        active_mapping = full_remap.index_select(0, mapping)
             else:
                 phys_real_x = real_x
+                active_mapping = mapping
+
+            token_context = TokenContext(
+                routed_tokens=phys_real_x,
+                unpermute_mapping=active_mapping,
+                token_rows=tokens,
+                top_k=self.top_k,
+                real_rows=local_real_rows,
+                total_rows=total_slots,
+            )
+            output_context = OutputContext(
+                unpermute_mapping=active_mapping,
+                real_rows=local_real_rows,
+                total_rows=total_slots,
+                identity_tokens=zero_x,
+            )
 
             if grad_enabled:
-                phys_real_y = _MegaMoeFunction.apply(
-                    phys_real_x,
+                output = _MegaMoeFunction.apply(
+                    hidden_flat,
                     _native_weight_operand(real_gate_up, plan),
                     _native_weight_operand(down, plan),
                     metadata,
                     plan,
                     resources.workspace,
                     None,
-                    None,
+                    router_weights,
                     claimed,
                     weight_binding,
+                    token_context,
+                    output_context,
                 )
             else:
-                phys_real_y = _execute_real_without_autograd(
+                output = _execute_real_without_autograd(
                     phys_real_x,
                     real_gate_up,
                     down,
                     metadata,
                     plan,
                     resources.workspace,
+                    output_context,
+                    router_weights,
                     workspace_claimed=claimed,
                     weight_binding=weight_binding,
                 )
@@ -833,12 +857,4 @@ class LongcatFlashExperts(MulticoreModule):
             if claimed:
                 resources.workspace.release()
 
-        if real_to_phys_map is not None:
-            real_y = load_torch_npu().npu_moe_token_unpermute(phys_real_y, real_to_phys_map)
-        else:
-            real_y = phys_real_y
-
-        # Keep real_y in the autograd graph even when local_real_rows == 0 (empty_source rank)
-        # so every EP rank participates symmetrically in backward SHMEM synchronization.
-        all_y = real_y if zero_x is None else torch.cat((real_y, zero_x), dim=0)
-        return restore_topk_output(all_y, mapping, router_weights).reshape_as(hidden)
+        return output.reshape_as(hidden)
