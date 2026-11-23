@@ -78,6 +78,9 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--zero", type=int)
     parser.add_argument("--top-k", type=int, default=12)
     parser.add_argument("--no-gate-up-padded", dest="gate_up_padded", action="store_false", default=True)
+    parser.add_argument("--replica-slots", type=int, default=0)
+    parser.add_argument("--replica-granularity", choices=("expert", "token"), default="expert")
+    parser.add_argument("--replica-min-rows", type=int, default=1024)
     parser.add_argument("--route-fixture", choices=("router", "hot"), default="router")
     parser.add_argument("--updates", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=10)
@@ -188,6 +191,9 @@ def candidate(args: argparse.Namespace) -> LongcatFlashExperts:
         swiglu_precision=args.swiglu_precision,
         gate_up_padded=args.gate_up_padded,
         initial_token_capacity=args.initial_token_capacity,
+        replica_slots_per_rank=args.replica_slots,
+        replica_granularity=args.replica_granularity,
+        replica_min_rows=args.replica_min_rows,
     )
 
 
@@ -305,9 +311,18 @@ def accuracy(
         local_pass = all(item["strict_pass"] for item in comparison.values()) and match
         state = torch.tensor([local_pass], dtype=torch.int32, device="npu")
         dist.all_reduce(state, op=dist.ReduceOp.MIN)
+        rplan = layer._last_replica_plan
+        rplan_summary = None if rplan is None else {
+            "home_only": rplan.home_only,
+            "granularity": rplan.granularity,
+            "transfers": len(rplan.transfers),
+            "logical_rank_loads": list(rplan.logical_rank_loads),
+            "physical_rank_loads": list(rplan.physical_rank_loads),
+        }
         records.append({
             "step": step,
             "routes": kind,
+            "replica_plan": rplan_summary,
             "comparison": comparison,
             "parameters_match": match,
             "all_ranks_strict_pass": bool(state.item()),

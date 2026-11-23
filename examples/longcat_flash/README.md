@@ -6,7 +6,8 @@ Standalone validation and benchmark scripts for the isolated `hyper_multicore.lo
 
 - Completely isolated from `MegaMoeExperts` high-level routing/unpermute logic.
 - Forward performs a single one-shot `npu_moe_init_routing_v2` permute + count over all real `[0, num_experts)` and zero/identity `[num_experts, num_experts + zero_experts)` experts.
-- Only the contiguous real-expert prefix `all_permuted[:R]` enters the fused `HyperMegaMoe` kernel; all-zero-expert steps skip the kernel completely.
+- Optional load-balanced expert replicas (`replica_slots_per_rank > 0`) operate strictly over real experts without affecting zero experts, supporting both `"expert"` (whole-expert move, exact 0.0 precision) and `"token"` (token-level split replica) granularities with forward-to-backward guest weight reuse.
+- Only real-expert rows enter the fused `HyperMegaMoe` kernel; all-zero-expert steps skip the kernel completely.
 - Output stitches `[real_y, all_permuted[R:]]` and executes a single fused `npu_moe_token_unpermute(..., probs=router_weights.float())` covering both real and zero expert FP32 weighting and gradients.
 - Supports both `--swiglu-precision fused` and `--swiglu-precision hf` (HF-compatible BF16 intermediate rounding).
 - `native_reference.py` mirrors the same one-shot permute + fused unpermute semantics for exact precision alignment.
@@ -20,15 +21,17 @@ torchrun --standalone --nproc_per_node=4 examples/longcat_flash/validate.py \
   --ep 4 --tokens 2048 --hidden 6144 --intermediate 2048 --real 32 --zero 16 --top-k 12 \
   --updates 4 --exercise-edge-routes --output /tmp/longcat_acc_fused
 
-# Full-width EP4 accuracy alignment (HF BF16 SwiGLU + edge routes)
+# Full-width EP4 accuracy alignment with expert replicas (slots=2, expert or token granularity)
 torchrun --standalone --nproc_per_node=4 examples/longcat_flash/validate.py \
-  --check accuracy --backend push --swiglu-precision hf \
+  --check accuracy --backend push --swiglu-precision fused \
+  --replica-slots 2 --replica-granularity expert \
   --ep 4 --tokens 2048 --hidden 6144 --intermediate 2048 --real 32 --zero 16 --top-k 12 \
-  --updates 4 --exercise-edge-routes --output /tmp/longcat_acc_hf
+  --updates 4 --exercise-edge-routes --output /tmp/longcat_acc_replica
 
-# Benchmark push vs native
+# Benchmark hot route with and without expert replicas
 torchrun --standalone --nproc_per_node=4 examples/longcat_flash/validate.py \
   --check benchmark --backend push --swiglu-precision fused \
+  --route-fixture hot --replica-slots 2 --replica-granularity expert \
   --ep 4 --tokens 2048 --hidden 6144 --intermediate 2048 --real 32 --zero 16 --top-k 12 \
-  --warmup 10 --samples 20 --output /tmp/longcat_bench_push
+  --warmup 10 --samples 50 --output /tmp/longcat_bench_hot_replica
 ```
