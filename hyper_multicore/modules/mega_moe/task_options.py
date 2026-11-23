@@ -19,7 +19,7 @@ from typing import Any
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.tasks.alltoall import ShmemTaskPartition, ShmemTransferEngine
 from hyper_multicore.scheduler.config import TaskType
-from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
+from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluPrecision, SwiGluTaskIteration
 from .probability_abi import PROBABILITY_POSITION_BACKWARD, PROBABILITY_POSITION_FORWARD, ProbabilityLayout
 
 
@@ -37,7 +37,7 @@ class MegaMoeTransportPayload(IntEnum):
 
 
 _ACTIVATION_MASK = int(SwiGluTaskIteration.PERSISTENT_LANES | SwiGluClampPosition.AFTER_SILU
-                       | MegaMoeActivationWeighting.BEFORE_FC2)
+                       | MegaMoeActivationWeighting.BEFORE_FC2 | SwiGluPrecision.HF_BF16)
 _TRANSPORT_MASK = int(ShmemTaskPartition.RUNTIME_ROWS | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES
                       | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS | ShmemTransferEngine.UDMA)
 _GMM_MODES = frozenset(GroupedMatmulTaskMode)
@@ -64,6 +64,8 @@ def _activation_options(task: Any) -> bool:
         raise ValueError(f"invalid activation flags {task.extra_value_1:#x}")
     if task.extra_value_1 & SwiGluClampPosition.AFTER_SILU and task.extra_value_0 == 0:
         raise ValueError("clamp position requires a clamp limit")
+    if task.extra_value_1 & SwiGluPrecision.HF_BF16 and task.extra_value_0 != 0:
+        raise ValueError("hf_bf16 SwiGLU does not support clamp")
     return activation_weighting(task) == MegaMoeActivationWeighting.BEFORE_FC2
 
 

@@ -62,6 +62,7 @@ class MegaMoeSpec:
     nominal_schedule: bool = False
     apply_probs_before_fc2: bool = False
     clamp_after_activation: bool = False
+    swiglu_hf_bf16: bool = False
     architecture: int = 2201
     precision: str = "bf16"
     transport_engine: str | None = "mte"
@@ -236,6 +237,7 @@ def bind_mega_moe_spec(
         nominal_schedule=specification.get("nominal_schedule", False),
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
         clamp_after_activation=specification.get("clamp_after_activation", False),
+        swiglu_hf_bf16=specification.get("swiglu_hf_bf16", False),
         architecture=architecture,
         precision=specification.get("precision", "bf16"),
         transport_engine=transport_engine,

@@ -43,6 +43,11 @@
             "purpose": "add optional pre/post-SiLU clipping and dynamic tail bounds"
           },
           {
+            "path": "hyper_multicore/ops/patches/swi_glu_hf_bf16.patch",
+            "sha256": "7229ef3cf13941588e296506c6cefbaae363989acfbf536d210176cb44412a09",
+            "purpose": "add optional HF-compatible BF16 intermediate rounding for SwiGLU and SwiGLUGrad"
+          },
+          {
             "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
             "sha256": "d1751299e120709f3a625af9b6d606c1696059fbb55c99ed01788765f1840004",
             "purpose": "add a logical token-block RMSNorm entry point and non-atomic Ascend950 backward-cache writes"

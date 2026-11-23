@@ -98,7 +98,8 @@ def _build_fwd_tensor_specs(
 
 
 def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
-                   down_proj_sv, combine_sv, num_cube_cores, clamp_after_activation=False, swiglu_limit=None):
+                   down_proj_sv, combine_sv, num_cube_cores, clamp_after_activation=False,
+                   swiglu_limit=None, swiglu_hf_bf16=False):
     """Create all OperatorNode objects for the forward graph."""
     (target, target_offset, src, src_offset, size_d,
      up_proj_weight, up_proj_glist, up_proj_y, swiglu_out,
@@ -142,7 +143,11 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
             task_num_fn=lambda tsv: (tsv.per_expert_seq // swiglu_sv) * tsv.single_rank_expert_num,
         ),
         tiling_position=_TILING_POS_SWIGLU,
-        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit, clamp_after_activation=clamp_after_activation),
+        fill_config=SwiGLUFillConfig(
+            clamp_limit=swiglu_limit,
+            clamp_after_activation=clamp_after_activation,
+            hf_bf16=swiglu_hf_bf16,
+        ),
     )
     down_proj = OperatorNode(
         name="down_proj", op_type=OpType.GMM,
@@ -185,6 +190,7 @@ def build_forward_graph(tsv: TaskSplitValue, *,
                         swiglu_limit:      float | None = None,
                         expert_weight_layout: str = "EIO",
                         clamp_after_activation: bool = False,
+                        swiglu_hf_bf16: bool = False,
                         apply_probs_before_fc2: bool = False) -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
 
@@ -223,6 +229,7 @@ def build_forward_graph(tsv: TaskSplitValue, *,
         dispatch_sv=dispatch_sv, up_proj_sv=up_proj_sv, swiglu_sv=swiglu_sv,
         down_proj_sv=down_proj_sv, combine_sv=combine_sv, num_cube_cores=num_cube_cores,
         swiglu_limit=swiglu_limit, clamp_after_activation=clamp_after_activation,
+        swiglu_hf_bf16=swiglu_hf_bf16,
     )
     graph = ComputeGraph()
     graph.task_validator = validate_task_options

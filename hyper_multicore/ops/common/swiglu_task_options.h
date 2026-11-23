@@ -12,5 +12,7 @@ enum class SwiGluClampPosition : uint32_t {
 };
 
 enum class SwiGluTaskIteration : uint32_t { TILED = 0, PERSISTENT_LANES = 2 };
+
+enum class SwiGluPrecision : uint32_t { FUSED = 0, HF_BF16 = 16 };
 }  // namespace MulticoreRuntime
 #endif  // HYPER_MULTICORE_OPS_COMMON_SWIGLU_TASK_OPTIONS_H_

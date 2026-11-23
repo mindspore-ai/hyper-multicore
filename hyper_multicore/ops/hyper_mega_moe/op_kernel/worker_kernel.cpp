@@ -149,7 +149,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   __aicore__ inline void RunSwiGlu(const TaskDesc &task, int64_t row, int64_t rows,
                                      GM_ADDR input, GM_ADDR output, GM_ADDR tiling) {
     swi_glu(input, output, nullptr, tiling, GetSwiGluClampLimit(task),
-            GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+            GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU,
+            GetSwiGluHfBf16(task));
     if (GetMegaMoeActivationWeighting(task) == MegaMoeActivationWeighting::BEFORE_FC2) {
       const auto &aux = task.outputs[task.num_outputs - 1];
       RoutingProbabilityTile<DTYPE_DISPATCH_TARGET> operation;
