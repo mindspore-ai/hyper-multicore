@@ -98,7 +98,7 @@ def _source_identity(root: Path) -> dict:
                 path.name == "hyper_multicore_build_info"
                 or path.suffix
                 in {".py", ".asc", ".cpp", ".cc", ".h", ".hpp", ".sh", ".bash",
-                    ".patch", ".json", ".ini", ".cmake", ".txt"}
+                    ".patch", ".json", ".ini", ".cmake", ".txt", ".pth"}
             ):
                 if any(part in {"lib", "__pycache__"} for part in path.relative_to(root).parts):
                     continue

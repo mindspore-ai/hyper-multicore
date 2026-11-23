@@ -35,16 +35,10 @@ def _active_multicore_vendor_roots() -> list[Path]:
         for value in os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep)
         if value and Path(value).name == "hyper_multicore_nn"
     ]
-    library_roots = {
-        Path(value).resolve()
-        for value in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
-        if value
-    }
     return [
         vendor_root
         for vendor_root in vendor_roots
         if (vendor_root / "op_api" / "lib" / "libcust_opapi.so").is_file()
-        and (vendor_root / "op_api" / "lib").resolve() in library_roots
     ]
 
 

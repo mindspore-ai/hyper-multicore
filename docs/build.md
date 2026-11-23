@@ -58,11 +58,13 @@ payload 位于 `build/native/payload/hyper_multicore/`。
 ```bash
 source /path/to/cann/set_env.sh
 python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<abi>-<platform>.whl"
-source "$(command -v hyper_multicore_set_env.bash)"
 ```
 
-激活脚本设置项目 vendor 的搜索路径，须在导入 Torch/TorchNpu 之前执行。
-更换制品或环境后使用新的 Python 进程。安装、导入和算子调用均不触发 native 编译或依赖下载。
+安装到 Python 的 `site-packages` 后，直接使用原有的 `python` 或 `torchrun` 命令。
+wheel 在 Python 的 `site` 初始化阶段将包内 vendor 加入当前进程的 `ASCEND_CUSTOM_OPP_PATH`，
+首次使用算子时按绝对路径加载包内库。需要测试另一套制品时，使用干净的环境启动新进程。
+源码 payload、仅通过 `PYTHONPATH` 暴露的 `pip --target` 安装或禁用 `site` 的启动方式，
+仍可在启动前用 `set_env.bash` 配置 vendor。安装、导入和算子调用均不触发 native 编译或依赖下载。
 
 ### 验证安装
 

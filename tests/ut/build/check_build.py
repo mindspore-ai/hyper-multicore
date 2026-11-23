@@ -369,6 +369,36 @@ while not Path(sys.argv[1]).exists():
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("HP-NATIVE-PAYLOAD-MISSING", result.stderr)
 
+    def test_wheel_site_startup_only_configures_its_opp_vendor(self):
+        """Python site startup preserves existing vendors and leaves ELF loading to the adapter."""
+        site_packages = self.root / "site-packages"
+        shutil.copytree(ROOT / "hyper_multicore/_build/wheel", site_packages,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        vendor = site_packages / "hyper_multicore/lib/vendors/hyper_multicore_nn"
+        library = "op_api/lib/libcust_opapi.so"
+        write(vendor / library)
+        existing_vendor = self.root / "other_vendor"
+        explicit_vendor = self.root / "checkout/vendors/hyper_multicore_nn"
+        write(explicit_vendor / library)
+        script = (
+            "import os, site, sys\n"
+            "before = os.environ.get('LD_LIBRARY_PATH')\n"
+            "site.addsitedir(sys.argv[1])\n"
+            "assert os.environ.get('LD_LIBRARY_PATH') == before\n"
+            "assert not {'hyper_multicore', 'torch', 'torch_npu'} & sys.modules.keys()\n"
+            "print(os.environ['ASCEND_CUSTOM_OPP_PATH'])\n"
+        )
+        command = [sys.executable, "-S", "-c", script, str(site_packages)]
+        for configured, expected in (
+            (str(existing_vendor), os.pathsep.join(map(str, (vendor, existing_vendor)))),
+            (str(vendor), str(vendor)),
+            (str(explicit_vendor), str(explicit_vendor)),
+        ):
+            environment = {**os.environ, "ASCEND_CUSTOM_OPP_PATH": configured}
+            result = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.strip(), expected)
+            self.assertEqual(result.stderr, "")
+
     def _sdk_fixture(self, directory):
         """Use real locked Git objects and recording tools in an isolated SDK project."""
         project, shmem, source = (directory / name for name in ("project", "shmem", "custom-json"))

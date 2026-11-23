@@ -25,12 +25,8 @@ if [[ "$PYTHON_BIN" != */* ]]; then
 fi
 CANN_ENV_FILE="${CANN_ENV_FILE:-/usr/local/Ascend/cann/set_env.sh}"  # codespell:ignore cann
 NATIVE_ENV_FILE="${NATIVE_ENV_FILE:-}"
-if [[ -z "$NATIVE_ENV_FILE" ]]; then
-    if [[ -f "$ROOT/build/native/payload/hyper_multicore/lib/set_env.bash" ]]; then
-        NATIVE_ENV_FILE="$ROOT/build/native/payload/hyper_multicore/lib/set_env.bash"
-    else
-        NATIVE_ENV_FILE=$(command -v hyper_multicore_set_env.bash) || die "activate the installed component environment"
-    fi
+if [[ -z "$NATIVE_ENV_FILE" && -f "$ROOT/build/native/payload/hyper_multicore/lib/set_env.bash" ]]; then
+    NATIVE_ENV_FILE="$ROOT/build/native/payload/hyper_multicore/lib/set_env.bash"
 fi
 VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-}"
 NNODES_VALUE="${NNODES:-1}"
@@ -80,7 +76,9 @@ done
 
 cd "$ROOT"
 source_env "$CANN_ENV_FILE"
-source_env "$NATIVE_ENV_FILE"
+if [[ -n "$NATIVE_ENV_FILE" ]]; then
+    source_env "$NATIVE_ENV_FILE"
+fi
 
 export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
 SHMEM_HOST_VALUE="${SHMEM_HOST:-$MASTER_ADDR_VALUE}"

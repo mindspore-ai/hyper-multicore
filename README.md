@@ -31,10 +31,10 @@ kernel 执行中。框架在设备侧管理任务依赖，减少独立 kernel �
 ```bash
 source /path/to/cann/set_env.sh
 python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<abi>-<platform>.whl"
-source "$(command -v hyper_multicore_set_env.bash)"
 ```
 
-在启动导入 Torch/torch-npu 的 Python 进程前完成激活。环境兼容、包来源和完整性检查见
+安装后直接使用原有的 `python` 或 `torchrun` 命令，HyperMulticore 的算子包会在 Python 启动时加入搜索路径。
+环境兼容、包来源和完整性检查见
 [安装与验证](docs/build.md#安装与验证)。
 
 ### 运行双卡 MoE 示例

@@ -82,7 +82,7 @@ source build/native/payload/hyper_multicore/lib/set_env.bash
 ```
 
 **安装模式**：安装目标 wheel 后，将完整 `tests/` 复制到源码树之外。
-清除指向源码的 `PYTHONPATH`，在新的测试目录激活已安装包，避免从 checkout 导入生产代码。
+清除指向源码的 `PYTHONPATH`，在新的测试目录使用已安装包，避免从 checkout 导入生产代码。
 
 ```bash
 # 从源码根目录复制；测试目录不包含 hyper_multicore/ 源码包。
@@ -90,10 +90,9 @@ test_run_dir=$(mktemp -d)
 cp -R tests "$test_run_dir/"
 cd "$test_run_dir"
 source /path/to/cann/set_env.sh
-source "$(command -v hyper_multicore_set_env.bash)"
 ```
 
-在启动 pytest 前完成上述激活。用 `ASCEND_RT_VISIBLE_DEVICES` 选择物理设备，按升序填写，
+在启动 pytest 前准备好 CANN。用 `ASCEND_RT_VISIBLE_DEVICES` 选择物理设备，按升序填写，
 并确认参与设备有足够显存。launcher 从列表中取本用例所需的设备数；省略该变量时从卡 0 开始选择。
 卡数不足会报错，不会自动缩小测试规模。
 

@@ -93,15 +93,11 @@ class TestMulticoreNative(unittest.TestCase):
             self.assertIn(expected, str(raised.exception))
         imports.assert_called_once_with("torch_npu")
 
-    def test_component_paths_accept_sourced_environment_without_modifying_it(self):
-        """Lookup accepts the sourced vendor paths without changing the process environment."""
-        op_api_root = self.vendor_root / "op_api" / "lib"
+    def test_component_paths_accept_opp_without_vendor_library_search_path(self):
+        """The registered OPP path suffices for lookup without editing either variable."""
         environment = {
             "ASCEND_CUSTOM_OPP_PATH": os.pathsep.join(["preexisting", str(self.vendor_root)]),
-            "LD_LIBRARY_PATH": os.pathsep.join([
-                "existing-lib",
-                str(op_api_root),
-            ]),
+            "LD_LIBRARY_PATH": "existing-lib",
         }
         with patch.dict(os.environ, environment, clear=True), patch.object(
             _loader, "_component_root", return_value=self.native_root
@@ -117,10 +113,10 @@ class TestMulticoreNative(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_missing_opp_environment_requires_set_env(self):
+    def test_missing_opp_environment_reports_activation_options(self):
         """Feature: MegaKernel diagnostics.
-        Description: The loader requires explicit environment activation before a framework is loaded.
-        Expectation: Missing opp environment requires set env.
+        Description: The loader requires the vendor to be registered before a framework is loaded.
+        Expectation: A missing OPP path reports the wheel and source activation options.
         """
         with patch.dict(os.environ, {}, clear=True), patch.object(
             _loader, "sys", SimpleNamespace(modules={})
@@ -128,7 +124,7 @@ class TestMulticoreNative(unittest.TestCase):
             _loader, "_component_root", return_value=self.native_root
         ), self.assertRaisesRegex(
             NativeComponentUnavailableError,
-            f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {re.escape(str(self.native_root / 'set_env.bash'))}",
+            f"HP-NATIVE-OPP-NOT-ACTIVATED.*site-packages.*source {re.escape(str(self.native_root / 'set_env.bash'))}",
         ):
             _loader.require_multicore_environment()
 

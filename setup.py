@@ -70,7 +70,10 @@ class BuildPy(build_py):
                 shutil.rmtree(package_build)
         super().run()
         if info is not None:
-            shutil.copytree(payload, Path(self.build_lib) / "hyper_multicore", dirs_exist_ok=True)
+            wheel_root = Path(self.build_lib)
+            shutil.copytree(payload, wheel_root / "hyper_multicore", dirs_exist_ok=True)
+            for name in ("hyper_multicore_opp.pth", "_hyper_multicore_opp.py"):
+                shutil.copy2(ROOT / "hyper_multicore/_build/wheel" / name, wheel_root / name)
 
 
 class BinaryDistribution(Distribution):

@@ -101,6 +101,8 @@ def validate_wheel(wheel: Path, payload: Path, info: dict) -> None:
     """Verify archive membership, RECORD, identities and native payload before publication."""
     with zipfile.ZipFile(wheel) as archive:
         names, record_path, metadata_path = wheel_identity_members(archive)
+        if not {"hyper_multicore_opp.pth", "_hyper_multicore_opp.py"}.issubset(names):
+            raise ValueError("Wheel is missing the site-packages OPP startup files")
         validate_wheel_record(archive, record_path, names)
         validate_wheel_metadata(archive, metadata_path, info)
         validate_wheel_payload(archive, names, payload, info)
