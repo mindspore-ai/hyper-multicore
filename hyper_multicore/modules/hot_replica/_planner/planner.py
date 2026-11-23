@@ -21,7 +21,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 
 from ._balance import _capacity_copies
-from ._dispatch import _home_layout, _materialize
+from ._dispatch import _home_layout, _materialize, aggregate_source_nodes, source_local_node_rows
 from ._placement import _consolidate_copies, _locality_copies
 from ._retained import _rebalance_retained_copies
 from ._selection import _admitted_uncalibrated_copies, _optional_peak_is_useful
@@ -56,6 +56,7 @@ def _prefer_locality(
     saved_rows: int,
     row_credit: int,
     cross_node_cost: float | None,
+    counts: tuple[tuple[int, ...], ...],
 ) -> list[dict[int, int]]:
     """Compare at most one whole-guest locality proposal under the original limits."""
     has_guests = any(
@@ -73,10 +74,17 @@ def _prefer_locality(
     alternate_peak = max(sum(row.values()) for row in alternative)
     if alternate_peak > ceiling:
         return copies
-    if cross_node_cost is not None and _critical_quota_work(
-        alternative, config, nodes, row_credit, cross_node_cost
-    ) >= _critical_quota_work(copies, config, nodes, row_credit, cross_node_cost):
-        return copies
+    if cross_node_cost is not None:
+        before = _critical_quota_work(copies, config, nodes, row_credit, cross_node_cost)
+        after = _critical_quota_work(alternative, config, nodes, row_credit, cross_node_cost)
+        if after > before:
+            return copies
+        if after == before:
+            # Equal replica work can still put very different token loads on
+            # the fabric. Compare the exact node-local quota rule in that tie.
+            sources = aggregate_source_nodes(counts, nodes)
+            if source_local_node_rows(alternative, sources) >= source_local_node_rows(copies, sources):
+                return copies
     return alternative if _optional_peak_is_useful(alternate_peak, loads, ceiling, admission, saved_rows) else copies
 
 
@@ -231,7 +239,7 @@ def build_expert_replica_plan(
     )
     copies = baseline if copies is None else copies
     copies = _prefer_locality(copies, config, nodes, loads, limit, receive_capacity, admission,
-                              minimum_saved_rows, transfer_row_credit, cross_node_cost)
+                              minimum_saved_rows, transfer_row_credit, cross_node_cost, counts)
     _consolidate_copies(copies, counts, config, nodes, transfer_row_credit)
     if minimum_replica_rows > 0 and admission > 0:
         copies = _rebalance_retained_copies(copies, counts, config.home_experts, nodes, minimum_replica_rows)

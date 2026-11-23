@@ -91,3 +91,22 @@ def test_cross_node_cost_does_not_veto_mandatory_receive_capacity():
                                      transfer_row_credit=1024, cross_node_cost=2.0)
     assert max(plan.destination_loads) <= 2048
     plan.validate()
+
+
+def test_equal_replica_cost_prefers_fewer_cross_node_token_rows():
+    """Use source quotas for a tie even when every whole-matrix edge costs 1.0."""
+    replicas = 6
+    counts = []
+    for rank in range(16):
+        row = [0] * 96
+        for position in range(4096 * 8):
+            expert = (position + 13 * rank) % 24 + 48 * (rank // 8)
+            row[expert] += 1
+        counts.append(row)
+    options = dict(minimum_replica_rows=1024, minimum_load_reduction=0.25, capacity_limit=393216,
+                   receive_capacity=393216, rank_nodes=(0,) * 8 + (1,) * 8, transfer_row_credit=896)
+    neutral = build_expert_replica_plan(counts, replicas, **options, cross_node_cost=1.0)
+    expensive = build_expert_replica_plan(counts, replicas, **options, cross_node_cost=2.0)
+    assert neutral.transfers and neutral == expensive
+    assert all(edge.owner_rank // 8 == edge.target_rank // 8 for edge in neutral.transfers)
+    neutral.validate()

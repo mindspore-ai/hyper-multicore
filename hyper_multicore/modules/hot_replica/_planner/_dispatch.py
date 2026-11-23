@@ -169,6 +169,26 @@ def _ordered_dispatch(counts, slots, copies):
     return intersect_source_intervals(counts, owners, destination_starts, destination_ends)
 
 
+def aggregate_source_nodes(counts, nodes):
+    """Aggregate the source wire by actual node before evaluating BF16 locality."""
+    unique_nodes, ranks_to_nodes = np.unique(nodes, return_inverse=True)
+    sources = np.zeros((len(unique_nodes), len(counts[0])), dtype=np.int64)
+    np.add.at(sources, ranks_to_nodes, np.asarray(counts, dtype=np.int64))
+    return ranks_to_nodes, sources
+
+
+def source_local_node_rows(copies, node_counts):
+    """Compute cross-node rows exactly for the rank-local then node-local lowering."""
+    ranks_to_nodes, sources = node_counts
+    destinations = np.zeros_like(sources)
+    for node, slots in zip(ranks_to_nodes, copies):
+        for expert, rows in slots.items():
+            destinations[node, expert] += rows
+    # The initial rank-local allocation is also node-local. After node-local
+    # filling, only the unfulfilled node quotas cross the node boundary.
+    return int(np.maximum(destinations - sources, 0).sum())
+
+
 def _materialize(
     counts: tuple[tuple[int, ...], ...] | np.ndarray,
     copies: list[dict[int, int]],
