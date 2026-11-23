@@ -25,8 +25,12 @@ from tests.common.port_utils import allocate_port
 
 
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_placement_checkpoint_and_close(monkeypatch):
+@pytest.mark.parametrize(("dispatch_mode", "layout"), [("push", "EIO"), ("pull", "EIO"), ("pull", "EOI")])
+def test_placement_checkpoint_and_close(monkeypatch, tmp_path, dispatch_mode, layout):
     prepare_multicore_test_environment()
+    monkeypatch.setenv("HOT_REPLICA_DISPATCH_MODE", dispatch_mode)
+    monkeypatch.setenv("HOT_REPLICA_WEIGHT_LAYOUT", layout)
+    monkeypatch.setenv("HOT_REPLICA_TEST_RESULTS", str(tmp_path))
     monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         run_multicore_case(str(Path(__file__).with_name("_test_hot_replica.py")),
@@ -34,12 +38,10 @@ def test_placement_checkpoint_and_close(monkeypatch):
 
 
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
-def test_placement_edge_cases(monkeypatch, tmp_path, dispatch_mode):
+def test_placement_edge_cases(monkeypatch, tmp_path):
     """Exercise both layouts, probability positions, splits and graph lifetimes."""
     prepare_multicore_test_environment()
     monkeypatch.setenv("EDGE_OUT", str(tmp_path / "edge-results"))
-    monkeypatch.setenv("EDGE_DISPATCH_MODE", dispatch_mode)
     monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         run_multicore_case(str(Path(__file__).with_name("_test_hot_replica_edge_cases.py")),

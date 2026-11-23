@@ -44,7 +44,7 @@ def test_serial_replica_widths_share_one_reservation_with_the_bank():
     """Keep one virtual reservation when the home counters cannot cover all widths."""
     spec = SimpleNamespace(local_experts=6, ep_size=32, top_k=8, initial_capacity_factor=1.25,
                            partial_weight_grad_dtype=None, batch_experts=False,
-                           expert_weight_layout="EIO")
+                           expert_weight_layout="EIO", compact_pull=True)
     owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
     owner.parent = SimpleNamespace(spec=spec, heap_manager=object())
     owner.pool, owner.geometries = None, {}
@@ -62,6 +62,7 @@ def test_serial_replica_widths_share_one_reservation_with_the_bank():
     assert first is second
     specification, dtype, receive, source = sizing.call_args.args
     assert (specification["num_experts"], dtype, receive, source) == (384, torch.bfloat16, 40960, 4096)
+    assert specification["compact_pull"]
     bank.assert_called_once_with(hidden, owner.parent, owner, pipeline=True,
                                  reservations=((specification, layout),))
     resource.assert_called_once()
