@@ -158,6 +158,7 @@ class PlacementResources:
         self.pool = None
         self.geometries = {}
         self.replica_slots_per_rank = specification.get("replica_slots_per_rank")
+        self.cross_node_cost = specification.get("cross_node_cost")
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
         built_in_a5 = built_in and spec.architecture == 3510
@@ -165,7 +166,8 @@ class PlacementResources:
         can_split_weights = supports_bounded_placement(spec)
         self.requires_fused_return = can_split_weights and spec.expert_weight_layout == "EIO"
         supported = built_in and can_split_weights
-        self.bounded = (BoundedPlacement(spec, replica_slots_per_rank=self.replica_slots_per_rank)
+        self.bounded = (BoundedPlacement(spec, replica_slots_per_rank=self.replica_slots_per_rank,
+                                        cross_node_cost=self.cross_node_cost)
                         if supported else None)
         self.bf16_partials = False
         self.prefer_bf16_partials = False
@@ -269,6 +271,7 @@ class PlacementResources:
             minimum_load_reduction=0.25 if request.training else 0.4,
             capacity_limit=peak, receive_capacity=peak, rank_nodes=self.rank_nodes,
             transfer_row_credit=spec.intermediate_size // 2 if request.training else 0,
+            cross_node_cost=self.cross_node_cost,
         )
         if not plan.transfers:
             return None

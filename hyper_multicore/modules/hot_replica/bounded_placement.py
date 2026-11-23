@@ -159,10 +159,12 @@ def _render_geometry(plan, spec, device, maximum, *, prepare_metadata=True):
 class BoundedPlacement:
     """Reuse immutable geometry on the same complete count wire and stream."""
 
-    def __init__(self, spec: MegaMoeSpec, *, replica_slots_per_rank: int | None = None) -> None:
+    def __init__(self, spec: MegaMoeSpec, *, replica_slots_per_rank: int | None = None,
+                 cross_node_cost: float | None = None) -> None:
         """Keep the most recent geometry for one EP execution owner."""
         self.spec = spec
         self.replica_slots_per_rank = min(spec.local_experts, replica_slots_per_rank or spec.local_experts)
+        self.cross_node_cost = cross_node_cost
         self.nodes = None
         self.snapshot = None
         self.key = None
@@ -236,6 +238,7 @@ class BoundedPlacement:
             minimum_load_reduction=0.25 if projections == 3 else 0.4,
             capacity_limit=capacity, receive_capacity=capacity, rank_nodes=self.nodes,
             transfer_row_credit=spec.intermediate_size * projections // 6,
+            cross_node_cost=self.cross_node_cost,
         )
         geometry = _render_geometry(plan, spec, device, maximum) if plan.transfers else None
         self.key, self.snapshot, self.geometry = key, wire.copy(), geometry

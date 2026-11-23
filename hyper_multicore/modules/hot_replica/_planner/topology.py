@@ -28,3 +28,13 @@ def _validate_rank_nodes(nodes: Sequence[int], size: int) -> tuple[int, ...]:
     if frozen and (len(frozen) != size or invalid):
         raise ValueError('Replica rank_nodes must contain one nonnegative integer node label per EP rank')
     return frozen
+
+
+def charge_replica_endpoints(ranks: int, edges, nodes: tuple[int, ...], cross_node_cost: float) -> list[float]:
+    """Charge each whole-matrix edge to both the owner and guest rank."""
+    charges = [0.0] * ranks
+    for owner, guest in edges:
+        charge = cross_node_cost if nodes and nodes[owner] != nodes[guest] else 1.0
+        charges[owner] += charge
+        charges[guest] += charge
+    return charges

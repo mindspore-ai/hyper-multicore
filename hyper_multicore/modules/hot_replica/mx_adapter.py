@@ -228,14 +228,17 @@ class MXPlacementResources(PlacementResources):
             if use_peak_policy:
                 plan = build_mx_peak_plan(counts, self.config, capacity=capacity, minimum_rows=_MINIMUM_ROWS,
                                           minimum_reduction=_MINIMUM_REDUCTION, row_credit=credit, nodes=self.nodes,
-                                          drain_peak_plateau=True, admit_small_transfer_plan=training)
+                                          drain_peak_plateau=True, admit_small_transfer_plan=training,
+                                          cross_node_cost=self.cross_node_cost if training else None)
                 if training:
-                    plan = localize_mx_guests(plan, self.nodes, mx_guest_transfer_rows(spec.intermediate_size))
+                    plan = localize_mx_guests(plan, self.nodes, mx_guest_transfer_rows(spec.intermediate_size),
+                                              cross_node_cost=self.cross_node_cost)
             elif training:
                 plan = build_mx_local_peak_plan(
                     counts, self.config, capacity=capacity, minimum_rows=_MINIMUM_ROWS,
                     minimum_reduction=_MINIMUM_REDUCTION, row_credit=credit, nodes=self.nodes,
                     transfer_rows=mx_guest_transfer_rows(spec.intermediate_size),
+                    cross_node_cost=self.cross_node_cost,
                     validated_expert_totals=tuple(snapshot.expert_totals.tolist()) if snapshot is not None else None,
                 )
             else:

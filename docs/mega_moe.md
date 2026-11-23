@@ -159,6 +159,8 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 ```
 
 - Push 的默认副本槽上限等于每 rank 的原属专家数 `num_experts / ep_size`。实际借用数量由路由、接收容量和放置代价决定。
+- `HotReplicaPlanner(cross_node_cost=1.0)` 给跨节点副本和同节点副本相同的权重传输代价。可以按链路与精度调节此倍率。
+  该设置用于默认有界配额的 BF16 Push 和 MXFP8 Push 训练规划，需在 EP 组内一致。省略时沿用平台原有估算。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   Pull 需要支持按实际行数切分 GET 的 A3 制品。默认放置策略沿用 Push 的配额计算，由执行 rank 从对称源区拉取 token。
   自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。

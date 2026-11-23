@@ -28,7 +28,7 @@ from ._selection import _admitted_uncalibrated_copies, _optional_peak_is_useful
 from .admission import reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
-from .topology import _validate_rank_nodes
+from .topology import _validate_rank_nodes, charge_replica_endpoints
 
 
 def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
@@ -54,6 +54,8 @@ def _prefer_locality(
     receive_capacity: int | None,
     admission: int,
     saved_rows: int,
+    row_credit: int,
+    cross_node_cost: float | None,
 ) -> list[dict[int, int]]:
     """Compare at most one whole-guest locality proposal under the original limits."""
     has_guests = any(
@@ -71,6 +73,10 @@ def _prefer_locality(
     alternate_peak = max(sum(row.values()) for row in alternative)
     if alternate_peak > ceiling:
         return copies
+    if cross_node_cost is not None and _critical_quota_work(
+        alternative, config, nodes, row_credit, cross_node_cost
+    ) >= _critical_quota_work(copies, config, nodes, row_credit, cross_node_cost):
+        return copies
     return alternative if _optional_peak_is_useful(alternate_peak, loads, ceiling, admission, saved_rows) else copies
 
 
@@ -83,21 +89,22 @@ def _validate_options(options: tuple[tuple[str, int | None], ...], reduction: fl
     return reduction_basis_points(reduction)
 
 
-def _traffic_work_is_useful(copies, loads, config, resident, row_credit, minimum_rows):
+def _critical_quota_work(copies, config, nodes, row_credit, cross_node_cost):
     """Charge actual incoming and owner-return matrices against saved critical work."""
+    if not row_credit:
+        return max(sum(row.values()) for row in copies)
+    home = config.home_experts
+    edges = ((expert // home, rank) for rank, row in enumerate(copies)
+             for expert, rows in row.items() if rows and expert // home != rank)
+    charges = charge_replica_endpoints(config.ep_size, edges, nodes, cross_node_cost)
+    return max(sum(row.values()) + row_credit * charge for row, charge in zip(copies, charges))
+
+
+def _traffic_work_is_useful(copies, loads, config, resident, row_credit, minimum_rows, nodes, cross_node_cost):
+    """Preserve capacity-required layouts and check optional rank work."""
     if not row_credit or max(loads) > resident:
         return True
-    outgoing, incoming = [0] * config.ep_size, [0] * config.ep_size
-    for rank, row in enumerate(copies):
-        for expert, rows in row.items():
-            owner = expert // config.home_experts
-            if rows and owner != rank:
-                outgoing[owner] += 1
-                incoming[rank] += 1
-    bound = max(
-        sum(row.values()) + row_credit * (sent + received)
-        for row, sent, received in zip(copies, outgoing, incoming)
-    )
+    bound = _critical_quota_work(copies, config, nodes, row_credit, cross_node_cost or 1.0)
     return max(loads) >= bound + minimum_rows
 
 
@@ -167,8 +174,9 @@ def build_expert_replica_plan(
     receive_capacity: int | None = None,
     rank_nodes: Sequence[int] = (),
     transfer_row_credit: int = 0,
+    cross_node_cost: float | None = None,
 ) -> ExpertExecutionPlan:
-    """Plan lossless replicas with the frozen production heuristic and no cost model.
+    """Plan lossless replicas under capacity limits and endpoint work checks.
 
     Args:
         counts_by_source: Nonnegative logical expert histograms, one row per EP rank.
@@ -184,6 +192,7 @@ def build_expert_replica_plan(
             Runtime adapters derive this from mandatory gradient bytes; counts-only
             callers should retain zero. Lower training gain floors also charge
             every actual incoming and owner-return matrix before admission.
+        cross_node_cost: Optional relative charge for a guest on another node.
 
     Returns:
         An immutable plan conserving every source/logical-expert row count.
@@ -220,12 +229,13 @@ def build_expert_replica_plan(
         totals, loads, config, limit, resident, target, minimum_replica_rows, admission, minimum_saved_rows
     )
     copies = baseline if copies is None else copies
-    copies = _prefer_locality(copies, config, nodes, loads, limit, receive_capacity, admission, minimum_saved_rows)
+    copies = _prefer_locality(copies, config, nodes, loads, limit, receive_capacity, admission,
+                              minimum_saved_rows, transfer_row_credit, cross_node_cost)
     _consolidate_copies(copies, counts, config, nodes, transfer_row_credit)
     if minimum_replica_rows > 0 and admission > 0:
         copies = _rebalance_retained_copies(copies, counts, config.home_experts, nodes, minimum_replica_rows)
     if 0 < admission < reduction_basis_points(0.4) and not _traffic_work_is_useful(
-        copies, loads, config, resident, transfer_row_credit, minimum_replica_rows
+        copies, loads, config, resident, transfer_row_credit, minimum_replica_rows, nodes, cross_node_cost
     ):
         copies = baseline
     return _materialize(counts, copies, config, capacity_limit, rank_nodes=nodes)

@@ -208,14 +208,18 @@ class MegaMoeExperts(MulticoreModule):
         planner_key = None
         replica_slots_per_rank = None
         receive_capacity_percent = None
+        cross_node_cost = None
         if planner is not None:
             from ..hot_replica.planner import HotReplicaPlanner  # pylint: disable=import-outside-toplevel
 
             if isinstance(planner, HotReplicaPlanner):
                 replica_slots_per_rank = planner.replica_slots_per_rank
                 receive_capacity_percent = planner.receive_capacity_percent
+                cross_node_cost = planner.cross_node_cost
             if receive_capacity_percent is not None and (precision != "bf16" or tuning.dispatch_mode != "push"):
                 raise ValueError("An explicit HotReplica receive capacity percentage requires BF16 Push")
+            if cross_node_cost is not None and tuning.dispatch_mode != "push":
+                raise ValueError("An explicit HotReplica cross_node_cost requires Push")
             if precision == "mxfp8":
                 if replica_slots_per_rank is not None:
                     raise ValueError("An explicit HotReplica guest budget requires BF16")
@@ -251,6 +255,7 @@ class MegaMoeExperts(MulticoreModule):
             "planner_key": planner_key,
             "replica_slots_per_rank": replica_slots_per_rank,
             "receive_capacity_percent": receive_capacity_percent,
+            "cross_node_cost": cross_node_cost,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from sys import float_info
 from typing import Any, Literal
 
 import torch
@@ -31,8 +32,9 @@ class HotReplicaPlanner(BasePlanner):
     def __init__(
         self, *, replica_slots_per_rank: int | None = None,
         receive_capacity_percent: int | Literal["auto"] | None = None,
+        cross_node_cost: float | None = None,
     ) -> None:
-        """Set optional limits on guest slots and receive rows relative to the EP mean."""
+        """Set optional guest and receive limits and a relative inter-node replica charge."""
         if replica_slots_per_rank is not None and (
             type(replica_slots_per_rank) is not int or replica_slots_per_rank <= 0
         ):
@@ -41,8 +43,13 @@ class HotReplicaPlanner(BasePlanner):
             type(receive_capacity_percent) is not int or receive_capacity_percent < 100
         ):
             raise ValueError('receive_capacity_percent must be an integer at least 100 or "auto"')
+        if cross_node_cost is not None:
+            if type(cross_node_cost) not in (int, float) or not 0 < cross_node_cost <= float_info.max:
+                raise ValueError("cross_node_cost must be a finite positive multiplier")
+            cross_node_cost = float(cross_node_cost)
         self._replica_slots_per_rank = replica_slots_per_rank
         self._receive_capacity_percent = receive_capacity_percent
+        self._cross_node_cost = cross_node_cost
         self._rejected_routes: OrderedDict[tuple[Any, ...], None] = OrderedDict()
 
     @property
@@ -55,6 +62,11 @@ class HotReplicaPlanner(BasePlanner):
         """Return the configured receive policy relative to the actual routed rows."""
         return self._receive_capacity_percent
 
+    @property
+    def cross_node_cost(self) -> float | None:
+        """Return the optional cross-node replica transfer multiplier."""
+        return self._cross_node_cost
+
     def configuration_key(self) -> str:
         """Include the explicit limits in the configuration agreed by EP ranks."""
         settings = []
@@ -62,6 +74,8 @@ class HotReplicaPlanner(BasePlanner):
             settings.append(f"replica_slots_per_rank={self.replica_slots_per_rank}")
         if self.receive_capacity_percent is not None:
             settings.append(f"receive_capacity_percent={self.receive_capacity_percent}")
+        if self.cross_node_cost is not None:
+            settings.append(f"cross_node_cost={self.cross_node_cost}")
         return ",".join(settings)
 
     @torch.no_grad()

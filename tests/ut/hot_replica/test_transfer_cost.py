@@ -14,6 +14,11 @@
 # ============================================================================
 """Validate placement transfer cost accounting."""
 
+import pytest
+
+from hyper_multicore.modules.hot_replica._planner.mx_peak_planner import _weighted_rank_peak
+from hyper_multicore.modules.hot_replica._planner.planner import build_expert_replica_plan
+from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.hot_replica.placement import placement_is_profitable
 
 
@@ -52,3 +57,37 @@ def test_actual_copy_count_and_backward_fetch_change_profitability(monkeypatch):
     assert placement_is_profitable(**geometry, transfer_experts=1, backward_prefetch_weight_bytes=400)
     assert not placement_is_profitable(**geometry, transfer_experts=2, backward_prefetch_weight_bytes=400)
     assert placement_is_profitable(**geometry, transfer_experts=2, backward_prefetch_weight_bytes=0)
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, float("nan"), float("inf"), "1"])
+def test_cross_node_cost_requires_a_finite_positive_multiplier(value):
+    """Reject invalid or ambiguous values before EP resource binding."""
+    with pytest.raises(ValueError, match="finite positive multiplier"):
+        HotReplicaPlanner(cross_node_cost=value)
+
+
+def test_cross_node_cost_is_part_of_ep_planner_identity():
+    """Two EP members may only share a planner configuration with the same charge."""
+    assert HotReplicaPlanner(cross_node_cost=1).configuration_key() == "cross_node_cost=1.0"
+    assert HotReplicaPlanner(cross_node_cost=0.75).configuration_key() != HotReplicaPlanner().configuration_key()
+
+
+def test_mx_cost_uses_actual_endpoints_and_charges_remote_edges_at_requested_rate():
+    """For identical work and peers, 1.0 prices remote and local equally."""
+    loads = (15000, 10000, 12000, 8000)
+    slots = ((0, -1), (1, -1), (2, 0), (3, 0))
+    local = _weighted_rank_peak(loads, slots, 1, (0, 0, 0, 0), 1000, 1.0)
+    remote = _weighted_rank_peak(loads, slots, 1, (0, 0, 1, 1), 1000, 1.0)
+    assert local == remote
+    assert _weighted_rank_peak(loads, slots, 1, (0, 0, 1, 1), 1000, 0.75) < remote
+    assert _weighted_rank_peak(loads, slots, 1, (0, 0, 1, 1), 1000, 2.0) > remote
+
+
+def test_cross_node_cost_does_not_veto_mandatory_receive_capacity():
+    """A required BF16 capacity plan still has to satisfy the actual row limit."""
+    counts = [[1024, 1024, 0, 0]] * 4
+    plan = build_expert_replica_plan(counts, 1, minimum_load_reduction=0.25, minimum_replica_rows=256,
+                                     capacity_limit=2048, receive_capacity=2048, rank_nodes=(0, 0, 1, 1),
+                                     transfer_row_credit=1024, cross_node_cost=2.0)
+    assert max(plan.destination_loads) <= 2048
+    plan.validate()
