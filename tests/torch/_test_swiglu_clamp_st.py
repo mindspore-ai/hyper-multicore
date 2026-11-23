@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch_npu
 
-from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
 from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as mega_function
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import execute_mega_moe
 from hyper_multicore.modules.mega_moe.route import (
@@ -114,9 +114,11 @@ def _new_layers(
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
-        numerics_options=MegaMoeNumericsOptions(
-            swiglu_limit=swiglu_limit, clamp_after_silu=clamp_after_silu,
-            apply_probs_before_fc2=apply_probs_before_fc2),
+        activation=SwiGLUParameters(
+            clamp_limit=swiglu_limit,
+            clamp_after_silu=clamp_after_silu,
+        ),
+        numerics_options=MegaMoeNumericsOptions(apply_probs_before_fc2=apply_probs_before_fc2),
         ep_group=dist.group.WORLD,
     ).to(device=baseline.DEVICE, dtype=torch.bfloat16)
     _initialize_weights(common, mega, shape)

@@ -82,7 +82,7 @@ MegaMoE 不接受 TP 大小参数。
 | 公开接口 | 用途 | 使用约定 |
 | --- | --- | --- |
 | `MegaMoeExperts` | 配置模型尺寸和 EP 组，执行专家前反向并管理执行资源 | 公开稳定 API；专家参数由调用方持有，每次 forward 传入。 |
-| `MegaMoeNumericsOptions` | 配置 SwiGLU 裁剪、路由概率的应用位置及 partial dW 精度 | 公开稳定 API；通过 `numerics_options=` 传入，按来源模型选择数值语义。 |
+| `MegaMoeNumericsOptions` | 配置路由概率的应用位置及 partial dW 精度 | 公开稳定 API；通过 `numerics_options=` 传入，按来源模型选择数值语义。 |
 | `MegaMoeTuningOptions` | 配置通信模式、容量、分片和可选调度 | 公开实验 API；通过 `tuning_options=` 传入。字段、可选值及默认执行策略不保证跨版本兼容，升级时须重新验证。 |
 | `MegaMoeSchedulerOptions` | 配置数学任务顺序、就绪扫描和 lowering | 公开实验 API；作为 `MegaMoeTuningOptions(scheduler=...)` 传入。 |
 
@@ -154,7 +154,7 @@ output = experts(
 | token 规格 | 按调用自动管理 | 按调用自动管理 |
 | 权重 | 模型持有，每次 forward 传入 `expert_weights`；EIO/EOI | 模型持有的外部 MX root；EIO |
 | H / I | 正整数；尺寸支持范围见下文 | 均须为 64 的正整数倍 |
-| 激活与概率位置 | 支持 SiLU 前后裁剪、FC2 前或后加权 | 普通 SwiGLU、FC2 后加权；`swiglu_limit` 必须为 `None`，拒绝 FC2 前加权 |
+| 激活与概率位置 | 支持 SiLU 前后裁剪、FC2 前或后加权 | 普通 SwiGLU、FC2 后加权；`activation.clamp_limit` 必须为 `None`，拒绝 FC2 前加权 |
 | 调度选择 | arch22 支持 compact、nominal 和专家批处理；arch35 使用逐专家 dense | arch35 逐专家 dense；拒绝 compact、nominal 和 batching |
 | 诊断 | task profiler 与适配范围内的 tensor dump | task profiler；不支持 tensor dump |
 | `dispatch_mode` | `push` / `pull` | `push` / `pull` |
@@ -219,39 +219,41 @@ M 和 N 必须均为 64 的倍数。root 上的物理字段按以下布局解释
 
 ### 模型数学与数值语义
 
-`MegaMoeNumericsOptions` 是公开稳定的数值配置接口，可直接从 `hyper_multicore` 导入。
-类型定义位于 `hyper_multicore/modules/mega_moe/numerics.py`，由 MegaMoE 管理，与实验调优配置分开。
-通过 `MegaMoeExperts(..., numerics_options=...)` 按模型逐层配置以下字段：
+激活算法及其私有参数通过 `MegaMoeExperts(activation=...)` 指定。`None` 默认选择
+`SwiGLUParameters()`；参数对象不可变，算法由对象类型决定，不另设算法字符串。
+两个参数类型均从 `hyper_multicore` 导入，定义位于 `modules/mega_moe/numerics.py`。
+
+| 参数类型 / 字段 | 默认值 | 语义 |
+| --- | --- | --- |
+| `SwiGLUParameters.clamp_limit` | `None` | 不进行 clamp；提供时须为正、有限且转换为 FP32 后仍为有限正数。gate 分支只截上界，up 分支截到 `[-limit, limit]`。 |
+| `SwiGLUParameters.clamp_after_silu` | `False` | 在 SiLU 前截 gate；`True` 在 SiLU 后、乘 up 前截 gate。仅在提供 clamp limit 时生效，必须为布尔值。 |
+| `SiTUGLUParameters.beta` | 必填 | 有限正数，转换为 FP32 后仍为有限正数。 |
+| `SiTUGLUParameters.linear_beta` | `0.0` | 有限数值；非正值关闭 up 分支 tanh，正值需转换为有效 FP32 正数。 |
+
+当前可独立构造 `SiTUGLUParameters`。设备实现接入前，将它传给 `MegaMoeExperts` 会在构造时抛出
+`NotImplementedError`。MXFP8 当前只支持普通 SwiGLU。
+
+`MegaMoeNumericsOptions` 通过 `numerics_options=` 配置通用数值选项：
 
 | 字段 | 默认值 | 语义 |
 | --- | --- | --- |
-| `partial_weight_grad_dtype` | `None` | `None` 和 `"native"` 使用后端默认的 BF16 partial dW；`"float32"` 使用 FP32 partial dW。最终梯度按调用方权重及梯度归并合同处理。 |
-| `swiglu_limit` | `None` | 不进行 clamp；提供时须为正、有限且可由 FP32 表示的值。gate 分支只截上界，up 分支截到 `[-limit, limit]`。 |
-| `clamp_after_silu` | `False` | `False` 在 SiLU 前截 gate；`True` 在 SiLU(gate) 后、乘 up 前截 gate 激活。仅在提供 `swiglu_limit` 时生效。 |
-| `apply_probs_before_fc2` | `False` | `False` 在 FC2 后对专家输出加权；`True` 对 BF16 SwiGLU 激活加权，再送入 FC2。 |
+| `partial_weight_grad_dtype` | `None` | `None` 和 `"native"` 使用 BF16 partial dW；`"float32"` 使用 FP32 partial dW。最终梯度按权重及梯度归并合同处理。 |
+| `apply_probs_before_fc2` | `False` | 在 FC2 后加权；`True` 对 BF16 激活加权后送入 FC2，必须为布尔值。 |
 
 ```python
-from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
 
-# 按来源模型选择数值语义；这里仅演示配置方式。
-numerics = MegaMoeNumericsOptions(
-    swiglu_limit=7.0,
-    clamp_after_silu=True,
-    apply_probs_before_fc2=True,
-)
 experts = MegaMoeExperts(
     hidden_size=512, intermediate_size=128, num_experts=4, top_k=2,
     ep_group=ep_group,
-    numerics_options=numerics,
+    activation=SwiGLUParameters(clamp_limit=7.0, clamp_after_silu=True),
+    numerics_options=MegaMoeNumericsOptions(apply_probs_before_fc2=True),
 )
 ```
 
-`clamp_after_silu` 和 `apply_probs_before_fc2` 必须是布尔值。
-数值配置和调优配置都是不可变的 frozen dataclass；执行器在构造时校验并规范化配置，
-不支持通过修改实例属性切换数值路径。省略 `numerics_options` 与传入
-`MegaMoeNumericsOptions()` 使用相同的默认语义。
-执行器保留 `swiglu_limit`、`clamp_after_silu` 和 `apply_probs_before_fc2` 三个只读查询属性；
-改变语义应创建新的配置和执行器。
+执行器通过只读 `activation` 属性返回激活参数，通过 `apply_probs_before_fc2` 查询概率位置。
+改变语义应创建新的配置和执行器。clamp 已从 `MegaMoeNumericsOptions` 移至 `SwiGLUParameters`；
+原 `swiglu_limit` / `clamp_after_silu` 模块属性改为读取 `activation.clamp_limit` / `activation.clamp_after_silu`。
 
 ### 裁剪与概率加权
 
@@ -269,7 +271,7 @@ activation = torch.nn.functional.silu(gate).clamp(max=L) * up.clamp(-L, L)
 ```
 
 这里的 after 指 SiLU 之后，不是对完整 SwiGLU 乘积截断。两者定义不同的函数和梯度；
-backward 和重算使用对应的 clamp 位置。`swiglu_limit=None` 时两种位置都走不截断路径。
+backward 和重算使用对应的 clamp 位置。`activation.clamp_limit=None` 时两种位置都走不截断路径。
 
 `apply_probs_before_fc2=True` 保留两处 BF16 舍入：先将 SwiGLU 激活写为 BF16，
 再以 FP32 乘对应路由概率，舍入为 BF16 后供 FC2 使用。其顺序可写成：

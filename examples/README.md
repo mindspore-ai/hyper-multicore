@@ -66,10 +66,11 @@ forward 返回三张量 tuple：`logits`、`topk_weights`、`topk_ids`。
 
 ```python
 import torch
-from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
 
 class RoutedExperts(torch.nn.Module):
     def __init__(self, source, *, hidden_size, intermediate_size, num_experts, top_k, ep_group,
+                 activation: SwiGLUParameters | None = None,
                  numerics_options: MegaMoeNumericsOptions | None = None):
         super().__init__()
         self.gate_up_weight = source.gate_up_weight
@@ -77,7 +78,7 @@ class RoutedExperts(torch.nn.Module):
         self.executor = MegaMoeExperts(
             hidden_size=hidden_size, intermediate_size=intermediate_size,
             num_experts=num_experts, top_k=top_k, ep_group=ep_group,
-            numerics_options=numerics_options,
+            activation=activation, numerics_options=numerics_options,
         )
 
     def forward(self, hidden_states, topk_ids, topk_weights):
@@ -94,8 +95,8 @@ class RoutedExperts(torch.nn.Module):
 EIO/EOI，契约见[输入与权重](../docs/mega_moe.md#输入与权重)。如果原模型的 gate/up 是两个
 独立参数，需要模型侧合并或调整存储；每次 forward 拼接可能产生额外复制。
 
-按来源模型逐层构造 `MegaMoeNumericsOptions(swiglu_limit=..., clamp_after_silu=...,
-apply_probs_before_fc2=...)`，再通过 `numerics_options=` 传入 adapter。
+按来源模型逐层构造 `SwiGLUParameters(clamp_limit=..., clamp_after_silu=...)`，通过 `activation=` 传入 adapter；
+概率位置通过 `numerics_options=MegaMoeNumericsOptions(apply_probs_before_fc2=...)` 指定。
 省略时使用不截断、FC2 后乘概率的默认语义。`clamp_after_silu=True` 指 SiLU 后、乘 up 前截断，
 概率前移则保留激活 BF16 写出和乘概率后 BF16 写出两处舍入，详见
 [数值语义](../docs/mega_moe.md#模型数学与数值语义)。这些选项由模型语义决定。

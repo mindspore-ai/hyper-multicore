@@ -35,7 +35,7 @@ class OwnedMegaMoeExperts(MegaMoeExperts):
                 raise TypeError("Pass test tuning fields or tuning_options, not both")
             kwargs["tuning_options"] = MegaMoeTuningOptions(**tuning)
         numerics = {name: kwargs.pop(name) for name in (
-            "swiglu_limit", "clamp_after_silu", "apply_probs_before_fc2",
+            "apply_probs_before_fc2",
         ) if name in kwargs}
         if numerics:
             if "numerics_options" in kwargs:

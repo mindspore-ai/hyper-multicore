@@ -15,6 +15,7 @@
 """Compose forward/backward expert DAGs from standard MX mathematical tasks."""
 from dataclasses import dataclass
 from typing import Any
+from hyper_multicore.modules.mega_moe.numerics import SwiGLUParameters
 from hyper_multicore.scheduler.config import (TaskSplitValue,
     init_task_split_value, configure_ready_handshake, validate_runtime_config, mega_moe_event_capacity)
 from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, TensorSpec, SplitSpec
@@ -115,8 +116,9 @@ def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
 
 def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool) -> MXFP8Runtime:
     """Wire per-expert dependencies; preserve adopted math, transport and task boundaries."""
-    if spec.swiglu_limit is not None:
-        raise ValueError("MX tasks currently require unclamped activation")
+    activation_parameters = spec.activation_parameters
+    if not isinstance(activation_parameters, SwiGLUParameters) or activation_parameters.clamp_limit is not None:
+        raise ValueError("MX tasks currently require unclamped SwiGLU")
     values = _MXTaskValues(tp=1, ep=spec.ep_size, seq_size=spec.local_num_tokens,
                            all_expert_num=spec.num_experts, top_k=spec.top_k,
                            compute_stages=4 if forward else 6, dispatch_mode=spec.dispatch_mode)

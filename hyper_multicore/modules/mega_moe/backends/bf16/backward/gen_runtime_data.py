@@ -123,7 +123,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     task_num_all = sum(op.task_num for op in graph.topological_sort()) + 1
 
     dispatch_op    = graph.get_op("dispatch")
-    swiglu_grad_op = graph.get_op("swiglu_grad")
+    activation_op = graph.get_op("activation")
     act_grad_op    = graph.get_op("act_grad")
     w1_grad_op     = graph.get_op("w1_grad")
     w2_grad_op     = graph.get_op("w2_grad")
@@ -132,7 +132,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     add_terminate(cfg, tsv,
                   w2_grad_op.task_num + w1_grad_op.task_num
                   + combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num, combine_op.task_num)
+    revise_task_queue(cfg, tsv, dispatch_op.task_num, activation_op.task_num, combine_op.task_num)
     revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
 
@@ -184,7 +184,7 @@ def _describe_graph(context: _GenerationContext) -> None:
     dispatch_op    = graph.get_op("dispatch")
     act_grad_op    = graph.get_op("act_grad")
     w2_grad_op     = graph.get_op("w2_grad")
-    swiglu_grad_op = graph.get_op("swiglu_grad")
+    activation_op = graph.get_op("activation")
     gate_grad_op   = graph.get_op("gate_grad")
     w1_grad_op     = graph.get_op("w1_grad")
     combine_op     = graph.get_op("combine")
@@ -192,7 +192,7 @@ def _describe_graph(context: _GenerationContext) -> None:
     print(f"[bwd] tp={args.tp} ep={args.ep} seq={args.seq_size} "
           f"E={args.all_expert_num} topk={args.top_k}")
     print(f"      dispatch={dispatch_op.task_num}  act_grad={act_grad_op.task_num}  "
-          f"w2_grad={w2_grad_op.task_num}  swiglu_grad={swiglu_grad_op.task_num}  "
+          f"w2_grad={w2_grad_op.task_num}  {activation_op.name}={activation_op.task_num}  "
           f"gate_grad={gate_grad_op.task_num}  w1_grad={w1_grad_op.task_num}  "
           f"combine={combine_op.task_num}")
 
@@ -206,7 +206,7 @@ def _write_tiling_files(context: _GenerationContext) -> None:
     gate_grad_op = graph.get_op("gate_grad")
     w1_grad_op = graph.get_op("w1_grad")
     w2_grad_op = graph.get_op("w2_grad")
-    swiglu_grad_op = graph.get_op("swiglu_grad")
+    activation_op = graph.get_op("activation")
     act_grad_bytes    = get_act_grad_tiling_bytes(act_grad_op.split_value,
                                                   hidden_size=args.hidden_size,
                                                   intermediate_size=args.intermediate_size,
@@ -227,7 +227,7 @@ def _write_tiling_files(context: _GenerationContext) -> None:
                                                  intermediate_size=args.intermediate_size,
                                                  num_groups=num_groups,
                                                  num_cube_cores=args.num_cube_cores)
-    swiglu_grad_bytes = get_swiglu_grad_tiling_bytes(swiglu_grad_op.split_value,
+    swiglu_grad_bytes = get_swiglu_grad_tiling_bytes(activation_op.split_value,
                                                      intermediate_size=args.intermediate_size)
 
     write_bin(os.path.join(args.output_dir, 'act_grad_tiling.bin'), act_grad_bytes)

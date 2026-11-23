@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from hyper_multicore._core_spec import get_device_core_spec
 from hyper_multicore._loader import query_npu_arch
+from .numerics import SiTUGLUParameters, SwiGLUParameters
 
 
 _COMMUNICATION_SPLIT = 128
@@ -53,7 +54,7 @@ class MegaMoeSpec:
     combine_split: int = _COMMUNICATION_SPLIT
     swiglu_split: int = _COMMUNICATION_SPLIT
     partial_weight_grad_dtype: str | None = None
-    swiglu_limit: float | None = None
+    activation_parameters: SwiGLUParameters | SiTUGLUParameters = field(default_factory=SwiGLUParameters)
     max_local_num_tokens: int | None = None
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
@@ -61,7 +62,6 @@ class MegaMoeSpec:
     batch_experts: bool = False
     nominal_schedule: bool = False
     apply_probs_before_fc2: bool = False
-    clamp_after_activation: bool = False
     architecture: int = 2201
     precision: str = "bf16"
     transport_engine: str | None = "mte"
@@ -205,7 +205,6 @@ def bind_mega_moe_spec(
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
     initial_capacity_factor = specification["initial_capacity_factor"]
-    swiglu_limit = specification["swiglu_limit"]
     receive_capacity = _resolve_receive_capacity(
         initial_capacity_factor,
         local_num_tokens * top_k,
@@ -223,7 +222,7 @@ def bind_mega_moe_spec(
         ep_group=ep_group,
         rank_id=rank_id,
         num_cube_cores=core_spec.num_cube_cores,
-        swiglu_limit=swiglu_limit,
+        activation_parameters=specification["activation_parameters"],
         partial_weight_grad_dtype=specification.get("partial_weight_grad_dtype"),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
@@ -235,7 +234,6 @@ def bind_mega_moe_spec(
         batch_experts=specification.get("batch_experts", False),
         nominal_schedule=specification.get("nominal_schedule", False),
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),
-        clamp_after_activation=specification.get("clamp_after_activation", False),
         architecture=architecture,
         precision=specification.get("precision", "bf16"),
         transport_engine=transport_engine,

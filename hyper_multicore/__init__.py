@@ -16,7 +16,9 @@
 
 from typing import TYPE_CHECKING, Any
 
-from hyper_multicore.modules.mega_moe.numerics import MegaMoeNumericsOptions
+from hyper_multicore.modules.mega_moe.numerics import (
+    MegaMoeNumericsOptions, SiTUGLUParameters, SwiGLUParameters,
+)
 from hyper_multicore.diagnostics import (
     MegaKernelDiagnostics, prepare_mega_kernel_diagnostics, validate_mega_kernel_diagnostic_contract,
 )
@@ -29,8 +31,9 @@ if TYPE_CHECKING:
     from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
 
 __all__ = [
-    "BasePlanner", "ExpertPlacement", "PlacementRequest",
-    "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaMoePlacementOptions", "MegaKernelDiagnostics",
+    "BasePlanner", "ExpertPlacement", "PlacementRequest", "SiTUGLUParameters", "SwiGLUParameters",
+    "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaMoeNumericsOptions",
+    "MegaMoePlacementOptions", "MegaKernelDiagnostics",
     "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
 ]
 
