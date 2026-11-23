@@ -1053,6 +1053,8 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     prepare_workspace(virtual_summary.plan_tokens, virtual_summary.maximum)
     if indexed:
         metadata = _compute_route_metadata(virtual_counts, table, None, virtual_spec, virtual_summary.capacity)
+        metadata = metadata.with_active_experts(
+            virtual_summary.all_experts_active, hidden.shape[0], virtual_summary.plan_tokens)
         virtual_tokens = hidden, placement.physical_inverse
     else:
         virtual_tokens = _materialize_route_permutation(hidden, placement.virtual_ids, virtual_spec, workspace)
