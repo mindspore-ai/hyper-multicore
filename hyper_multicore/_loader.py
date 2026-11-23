@@ -109,7 +109,8 @@ def require_multicore_environment() -> Path:
         set_env_script = component_root / "set_env.bash"
         guidance = (
             "Start a fresh Python process with the wheel installed in site-packages. "
-            f"For source/PYTHONPATH payloads, run source {set_env_script} before starting Python."
+            "For source/PYTHONPATH payloads or with automatic OPP registration disabled, "
+            f"run source {set_env_script} before starting Python."
         )
         detail = f"component=multicore missing=ASCEND_CUSTOM_OPP_PATH vendor={vendor_root}. "
         if any(module in sys.modules for module in ("torch", "torch_npu")):

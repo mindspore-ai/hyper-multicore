@@ -17,7 +17,11 @@
 import os
 
 
-def _configure_vendor() -> None:
+def configure_vendor() -> None:
+    """Register the installed vendor after any explicitly configured vendors."""
+    if os.environ.get("HYPER_MULTICORE_DISABLE_AUTO_OPP") == "1":
+        return
+
     site_packages = os.path.dirname(os.path.realpath(__file__))
     vendor_name = "hyper_multicore_nn"
     vendor = os.path.join(site_packages, "hyper_multicore/lib/vendors", vendor_name)
@@ -32,7 +36,4 @@ def _configure_vendor() -> None:
         if os.path.basename(active_vendor) == vendor_name and os.path.isfile(os.path.join(active_vendor, library)):
             # An explicitly activated checkout or an inherited wheel owns this process.
             return
-    os.environ[variable] = os.pathsep.join(filter(None, (vendor, configured)))
-
-
-_configure_vendor()
+    os.environ[variable] = os.pathsep.join(filter(None, (configured, vendor)))

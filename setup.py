@@ -72,7 +72,7 @@ class BuildPy(build_py):
         if info is not None:
             wheel_root = Path(self.build_lib)
             shutil.copytree(payload, wheel_root / "hyper_multicore", dirs_exist_ok=True)
-            for name in ("hyper_multicore_opp.pth", "_hyper_multicore_opp.py"):
+            for name in BUILD_HELPERS.WHEEL_STARTUP_FILES:
                 shutil.copy2(ROOT / "hyper_multicore/_build/wheel" / name, wheel_root / name)
 
 

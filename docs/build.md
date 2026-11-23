@@ -61,10 +61,17 @@ python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<ab
 ```
 
 安装到 Python 的 `site-packages` 后，直接使用原有的 `python` 或 `torchrun` 命令。
-wheel 在 Python 的 `site` 初始化阶段将包内 vendor 加入当前进程的 `ASCEND_CUSTOM_OPP_PATH`，
-首次使用算子时按绝对路径加载包内库。需要测试另一套制品时，使用干净的环境启动新进程。
-源码 payload、仅通过 `PYTHONPATH` 暴露的 `pip --target` 安装或禁用 `site` 的启动方式，
-仍可在启动前用 `set_env.bash` 配置 vendor。安装、导入和算子调用均不触发 native 编译或依赖下载。
+wheel 在 Python 的 `site` 初始化阶段将包内 vendor 追加到当前进程的 `ASCEND_CUSTOM_OPP_PATH`，
+保留已有 vendor 的顺序。已显式配置或继承了一套有效的 HyperMulticore vendor 时，沿用该路径。
+Python 3.14 及以前通过 `.pth` 触发注册，Python 3.15 起通过同名 `.start` 调用同一个注册函数。
+首次使用算子时按绝对路径加载包内库，加载器检查 vendor 与当前制品一致。
+需要测试另一套制品时，从只配置了 CANN 的 shell 启动对应环境的 Python。
+
+可在启动 Python 前设置 `HYPER_MULTICORE_DISABLE_AUTO_OPP=1`，仅跳过本次自动注册。
+需要在关闭自动注册后使用算子时，在启动 Python 前显式配置 vendor，例如用
+`source "$(command -v hyper_multicore_set_env.bash)"`。
+源码 payload、仅通过 `PYTHONPATH` 暴露的 `pip --target` 安装或禁用 `site` 的启动方式也可使用显式激活。
+安装、导入和算子调用均不触发 native 编译或依赖下载。
 
 ### 验证安装
 

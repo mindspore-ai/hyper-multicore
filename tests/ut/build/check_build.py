@@ -377,7 +377,7 @@ while not Path(sys.argv[1]).exists():
         vendor = site_packages / "hyper_multicore/lib/vendors/hyper_multicore_nn"
         library = "op_api/lib/libcust_opapi.so"
         write(vendor / library)
-        existing_vendor = self.root / "other_vendor"
+        existing = os.pathsep.join(str(self.root / name) for name in ("first_vendor", "second_vendor"))
         explicit_vendor = self.root / "checkout/vendors/hyper_multicore_nn"
         write(explicit_vendor / library)
         script = (
@@ -386,18 +386,29 @@ while not Path(sys.argv[1]).exists():
             "site.addsitedir(sys.argv[1])\n"
             "assert os.environ.get('LD_LIBRARY_PATH') == before\n"
             "assert not {'hyper_multicore', 'torch', 'torch_npu'} & sys.modules.keys()\n"
-            "print(os.environ['ASCEND_CUSTOM_OPP_PATH'])\n"
+            "print(repr(os.environ.get('ASCEND_CUSTOM_OPP_PATH')))\n"
         )
         command = [sys.executable, "-S", "-c", script, str(site_packages)]
-        for configured, expected in (
-            (str(existing_vendor), os.pathsep.join(map(str, (vendor, existing_vendor)))),
-            (str(vendor), str(vendor)),
-            (str(explicit_vendor), str(explicit_vendor)),
+        base_env = os.environ.copy()
+        base_env.pop("ASCEND_CUSTOM_OPP_PATH", None)
+        base_env.pop("HYPER_MULTICORE_DISABLE_AUTO_OPP", None)
+        for configured, disabled, expected in (
+            (None, False, str(vendor)),
+            (existing, False, os.pathsep.join((existing, str(vendor)))),
+            (str(vendor), False, str(vendor)),
+            (str(explicit_vendor), False, str(explicit_vendor)),
+            (None, True, None),
+            (existing, True, existing),
         ):
-            environment = {**os.environ, "ASCEND_CUSTOM_OPP_PATH": configured}
-            result = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
-            self.assertEqual(result.stdout.strip(), expected)
-            self.assertEqual(result.stderr, "")
+            with self.subTest(configured=configured, disabled=disabled):
+                environment = base_env.copy()
+                if configured is not None:
+                    environment["ASCEND_CUSTOM_OPP_PATH"] = configured
+                if disabled:
+                    environment["HYPER_MULTICORE_DISABLE_AUTO_OPP"] = "1"
+                result = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.strip(), repr(expected))
+                self.assertEqual(result.stderr, "")
 
     def _sdk_fixture(self, directory):
         """Use real locked Git objects and recording tools in an isolated SDK project."""

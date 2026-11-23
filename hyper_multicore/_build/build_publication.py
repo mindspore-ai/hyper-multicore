@@ -28,7 +28,7 @@ import shutil
 import tempfile
 import zipfile
 from packaging.requirements import Requirement
-from .artifacts import _shmem_cpp_test_sources, _source_identity
+from .artifacts import WHEEL_STARTUP_FILES, _shmem_cpp_test_sources, _source_identity
 from .command_runner import Commands
 from ._bootstrap import load_module
 
@@ -101,7 +101,7 @@ def validate_wheel(wheel: Path, payload: Path, info: dict) -> None:
     """Verify archive membership, RECORD, identities and native payload before publication."""
     with zipfile.ZipFile(wheel) as archive:
         names, record_path, metadata_path = wheel_identity_members(archive)
-        if not {"hyper_multicore_opp.pth", "_hyper_multicore_opp.py"}.issubset(names):
+        if not set(WHEEL_STARTUP_FILES).issubset(names):
             raise ValueError("Wheel is missing the site-packages OPP startup files")
         validate_wheel_record(archive, record_path, names)
         validate_wheel_metadata(archive, metadata_path, info)

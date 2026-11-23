@@ -1,1 +1,1 @@
-import _hyper_multicore_opp
+import _hyper_multicore_opp; _hyper_multicore_opp.configure_vendor()
