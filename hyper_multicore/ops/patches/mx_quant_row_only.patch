@@ -1,0 +1,272 @@
+--- a/quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35/dynamic_mx_quant_with_dual_axis_base.h
++++ b/quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35/dynamic_mx_quant_with_dual_axis_base.h
+@@ -82,7 +82,7 @@
+ constexpr float DIGIT_SEVEN_FLOAT = 7.0f;
+ constexpr uint16_t elementAfterReduce = platform::GetVRegSize() / platform::GetUbBlockSize();
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly = false>
+ class DynamicMxQuantWithDualAxisBase {
+ public:
+     __aicore__ inline DynamicMxQuantWithDualAxisBase(
+@@ -224,8 +224,8 @@
+     int64_t oneBlockCountB8_ = UBBlockSize_ / sizeof(uint8_t);
+ };
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::InitParams()
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::InitParams()
+ {
+     blockIdx_ = logicalBlockIndex_ >= 0 ? logicalBlockIndex_ : GetBlockIdx();
+     int64_t headCoreNum = tilingData_->headCoreNum;
+@@ -283,8 +283,8 @@
+     }
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ProcessOneLoop(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ProcessOneLoop(
+     int64_t calcCol, int64_t calcRow, int64_t xUbOffset, int64_t scale1Offset, int64_t scale2Offset,
+     int64_t dimNeg1IsOdd)
+ {
+@@ -293,8 +293,8 @@
+     CopyOut(xUbOffset, scale1Offset, scale2Offset, calcRow, calcCol);
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeAll(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeAll(
+     int64_t blockCount, int64_t dataLen)
+ {
+     LocalTensor<xDtype> x = inQueue.template DeQue<xDtype>();
+@@ -419,10 +419,12 @@
+     // WaitFlag<HardEvent::V_S>(eventIDVToS);
+ 
+     // -2轴的scale交织处理
+-    for (int64_t i = 1; i < ((calcBlockLoop + 1) / DIGIT_TWO * DIGIT_TWO); i = i + 2) {
+-        Interleave(
+-            mxScale2[(i - 1) * ubRowLen_], mxScale2[i * ubRowLen_], tmpScale2Local[(i - 1) * ubRowLen_],
+-            tmpScale2Local[i * ubRowLen_], ubRowLen_);
++    if constexpr (!rowOnly) {
++        for (int64_t i = 1; i < ((calcBlockLoop + 1) / DIGIT_TWO * DIGIT_TWO); i = i + 2) {
++            Interleave(
++                mxScale2[(i - 1) * ubRowLen_], mxScale2[i * ubRowLen_], tmpScale2Local[(i - 1) * ubRowLen_],
++                tmpScale2Local[i * ubRowLen_], ubRowLen_);
++        }
+     }
+ 
+     mxScaleQueue1.template EnQue(mxScale1);
+@@ -432,8 +434,8 @@
+     inQueue.template FreeTensor(x);
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeScaleOcp(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeScaleOcp(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint8_t* mxScale1Addr,
+     __ubuf__ uint16_t* mxScale1ReciprocalAddr, __ubuf__ uint8_t* mxScale2Addr,
+     __ubuf__ uint16_t* mxScale2ReciprocalAddr)
+@@ -603,8 +605,8 @@
+ // CuBALS Scale算法实现 (scaleAlg=1, FP8专用)
+ // 整体框架与ComputeScaleOcp一致：循环blockCount次处理-1轴scale，循环后处理-2轴scale
+ // 算法差异：OCP使用指数提取法，CuBALS使用 Amax/Amax(DType) + FP32指数尾数条件舍入法
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeScaleCublas(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeScaleCublas(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint8_t* mxScale1Addr,
+     __ubuf__ uint16_t* mxScale1ReciprocalAddr, __ubuf__ uint8_t* mxScale2Addr,
+     __ubuf__ uint16_t* mxScale2ReciprocalAddr)
+@@ -703,8 +705,10 @@
+             MicroAPI::ReduceMaxWithDataBlock(absMaxDim1, absMaxDim1, maskAll);
+ 
+             // 4. -2轴: 逐行累积偶数列和奇数列的绝对值max
++            if constexpr (!rowOnly) {
+             MicroAPI::Max(absMax1Dim2, absMax1Dim2, absMax0, maskAll);
+             MicroAPI::Max(absMax2Dim2, absMax2Dim2, absMax1, maskAll);
++            }
+ 
+             // ============================================================
+             // 5. 计算-1轴CuBALS Scale (FP32精度)
+@@ -767,6 +771,7 @@
+         // 每个需要拆分为Zero/One两半分别做FP32计算，再合并
+         // ========================================================================
+ 
++        if constexpr (!rowOnly) {
+         // ---------- 处理absMax1Dim2 (偶数列, -2轴scale的交织第一部分) ----------
+         // Zero半 (偶数位) — 复用-1轴寄存器: maxFP32_0, expFP32_0, manFP32_0
+         MicroAPI::Cast<float, xDtype, castTraitXdtypetoFp32Zero>(
+@@ -886,6 +891,7 @@
+             mxScale2Addr, mxScale1B8, mxScale2OneB8, maskB8);
+         MicroAPI::DataCopy<uint16_t, MicroAPI::StoreDist::DIST_INTLV_B16>(
+             mxScale2ReciprocalAddr, reversedShareExp1, absMax0, maskAll);
++        }
+     }
+ }
+ 
+@@ -893,9 +899,9 @@
+ // 整体框架与ComputeScaleOcp一致：循环blockCount次处理-1轴scale，循环后处理-2轴scale
+ // -1轴算法：取BF16绝对值max → addValueBit进位取指数法
+ // -2轴算法：累积BF16绝对值max → SUB_NUM_FOR_SCALE减法取指数法
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
+ __aicore__ inline void
+-DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeScaleDynamicDefault(
++DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeScaleDynamicDefault(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint8_t* mxScale1Addr,
+     __ubuf__ uint16_t* mxScale1ReciprocalAddr, __ubuf__ uint8_t* mxScale2Addr,
+     __ubuf__ uint16_t* mxScale2ReciprocalAddr)
+@@ -1128,9 +1134,9 @@
+ // 与CuBALS (scaleAlg=1) 类似，使用FP32精度乘以invDstTypeMax_，但：
+ // 1. 乘法因子为invDstTypeMax_ (1/dstTypeMax) 而非invDtypeMax_ (1/AMax(DType))
+ // 2. 条件舍入仅处理normal场景 (exp>0 && exp<254 && man>0)，不处理subnormal场景
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
+ __aicore__ inline void
+-DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeScaleDynamicCustom(
++DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeScaleDynamicCustom(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint8_t* mxScale1Addr,
+     __ubuf__ uint16_t* mxScale1ReciprocalAddr, __ubuf__ uint8_t* mxScale2Addr,
+     __ubuf__ uint16_t* mxScale2ReciprocalAddr)
+@@ -1396,8 +1402,8 @@
+     }
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeYVf(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeYVf(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint16_t* mxScale1ReciprocalAddr,
+     __ubuf__ uint16_t* mxScale2ReciprocalAddr, __ubuf__ uint8_t* y1Addr, __ubuf__ uint8_t* y2Addr)
+ {
+@@ -1409,15 +1415,17 @@
+         }
+     } else {
+         ComputeY1ToFP8(dataLen, blockCount, xAddr, mxScale1ReciprocalAddr, y1Addr);
++        if constexpr (!rowOnly) {
+         ComputeY2ToFP8(dataLen, blockCount, xAddr, mxScale2ReciprocalAddr, y2Addr);
+         ComputeY2ToFP8(
+             dataLen, blockCount, xAddr + vlForHalfNumber_, mxScale2ReciprocalAddr + vlForHalfNumber_,
+             y2Addr + vlForHalfNumber_);
++        }
+     }
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeYBF16ToFP4(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeYBF16ToFP4(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint16_t* mxScale1ReciprocalAddr,
+     __ubuf__ uint8_t* y1Addr, __ubuf__ uint16_t* mxScale2ReciprocalAddr, __ubuf__ uint8_t* y2Addr)
+ {
+@@ -1475,8 +1483,8 @@
+     return;
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeYFP16ToFP4(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeYFP16ToFP4(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint16_t* mxScale1ReciprocalAddr,
+     __ubuf__ uint8_t* y1Addr, __ubuf__ uint16_t* mxScale2ReciprocalAddr, __ubuf__ uint8_t* y2Addr)
+ {
+@@ -1628,8 +1636,8 @@
+ // 优化后的ComputeY1ToFP8: 参考DynamicMxQuant ComputeData的4路RegLayout Cast+Add模式
+ // 消除多次Interleave操作，使用ZERO/ONE/TWO/THREE四个RegLayout将FP32→FP8的结果
+ // 分别放到uint32的4个字节位置，通过Add合并后一次StoreAlign输出
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeY1ToFP8(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeY1ToFP8(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint16_t* mxScale1ReciprocalAddr,
+     __ubuf__ uint8_t* y1Addr)
+ {
+@@ -1712,8 +1720,8 @@
+ // 优化后的ComputeY2ToFP8: 参考DynamicMxQuant ComputeData的RegLayout优化模式
+ // 使用ZERO/ONE两个RegLayout将FP32→FP8的结果分别放到uint32的byte0和byte1位置
+ // 通过Add合并后Pack+DataCopy输出，消除Interleave和多余的Pack操作
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeY2ToFP8(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeY2ToFP8(
+     uint16_t dataLen, uint16_t blockCount, __ubuf__ xDtype* xAddr, __ubuf__ uint16_t* mxScale2ReciprocalAddr,
+     __ubuf__ uint8_t* y2Addr)
+ {
+@@ -1766,9 +1774,9 @@
+     }
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
+ __aicore__ inline void
+-DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::ComputeFP4FromHalf(
++DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::ComputeFP4FromHalf(
+     MicroAPI::RegTensor<float>& Reg)
+ {
+     MicroAPI::MaskReg pregAll32 = MicroAPI::CreateMask<uint32_t, MicroAPI::MaskPattern::ALL>();
+@@ -1815,8 +1823,8 @@
+         (MicroAPI::RegTensor<int32_t>&)Reg, negZero, (MicroAPI::RegTensor<int32_t>&)Reg, zeroMask);
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::CopyIn(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::CopyIn(
+     int64_t offset, int64_t blockCount, int64_t dataLen, int64_t dimNeg1IsOdd)
+ {
+     // 第一行第一块到第二行的第一块，间隔长度
+@@ -1839,8 +1847,8 @@
+     inQueue.template EnQue(xLocal);
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::CopyOut(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::CopyOut(
+     int64_t yOffset, int64_t scale1OutOffset, int64_t scale2OutOffset, int64_t blockCount, int64_t dataLen)
+ {
+     uint16_t outBurst = 0;
+@@ -1891,7 +1899,9 @@
+     outQueue1.FreeTensor(y1Local);
+ 
+     LocalTensor<uint8_t> y2Local = outQueue2.template DeQue<uint8_t>();
+-    DataCopyPad(yGm2_[YOffset], y2Local, yCopyOutParams);
++    if constexpr (!rowOnly) {
++        DataCopyPad(yGm2_[YOffset], y2Local, yCopyOutParams);
++    }
+     outQueue2.FreeTensor(y2Local);
+ 
+     LocalTensor<uint8_t> mxScale1Local = mxScaleQueue1.template DeQue<uint8_t>();
+@@ -1899,12 +1909,14 @@
+     mxScaleQueue1.FreeTensor(mxScale1Local);
+ 
+     LocalTensor<uint8_t> mxScale2Local = mxScaleQueue2.template DeQue<uint8_t>();
+-    DataCopyPad(mxScaleGm2_[scale2OutOffset], mxScale2Local, scale2CopyOutParams);
++    if constexpr (!rowOnly) {
++        DataCopyPad(mxScaleGm2_[scale2OutOffset], mxScale2Local, scale2CopyOutParams);
++    }
+     mxScaleQueue2.FreeTensor(mxScale2Local);
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::Init(
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::Init(
+     GM_ADDR x, GM_ADDR y1, GM_ADDR mxScale1, GM_ADDR y2, GM_ADDR mxScale2)
+ {
+ #if (__NPU_ARCH__ == 3510)
+@@ -1944,8 +1956,8 @@
+     pipe_->InitBuffer(tmpScale2Buf, mxScale2BufferSize_);
+ }
+ 
+-template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg>
+-__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg>::Process()
++template <typename xDtype, typename y1Dtype, typename y2Dtype, AscendC::RoundMode roundMode, uint64_t scaleAlg, bool rowOnly>
++__aicore__ inline void DynamicMxQuantWithDualAxisBase<xDtype, y1Dtype, y2Dtype, roundMode, scaleAlg, rowOnly>::Process()
+ {
+     if (blockIdx_ >= tilingData_->usedCoreNum) {
+         return;

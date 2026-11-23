@@ -6,7 +6,9 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <acl/acl.h>
+#include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <tuple>
 
 #include "ATen/ATen.h"
@@ -26,14 +28,18 @@ extern "C" void HmcLaunchZeroCold_arch3510(unsigned blocks, void* stream, uint8_
 #define HMC_UTILITY_ARCH35(name) (static_cast<decltype(&name##_arch3510)>(nullptr))
 #endif
 namespace {
-template <typename Fn> Fn SelectUtility(int32_t device, Fn arch22, Fn arch35) {
+int64_t UtilityArchitecture(int32_t device) {
   int64_t npu_arch = 0;
   // Older PTA-bundled ACL headers omit the enum name; CANN's public attribute
   // number matches _loader._ACL_DEV_ATTR_NPU_ARCH and is supported by the runtime.
   constexpr auto kNpuArchAttribute = static_cast<aclrtDevAttr>(601);
   const auto status = aclrtGetDeviceInfo(device, kNpuArchAttribute, &npu_arch);
   TORCH_CHECK(status == ACL_SUCCESS, "cannot query NPU architecture for device ", device, ": ", status);
-  switch (npu_arch) {
+  return npu_arch;
+}
+
+template <typename Fn> Fn SelectUtility(int32_t device, Fn arch22, Fn arch35) {
+  switch (const auto npu_arch = UtilityArchitecture(device)) {
     case 2201:
       TORCH_CHECK(arch22 != nullptr, "MoE utility provider is missing arch22 (Atlas A2/A3 series)");
       return arch22;
@@ -104,24 +110,27 @@ TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) { m.impl("zero_empty_expert_
 TORCH_LIBRARY_IMPL(hyper_multicore, Meta, m) { m.impl("zero_empty_expert_grad_", &ZeroEmptyMeta); }
 
 extern "C" void HmcLaunchRouteMetadata_arch2201(unsigned blocks, void* stream, uint8_t* counts, uint8_t* offsets,
-                                       uint8_t* sizes, int32_t ep, int32_t experts,
+                                       uint8_t* sizes, uint8_t* summary, int32_t ep, int32_t experts,
                                        int32_t rank, int32_t stride, int32_t group,
-                                       int32_t programs, int32_t bytes, int32_t row_stride, int32_t hidden_size);
+                                       int32_t programs, int32_t bytes, int32_t row_stride, int32_t hidden_size,
+                                       bool attach_summary);
 extern "C" void HmcLaunchRouteMetadata_arch3510(unsigned blocks, void* stream, uint8_t* counts, uint8_t* offsets,
-                                       uint8_t* sizes, int32_t ep, int32_t experts,
+                                       uint8_t* sizes, uint8_t* summary, int32_t ep, int32_t experts,
                                        int32_t rank, int32_t stride, int32_t group,
-                                       int32_t programs, int32_t bytes, int32_t row_stride, int32_t hidden_size);
+                                       int32_t programs, int32_t bytes, int32_t row_stride, int32_t hidden_size,
+                                       bool attach_summary);
 namespace {
-std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_t rank, int64_t ub,
-                                                int64_t hidden_size) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor> RouteMetadata(const at::Tensor& counts, int64_t rank, int64_t ub,
+                                                          int64_t hidden_size, bool include_summary,
+                                                          bool reuse_offset_aiv = false) {
   TORCH_CHECK(counts.dim() == 2 && counts.scalar_type() == at::kInt && counts.stride(1) == 1,
               "expected row-contiguous int32 [source,expert]");
-  const int64_t p = counts.size(0), e = counts.size(1);
+  const int64_t p = counts.size(0), e = counts.size(1) - (include_summary ? 3 : 0);
   TORCH_CHECK(p > 0 && e > 0 && e % p == 0 && rank >= 0 && rank < p && p <= INT32_MAX && e <= INT32_MAX / p,
               "invalid geometry");
   const auto row_stride = counts.stride(0);
-  TORCH_CHECK(row_stride >= e && row_stride <= INT32_MAX, "invalid count row stride");
-  const auto span = (p - 1) * row_stride + e;
+  TORCH_CHECK(row_stride >= counts.size(1) && row_stride <= INT32_MAX, "invalid count row stride");
+  const auto span = (p - 1) * row_stride + counts.size(1);
   TORCH_CHECK(span <= INT32_MAX, "count matrix span exceeds the native bound");
   const auto local = e / p, stride = (e + 31) / 32 * 32;
   auto aligned = [](int64_t x) { return (x + 7) / 8 * 8; };
@@ -130,28 +139,125 @@ std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_
   TORCH_CHECK(hidden_size > 0 && hidden_size <= INT32_MAX, "invalid hidden size");
   const int64_t copies = hidden_size == 1 ? 1 : 2;
   c10::DeviceGuard guard(counts.device());
-  auto offsets = at::empty({copies * (4 * stride + local)}, counts.options().dtype(at::kLong));
-  auto sizes = at::empty({copies * 2 * stride}, counts.options());
   int64_t group = 1;
   while ((group * local) % 16 != 0) ++group;
   const auto programs = (p + group - 1) / group;
+  int64_t blocks = 2 * programs;
+  bool attach_summary = false;
+  if (include_summary) {
+    int64_t cores = 0;
+    const auto status = aclrtGetDeviceInfo(counts.get_device(), ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
+    TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
+    const auto summary_blocks = std::min(p, cores - blocks);
+    // Each offset block scans its group twice. Keep each summary block within
+    // two groups of rows and use a separate reduction when no such slots remain.
+    if (summary_blocks < (p + 2 * group - 1) / (2 * group)) {
+      // A saturated grid can reuse the count table in the offset workers' UB.
+      attach_summary = reuse_offset_aiv && blocks == cores && UtilityArchitecture(counts.get_device()) == 3510;
+      if (!attach_summary) {
+        return {};
+      }
+    } else {
+      blocks += summary_blocks;
+    }
+  }
+  auto offsets = at::empty({copies * (4 * stride + local)}, counts.options().dtype(at::kLong));
+  auto sizes = at::empty({copies * 2 * stride}, counts.options());
+  auto summary = include_summary ? at::empty({p, 8}, counts.options().dtype(at::kLong)) : at::Tensor();
   const auto stream = c10_npu::getCurrentNPUStream().stream(false);
   auto run = [=]() -> int {
     auto launch = SelectUtility(counts.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRouteMetadata),
                                 HMC_UTILITY_ARCH35(HmcLaunchRouteMetadata));
-    launch(2 * programs, stream, static_cast<uint8_t*>(counts.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
-           static_cast<uint8_t*>(sizes.data_ptr()), p, e, rank, stride, group, programs, bytes,
-           row_stride, hidden_size);
+    launch(blocks, stream, static_cast<uint8_t*>(counts.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
+           static_cast<uint8_t*>(sizes.data_ptr()), summary.defined() ? static_cast<uint8_t*>(summary.data_ptr()) : nullptr,
+           p, e, rank, stride, group, programs, bytes, row_stride, hidden_size, attach_summary);
     return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
   };
   at_npu::native::OpCommand::RunOpApi("HmcRouteOffsets", run);
-  return {offsets, sizes};
+  return {offsets, sizes, summary};
+}
+
+std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_t rank, int64_t ub,
+                                             int64_t hidden_size) {
+  auto metadata = RouteMetadata(counts, rank, ub, hidden_size, false);
+  return {std::get<0>(metadata), std::get<1>(metadata)};
+}
+
+using OptionalTensor = std::optional<at::Tensor>;
+
+std::tuple<OptionalTensor, OptionalTensor, OptionalTensor> RouteOffsetsAndSummary(
+    const at::Tensor& payload, int64_t rank, int64_t ub, int64_t hidden_size, bool reuse_offset_aiv) {
+  auto [offsets, sizes, summary] = RouteMetadata(payload, rank, ub, hidden_size, true, reuse_offset_aiv);
+  if (!summary.defined()) {
+    return {};
+  }
+  return {offsets, sizes, summary};
 }
 }  // namespace
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
   m.def("route_offsets(Tensor counts, int rank, int ub, int hidden_size=1) -> (Tensor, Tensor)");
+  m.def("route_offsets_and_summary(Tensor payload, int rank, int ub, int hidden_size, bool reuse_offset_aiv=False) -> "
+        "(Tensor?, Tensor?, Tensor?)");
 }
-TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) { m.impl("route_offsets", RouteOffsets); }
+TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
+  m.impl("route_offsets", RouteOffsets);
+  m.impl("route_offsets_and_summary", RouteOffsetsAndSummary);
+}
+
+#if HMC_UTILITY_ARCH3510
+extern "C" void HmcLaunchMxRouteSummary_arch3510(
+    unsigned workers, void* stream, const int32_t* payload, int64_t* output,
+    uint32_t peers, uint32_t experts, bool nddma);
+
+namespace {
+at::Tensor MxRouteSummary(const at::Tensor& payload, bool nddma) {
+  TORCH_CHECK(payload.dim() == 2 && payload.scalar_type() == at::kInt && payload.is_contiguous() &&
+                  payload.device().type() == c10::DeviceType::PrivateUse1,
+              "MX route summary requires a contiguous INT32 NPU wire table");
+  const auto peers = payload.size(0), experts = payload.size(1) - 3;
+  TORCH_CHECK(peers > 0 && peers <= 128 && experts > 0 && experts <= 4096 && experts % peers == 0,
+              "MX route summary wire table exceeds supported geometry");
+  const c10::DeviceGuard guard(payload.device());
+  const auto device = payload.get_device();
+  TORCH_CHECK(UtilityArchitecture(device) == 3510, "MX route summary requires an arch3510 device");
+  int64_t cores = 0;
+  const auto status = aclrtGetDeviceInfo(device, ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
+  TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
+  auto result = at::empty({peers, 8}, payload.options().dtype(at::kLong));
+  const auto stream = c10_npu::getCurrentNPUStream(device).stream(false);
+  auto run = [=]() -> int {
+    HmcLaunchMxRouteSummary_arch3510(std::min(cores, peers), stream, payload.data_ptr<int32_t>(),
+                                    result.data_ptr<int64_t>(), peers, experts, nddma);
+    return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+  };
+  at_npu::native::OpCommand::RunOpApi("HmcMxRouteSummary", run);
+  return result;
+}
+
+void PublishMxProjectionReady(const at::Tensor& flag, const at::Tensor& epoch) {
+  TORCH_CHECK(flag.scalar_type() == at::kInt && epoch.scalar_type() == at::kInt &&
+              flag.numel() == 1 && epoch.numel() == 1 && flag.is_contiguous() && epoch.is_contiguous() &&
+              flag.device() == epoch.device() && flag.device().type() == c10::DeviceType::PrivateUse1,
+              "MX projection readiness requires two INT32 device scalars");
+  const c10::DeviceGuard guard(flag.device());
+  auto stream = c10_npu::getCurrentNPUStream(flag.get_device()).stream(false);
+  auto run = [=]() -> int {
+    return aclrtMemcpyAsync(flag.data_ptr(), sizeof(int32_t), epoch.data_ptr(),
+                            sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+  };
+  // A data-move command can run while the fused consumer occupies all AIVs.
+  at_npu::native::OpCommand::RunOpApi("HmcPublishMxProjectionReady", run);
+}
+}  // namespace
+TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
+  m.def("mx_route_summary(Tensor payload, bool nddma=False) -> Tensor");
+  m.def("hot_replica_publish_mx_projection_ready_(Tensor(a!) flag, Tensor epoch) -> ()");
+}
+TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
+  m.impl("mx_route_summary", &MxRouteSummary);
+  m.impl("hot_replica_publish_mx_projection_ready_", &PublishMxProjectionReady);
+}
+#endif
 
 extern "C" void HmcLaunchPermuteFromMapping_arch2201(unsigned blocks, void* stream, uint8_t* tokens, uint8_t* mapping,
                                             uint8_t* probabilities, uint8_t* output, uint8_t* output_probabilities,

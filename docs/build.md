@@ -458,8 +458,10 @@ python -c 'from hyper_multicore import MegaMoeExperts; print(MegaMoeExperts.__na
 [MegaMoeExperts](mega_moe.md#基本用法)。
 
 `ascend950` 的 SHMEM 默认启用 `mte_udma`。如需让专家通信使用 MTE，在各 rank 启动前设置
-`HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte`。固定堆预算和日志均沿用
+`HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte`。SHMEM 堆预算和日志均沿用
 [SHMEM 配置](shmem.md#6-配置与日志)，默认设置足以运行常规示例。
+
+启用 MXFP8 专家副本时，按[自适应专家放置](mega_moe.md#自适应专家放置)配置设备和 SHMEM。
 
 ### 独立回放与队列诊断
 

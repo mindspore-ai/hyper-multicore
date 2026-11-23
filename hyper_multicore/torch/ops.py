@@ -1062,3 +1062,19 @@ def route_offsets(counts: torch.Tensor, rank: int, ub_bytes: int,
     """Build row and element descriptors through the normal framework adapter."""
     _load_native()
     return torch.ops.hyper_multicore.route_offsets(counts, rank, ub_bytes, hidden_size)
+
+
+def route_offsets_and_summary(
+    payload: torch.Tensor, rank: int, ub_bytes: int, hidden_size: int, *, reuse_offset_aiv: bool = False,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Build descriptors and a validation summary when both fit this device launch."""
+    _load_native()
+    if reuse_offset_aiv:
+        return torch.ops.hyper_multicore.route_offsets_and_summary(payload, rank, ub_bytes, hidden_size, True)
+    return torch.ops.hyper_multicore.route_offsets_and_summary(payload, rank, ub_bytes, hidden_size)
+
+
+def mx_route_summary(payload: torch.Tensor, *, nddma: bool = False) -> torch.Tensor:
+    """Reduce the INT32 gathered count table into exact INT64 summary rows."""
+    _load_native()
+    return torch.ops.hyper_multicore.mx_route_summary(payload, nddma)

@@ -29,8 +29,11 @@
 #endif
 #include "common/mega_moe/task_options.h"
 #include "common/mega_moe/routing_probabilities.h"
+#include "common/mega_moe/replica_weight_ready.h"
+#include "common/mega_moe/replica_gradient_bands.h"
 
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+#include "common/mega_moe/adapters/arch35/bf16_replica_prefetch.h"
 #include "common/mega_moe/adapters/arch35/swiglu/bf16_grad_worker.h"
 #endif
 
@@ -65,6 +68,61 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, Ka));
   static constexpr int64_t GMM_MATMUL_K_FIELDS_BYTES =
     offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
+
+  __aicore__ inline void RunBackward() {
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510)
+    replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
+    replica_bf16_partials_ = MulticoreMoE::UsesBf16ReplicaPartials(replica_launch_);
+    gradient_bands_[0] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 0);
+    gradient_bands_[1] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 1);
+#endif
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+    MulticoreMoE::PrefetchA5ReplicaWeights(replica_launch_, worker_id_);
+#endif
+    // Reserved merge lanes still participate in the ordinary entry handshake.
+    this->Process();
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
+    const auto first = gradient_bands_[0];
+    const bool merge = first != nullptr && first->owned != 0 && worker_id_ % VECTOR_WORKER_STRIDE == 0;
+    if (merge) {
+      const uint32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
+      const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+      // Keep a single scalar frame for the two projections.
+#pragma unroll 1
+      for (uint32_t projection = 0; projection < 2; ++projection) {
+        if (replica_bf16_partials_) {
+          MulticoreMoE::ReturnBf16ReplicaGradientBands(
+              gradient_bands_[projection], input_list[19], worker, core_num, ep);
+        } else {
+          MulticoreMoE::ReturnReplicaGradientBands(
+              gradient_bands_[projection], input_list[19], worker, core_num, ep);
+        }
+      }
+    }
+    if (first != nullptr && worker_id_ == 0) {
+#pragma unroll 1
+      for (uint32_t projection = 0; projection < 2; ++projection) {
+        MulticoreMoE::WaitReplicaGradientAcks(gradient_bands_[projection]);
+      }
+    }
+#elif defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
+    if (gradient_bands_[0] != nullptr && worker_id_ % 2 == 0 &&
+        worker_id_ / 2 < MulticoreMoE::kA5ReplicaHelpers) {
+      const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+#pragma unroll 1
+      for (uint32_t projection = 0; projection < 2; ++projection) {
+        MulticoreMoE::PublishA5ReplicaGradientReady(gradient_bands_[projection], worker_id_ / 2, core_num, ep);
+        MulticoreMoE::ReturnA5ReplicaGradientBands(gradient_bands_[projection], worker_id_ / 2, core_num, ep);
+      }
+      if (worker_id_ == 0) {
+#pragma unroll 1
+        for (uint32_t projection = 0; projection < 2; ++projection) {
+          MulticoreMoE::WaitReplicaGradientAcks(gradient_bands_[projection]);
+        }
+      }
+    }
+#endif
+  }
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     if (!IsMoeTaskOptionsValid(task_desc, WORKSPACE_IDX)) AscendC::Trap();
@@ -102,6 +160,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   }
 
  private:
+  const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
+  const __gm__ MulticoreMoE::ReplicaGradientBandRecord *gradient_bands_[2] = {nullptr, nullptr};
+  bool replica_bf16_partials_ = false;
+
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
       uint32_t bits;
@@ -278,7 +340,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
     if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
       GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
-      MulticoreBf16::ExecuteGmmTask<DTYPE_HIDDEN_DW>(task_desc, input_list, this->core_num, task_tiling);
+      const uint32_t output = task_desc.outputs[0].input_position;
+      const auto gradient = (output == 6 || output == 18) ? gradient_bands_[output == 6 ? 0 : 1] : nullptr;
+      MulticoreBf16::ExecuteGmmTask<DTYPE_HIDDEN_DW>(
+          task_desc, input_list, this->core_num, task_tiling, replica_launch_,
+          task_desc.inputs[1].input_position == 11 ? 0 : 1, gradient);
       return;
     }
 #endif
@@ -294,44 +360,65 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        GM_ADDR grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
-        GlobalTensor<int64_t> grouped_list_tensor_real;
-        grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
         const bool batched = IsBatchedGroupedMatmulTask(task_desc);
+        const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
         if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
           for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
             this->WaitForDependency(task_desc.dependent_event + expert, task_desc.dependency_poll_interval_us);
           }
         }
-        int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index);
-        int64_t start = 0;
-        if (data_index != 0) {
-          value = value - grouped_list_tensor.GetValue(data_index - 1);
-          start = grouped_list_tensor.GetValue(data_index - 1);
-        }
+        const int64_t start = data_index == 0 ? 0 : grouped_list_tensor.GetValue(data_index - 1);
+        const int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index) - start;
+        // The placement contains only positive guest quotas. An empty owner
+        // starts from zero scratch and the reducer does not wait for its flags.
         if (value == 0) {
           return;
         }
-        const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
-        PrepareGroupedMatmulList(grouped_list_tensor, grouped_list_tensor_real, grouped_list_real,
-                                 expert_num_single_rank, data_index, value, batched, single_group);
-
-        GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
-        __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
-        if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-          tilingdata_data->mmTilingData.Ka = value;
-          tilingdata_data->mmTilingData.Kb = value;
-          tilingdata_data->mmTilingData.singleCoreK = value;
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
-        } else {
-          tilingdata_data->gmmBaseParams.m = value;
-          tilingdata_data->mmTilingData.M = value;
-          tilingdata_data->mmTilingData.singleCoreM = value;
-          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
-          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+        const uint32_t output = task_desc.outputs[0].input_position;
+#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
+        GM_ADDR band_flags = nullptr;
+        int32_t band_epoch = 0;
+        uint32_t band_rows = 0;
+        const auto bands = (output == 6 || output == 18) ? gradient_bands_[output == 6 ? 0 : 1] : nullptr;
+        if (bands != nullptr) {
+          const auto element_size = replica_bf16_partials_ ? sizeof(bfloat16_t) : sizeof(float);
+          if (!single_group || task_desc.outputs[0].data_type != element_size) AscendC::Trap();
+          band_flags = reinterpret_cast<GM_ADDR>(MulticoreMoE::GradientBandExpertFlags(bands, data_index, core_num));
+          band_epoch = bands->epoch;
+          band_rows = bands->band_rows;
         }
-        PipeBarrier<PIPE_ALL>();
+#endif
+        const uint32_t weight = task_desc.inputs[1].input_position;
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+        const bool explicit_split = !batched && value > 0 && value <= INT32_MAX;
+#else
+        constexpr bool explicit_split = false;
+#endif
+        GM_ADDR grouped_list_real = nullptr;
+        GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
+        if (!explicit_split) {
+          grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
+          GlobalTensor<int64_t> grouped_list_tensor_real;
+          grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
+          PrepareGroupedMatmulList(grouped_list_tensor, grouped_list_tensor_real, grouped_list_real,
+                                   expert_num_single_rank, data_index, value, batched, single_group);
+
+          __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
+          if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
+            tilingdata_data->mmTilingData.Ka = value;
+            tilingdata_data->mmTilingData.Kb = value;
+            tilingdata_data->mmTilingData.singleCoreK = value;
+            cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
+          } else {
+            tilingdata_data->gmmBaseParams.m = value;
+            tilingdata_data->mmTilingData.M = value;
+            tilingdata_data->mmTilingData.singleCoreM = value;
+            cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+            cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+          }
+          PipeBarrier<PIPE_ALL>();
+        }
 
         int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
         int64_t input_1_offset = GmmRowOffset(task_desc.inputs[1], start);
@@ -345,13 +432,53 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
           output_0_offset = static_cast<int64_t>(data_index) * task_desc.inputs[0].dim[1] *
                             task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
         }
+        GM_ADDR output_base = input_list[output];
+        bool fp32_output = task_desc.outputs[0].data_type == sizeof(float);
+#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
+        if (bands != nullptr) {
+          const uint64_t elements = bands->rows * bands->columns;
+          if (data_index >= bands->home) {
+            output_base = reinterpret_cast<GM_ADDR>(bands->guest);
+            output_0_offset = (data_index - bands->home) * elements *
+                              (replica_bf16_partials_ ? sizeof(bfloat16_t) : sizeof(float));
+          } else {
+            const uint64_t scratch = MulticoreMoE::GradientBandOwnerScratch(bands, data_index);
+            if (replica_bf16_partials_) {
+              output_0_offset = data_index * elements * sizeof(bfloat16_t);
+              if (scratch == 0) band_flags = nullptr;
+            } else if (scratch != 0) {
+              if (bands->scratch == 0) AscendC::Trap();
+              output_base = reinterpret_cast<GM_ADDR>(bands->scratch);
+              output_0_offset = (scratch - 1) * elements * sizeof(float);
+            } else {
+              fp32_output = false;
+              output_0_offset = data_index * elements * sizeof(bfloat16_t);
+              band_flags = nullptr;
+            }
+          }
+        }
+#endif
+        GM_ADDR input_1 = input_list[weight] + input_1_offset;
+        if (weight == 7 || weight == 11) {
+          const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
+              task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
+          input_1 = MulticoreMoE::ReplicaWeight(input_1, matrix_bytes, data_index, weight == 11 ? 0 : 1,
+              replica_launch_, single_group);
+        }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset, nullptr, nullptr, nullptr,
+                       input_1, nullptr, nullptr, nullptr,
                        nullptr, nullptr, grouped_list_real, nullptr,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
+                       output_base + output_0_offset, input_list[WORKSPACE_IDX],
                        tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
                        getTransposeData(task_desc.inputs[1].transpose_flag),
-                        task_desc.outputs[0].data_type == sizeof(float));
+                       fp32_output
+#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
+                       , band_flags, band_epoch, band_rows
+#endif
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+                       , explicit_split ? static_cast<int32_t>(value) : 0, single_group, single_group ? 0 : data_index
+#endif
+        );
       }
       return;
     }
@@ -431,5 +558,5 @@ extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8
                                                 GM_ADDR *input_list) {
   MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
-  worker.Process();
+  worker.RunBackward();
 }

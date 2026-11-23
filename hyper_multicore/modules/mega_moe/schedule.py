@@ -14,6 +14,7 @@ from .transport import TRANSPORT_TASKS, transport_queues
 
 TWO_EXPERT_PIPELINE = 'two_expert_pipeline'
 BUILDER_ORDER = 'builder_order'
+MX_GRADIENT_CUBE_CORES = 32
 
 
 def validate_schedule_options(options):
@@ -55,7 +56,7 @@ class ExpertStages:
         return range(begin + expert * width + lane, begin + (expert + 1) * width, self.cores)
 
 
-def _expert_stages(graph, spec, forward, cfg):
+def _expert_stages(graph, spec, forward, cfg, mx_activation_first):
     """Identify which expert and math stage own each scheduled task."""
     # These are mathematical roles, not descriptor ports or physical worker IDs.
     aliases = ({'up': 'up_proj', 'down': 'down_proj', 'activation': 'swiglu',
@@ -69,7 +70,7 @@ def _expert_stages(graph, spec, forward, cfg):
     vectors = ('activation',) if forward else ('activation_grad',)
     if spec.precision == 'mxfp8':
         if not forward:
-            cubes = ('dw_down', 'da', 'dw_up', 'dx')
+            cubes = ('da', 'dw_down', 'dw_up', 'dx') if mx_activation_first else ('dw_down', 'da', 'dw_up', 'dx')
         vectors = ('quant_input', *vectors)
     offsets, offset = {}, 0
     for op in graph.topological_sort():
@@ -122,6 +123,29 @@ def _builder_order(stages):
     return [list(queue) for queue in stages.original_cubes], vectors
 
 
+REPLICA_HELPERS = 4
+
+
+def _reserve_replica_workers(vectors, *, mx_gradient_helpers):
+    """Free four even AIVs and keep math producers ordered."""
+    lanes = vectors[::2]
+    reserved = REPLICA_HELPERS
+    if len(lanes) <= reserved:
+        raise ValueError("Replica helpers require additional math workers")
+    if mx_gradient_helpers:
+        if len(lanes) != MX_GRADIENT_CUBE_CORES or len({len(queue) for queue in lanes}) != 1:
+            raise ValueError(f"MX gradient helpers require {MX_GRADIENT_CUBE_CORES} equal logical math queues")
+        # Keep MXFP8's producer window order when distributing its multiple stages.
+        work = [task for position in zip(*lanes) for task in position]
+    else:
+        # BF16 has one vector math stage per phase. Task IDs keep its expert
+        # order even when the logical math queues have unequal lengths.
+        work = sorted(task for lane in lanes for task in lane)
+    active = len(lanes) - reserved
+    for lane in range(len(lanes)):
+        vectors[2 * lane] = [] if lane < reserved else work[lane - reserved::active]
+
+
 # Add implemented policies here; no placeholder strategies or dynamic plugins.
 _POLICIES = {TWO_EXPERT_PIPELINE: _two_expert_pipeline, BUILDER_ORDER: _builder_order}
 
@@ -140,16 +164,28 @@ def describe_schedule_policy(name):
             'architecture': 'arch35'}
 
 
-def configure_expert_queues(cfg, graph, spec, *, forward):
+def configure_expert_queues(
+    cfg, graph, spec, *, forward, mx_gradient_helpers=False, mx_activation_first=False, bf16_replica_helpers=False,
+):
     """Compile a policy over fixed QP0 owners and serialize the existing queue ABI."""
     if spec.schedule_policy == 'auto':
         spec = replace(spec, schedule_policy=TWO_EXPERT_PIPELINE)
-    stages = _expert_stages(graph, spec, forward, cfg)
+    stages = _expert_stages(graph, spec, forward, cfg, mx_activation_first)
     describe_schedule_policy(spec.schedule_policy)
     cubes, math = _POLICIES[spec.schedule_policy](stages)
+    if mx_gradient_helpers:
+        if forward or spec.precision != 'mxfp8' or spec.transport_engine != 'udma':
+            raise ValueError("MX gradient helpers require the backward UDMA graph")
+    if mx_gradient_helpers or bf16_replica_helpers:
+        _reserve_replica_workers(math, mx_gradient_helpers=mx_gradient_helpers)
     communication = [tid for tid in cfg.vector_task_indices[:cfg.task_index_num[1]]
                      if cfg.all_tasks[tid].task_type in (*TRANSPORT_TASKS, TaskType.TASK_TERMINATE)]
     vectors = transport_queues(cfg, spec, communication)
+    if spec.architecture == 3510 and spec.precision == 'mxfp8' and spec.transport_engine == 'udma':
+        # These queues own arithmetic dependencies only. Transport keeps its QP0 polling interval.
+        for queue in (*cubes, *math):
+            for tid in queue:
+                cfg.all_tasks[tid].dependency_poll_interval_us = 5
     for queue, compute in zip(vectors, math):
         queue.extend(compute)
     result = install_worker_queues(cfg, cubes, vectors, cube_ready_depth=spec.ready_depth or 0,

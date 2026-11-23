@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Internal expert placement and transfer for the MegaMoE BF16 backend."""
+"""Expert placement and transfer for the MegaMoE BF16 and MXFP8 backends."""

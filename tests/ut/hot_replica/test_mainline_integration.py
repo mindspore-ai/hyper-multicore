@@ -14,6 +14,7 @@
 # ============================================================================
 """Regression coverage for single-backend placement and original-route fallback."""
 
+import struct
 from typing import get_type_hints
 from types import SimpleNamespace
 from contextlib import nullcontext
@@ -22,26 +23,127 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from hyper_multicore import BasePlanner, ExpertPlacement, MegaMoePlacementOptions, MegaMoeExperts
+from hyper_multicore import BasePlanner, ExpertPlacement, MegaMoePlacementOptions, MegaMoeExperts, PlacementRequest
 from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.mega_moe import route, resources as resource_module
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _plan_events
-from hyper_multicore.modules.mega_moe.heap_manager import _workspace_layout
-from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
+from hyper_multicore.modules.hot_replica import capability, checkpoint as replay, mx_adapter
+from hyper_multicore.modules.hot_replica._planner import aligned
+from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica._planner.plan import ExpertExecutionPlan, _replica_transfers
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
-    ExpertWeightBinding, PlacementResources, workspace_reservations,
+    ExpertWeightBinding, PlacementResources, _bind_custom_copy_rows, _get_mega_bank,
 )
+from hyper_multicore.modules.hot_replica.mx_gradient import (
+    GRADIENT_HELPERS, MXGradientPool, MXGradientStorage, pack_mx_gradient_return,
+)
+from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+
+
+def test_mx_transfer_slots_match_the_execution_plan_and_gradient_record():
+    """The wire record indexes guest banks while TN events index physical slots."""
+    config = ExpertReplicaConfig(num_experts=12, ep_size=2, replica_slots_per_rank=2)
+    home = config.home_experts
+    copies = ((-1, 8), (1, -1))
+    physical = (tuple(range(home)) + copies[0], tuple(range(home, 2 * home)) + copies[1])
+    counts = ((0,) * config.num_experts,) * config.ep_size
+    dispatch = ((0,) * config.physical_experts,) * config.ep_size
+    plan = ExpertExecutionPlan(config, counts, physical, dispatch)
+    plan.validate()
+    edges = _replica_transfers(copies, home)
+    assert edges == plan.transfers
+    assert [(edge.target_rank, edge.target_slot, edge.guest_slot(home)) for edge in edges] == [
+        (0, home + 1, 1), (1, home, 0),
+    ]
+
+    placement = SimpleNamespace(borrowed_capacity=2, copies_by_rank=copies)
+    storage = MXGradientStorage(256, 512, 768, 1024, 1280, 1536, 256)
+    events = tuple(range(100, 100 + config.slots_per_rank))
+    payload = pack_mx_gradient_return(placement, 0, home, events, 128, storage, 1, 16)
+    words = struct.unpack(f"<{len(payload) // 8}Q", payload)
+    assert words[16:19] == (1, 1, events[home + 1])  # Incoming owner, guest bank, TN event.
+    assert words[19:23] == (1, 0, 1, events[1])  # Target, guest bank, owner slot and event.
+
+
+@pytest.mark.parametrize("local_experts", (4, 6, 8))
+def test_mx_snapshot_reuses_validated_totals_in_the_active_plan(local_experts):
+    """The validated snapshot takes the same exact placement as the raw count path."""
+    ep, tokens, top_k = 32, 4096, 8
+    spec = MegaMoeSpec(local_num_tokens=tokens, hidden_size=5120, intermediate_size=1792,
+                       num_experts=ep * local_experts, top_k=top_k, initial_capacity_factor=4,
+                       receive_capacity=ep * tokens * top_k, ep_size=ep, ep_group=None,
+                       rank_id=0, num_cube_cores=32, auto_tokens=True, architecture=3510, precision="mxfp8")
+    resource = mx_adapter.MXPlacementResources(SimpleNamespace(spec=spec, workspace=object()), {}, True)
+    resource.nodes = tuple(rank // 8 for rank in range(ep))
+    resource._previous_active = True
+    wire = torch.zeros((ep, spec.num_experts + 3), dtype=torch.int32)
+    wire[:, 1] = tokens
+    wire[:, 2] = mx_adapter._TRAINING_MASK
+    wire[:, 3:3 + top_k] = tokens
+    hidden = SimpleNamespace(shape=(tokens, spec.hidden_size), device=wire.device)
+    source_rows = []
+    summary, _, _, snapshot = resource._read_route(wire, hidden, None, source_rows, use_snapshot=True)
+
+    def _geometry(plan, *_):
+        return SimpleNamespace(plan=plan, storage_bytes=lambda: 0)
+
+    with patch.object(mx_adapter, "_render_geometry", side_effect=_geometry):
+        baseline = resource._select(hidden, wire, summary, wire.tolist(), source_rows,
+                                    mx_adapter._TRAINING_MASK, None)
+        with patch.object(aligned, "_counts_matrix", side_effect=AssertionError("counts already validated")):
+            actual = resource._select(hidden, wire, summary, None, source_rows, mx_adapter._TRAINING_MASK, None,
+                                      snapshot=snapshot, use_snapshot=True)
+            repeated = resource._select(hidden, wire, summary, None, source_rows, mx_adapter._TRAINING_MASK, None,
+                                        snapshot=snapshot, use_snapshot=True)
+    assert baseline.plan.transfers
+    baseline.plan.validate()
+    assert actual.plan == baseline.plan
+    assert repeated is actual
+
+    # A negative expert count is invalid even when the source sum is correct.
+    wire[0, 3 + top_k] = -1
+    wire[0, 4 + top_k] = 1
+    with pytest.raises(RuntimeError, match="actual distinct Top-K"):
+        resource._read_route(wire, hidden, None, [], use_snapshot=True)
+
+
+def test_mx_gradient_bank_registers_with_the_virtual_workspace():
+    """Reserve the FP32 guest inbox and both projections in the route transaction."""
+    hidden = torch.empty((0, 128), dtype=torch.bfloat16)
+    spec = SimpleNamespace(local_experts=6, hidden_size=128, intermediate_size=64, num_cube_cores=24,
+                           ep_group=object(), expert_weight_layout="EIO", architecture=3510)
+    manager = Mock()
+    manager.access.side_effect = nullcontext
+    owner = Mock(bounded=None)
+    virtual_reservation = ({"kind": "virtual-route"}, object())
+    with (patch("torch.distributed.get_rank", return_value=0),
+          patch("torch.distributed.get_world_size", return_value=16),
+          patch.object(MXGradientPool, "allocate") as allocate):
+        pool = _get_mega_bank(hidden, SimpleNamespace(spec=spec, heap_manager=manager), owner,
+                              pool_type=MXGradientPool, reservations=(virtual_reservation,))
+    reservations, = manager.reserve.call_args.args
+    assert reservations[0] is virtual_reservation and len(reservations) == 2
+    key, layout = reservations[1]
+    assert key["kind"] == "hot_replica_mx_gradients"
+    fp32_guests = 2 * 3 * spec.hidden_size * spec.intermediate_size * 4
+    flags = (3 * pool.flag_words + GRADIENT_HELPERS * 16) * 4
+    scratch = GRADIENT_HELPERS * 2 * pool.chunk_elements * 4
+    assert layout.required_bytes == fp32_guests + flags + scratch + 1024
+    assert owner in pool.owners and pool.pipeline is None
+    manager.bind.assert_called_once_with(pool, spec, key)
+    allocate.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
     "precision,mode,value,error",
     [
         ("bf16", "push", True, TypeError),
+        ("bf16", "pull", HotReplicaPlanner(receive_capacity_percent=102), ValueError),
         ("mxfp8", "push", HotReplicaPlanner(), ValueError),
-        ("bf16", "pull", HotReplicaPlanner(), ValueError),
+        ("mxfp8", "pull", HotReplicaPlanner(), ValueError),
     ],
 )
 def test_unsupported_configuration_fails_before_binding(precision, mode, value, error):
@@ -69,6 +171,37 @@ def test_invalid_placement_strategy_fails_before_binding(options, error):
         MegaMoeExperts(hidden_size=128, intermediate_size=128, num_experts=4, top_k=2, expert_placement=options)
 
 
+@pytest.mark.parametrize("percent", (99, True, 102.5, "102"))
+def test_invalid_receive_capacity_percentage_fails_before_binding(percent):
+    with pytest.raises(ValueError, match="receive_capacity_percent"):
+        HotReplicaPlanner(receive_capacity_percent=percent)
+
+
+@pytest.mark.parametrize(("mean_rows", "percent", "expected"), [
+    (6400, 102, 6528), (6401, 102, 6656), (1024, 102, 1152), (0, 102, 0), (32768, 200, 42624),
+])
+def test_explicit_receive_limit_rounds_up_and_only_tightens(mean_rows, percent, expected):
+    request = PlacementRequest(
+        torch.empty(0, 2560, dtype=torch.bfloat16), torch.empty(0, 4), torch.empty(8, 128), None,
+        8 * mean_rows, 8 * mean_rows, 0, 1408, 24, True,
+    )
+    with patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable", return_value=False) as cost:
+        assert HotReplicaPlanner(receive_capacity_percent=percent).plan(request) is None
+    assert cost.call_args.args[:2] == (request.maximum_received, expected)
+
+
+def test_receive_capacity_percentage_is_agreed_before_a5_device_binding():
+    planner = HotReplicaPlanner(receive_capacity_percent=102, replica_slots_per_rank=3)
+    assert planner.configuration_key() == "replica_slots_per_rank=3,receive_capacity_percent=102"
+    with (
+        patch.object(capability._collective, "exchange", side_effect=lambda value, **_: [value, value]),
+        patch.object(capability, "_require_a5_bf16") as bind,
+        pytest.raises(RuntimeError, match="requires Ascend910_93"),
+    ):
+        capability.require_capability(None, None, architecture=3510, receive_capacity_percent=102)
+    bind.assert_not_called()
+
+
 def test_placement_requires_multiple_ranks():
     with pytest.raises(ValueError, match="EP group"):
         MegaMoeExperts(
@@ -78,6 +211,32 @@ def test_placement_requires_multiple_ranks():
             top_k=2,
             expert_placement=MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner()),
         )
+
+
+def test_bf16_pull_accepts_adaptive_placement():
+    """Bind the existing BF16 placement configuration to Pull."""
+    from hyper_multicore.modules.mega_moe import module
+
+    with patch.object(module, "_resolve_ep_size", return_value=2):
+        expert = MegaMoeExperts(
+            hidden_size=128, intermediate_size=128, num_experts=4, top_k=2,
+            tuning_options=MegaMoeTuningOptions(dispatch_mode="pull"),
+            expert_placement=MegaMoePlacementOptions("adaptive", HotReplicaPlanner()),
+        )
+    try:
+        assert expert._resource_group.specification["dispatch_mode"] == "pull"  # pylint: disable=protected-access
+        assert expert._resource_group.specification["hot_replica"]  # pylint: disable=protected-access
+    finally:
+        expert.close()
+
+
+def test_a3_bf16_pull_keeps_replica_capability_guard():
+    """Reject an unqualified replica transport before allocating its banks."""
+    with (
+        patch.object(capability._collective, "exchange", side_effect=lambda value, **_: [value, value]),
+        pytest.raises(RuntimeError, match="BF16 HotReplica Pull requires Ascend950"),
+    ):
+        capability.require_capability(None, None, architecture=2201, dispatch_mode="pull")
 
 
 @pytest.mark.parametrize("options", [None, MegaMoePlacementOptions(strategy="none")])
@@ -117,18 +276,44 @@ def test_supported_device_requires_selected_adapter_artifacts():
         capability._require_a3(tensor)  # pylint: disable=protected-access
 
 
+def test_a5_bf16_requires_its_own_replica_bank(tmp_path):
+    tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=0), dtype=torch.bfloat16)
+    artifacts = {"soc": "ascend950", "bridge": "bridge.so", "kernels": "kernels.so"}
+    selected = {"root": tmp_path, "variant": {"hot_replica_bf16_arch35": artifacts}}
+    (tmp_path / artifacts["bridge"]).touch()
+    with patch.object(capability, "validate_native_compatibility", return_value=selected):
+        with pytest.raises(RuntimeError, match="Ascend950 BF16 HotReplica artifact is missing: kernels"):
+            capability.require_capability(tensor, None, architecture=3510)
+        (tmp_path / artifacts["kernels"]).touch()
+        capability.require_capability(tensor, None, architecture=3510)
+
+
+def test_mx_capability_checks_cube_geometry_before_loading_replica_artifacts() -> None:
+    """Converge a device limitation during binding, before a hotspot can allocate guest resources."""
+    tensor = SimpleNamespace(device=SimpleNamespace(type="npu", index=3), dtype=torch.bfloat16)
+    with (
+        patch.object(capability, "load_torch_npu"),
+        patch.object(capability, "query_npu_arch", return_value=3510),
+        patch.object(capability, "validate_native_compatibility") as manifest,
+        pytest.raises(RuntimeError, match="HotReplica capability failed.*requires 32 Cube cores, got 24"),
+    ):
+        capability.require_capability(tensor, None, mx_cube_cores=24)
+    manifest.assert_not_called()
+
+
 def test_no_move_preserves_original_prepared_route_and_capacity():
     """Preserve validated routing and capacity when placement is declined."""
     hidden = torch.empty(2, 8)
     ids = torch.tensor([[0], [1]])
-    spec, workspace, metadata = object(), object(), object()
+    spec, workspace, metadata = SimpleNamespace(dispatch_mode="push"), object(), object()
     counts = torch.tensor([1, 1])
     gathered = torch.tensor([[0, 2, 1, 1, 1]])
     permutation = (hidden, torch.tensor([0, 1]))
     original = object()
     prepare, select, work = Mock(), Mock(return_value=None), Mock()
+    summary = route._RouteSummary(2, 128, 2)
     with (
-        patch.object(route, "_read_cached_route", return_value=((2, 128, 2), [], metadata)) as read,
+        patch.object(route, "_read_cached_route", return_value=(summary, [], metadata)) as read,
         patch.object(route, "_finalize_dynamic_route", return_value=original) as finish,
     ):
         result = route._prepare_placed_route(  # pylint: disable=protected-access
@@ -151,6 +336,17 @@ def test_failed_weight_publication_releases_bank():
     with pytest.raises(RuntimeError, match="launch failed"):
         binding.acquire((object(), object()))
     pool.release.assert_called_once()
+
+
+def test_failed_split_publication_drains_streams_before_bank_release():
+    pool = Mock()
+    pool.pipeline.begin.side_effect = RuntimeError("peer copy failed")
+    binding = ExpertWeightBinding(pool, Mock(), "EIO", fused=True)
+    with patch("hyper_multicore.modules.hot_replica.shmem_transfer._ordered_transfers",
+               return_value=nullcontext()), pytest.raises(RuntimeError, match="peer copy failed"):
+        binding.acquire((object(), object()))
+    assert [name for name, _, _ in pool.method_calls][-2:] == ["pipeline.complete", "release"]
+    assert pool.pipeline.resident is None
 
 
 def test_child_resources_prevent_parent_cleanup():
@@ -176,6 +372,29 @@ def test_fp32_owner_gradient_reaches_native_reduction_without_rounding():
     torch.testing.assert_close(bridge.reduce.call_args.args[0], gradient, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(("partial_dtype", "new_bridge", "native"), [
+    (torch.bfloat16, True, True), (torch.bfloat16, False, False), (torch.float32, True, False),
+])
+def test_native_home_gradient_keeps_fp32_guest_payload_and_legacy_fallback(partial_dtype, new_bridge, native):
+    """Keep original local precision and the ordered FP32 wire in the buffered reducer."""
+    gradient = torch.arange(12, dtype=partial_dtype).view(3, 2, 2)
+    bank = torch.empty(4, 2, 2, dtype=torch.bfloat16)
+    copies = torch.tensor([[2], [0]], dtype=torch.int32)
+    bridge = SimpleNamespace(reduce=Mock())
+    if new_bridge:
+        bridge.reduce_buffered = Mock()
+        bridge.buffered_plan_fits = Mock(return_value=True)
+    with patch("hyper_multicore.modules.hot_replica.bank_ops.load_bridge", return_value=bridge):
+        result, = reduce_banks((gradient,), (bank,), copies, 0, 1, (torch.bfloat16,), prefer_buffered=True)
+    called = bridge.reduce_buffered if native else bridge.reduce
+    called.assert_called_once()
+    source, output, slots, *_ = called.call_args.args
+    assert source.dtype == (partial_dtype if native else torch.float32)
+    assert output is result and result.dtype == torch.bfloat16
+    assert result.untyped_storage().data_ptr() != gradient.untyped_storage().data_ptr()
+    torch.testing.assert_close(slots, gradient[2:].float(), rtol=0, atol=0)
+
+
 def test_placement_reuses_validated_source_totals_and_autograd_mask():
     """Reuse existing source counts and gradient participation without rereading."""
     hidden = torch.empty(2, 8)
@@ -195,11 +414,12 @@ def test_placement_reuses_validated_source_totals_and_autograd_mask():
         """Expose source totals from the existing validation readback."""
         del payload, spec, workspace, device, kwargs
         source_rows.extend((2, 6))
-        return (2, 128, 6), None, None
+        return route._RouteSummary(2, 128, 6), None, None
 
     with patch.object(route, "_read_cached_route", side_effect=read), patch.object(route, "_finalize_dynamic_route"):
         route._prepare_placed_route(  # pylint: disable=protected-access
-            hidden, ids, object(), object(), (hidden, ids), counts, gathered, None, None, Mock(), selection, 1
+            hidden, ids, SimpleNamespace(dispatch_mode="push"), object(), (hidden, ids), counts, gathered,
+            None, None, Mock(), selection, 1
         )
     assert selection.call_args.args[4] == [2, 6]
     assert selection.call_args.args[6] == 1
@@ -232,8 +452,8 @@ def test_configuration_mismatch_fails_before_optional_capability_collective():
 def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
     """Reuse negative cost decisions without caching routes or current weights."""
     spec = SimpleNamespace(
-        ep_size=2, local_experts=4, top_k=2, hidden_size=8,
-        intermediate_size=4, num_cube_cores=24, rank_id=0, apply_probs_before_fc2=True,
+        architecture=0, ep_size=2, local_experts=4, top_k=2, hidden_size=8,
+        intermediate_size=4, num_cube_cores=24, rank_id=0, apply_probs_before_fc2=True, dispatch_mode="push",
     )
     owner = PlacementResources(SimpleNamespace(spec=spec), {}, False)
     hidden, ids, gathered = torch.empty(2, 8), torch.zeros(2, 2), torch.zeros(2, 11)
@@ -244,7 +464,7 @@ def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
         patch(module + ".placement_is_profitable", side_effect=[True, False, True, False]) as cost,
         patch(module + ".build_placement", return_value=candidate) as build,
     ):
-        arguments = (hidden, ids, gathered, (8, 128, 8), [4, 4], torch.zeros(4), 1)
+        arguments = (hidden, ids, gathered, route._RouteSummary(8, 128, 8), [4, 4], torch.zeros(4), 1)
         assert owner.select(*arguments, planner=planner, host_rows=[[1, 2, 1, 4]]) is None
         assert owner.select(*arguments, planner=planner, host_rows=[[1, 2, 1, 4]]) is None
         assert build.call_count == 1 and cost.call_count == 2
@@ -253,23 +473,57 @@ def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
     assert owner.pool is None and not owner.geometries
 
 
-def test_bailing_source_bound_reserves_ordinary_and_virtual_storage():
-    """Budget both layout variants and one shared expert bank."""
-    ordinary = {
-        "ep_size": 8, "hidden_size": 2560, "intermediate_size": 768,
-        "local_num_tokens": 128, "num_experts": 512, "top_k": 8,
-        "initial_capacity_factor": 1.25, "auto_tokens": True, "apply_probs_before_fc2": True,
-        "hot_replica": True, "source_token_bound": 4096,
-    }
-    entries, headroom = workspace_reservations(
-        (ordinary, dict(ordinary, swiglu_limit=1.0)), torch.bfloat16, 24,
+@pytest.mark.parametrize("budget", [2, 6])
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_a5_bf16_bounded_quota_uses_the_real_guest_budget(budget, dispatch_mode):
+    spec = SimpleNamespace(
+        architecture=3510, dispatch_mode=dispatch_mode, transport_engine="udma", ep_size=2, num_experts=12,
+        local_experts=6, top_k=6, hidden_size=5120,
+        intermediate_size=1792, ep_group=object(), rank_id=0, num_cube_cores=32,
+        apply_probs_before_fc2=False, partial_weight_grad_dtype="float32", batch_experts=False,
     )
-    assert [layout.receive_capacity for _, layout in entries] == [110208, 110208]
-    assert [layout.token_capacity for _, layout in entries] == [4096, 4096]
-    virtual = dict(ordinary, num_experts=1024, hot_replica=False, source_token_bound=None)
-    virtual_bytes = _workspace_layout(virtual, torch.bfloat16, 42624, 4096).required_bytes
-    bank_bytes = 6 * 64 * 2560 * 768 * torch.bfloat16.itemsize + 1024
-    assert headroom == 2 * virtual_bytes + bank_bytes
+    planner = HotReplicaPlanner(replica_slots_per_rank=budget)
+    settings = {"planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__,
+                                planner.configuration_key()),
+                "replica_slots_per_rank": budget}
+    with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline",
+               return_value=dispatch_mode == "pull"):
+        placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
+    placement.rank_nodes = (0, 1)
+    hidden = torch.empty((1, 5120), dtype=torch.bfloat16).expand(4096, 5120)
+    ids = torch.arange(6, dtype=torch.int32).repeat(4096, 1)
+    gathered = torch.tensor([[0] * 3 + [4096] * 6 + [0] * 6] * 2, dtype=torch.int32)
+    inverse = torch.argsort(torch.argsort(ids.flatten(), stable=True))
+    with (
+        patch.object(planner, "plan", side_effect=AssertionError("A3 transfer estimate used on A5")),
+        patch.object(placement, "bind", side_effect=lambda _hidden, plan, **_: plan),
+    ):
+        selected = placement.select(
+            hidden, ids, gathered, route._RouteSummary(4096, 4096, 49152), [24576, 24576], inverse,
+            13, planner=planner, host_rows=gathered.tolist(),
+        )
+    assert 1 <= selected.borrowed_capacity <= budget
+    assert sum(expert >= 0 for expert in selected.copies_by_rank[1]) == min(budget, 3)
+
+
+@pytest.mark.parametrize(("transport", "kernel_pipeline", "batch_experts"), [
+    ("mte", True, False),
+    ("udma", False, False),
+    ("udma", True, True),
+])
+def test_a5_bf16_pull_without_fusion_uses_the_generic_planner(transport, kernel_pipeline, batch_experts):
+    """Keep Pull on its original admission when the fused path is unavailable."""
+    spec = SimpleNamespace(
+        architecture=3510, dispatch_mode="pull", transport_engine=transport, num_experts=12, ep_size=2,
+        local_experts=6, hidden_size=5120, intermediate_size=1792, num_cube_cores=32, batch_experts=batch_experts,
+    )
+    planner = HotReplicaPlanner()
+    settings = {"planner_key": (type(planner).__module__, type(planner).__qualname__, planner.configuration_key())}
+    with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.has_a5_bf16_pipeline",
+               return_value=kernel_pipeline):
+        placement = PlacementResources(SimpleNamespace(spec=spec), settings, False)
+    assert not placement.uses_a5_quotas
+    assert not placement.pipeline_enabled
 
 
 def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
@@ -306,6 +560,90 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     version[0] += 1
     assert wrapped() == (False, False)
     binding.prepare_replay.assert_called_once_with()
+
+
+def test_checkpoint_with_supplied_counts_requires_the_original_order_and_histogram(monkeypatch):
+    """A replay hit requires the actual Router inputs on every EP rank."""
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
+    peer_matches = [True]
+
+    def gather(out, local, **_):
+        out[:] = local
+        if not peer_matches[0]:
+            out[1] = 0
+
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    spec = SimpleNamespace(ep_size=2, ep_group=object())
+    hidden, probabilities = torch.ones((2, 4)), torch.ones((2, 1))
+    ids = torch.arange(4, dtype=torch.int64)[::2].view(2, 1)
+    counts = torch.tensor([1, 9, 0, 9, 1, 9, 0, 9], dtype=torch.int64)[::2]
+    owner = object()
+
+    def invocation(current_ids, current_counts):
+        record, recomputing = replay.route_record(owner)
+        if recomputing:
+            return replay.agree_replay(
+                record, hidden, current_ids, probabilities, current_counts, spec, 15, weight_error=False,
+            )
+        record.stream = "s"
+        with record.save_supplied_route(current_ids, current_counts):
+            record.route = object()
+        return None
+
+    wrapped = replay.wrap_checkpoint(invocation, lambda: 0)
+    with torch.no_grad():
+        wrapped(ids, counts)
+    assert wrapped(ids.clone(), counts.clone())
+    assert not wrapped(ids.flip(0), counts)
+    assert not wrapped(ids, counts.roll(1))
+    assert not wrapped(ids, None)
+    peer_matches[0] = False
+    assert not wrapped(ids, counts)
+
+
+def test_guest_snapshot_is_invocation_scoped_and_requires_all_ranks(monkeypatch):
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
+    peer_has_snapshot = [True]
+
+    def gather(out, local, **_):
+        out[:] = local
+        if not peer_has_snapshot[0]:
+            out[1] &= 63
+
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    spec = SimpleNamespace(ep_size=2, ep_group=object())
+    owner = object()
+    hidden, ids, counts = torch.ones(1, 4), torch.tensor([[0, 1]]), torch.tensor([1, 1])
+    probs = torch.full((1, 2), .5)
+    version = [0]
+    tapes = [replay.ReplayCheckpoint(lambda: version[0], guest_snapshot_bytes=128) for _ in range(2)]
+    snapshots = [object(), object()]
+    for tape, snapshot in zip(tapes, snapshots):
+        with tape.scope(False):
+            record, _ = replay.route_record(owner)
+            assert replay.guest_weight_replay(record) == (record, False)
+            record.stream = "s"
+            with record.save_supplied_route(ids, counts):
+                record.route = object()
+            record.guest_weight_snapshot = snapshot
+
+    def recompute(tape, same_ids=True):
+        with tape.scope(True):
+            record, active = replay.route_record(owner)
+            agreed = replay.agree_replay(record, hidden, ids if same_ids else ids.flip(1), probs, counts,
+                                         spec, 13, weight_error=False)
+            selection = replay.guest_weight_replay(record)
+            assert active and not record.allow_activation
+            return agreed, selection[0].guest_weight_snapshot if selection is not None else None
+
+    assert recompute(tapes[1]) == (True, snapshots[1])
+    assert recompute(tapes[0]) == (True, snapshots[0])
+    peer_has_snapshot[0] = False
+    assert recompute(tapes[0]) == (True, None)
+    peer_has_snapshot[0] = True
+    assert recompute(tapes[1], same_ids=False) == (False, None)
+    version[0] += 1
+    assert recompute(tapes[1]) == (False, None)
 
 
 def test_early_weight_restore_uses_bank_generation(monkeypatch):
@@ -367,7 +705,7 @@ def test_virtual_event_views_keep_the_ready_generation_at_the_physical_tail():
 
 
 def test_forward_uses_injected_planner_after_count_exchange():
-    """Use the injected instance and its row bound on the normal forward path."""
+    """Use the injected instance on the normal forward path."""
     from hyper_multicore.modules.mega_moe import invocation, module
 
     class RecordingPlanner(BasePlanner):
@@ -375,13 +713,14 @@ def test_forward_uses_injected_planner_after_count_exchange():
             self.seen = request
             return None
 
-    planner = RecordingPlanner(source_token_bound=4096)
+    planner = RecordingPlanner()
     with patch.object(module, "_resolve_ep_size", return_value=2):
         options = MegaMoePlacementOptions(strategy="adaptive", planner=planner)
         expert = MegaMoeExperts(hidden_size=8, intermediate_size=4, num_experts=4, top_k=1, expert_placement=options)
     hidden, ids = torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int32)
     probs, roots = torch.ones(2, 1), (torch.empty(2, 8, 8), torch.empty(2, 4, 8))
-    spec = SimpleNamespace(auto_tokens=True, dispatch_mode="push", intermediate_size=4, rank_id=0,
+    spec = SimpleNamespace(architecture=0, auto_tokens=True, dispatch_mode="push", precision="bf16",
+                           intermediate_size=4, rank_id=0,
                            num_cube_cores=24, apply_probs_before_fc2=True)
     owner = SimpleNamespace(spec=spec, workspace=Mock(), prepare_auto_workspace=Mock())
     owner.placement = PlacementResources(owner, expert._resource_group.specification, False)
@@ -395,6 +734,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
             kwargs["prepare_workspace"], kwargs["select_placement"], kwargs["autograd_mask"],
         )
 
+    summary = route._RouteSummary(2, 128, 2)
     try:
         with (
             patch.object(expert, "_prepare_forward_inputs", return_value=(hidden, False)),
@@ -402,12 +742,11 @@ def test_forward_uses_injected_planner_after_count_exchange():
             patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
             patch.object(replay, "route_record", return_value=(None, False)),
             patch.object(invocation, "prepare_topk_route", side_effect=exchanged) as exchange,
-            patch.object(route, "_read_cached_route", return_value=((2, 128, 2), None, None)) as read,
+            patch.object(route, "_read_cached_route", return_value=(summary, None, None)) as read,
             patch.object(route, "_finalize_dynamic_route", return_value=ordinary),
             patch.object(expert._backend, "forward", return_value=hidden) as forward,
         ):
             assert expert(hidden, ids, probs, expert_weights=roots) is hidden
-        assert owner.placement.source_bound == 4096
         exchange.assert_called_once()
         read.assert_called_once()
         torch.testing.assert_close(planner.seen.counts_by_source, counts[:, 3:])
@@ -416,60 +755,154 @@ def test_forward_uses_injected_planner_after_count_exchange():
         expert.close()
 
 
-def test_borrowed_fp32_targets_keep_partials_and_restore_owner_dtype():
-    """Return the FP32 partial without converting it to the compute dtype."""
-    from hyper_multicore.modules.hot_replica.runtime import _BorrowedExpertWeights
-
-    first = torch.ones((1, 1, 2), requires_grad=True)
-    second = torch.ones((1, 1, 1), dtype=torch.bfloat16, requires_grad=True)
-    binding = Mock()
-    binding.pool.local_experts = 1
-    binding.acquire.return_value = (
-        torch.ones((2, 1, 2), dtype=torch.bfloat16),
-        torch.ones((2, 1, 1), dtype=torch.bfloat16),
-    )
-
-    def reduce(gradients, copies, *, output_dtypes, published_slots):
-        del copies, published_slots
-        return tuple(grad[:1].to(dtype) for grad, dtype in zip(gradients, output_dtypes))
-
-    binding.pool.return_generated_gradients.side_effect = reduce
-    w1, w2, target1, target2 = _BorrowedExpertWeights.apply(
-        first, second, binding, None, torch.bfloat16, True,
-    )
-    assert w1.dtype == w2.dtype == torch.bfloat16
-    assert not w1.requires_grad and not w2.requires_grad
-    assert target1.dtype == target2.dtype == torch.float32
-    first_partial = torch.full_like(target1, 1.003)
-    torch.autograd.backward(target1, first_partial)
-
-    sent = binding.pool.return_generated_gradients.call_args.args[0]
-    torch.testing.assert_close(sent[0], first_partial, rtol=0, atol=0)
-    assert sent[1].dtype == torch.float32 and torch.count_nonzero(sent[1]) == 0
-    torch.testing.assert_close(first.grad, first_partial[:1], rtol=0, atol=0)
-    assert second.grad.dtype == torch.bfloat16 and torch.count_nonzero(second.grad) == 0
-
-
 def test_public_placement_hints_and_omitted_local_capacity():
     """Resolve public types and sum destination columns across all source ranks."""
     assert get_type_hints(MegaMoePlacementOptions)["planner"] == BasePlanner | None
+    assert get_type_hints(ExpertPlacement)["route_metadata"] == route.RouteMetadata | None
     placement = ExpertPlacement(torch.tensor([[0]]), torch.tensor([[2, 0, 1, 3], [1, 0, 2, 1]]),
                                 torch.tensor([[1], [0]], dtype=torch.int32), 1, 7)
     assert [placement.received_rows(rank) for rank in range(2)] == [3, 7]
 
 
-@pytest.mark.parametrize("bound", [None, 4096])
-def test_checkpoint_request_is_training_independently_of_reservation(bound):
-    """Keep the checkpoint state even when no initial capacity is supplied."""
-    spec = SimpleNamespace(rank_id=0, intermediate_size=4, num_cube_cores=24, apply_probs_before_fc2=True)
-    owner = SimpleNamespace(spec=spec, workspace=SimpleNamespace(capacity_floor=128))
-    resources = PlacementResources(owner, {"source_token_bound": bound}, False)
+@pytest.mark.parametrize("guest_count", [0, 3])
+def test_custom_placement_derives_fused_rows_from_counts(guest_count):
+    """Require a producer for every published guest on both EP ranks."""
+    copies = torch.tensor([[2, -1], [-1, -1]], dtype=torch.int32)
+    counts = torch.tensor([[3, 2, guest_count, 0, 4, 5, 0, 0], [1, 0, 0, 0, 2, 1, 0, 0]])
+    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 12)
+    bound = [
+        _bind_custom_copy_rows(SimpleNamespace(local_experts=2, ep_size=2, rank_id=rank), placement)
+        for rank in range(2)
+    ]
+    if guest_count:
+        assert [result.copies_by_rank for result in bound] == [((2, -1), (-1, -1))] * 2
+        assert [(result.owner_rows, result.published_slots) for result in bound] == [((4, 2), 1), ((6, 6), 0)]
+    else:
+        assert all(not result.copies_by_rank for result in bound)
+
+
+def test_a3_eio_custom_placement_keeps_active_local_slots_and_ignores_idle_guests():
+    """Only real guest producers contribute to the fused return schedule."""
+    copies = torch.tensor([[0, 3], [-1, -1]], dtype=torch.int32)
+    counts = torch.tensor([[3, 2, 3, 0, 4, 5, 0, 0], [1, 0, 0, 0, 2, 1, 0, 0]])
+    spec = SimpleNamespace(local_experts=2, ep_size=2, rank_id=0)
+    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 12)
+    bound = _bind_custom_copy_rows(spec, placement, fused_return=True)
+    assert bound.copies_by_rank == ((0, -1), (-1, -1))
+    assert bound.published_slots == 1
+    assert bound.owner_rows == (4, 2)
+    counts[0, 2] = 0
+    assert _bind_custom_copy_rows(spec, placement, fused_return=True) is None
+
+
+def test_checkpoint_request_is_training_with_automatic_capacity():
+    """Request a training plan even during the no-grad checkpoint forward."""
+    spec = SimpleNamespace(architecture=0, rank_id=0, intermediate_size=4, num_cube_cores=24,
+                           apply_probs_before_fc2=True, dispatch_mode="push")
+    owner = SimpleNamespace(spec=spec)
+    resources = PlacementResources(owner, {}, False)
     ids = torch.tensor([[0]])
     with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True):
-        request = resources.request(torch.zeros(1, 4), ids, torch.zeros(2, 5), (1, 128, 1),
+        request = resources.request(torch.zeros(1, 4), ids, torch.zeros(2, 5), route._RouteSummary(1, 128, 1),
                                     [1, 1], ids, 0, host_rows=None)
     assert request.training and request.checkpointing
-    assert request.ordinary_receive_capacity == (128 if bound else None)
+    assert request.ordinary_receive_capacity is None
+
+
+@pytest.mark.parametrize("home", [4, 5, 8, 12, 16])
+@pytest.mark.parametrize("batch_experts", [False, True])
+def test_a3_saved_route_uses_shared_quota_geometry(home, batch_experts):
+    """Use the same quotas for the policy, checkpoint and batch lowering."""
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=batch_experts, dispatch_mode="push", transport_engine="mte",
+        ep_size=2, rank_id=0, num_experts=2 * home, local_experts=home, hidden_size=32, intermediate_size=64,
+        top_k=2, num_cube_cores=24, apply_probs_before_fc2=True, expert_weight_layout="EOI",
+        partial_weight_grad_dtype=None,
+    )
+    owner = SimpleNamespace(spec=spec)
+    planner = HotReplicaPlanner()
+    resources = PlacementResources(owner, {
+        "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__),
+    }, False, bf16_partials=True)
+    resources.bounded.nodes = (0, 0)
+    ids = torch.arange(2, dtype=torch.int32).expand(2048, 2).contiguous()
+    source_counts = [1, 2048, 12, 2048, 2048] + [0] * (2 * home - 2)
+    wire = torch.tensor([source_counts] * 2, dtype=torch.int32)
+    hidden = torch.empty(2048, 32, dtype=torch.bfloat16)
+    summary = route._RouteSummary(8192, 2048, 8192)
+    inverse = ids.flatten().argsort(stable=True).argsort().view_as(ids)
+    rows = wire.tolist()
+    with (
+        patch("hyper_multicore.modules.hot_replica.planner.placement_receive_limit", return_value=4096),
+        patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable", return_value=True),
+        patch.object(resources, "bind") as bind,
+        patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True),
+    ):
+        request = resources.request(hidden, ids, wire, summary, [4096, 4096], inverse, 12, host_rows=rows)
+        expected = planner.plan(request)
+        with patch.object(planner, "plan", side_effect=AssertionError("generic planner called")):
+            resources.select(hidden, ids, wire, summary, [4096, 4096], inverse, 12, planner=planner,
+                             checkpointing=not batch_experts, host_rows=rows)
+    actual = bind.call_args.args[1]
+    assert actual is not None and expected is not None
+    torch.testing.assert_close(actual.virtual_ids, expected.virtual_ids)
+    torch.testing.assert_close(actual.counts_by_source, expected.counts_by_source)
+    torch.testing.assert_close(actual.copies, expected.copies)
+    assert (actual.receive_capacity, actual.transfer_experts) == (
+        expected.receive_capacity, expected.transfer_experts,
+    )
+    assert resources.bounded.geometry is None
+    assert bind.call_args.kwargs["fused"]
+
+
+@pytest.mark.parametrize(("ep", "home", "top_k", "tokens", "checkpointing"), [
+    (2, 4, 2, 641, False),
+    (4, 6, 4, 4097, True),
+])
+@pytest.mark.parametrize("decision", ("admit", "reject_capacity", "reject_movement"))
+def test_a3_receive_capacity_uses_agreed_rows(ep, home, top_k, tokens, checkpointing, decision):
+    """Tight quotas govern the configured planner with and without the count wire."""
+    budget = 1 if decision == "reject_capacity" else None
+    percent = 100 if budget is not None else 102
+    if budget is not None:
+        top_k = home
+    planner = HotReplicaPlanner(receive_capacity_percent=percent, replica_slots_per_rank=budget)
+    spec = SimpleNamespace(
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
+        ep_size=ep, rank_id=0, num_experts=ep * home, local_experts=home, hidden_size=32, intermediate_size=64,
+        top_k=top_k, num_cube_cores=24, apply_probs_before_fc2=False, expert_weight_layout="EOI",
+        partial_weight_grad_dtype=None,
+    )
+    resources = PlacementResources(SimpleNamespace(spec=spec), {
+        "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__, planner.configuration_key()),
+        "receive_capacity_percent": percent, "replica_slots_per_rank": budget,
+    }, False, bf16_partials=True)
+    ids = torch.arange(top_k, dtype=torch.int32).expand(tokens, top_k).contiguous()
+    source_tokens = [tokens] * (ep - 1) + [0]
+    wire = torch.tensor([[0, count, 13] + [count] * top_k + [0] * (ep * home - top_k)
+                         for count in source_tokens], dtype=torch.int32)
+    source_rows = [count * top_k for count in source_tokens]
+    peak = sum(source_rows)
+    average = (peak + ep - 1) // ep
+    limit = (average * percent + 12799) // 12800 * 128
+    summary = route._RouteSummary(peak, tokens, peak)
+    agreed = {"host_rows": wire.tolist()} if checkpointing else {"snapshot": SimpleNamespace(wire=wire.numpy())}
+    with (
+        patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable",
+              side_effect=[True, decision != "reject_movement"]) as cost,
+        patch.object(resources, "bind", side_effect=lambda _hidden, placement, **_: placement),
+    ):
+        placement = resources.select(torch.empty(tokens, 32, dtype=torch.bfloat16), ids, wire, summary, source_rows,
+                                     None, 13, planner=planner, checkpointing=checkpointing, **agreed)
+    assert cost.call_args_list[0].args[:2] == (peak, limit)
+    if decision == "reject_capacity":
+        assert placement is None and cost.call_count == 1
+    elif decision == "reject_movement":
+        assert placement is None and cost.call_args.kwargs["transfer_experts"] > 0
+    else:
+        assert placement.receive_capacity <= limit
+        assert placement.borrowed_capacity > 0 and cost.call_args.kwargs["transfer_experts"] > 0
+        assert placement.counts_by_source.sum(1).tolist() == source_rows
 
 
 def test_manifest_checks_custom_policy_settings():

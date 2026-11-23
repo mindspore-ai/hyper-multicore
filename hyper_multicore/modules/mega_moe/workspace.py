@@ -77,6 +77,7 @@ def _workspace_allocation_specs(
 
 def _spec_workspace_bytes(
     specification: Mapping[str, Any], dtype: torch.dtype, *, receive_capacity: int | None = None,
+    borrows_receive_buffer: bool = False,
 ) -> int:
     """Return planned symmetric bytes for one execution-resource group."""
     local_tokens = specification["local_num_tokens"]
@@ -104,7 +105,9 @@ def _spec_workspace_bytes(
     return sum(
         spec.dtype.itemsize * math.prod(spec.shape)
         + spec.alignment_bytes - 1
-        for _, spec in allocations
+        for name, spec in allocations
+        if name != "routed_buffer" or not specification.get("_borrows_routed_buffer", False)
+        if name != "expert_buffer" or not borrows_receive_buffer
     )
 
 
@@ -168,9 +171,46 @@ class MegaMoeWorkspace:
     heap_manager: Any | None = field(default=None, repr=False)
     route_cache: Any | None = field(default=None, repr=False)
     route_header_cache: Any | None = field(default=None, repr=False)
+    placement_wire: Any | None = field(default=None, repr=False)
+    placement_readback: Any | None = field(default=None, repr=False)
     route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+    routed_buffer_owner: MegaMoeWorkspace | None = field(default=None, repr=False)
+    borrows_receive_buffer: bool = False
+    _routed_only: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def lease_owner(self) -> MegaMoeWorkspace:
+        """Order every user of the same routed scratch on one stream event."""
+        return self if self.routed_buffer_owner is None else self.routed_buffer_owner
+
+    @property
+    def receive_buffer(self):
+        """Resolve the latest receive allocation while holding the workspace lease."""
+        return self.lease_owner.expert_buffer if self.borrows_receive_buffer else self.expert_buffer
+
+    def _allocation_specs(self, spec, dtype, capacity, *, routed_only):
+        precision = getattr(spec, "precision", "bf16")
+        allocations = _workspace_allocation_specs(
+            dispatch_mode=spec.dispatch_mode,
+            routed_slots=spec.routed_slots,
+            receive_capacity=capacity,
+            hidden_size=spec.hidden_size,
+            ep_size=spec.ep_size,
+            num_experts=spec.num_experts,
+            compute_stages=6 if precision == "mxfp8" else 3,
+            dtype=dtype,
+            apply_probs_before_fc2=spec.apply_probs_before_fc2,
+        )
+        if routed_only:
+            return tuple(item for item in allocations if item[0] == "routed_buffer")
+        if precision == "mxfp8" and spec.dispatch_mode == "push" and not spec.apply_probs_before_fc2:
+            # Keep the long-lived routed and event buffers away from the growing receive allocation.
+            allocations = (*allocations[1:], allocations[0])
+        return tuple(item for item in allocations
+                     if item[0] != "routed_buffer" or self.routed_buffer_owner is None
+                     if item[0] != "expert_buffer" or not self.borrows_receive_buffer)
 
     def probabilities(self, spec: MegaMoeSpec) -> ProbabilityWorkspace:
         """Rebind aliases when heap storage or a retained plan's stride changes."""
@@ -193,17 +233,7 @@ class MegaMoeWorkspace:
         """Project materialized symmetric fields into ordered restart replacements."""
         if self.completion_event is None:
             return ()
-        targets = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=receive_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        targets = self._allocation_specs(spec, dtype, receive_capacity, routed_only=self._routed_only)
         replacement = _lifecycle._AllocationReplacement  # pylint: disable=protected-access
         return tuple(replacement(getattr(self, field_name), target) for field_name, target in targets)
 
@@ -215,7 +245,7 @@ class MegaMoeWorkspace:
         replacements: tuple[_lifecycle._AllocationReplacement, ...],  # pylint: disable=protected-access
     ) -> bool:
         """Validate the read-only workspace state captured for restart preflight."""
-        if self.in_use:
+        if self.lease_owner.in_use:
             raise RuntimeError("active workspace lease prevents heap growth")
         if self.closing:
             raise RuntimeError("closing workspace prevents heap growth")
@@ -224,17 +254,7 @@ class MegaMoeWorkspace:
             if replacements:
                 raise RuntimeError("lazy workspace must not describe restart Allocations")
             return False
-        expected = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=current_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        expected = self._allocation_specs(spec, dtype, current_capacity, routed_only=self._routed_only)
         if len(replacements) != len(expected):
             raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
         for (field_name, current_spec), replacement in zip(expected, replacements):
@@ -254,17 +274,7 @@ class MegaMoeWorkspace:
         tensors: tuple[torch.Tensor, ...],
     ) -> None:
         """Bind validated replacement Tensors without allocating or running collectives."""
-        targets = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=receive_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        targets = self._allocation_specs(spec, dtype, receive_capacity, routed_only=self._routed_only)
         self.probability_views = None
         self.source_buffer = None
         self.expert_buffer = None
@@ -289,17 +299,7 @@ class MegaMoeWorkspace:
         tensors: tuple[torch.Tensor, ...],
     ) -> None:
         """Validate a complete replacement slice without modifying workspace state."""
-        targets = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=receive_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        targets = self._allocation_specs(spec, dtype, receive_capacity, routed_only=self._routed_only)
         if len(tensors) != len(targets):
             raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
         for tensor, (_, target) in zip(tensors, targets):
@@ -337,16 +337,21 @@ class MegaMoeWorkspace:
         with self._access():
             self._ensure_buffers(spec, dtype, device)
 
+    def ensure_routed_buffer(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
+        """Materialize routed scratch before the first placed call needs it."""
+        with self._access():
+            self._ensure_buffers(spec, dtype, device, routed_only=True)
+
     def _access(self) -> Any:
         """Exclude submissions during a root Runtime restart."""
         return self.heap_manager.access() if self.heap_manager is not None else nullcontext()
 
-    def _ensure_buffers(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
+    def _ensure_buffers(self, spec: MegaMoeSpec, dtype: Any, device: Any, *, routed_only=False) -> None:
         """Allocate this workspace at its current monotonic capacity."""
         if self.closing:
             raise RuntimeError("cannot allocate a closing MegaMoe workspace.")
         requested_capacity = max(spec.receive_capacity, self.capacity_floor)
-        if self.expert_buffer is not None or self.source_buffer is not None:
+        if self.completion_event is not None:
             compatible = (
                 self.dispatch_mode == spec.dispatch_mode
                 and self.dtype == dtype
@@ -356,24 +361,15 @@ class MegaMoeWorkspace:
             )
             if not compatible:
                 raise ValueError("MegaMoe workspace cannot change device, dtype, routed shape, or capacity.")
-            return
+            if routed_only or not self._routed_only:
+                return
 
-        self._allocate_buffers(spec, dtype, device, requested_capacity)
+        self._allocate_buffers(spec, dtype, device, requested_capacity, routed_only=routed_only)
 
     @torch.inference_mode(False)
-    def _allocate_buffers(self, spec, dtype, device, requested_capacity):
+    def _allocate_buffers(self, spec, dtype, device, requested_capacity, *, routed_only=False):
         """Create mutable persistent buffers even after an inference-only first call."""
-        allocations = _workspace_allocation_specs(
-            dispatch_mode=spec.dispatch_mode,
-            routed_slots=spec.routed_slots,
-            receive_capacity=requested_capacity,
-            hidden_size=spec.hidden_size,
-            ep_size=spec.ep_size,
-            num_experts=spec.num_experts,
-            compute_stages=6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3,
-            dtype=dtype,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2,
-        )
+        allocations = self._allocation_specs(spec, dtype, requested_capacity, routed_only=routed_only)
         self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
@@ -381,13 +377,22 @@ class MegaMoeWorkspace:
         self.routed_slots = spec.routed_slots
         stages = 6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3
         self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size, stages) * 4
+        created = []
         try:
             for field_name, allocation in allocations:
+                if self._routed_only and field_name == "routed_buffer":
+                    continue
                 setattr(self, field_name, shmem.empty(
                     allocation.shape,
                     dtype=allocation.dtype,
                     alignment=allocation.alignment_bytes,
                 ))
+                created.append(field_name)
+            if self.completion_event is None:
+                self.completion_event = torch.npu.Event()
+            if routed_only:
+                self._routed_only = True
+                return
             self.gmm_workspace = torch.empty(
                 (_GMM_WORKSPACE_BYTES,),
                 dtype=torch.uint8,
@@ -399,12 +404,15 @@ class MegaMoeWorkspace:
                 dtype=torch.uint8,
                 device=device,
             )
-            self.completion_event = torch.npu.Event()
-            self.completion_stream = None
         except Exception:
-            self._free_symmetric_tensors()
+            for field_name in created:
+                shmem.free(getattr(self, field_name))
+                setattr(self, field_name, None)
             self._free_local_tensors()
+            if not self._routed_only:
+                self.completion_event = None
             raise
+        self._routed_only = False
 
     def prepare_event_counters(self, *, forward: bool) -> Any:
         """Reset per-call counters while preserving the ready generation."""
@@ -441,33 +449,36 @@ class MegaMoeWorkspace:
 
     def wait_for_reuse(self, *, stream: Any = None) -> None:
         """Order count exchange after the previous workspace lease."""
-        with self._access(), self.lock:
-            self._wait_for_completion(stream)
+        owner = self.lease_owner
+        with self._access(), owner.lock:
+            owner._wait_for_completion(stream)
 
     def claim(self) -> None:
         """Claim serial storage without re-waiting on its own stream."""
-        with self._access(), self.lock:
-            if self.closing:
+        owner = self.lease_owner
+        with self._access(), owner.lock:
+            if self.closing or owner.closing:
                 raise RuntimeError("cannot claim a closing MegaMoe workspace.")
-            if self.in_use:
+            if owner.in_use:
                 raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
             self.lease_stream = (torch.npu.current_stream(self.device)
                                  if getattr(self.device, "type", None) == "npu" else None)
-            self._wait_for_completion(self.lease_stream)
-            self.in_use = True
+            owner._wait_for_completion(self.lease_stream)
+            self.in_use = owner.in_use = True
 
     def release(self, *, stream: Any = None) -> None:
         """Always record completion, including for a future cross-stream consumer."""
-        with self._access(), self.lock:
-            if not self.in_use:
+        owner = self.lease_owner
+        with self._access(), owner.lock:
+            if not self.in_use or not owner.in_use:
                 raise RuntimeError("MegaMoe workspace was released without an active lease.")
             if stream is None:
                 stream = torch.npu.current_stream(self.device)
-            self.completion_event.record(stream)
-            self.completion_stream = stream
-            self.in_use = False
+            owner.completion_event.record(stream)
+            owner.completion_stream = stream
+            self.in_use = owner.in_use = False
             self.lease_stream = None
-            self.used = True
+            owner.used = True
 
     def _free_symmetric_tensors(self) -> None:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
@@ -538,6 +549,8 @@ class MegaMoeWorkspace:
             self.closing = True
             self.route_cache = None
             self.route_header_cache = None
+            self.placement_wire = None
+            self.placement_readback = None
             self.planned_route_cache = None
             self.route_cache_probe_after = 0
         # An empty rank must still participate when peers retain buffers after a failure.

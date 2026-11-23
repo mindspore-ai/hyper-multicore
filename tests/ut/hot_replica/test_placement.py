@@ -14,18 +14,61 @@
 # ============================================================================
 """CPU contracts for planner count formats and optional execution dependencies."""
 
-import sys
-from types import ModuleType
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from hyper_multicore.modules.hot_replica import placement
+from hyper_multicore.modules.hot_replica._planner import planner as quota_planner
+from hyper_multicore.modules.hot_replica._planner.aligned import build_aligned_expert_plan
+from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica._planner.mx_peak_planner import build_mx_local_peak_plan
 
 
 class TestHotReplicaPlacement(unittest.TestCase):
     """Reject invalid metadata before any optional device kernel is called."""
+
+    def test_mx_skips_whole_search_when_largest_expert_cannot_fit(self) -> None:
+        config = ExpertReplicaConfig(4, 4, 1)
+        matrix = ((16384, 0, 0, 0),) + ((0, 0, 0, 0),) * 3
+        with patch("hyper_multicore.modules.hot_replica._planner.whole._select_whole_targets") as whole:
+            plan = build_aligned_expert_plan(
+                matrix, config, capacity_limit=16384, minimum_replica_rows=64, minimum_load_reduction=.25,
+            )
+        whole.assert_not_called()
+        plan.validate()
+        self.assertEqual(max(plan.destination_loads), 8192)
+
+    def test_mx_local_peak_refines_tied_ranks_without_changing_node_traffic(self) -> None:
+        config = ExpertReplicaConfig(8, 8, 1)
+        nodes = (0, 0, 0, 0, 1, 1, 1, 1)
+        matrix = ((8192, 0, 0, 0, 8192, 0, 0, 0),) * 8
+        baseline = build_aligned_expert_plan(
+            matrix, config, capacity_limit=131072, minimum_replica_rows=8192, minimum_load_reduction=.25,
+            rank_nodes=nodes,
+        )
+        options = dict(capacity=131072, minimum_rows=8192, minimum_reduction=.25, row_credit=0, nodes=nodes)
+        plan = build_mx_local_peak_plan(matrix, config, transfer_rows=3178, **options)
+        plan.validate()
+        self.assertEqual(max(baseline.destination_loads), 32768)
+        self.assertEqual(max(plan.destination_loads), 16384)
+        self.assertTrue(all(nodes[edge.owner_rank] == nodes[edge.target_rank] for edge in plan.transfers))
+        for before, after in zip(baseline.dispatch_counts, plan.dispatch_counts):
+            # The total is conserved for each source rank and destination node.
+            self.assertEqual(sum(before[:8]), sum(after[:8]))
+        self.assertEqual(build_mx_local_peak_plan(matrix, config, transfer_rows=32768, **options), baseline)
+
+    def test_mx_local_peak_does_not_admit_an_inactive_short_route(self) -> None:
+        config = ExpertReplicaConfig(4, 4, 1)
+        matrix = ((1024, 0, 0, 0),) * 4
+        plan = build_mx_local_peak_plan(
+            matrix, config, capacity=4096, minimum_rows=8192, minimum_reduction=.25,
+            row_credit=896, nodes=(0, 0, 1, 1), transfer_rows=3178,
+        )
+        plan.validate()
+        self.assertFalse(plan.transfers)
 
     def test_receive_limit_matches_full_and_short_pr19_routes(self) -> None:
         limit = placement.placement_receive_limit
@@ -34,6 +77,22 @@ class TestHotReplicaPlacement(unittest.TestCase):
         self.assertEqual(limit(1024, 8, 64, 8, 2560, 2), 8192)
         self.assertEqual(limit(1024, 8, 64, 8, 65536, 2), 1408)
         self.assertEqual(limit(0, 8, 64, 8, 2560, 2), 0)
+
+    def test_capacity_search_materializes_only_the_selected_feasible_quotas(self) -> None:
+        wire = np.array([[16384] * 4 + [0] * 4] * 2, dtype=np.int32)
+        targets = (73728, 66816)
+        build = quota_planner.build_capacity_plan
+        with patch.object(quota_planner, "_materialize", wraps=quota_planner._materialize) as render:
+            tight = build(wire, 85248, replica_slots_per_rank=2, alternatives=targets,
+                          score=lambda peak, degree: 150000 - peak - 1000 * degree)
+            render.assert_called_once()
+            self.assertLessEqual(max(tight.destination_loads), targets[-1])
+            self.assertEqual(tight.maximum_transfer_degree, 2)
+        limited = build(wire, 85248, replica_slots_per_rank=1, alternatives=targets,
+                        score=lambda peak, degree: 150000 - peak - 1000 * degree)
+        self.assertEqual(limited.maximum_transfer_degree, 1)
+        self.assertGreater(max(limited.destination_loads), targets[0])
+        self.assertIsNone(build(wire, 85248, alternatives=targets, score=lambda *_: -1))
 
     def test_cost_charges_gradient_wire_bytes_and_peer_fanout(self) -> None:
         """Identical arithmetic must not ignore larger gradients or more peers."""
@@ -76,42 +135,41 @@ class TestHotReplicaPlacement(unittest.TestCase):
         self.assertTrue(placement.placement_is_profitable(*geometry, projection_flops=6))
         self.assertFalse(placement.placement_is_profitable(*geometry, projection_flops=4))
 
-    def test_native_and_legacy_counts_share_the_int32_planner(self) -> None:
-        """Normalize equivalent wire types without changing the ownership decision."""
+    def test_capacity_placement_preserves_source_intervals(self) -> None:
+        """Split the same logical expert in source-rank order for both wire dtypes."""
         for dtype in (torch.int32, torch.int64):
             with self.subTest(dtype=dtype):
-                counts = torch.tensor([[512, 0], [0, 0]], dtype=dtype)
-                copies = torch.full((2, 1), -1, dtype=torch.int32)
-                with (
-                    patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}),
-                    patch(
-                        "hyper_multicore.modules.hot_replica.placement.allocate_experts",
-                        return_value=(torch.zeros(2, 2, dtype=torch.int32), None, None, copies),
-                    ) as allocate,
-                ):
-                    result = placement.build_placement(
-                        torch.empty(512, 4),
-                        torch.zeros(512, 1, dtype=torch.int32),
-                        counts,
-                        256,
-                        0,
-                    )
-                self.assertIsNone(result)
-                actual_counts, actual_capacity = allocate.call_args.args
-                self.assertEqual(actual_capacity, 256)
-                self.assertEqual(actual_counts.dtype, torch.int32)
-                torch.testing.assert_close(actual_counts, counts.to(torch.int32))
+                counts = torch.tensor([[4, 0], [2, 0]], dtype=dtype)
+                result = placement.build_placement(
+                    torch.empty(4, 4), torch.zeros(4, 1, dtype=torch.int32),
+                    counts, 3, 0, source_inverse=torch.arange(4, dtype=torch.int32),
+                )
+                self.assertIsNotNone(result)
+                torch.testing.assert_close(result.virtual_ids, torch.tensor([[0], [0], [0], [3]], dtype=torch.int32))
+                torch.testing.assert_close(result.counts_by_source,
+                                           torch.tensor([[3, 0, 0, 1], [0, 0, 0, 2]], dtype=torch.int32))
+                torch.testing.assert_close(result.copies, torch.tensor([[-1], [0]], dtype=torch.int32))
+                self.assertEqual((result.receive_capacity, result.published_slots), (3, 0))
+
+    def test_capacity_placement_honors_an_explicit_guest_budget(self) -> None:
+        counts = torch.tensor([[4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0],
+                               [4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0]], dtype=torch.int32)
+        ids = torch.arange(6, dtype=torch.int32).repeat_interleave(4).view(-1, 1)
+        hidden = torch.empty(24, 4)
+        inverse = torch.arange(24, dtype=torch.int32)
+        ordinary = placement.build_placement(hidden, ids, counts, 24, 1, source_inverse=inverse)
+        capped = placement.build_placement(
+            hidden, ids, counts, 24, 1, source_inverse=inverse, replica_slots_per_rank=2,
+        )
+        self.assertEqual((ordinary.published_slots, ordinary.receive_capacity), (3, 24))
+        self.assertEqual((capped.borrowed_capacity, capped.published_slots, capped.receive_capacity), (2, 2, 32))
+        self.assertEqual(capped.counts_by_source.sum().item(), ids.numel() * 2)
 
     def test_wide_counts_reject_overflow_before_allocator(self) -> None:
         """A large INT64 wire count must never wrap to a negative planner value."""
         counts = torch.tensor([[2**31, 0], [0, 0]], dtype=torch.int64)
-        with (
-            patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}),
-            patch("hyper_multicore.modules.hot_replica.placement.allocate_experts") as allocate,
-            self.assertRaisesRegex(ValueError, "INT32 planner limit"),
-        ):
+        with self.assertRaisesRegex(ValueError, "INT32 planner limit"):
             placement.build_placement(torch.empty(0, 4), torch.empty(0, 1, dtype=torch.int32), counts, 1, 0)
-        allocate.assert_not_called()
 
     def test_invalid_topologies_fail_before_allocator(self) -> None:
         """An invalid rank or expert extent cannot launch an asymmetric plan."""
@@ -122,8 +180,7 @@ class TestHotReplicaPlacement(unittest.TestCase):
         ):
             with self.subTest(shape=counts.shape, rank=rank):
                 with (
-                    patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}),
-                    patch("hyper_multicore.modules.hot_replica.placement.allocate_experts") as allocate,
+                    patch("hyper_multicore.modules.hot_replica.placement.build_capacity_plan") as allocate,
                     self.assertRaises(ValueError),
                 ):
                     placement.build_placement(

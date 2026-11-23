@@ -46,14 +46,23 @@ class _MXFP8Plan:
     spec: object
     forward: _DeviceRuntime
     backward: _DeviceRuntime
+    home_experts: int | None = None
+
+    @cached_property
+    def forward_without_grad(self) -> _DeviceRuntime:
+        """Build the row-only forward graph on first use."""
+        host = build_mxfp8_runtime(self.spec, forward=True, row_only=True, home_experts=self.home_experts)
+        return _device_runtime(host, self.forward.runtime.device, self.spec)
 
 
 class Resources(_MegaMoeExecutionResources):
     """Own MX execution plans for the bound workspace."""
-    def __init__(self, specification, tensor, *, expert_weight_layout, shared, active_specifications):
+    def __init__(self, specification, tensor, *, expert_weight_layout, shared, active_specifications,
+                 workspace_layout=None, routed_buffer_owner=None):
         super().__init__(
             specification, tensor, expert_weight_layout=expert_weight_layout, shared=shared,
-            active_specifications=active_specifications,
+            active_specifications=active_specifications, workspace_layout=workspace_layout,
+            routed_buffer_owner=routed_buffer_owner,
         )
         self._plans = OrderedDict()
 
@@ -62,7 +71,7 @@ class Resources(_MegaMoeExecutionResources):
         if self.spec.architecture != 3510:
             raise ValueError("MXFP8 experts require arch35")
 
-    def plan_for_capacity(self, capacity, device, *, tokens=None):
+    def plan_for_capacity(self, capacity, device, *, tokens=None, home_experts=None):
         """Cache pointer-free Pull plans independently of the live per-expert loads."""
         coverage = self.spec.local_num_tokens if tokens is None else tokens
         if coverage > self._token_capacity:
@@ -73,12 +82,14 @@ class Resources(_MegaMoeExecutionResources):
             if not 1 <= capacity <= limit:
                 raise ValueError(f"Pull receive capacity must be in [1, {limit}]")
             capacity = limit
-        key = (coverage, capacity)
+        key = (coverage, capacity) if home_experts is None else (coverage, capacity, home_experts)
         if key not in self._plans:
             spec = replace(active_spec, receive_capacity=capacity)
-            self._plans[key] = _MXFP8Plan(
-                spec, _device_runtime(build_mxfp8_runtime(spec, forward=True), device, spec),
-                _device_runtime(build_mxfp8_runtime(spec, forward=False), device, spec))
+            forward = build_mxfp8_runtime(spec, forward=True, home_experts=home_experts)
+            backward = build_mxfp8_runtime(spec, forward=False, home_experts=home_experts,
+                                          gradient_helpers=home_experts is not None)
+            self._plans[key] = _MXFP8Plan(spec, _device_runtime(forward, device, spec),
+                                        _device_runtime(backward, device, spec), home_experts)
         self._plans.move_to_end(key)
         while len(self._plans) > 4:
             self._plans.popitem(last=False)
@@ -101,5 +112,11 @@ def forward(module, hidden_states, hidden_flat, topk_ids, topk_weights, weights,
     del hidden_flat, topk_ids
     shapes = ((module.local_experts, module.hidden_size, 2 * module.intermediate_size),
               (module.local_experts, module.intermediate_size, module.hidden_size))
-    execution = MXFP8Execution(resources, nograd_no_clone=module.nograd_no_clone)
+    binding = route.weight_binding
+    if binding is None:
+        execution = MXFP8Execution(resources, nograd_no_clone=module.nograd_no_clone)
+    else:
+        execution = MXFP8Execution(route.execution_resources, nograd_no_clone=module.nograd_no_clone,
+                                   placement=binding.placement, weight_prefetch=binding.prefetch,
+                                   gradient_pool=binding.gradients)
     return execute_mxfp8_experts(hidden_states, *weights, route, topk_weights, shapes, execution)

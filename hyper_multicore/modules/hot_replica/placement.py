@@ -16,13 +16,15 @@
 
 from __future__ import annotations
 
-import numpy as np
+from collections.abc import Callable
 
 import torch
 
 from ..base_planner import ExpertPlacement
-from .allocator import allocate_experts
-from .render import render_expert_major
+from ..mega_moe.route import _upload_route_tensor
+from ._planner.planner import build_capacity_plan
+from ._planner.plan import ExpertExecutionPlan
+from .render import render_plan
 
 # Effective A3 planner estimates from the original prefetch/return cost model.
 # Profiled compute saved by placement at H=5120/I=1792 exceeded the old
@@ -56,31 +58,6 @@ def placement_receive_limit(
     return (limit + tile - 1) // tile * tile
 
 
-def _bounded_transfer_seconds(
-    ranks: int, local: int, weight_bytes: int, gradient_bytes: int,
-) -> float:
-    """Estimate the leased bank traffic for a route with a configured source bound."""
-    staging = (3 * weight_bytes + 2 * gradient_bytes) / _A3_STAGING_BYTES_PER_SECOND
-    peer = (ranks - 1) * (weight_bytes + gradient_bytes) / (local * _A3_PEER_BYTES_PER_SECOND)
-    return _A3_PLACEMENT_SECONDS + staging + peer
-
-
-def bounded_move_pays(
-    maximum: int, after: int, hidden: int, intermediate: int, cube_cores: int,
-    ep_size: int, local_experts: int, element_size: int, *, training: bool, replay: bool,
-    apply_probs_before_fc2: bool,
-) -> bool:
-    """Compare placement work against the busiest rank's saved projection work."""
-    weights = 3 * local_experts * hidden * intermediate
-    gradient_bytes = weights * 4 if training else 0
-    transfer = _bounded_transfer_seconds(ep_size, local_experts, weights * element_size, gradient_bytes)
-    if replay:
-        transfer += 2 * weights * element_size / _A3_STAGING_BYTES_PER_SECOND
-    flops = 18 if replay and not apply_probs_before_fc2 else 12 if training else 6
-    compute = flops * max(0, maximum - after) * hidden * intermediate
-    return compute > transfer * cube_cores * 4e12
-
-
 def _transfer_seconds(weight_bytes, gradient_bytes, ep_size, local_experts, replay_bytes, transfer_experts):
     """Time to stage the shard and fetch/return one expert per peer."""
     copies = ep_size - 1 if transfer_experts is None else transfer_experts
@@ -98,7 +75,7 @@ def _transfer_seconds(weight_bytes, gradient_bytes, ep_size, local_experts, repl
     return _A3_PLACEMENT_SECONDS + staging + peer
 
 
-def placement_is_profitable(
+def placement_benefit_seconds(
     maximum_received: int,
     target_load: int,
     hidden_size: int,
@@ -112,8 +89,8 @@ def placement_is_profitable(
     gradient_bytes: int | None = None,
     backward_prefetch_weight_bytes: int = 0,
     transfer_experts: int | None = None,
-) -> bool:
-    """Estimate critical compute saved against dtype-aware bank and peer traffic.
+) -> float:
+    """Estimate critical compute time saved minus dtype-aware bank and peer traffic.
 
     Include weight publication, FP32 home-gradient materialization, borrowed
     gradient publication, owner accumulation and the returned parameter store.
@@ -157,10 +134,15 @@ def placement_is_profitable(
     excess = max(0, maximum_received - target_load)
     saved_compute = projection_flops * excess * hidden_size * intermediate_size / (cube_cores * _A3_FLOPS_PER_CUBE)
     restore = 2 * backward_prefetch_weight_bytes / _A3_STAGING_BYTES_PER_SECOND
-    return saved_compute > restore + _transfer_seconds(
+    return saved_compute - (restore + _transfer_seconds(
         weight_bytes, gradient_bytes, ep_size, local_experts,
         backward_prefetch_weight_bytes, transfer_experts,
-    )
+    ))
+
+
+def placement_is_profitable(*args, **kwargs) -> bool:
+    """Admit placements with strictly positive estimated savings."""
+    return placement_benefit_seconds(*args, **kwargs) > 0
 
 
 def _token_order(hidden, ids, experts, supplied):
@@ -193,11 +175,14 @@ def build_placement(
     rank: int,
     *,
     source_inverse: torch.Tensor | None = None,
+    replica_slots_per_rank: int | None = None,
+    alternatives: tuple[int, ...] = (),
+    score: Callable[[int, int], float] | None = None,
 ) -> ExpertPlacement | None:
     """Borrow experts and render their virtual IDs without changing the router.
 
-    Each virtual rank owns its home expert slots followed by equally many optional
-    borrowed slots. Original expert parameters and optimizer ownership stay unchanged.
+    Each virtual rank owns its home expert slots followed by optional borrowed slots.
+    Original expert parameters and optimizer ownership stay unchanged.
     The caller supplies its existing count table and load target; this function
     performs no additional count collective or expert computation.
 
@@ -207,12 +192,13 @@ def build_placement(
         counts_by_source: Current [EP, global experts] source-count table.
         capacity: Positive target routed rows per rank for the allocator.
         rank: Rank within this ordered EP group.
+        replica_slots_per_rank: Optional cap on guests, defaulting to the number of home experts.
+        alternatives: Additional receive targets for cost-based quota selection.
+        score: Estimated saving for the actual receive peak and transfer degree.
 
     Returns:
         A per-invocation placement, or None when no expert needs to be borrowed.
     """
-    # The primitive is optional and is loaded only when placement is actually used.
-
     if counts_by_source.ndim != 2:
         raise ValueError("HotReplica counts must be a source-by-expert matrix")
     ranks, experts = counts_by_source.shape
@@ -220,37 +206,38 @@ def build_placement(
         raise ValueError("HotReplica counts must describe a valid ordered EP topology")
     if counts_by_source.dtype not in (torch.int32, torch.int64):
         raise TypeError("HotReplica counts must use INT32 or INT64")
-    gathered = counts_by_source.contiguous()
-    if gathered.dtype == torch.int64:
-        # The legacy route wire uses INT64; the planner's arithmetic is INT32.
-        total = int(gathered.sum(dtype=torch.int64).item())
-        if not 0 <= total <= 2**31 - 1:
-            raise ValueError("HotReplica routed row count exceeds the native INT32 planner limit")
-        gathered = gathered.to(torch.int32)
-    local = experts // ranks
-    cumulative, _, _, copies = allocate_experts(gathered, max(1, capacity))
-    if tuple(cumulative.shape) != (experts, ranks):
-        raise ValueError("HotReplica allocator returned an invalid cumulative extent")
-    # One readback supplies occupied slot width and post-placement receive bounds.
-    # Keep the tables as arrays rather than allocating Python objects per expert.
-    summary = torch.cat((copies.flatten(), cumulative.sum(0, dtype=torch.int64))).cpu().numpy()
-    slots = summary[:experts].reshape(ranks, local)
-    used = np.flatnonzero((slots >= 0).any(axis=0))
-    if not used.size:
+    plan = build_capacity_plan(
+        counts_by_source.cpu().numpy(), capacity, replica_slots_per_rank=replica_slots_per_rank,
+        alternatives=alternatives, score=score,
+    )
+    if plan is None:
         return None
-    needed = int(used[-1]) + 1
-    borrowed = min(local, 1 << (needed - 1).bit_length())
-    rank_loads = np.diff(summary[experts:], prepend=0)
-    bound, local_bound = int(rank_loads.max()), int(rank_loads[rank])
-    sorted_ids, table = render_expert_major(gathered, cumulative, copies, rank, borrowed, topk_ids.numel())
-    copies = copies[:, :borrowed].contiguous()
+    return render_placement(hidden, topk_ids, plan, rank, source_inverse=source_inverse)
+
+
+def render_placement(
+    hidden: torch.Tensor,
+    topk_ids: torch.Tensor,
+    plan: ExpertExecutionPlan,
+    rank: int,
+    *,
+    source_inverse: torch.Tensor | None = None,
+) -> ExpertPlacement:
+    """Render the admitted source quotas using the existing device permutation."""
+    experts = plan.config.num_experts
+    used = max(plan.replica_slots_used)
+    borrowed = min(plan.config.replica_slots_per_rank, 1 << (used - 1).bit_length())
+    device = topk_ids.device
+    ordered, table, owners = render_plan(plan, rank, borrowed)
+    if ordered.size != topk_ids.numel():
+        raise ValueError("HotReplica counts must describe the local Top-K routes")
+    sorted_ids = _upload_route_tensor(torch.from_numpy(ordered), device)
     ids = sorted_ids.index_select(
-        0, _token_order(hidden, topk_ids, counts_by_source.shape[1], source_inverse)
+        0, _token_order(hidden, topk_ids, experts, source_inverse)
     ).reshape_as(topk_ids)
-    valid = slots[slots >= 0]
-    outgoing = np.bincount(valid // local, minlength=ranks)
-    incoming = (slots >= 0).sum(axis=1)
-    transfers = max(int(outgoing.max()), int(incoming.max()))
-    published = np.flatnonzero(slots[rank] >= 0)
-    last_slot = int(published[-1]) + 1 if published.size else 0
-    return ExpertPlacement(ids, table, copies, borrowed, bound, local_bound, transfers, last_slot)
+    copies = _upload_route_tensor(torch.tensor(owners, dtype=torch.int32), device)
+    table = _upload_route_tensor(torch.from_numpy(table), device)
+    loads = plan.destination_loads
+    return ExpertPlacement(ids, table, copies, borrowed, max(loads), loads[rank],
+                           plan.maximum_transfer_degree, plan.replica_slots_used[rank], copies_by_rank=owners,
+                           owner_rows=plan.destination_counts[rank][:plan.config.home_experts])

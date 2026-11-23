@@ -52,26 +52,3 @@ def test_actual_copy_count_and_backward_fetch_change_profitability(monkeypatch):
     assert placement_is_profitable(**geometry, transfer_experts=1, backward_prefetch_weight_bytes=400)
     assert not placement_is_profitable(**geometry, transfer_experts=2, backward_prefetch_weight_bytes=400)
     assert placement_is_profitable(**geometry, transfer_experts=2, backward_prefetch_weight_bytes=0)
-
-
-def test_native_plans_to_average_when_grouped_gemms_repay_transfer(monkeypatch):
-    """The receive limit and the native target serve separate purposes."""
-    from unittest.mock import Mock  # pylint: disable=import-outside-toplevel
-
-    import torch  # pylint: disable=import-outside-toplevel
-
-    from hyper_multicore.modules.hot_replica.planner import (  # pylint: disable=import-outside-toplevel
-        HotReplicaPlanner, PlacementRequest,
-    )
-
-    planner = HotReplicaPlanner()
-    result = object()
-    builder = Mock(return_value=result)
-    monkeypatch.setattr(planner, "_build", builder)
-    request = PlacementRequest(
-        torch.empty((0, 2560), dtype=torch.bfloat16), torch.empty((0, 8), dtype=torch.int64),
-        torch.zeros((8, 512), dtype=torch.int64), None, 123419, 262080, 0, 768, 24, True,
-    )
-    assert planner.plan(request) is None
-    assert planner.plan_native(request) is result
-    builder.assert_called_once_with(request, 32760)

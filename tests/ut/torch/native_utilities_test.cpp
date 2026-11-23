@@ -20,20 +20,26 @@ int launch_calls = 0;
 int status_reads = 0;
 }  // namespace launch_test
 
-extern "C" void HmcLaunchRouteMetadata_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+extern "C" void HmcLaunchRouteMetadata_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
                                        int32_t, int32_t, int32_t,
-                                       int32_t, int32_t, int32_t, int32_t, int32_t, int32_t) {
+                                       int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, bool attach_summary) {
+  if (attach_summary) throw std::logic_error("unexpected attached summary for route_offsets");
   launch_test::selected_arch = 2201;
   ++launch_test::launch_calls;
   launch_test::last_status = launch_test::injected_status;
 }
 
-extern "C" void HmcLaunchRouteMetadata_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+extern "C" void HmcLaunchRouteMetadata_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
                                        int32_t, int32_t, int32_t,
-                                       int32_t, int32_t, int32_t, int32_t, int32_t, int32_t) {
+                                       int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, bool attach_summary) {
+  if (attach_summary) throw std::logic_error("unexpected attached summary for route_offsets");
   launch_test::selected_arch = 3510;
   ++launch_test::launch_calls;
   launch_test::last_status = launch_test::injected_status;
+}
+
+extern "C" void HmcLaunchMxRouteSummary_arch3510(unsigned, void*, const int32_t*, int64_t*, uint32_t, uint32_t, bool) {
+  throw std::logic_error("unexpected standalone summary for route_offsets");
 }
 
 extern "C" void HmcLaunchZeroCold_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, int64_t, int64_t, int64_t) {

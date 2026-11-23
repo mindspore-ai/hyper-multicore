@@ -128,4 +128,5 @@ def get_swiglu_tiling_bytes(split_value: int, *,
         raise KeyError(f"SwiGLU tiling: split_value={split_value} not found")
     td = copy.copy(SWIGLU_TABLE[split_value])
     td.colLen = intermediate_size
+    td.is32BAligned = int(intermediate_size % 16 == 0)
     return _expand_swiglu_struct(td)

@@ -16,8 +16,11 @@
 
 import unittest
 
+import torch
+
 from hyper_multicore.diagnostics.common.graph import DiagnosticSpec, build_graph_metadata
 from hyper_multicore.modules.mega_moe.diagnostics import _mega_moe_owner_options
+from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _diagnostic_runtime
 from hyper_multicore.modules.mega_moe.backends.bf16.forward.graph import build_forward_graph
 from hyper_multicore.scheduler.config import TaskDescC, TaskSplitValue, TaskType
 from hyper_multicore.scheduler.runtime import allocate_runtime_config
@@ -26,6 +29,17 @@ from tests.common.mark_utils import arg_mark
 
 class TestMegaMoeDiagnostics(unittest.TestCase):
     """Keep business-specific diagnostic rules outside generic tool tests."""
+
+    def test_profiler_retains_replica_launch_suffix(self):
+        """Preserve both runtime images and the device's extension offset."""
+        ordinary = torch.tensor([1, 0, 2], dtype=torch.uint8)
+        profiler = torch.tensor([1, 1, 2], dtype=torch.uint8)
+        extended = torch.tensor([1, 0, 2, 0, 3, 4], dtype=torch.uint8)
+        self.assertEqual(_diagnostic_runtime(profiler, ordinary, extended).tolist(), [1, 1, 2, 0, 3, 4])
+        self.assertEqual(extended.tolist(), [1, 0, 2, 0, 3, 4])
+        self.assertIs(_diagnostic_runtime(profiler, ordinary, None), profiler)
+        with self.assertRaisesRegex(RuntimeError, "runtime extension offset"):
+            _diagnostic_runtime(profiler[:2], ordinary, extended)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

@@ -107,7 +107,8 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
                                   config.timeout_seconds,
                                   config.data_engine,
                                   effective_bootstrap_endpoint,
-                                  unique_id};
+                                  unique_id,
+                                  config.udma_qp_num};
   HP_SM_LOG_DEBUG(root.root_rank, "Initialize", "CannCall", "aclshmemx_init_attr enter");
   const Status initialize_status = cann::host::initialize(options);
   if (initialize_status.error_code != ErrorCode::Ok) {
@@ -355,10 +356,11 @@ Status Runtime::ValidateInitialInput(const RootWorldInfo &root, const Config &co
                        std::to_string(root.root_rank) + ", root_size=" + std::to_string(root.root_size));
   }
   if (config.heap_size_bytes == 0 || config.timeout_seconds == 0 ||
-      (config.data_engine != DataEngine::Mte && config.data_engine != DataEngine::MteUdma)) {
+      (config.data_engine != DataEngine::Mte && config.data_engine != DataEngine::MteUdma) ||
+      !IsValidUdmaQpCount(config.data_engine, config.udma_qp_num)) {
     return MakeError(ErrorCode::InvalidConfig,
                      "Runtime Config requires positive heap/timeout values and a supported "
-                     "MTE or MTE/UDMA data engine");
+                     "MTE or MTE/UDMA data engine with a valid QP count");
   }
   if (config.bootstrap_endpoint_base.empty() || config.bootstrap_endpoint_base.size() > kMaxBootstrapEndpointBytes) {
     return MakeError(ErrorCode::InvalidConfig, "bootstrap_endpoint_base must contain between 1 and " +

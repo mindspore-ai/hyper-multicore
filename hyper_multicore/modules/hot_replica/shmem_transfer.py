@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 import threading
 import weakref
 from typing import Any
@@ -34,6 +34,7 @@ from hyper_multicore.shmem import _lifecycle
 
 from .bank_ops import prefetch_banks, reduce_banks
 from .placement import ExpertPlacement
+from .pipeline import ReplicaPipeline, projection_shapes
 
 @contextmanager
 def _ordered_transfers(pool: Any):
@@ -55,18 +56,27 @@ def _ordered_transfers(pool: Any):
 _ROOT_TRANSFER_EVENTS = weakref.WeakKeyDictionary()
 
 
+def _expert_bank_bytes(local_experts, hidden, intermediate, dtype, *, bank_experts=None):
+    """Size a combined expert bank before allocating independent signals."""
+    extent = 2 * local_experts if bank_experts is None else bank_experts
+    return 3 * extent * hidden * intermediate * dtype.itemsize + 1024
+
+
 class SharedExpertPool:
     """Lease expert storage under an active SHMEM lifecycle."""
+
+    pool_kind = "hot_replica_expert_bank"
 
     def __init__(
         self, hidden: torch.Tensor, group: torch.distributed.ProcessGroup,
         local_experts: int, intermediate_size: int, blocks: int, layout: str, *,
-        root: Any, access: Callable[[], AbstractContextManager],
+        root: Any, access: Callable[[], AbstractContextManager], pipeline: bool = False,
     ) -> None:
         """Describe a bank that either EP backend can allocate and lease."""
         self.group = group
         self.rank, self.ranks = torch.distributed.get_rank(group), torch.distributed.get_world_size(group)
         self.local_experts = local_experts
+        self.bank_experts = 2 * local_experts
         self.hidden, self.intermediate = hidden.shape[-1], intermediate_size
         self.blocks = blocks
         self.device, self.dtype = hidden.device, hidden.dtype
@@ -90,11 +100,16 @@ class SharedExpertPool:
         }
         self.capacity_floor = local_experts
         self.expert_weight_layout = layout
+        self.pipeline = ReplicaPipeline(self) if pipeline else None
 
     @property
     def allocation_bytes(self) -> int:
-        """Report the aligned combined weight-bank requirement."""
-        return 6 * self.local_experts * self.hidden * self.intermediate * self.dtype.itemsize + 1024
+        """Report the aligned combined bank and optional peer-event requirement."""
+        weights = _expert_bank_bytes(
+            self.local_experts, self.hidden, self.intermediate, self.dtype, bank_experts=self.bank_experts,
+        )
+        signal_bytes = 0 if self.pipeline is None else 4 * self.pipeline.signal_words + 512
+        return weights + signal_bytes
 
     def allocate(self) -> None:
         """Allocate after the caller has acquired the runtime and reserved capacity."""
@@ -110,11 +125,15 @@ class SharedExpertPool:
                     allocated.append(shmem.empty(shape, dtype=self.dtype, alignment=512))
             finally:
                 self.weights = tuple(allocated)
+            if self.pipeline is not None:
+                self.pipeline.allocate()
             if self.completion_event is None:
                 self.completion_event = torch.npu.Event()
 
     def _free(self) -> None:
         self._alternate_banks = ()
+        if self.pipeline is not None:
+            self.pipeline.free()
         # A later collective free can fail. Retire each successful allocation
         # immediately so a retry does not free the same SHMEM storage twice.
         while self.weights:
@@ -123,15 +142,16 @@ class SharedExpertPool:
         self.completion_stream = None
 
     def _bank_shapes(self, layout=None):
-        if (layout or self.expert_weight_layout) == "EOI":
-            return (
-                (2 * self.local_experts, 2 * self.intermediate, self.hidden),
-                (2 * self.local_experts, self.hidden, self.intermediate),
-            )
-        return (
-            (2 * self.local_experts, self.hidden, 2 * self.intermediate),
-            (2 * self.local_experts, self.intermediate, self.hidden),
+        return tuple(
+            (self.bank_experts, *shape)
+            for shape in projection_shapes(self.hidden, self.intermediate, layout or self.expert_weight_layout)
         )
+
+    def _allocations(self, dtype):
+        specs = tuple((shape, dtype) for shape in self._bank_shapes())
+        if self.pipeline is None:
+            return self.weights, specs
+        return (*self.weights, self.pipeline.storage), (*specs, ((self.pipeline.signal_words,), torch.int32))
 
     def describe_restart_allocations(
         self,
@@ -141,11 +161,12 @@ class SharedExpertPool:
     ) -> tuple[Any, ...]:
         """Participate in HyperMulticore's atomic allocation replacement, without rebuilding runtime."""
         del spec, receive_capacity
+        tensors, specs = self._allocations(dtype)
         return tuple(
             _lifecycle._AllocationReplacement(  # pylint: disable=protected-access
-                tensor, _lifecycle._AllocationSpec(shape, dtype, 512)  # pylint: disable=protected-access
+                tensor, _lifecycle._AllocationSpec(shape, tensor_dtype, 512)  # pylint: disable=protected-access
             )
-            for tensor, shape in zip(self.weights, self._bank_shapes())
+            for tensor, (shape, tensor_dtype) in zip(tensors, specs)
         )
 
     def validate_restart_allocations(
@@ -159,10 +180,11 @@ class SharedExpertPool:
         del spec, current_capacity
         if self.in_use:
             raise RuntimeError("Active HotReplica bank prevents heap growth")
-        if len(replacements) != len(self.weights):
+        tensors, specs = self._allocations(dtype)
+        if len(replacements) != len(tensors):
             raise RuntimeError("HotReplica bank restart allocation mapping changed")
-        for tensor, replacement, shape in zip(self.weights, replacements, self._bank_shapes()):
-            if replacement.current is not tensor or tuple(tensor.shape) != shape or tensor.dtype != dtype:
+        for tensor, replacement, (shape, tensor_dtype) in zip(tensors, replacements, specs):
+            if replacement.current is not tensor or tuple(tensor.shape) != shape or tensor.dtype != tensor_dtype:
                 raise RuntimeError("HotReplica bank restart mapping does not match committed storage")
         return bool(self.weights)
 
@@ -175,10 +197,12 @@ class SharedExpertPool:
     ) -> None:
         """Validate every replacement before the HeapManager commits any owner."""
         del spec, receive_capacity
-        if len(tensors) != len(self._bank_shapes()):
+        _, specs = self._allocations(dtype)
+        if len(tensors) != len(specs):
             raise RuntimeError("HotReplica bank restart returned incomplete storage")
         if any(
-            tuple(tensor.shape) != shape or tensor.dtype != dtype for tensor, shape in zip(tensors, self._bank_shapes())
+            tuple(tensor.shape) != shape or tensor.dtype != tensor_dtype
+            for tensor, (shape, tensor_dtype) in zip(tensors, specs)
         ):
             raise RuntimeError("HotReplica bank restart returned an incompatible allocation")
 
@@ -193,7 +217,10 @@ class SharedExpertPool:
         """Bind new bank tensors after HMC replaces the symmetric heap."""
         del spec, dtype, device, receive_capacity
         self._alternate_banks = ()
-        self.weights = tuple(tensors)
+        count = len(self._bank_shapes())
+        self.weights = tensors[:count]
+        if self.pipeline is not None:
+            self.pipeline.bind(tensors[count])
         self.generation += 1
         # The heap transaction retired the previous bank. Retain its completion
         # event as a conservative first-use dependency, but forget its stream.
@@ -242,6 +269,13 @@ class SharedExpertPool:
         """Return the logical prefix of the leased bank."""
         return tuple(bank[:self.local_experts + extra] for bank in self.leased_banks)
 
+    def _generic_banks(self):
+        """Expose the original 2L geometry to the two-stage transfer kernels."""
+        extent = 2 * self.local_experts
+        if self.bank_experts == extent:
+            return self.leased_banks
+        return tuple(bank[:extent] for bank in self.leased_banks)
+
     def stage_snapshot(self, layout: str, snapshot: tuple[tuple[torch.Tensor, ...], Any]) -> int | None:
         """Submit a local suffix restore and retire its lease on the copy stream."""
         tails, _ = snapshot
@@ -257,18 +291,19 @@ class SharedExpertPool:
                 try:
                     # Invalidate old tickets before a write, including a failed copy.
                     self.generation += 1
-                    self._restore_suffix(snapshot)
+                    self.restore_snapshot(snapshot, self.local_experts)
                     self.statistics["early_restores"] += 1
                     return self.generation
                 finally:
                     self.release()
 
-    def _restore_suffix(self, snapshot: tuple[tuple[torch.Tensor, ...], Any]) -> None:
+    def restore_snapshot(self, snapshot: tuple[tuple[torch.Tensor, ...], Any], start: int) -> None:
+        """Copy saved guest operands into the selected prefix or suffix."""
         tails, ready = snapshot
         stream = torch.npu.current_stream(self.device)
         stream.wait_event(ready)
         for bank, tail in zip(self.leased_banks, tails):
-            bank[self.local_experts:self.local_experts + tail.shape[0]].copy_(tail)
+            bank[start:start + tail.shape[0]].copy_(tail)
             tail.record_stream(stream)
 
     def prefetch(
@@ -279,9 +314,11 @@ class SharedExpertPool:
         """Publish current owner weights and fill borrowed slots on the lease stream."""
         if not self.in_use:
             raise RuntimeError("HotReplica prefetch requires an active bank lease")
+        if self.pipeline is not None:
+            self.pipeline.invalidate()
         with _ordered_transfers(self):
             if snapshot is None:
-                prefetch_banks(weights, self.leased_banks, copies, self.rank, self.blocks)
+                prefetch_banks(weights, self._generic_banks(), copies, self.rank, self.blocks)
                 self.statistics["remote_prefetches"] += int(bool(extra))
             else:
                 for bank, home in zip(self.leased_banks, weights):
@@ -289,7 +326,7 @@ class SharedExpertPool:
                 if staged_generation is not None and staged_generation == self.generation:
                     self.statistics["early_restore_hits"] += 1
                 else:
-                    self._restore_suffix(snapshot)
+                    self.restore_snapshot(snapshot, self.local_experts)
                 self.statistics["checkpoint_restores"] += 1
         self.generation += 1
         self.statistics["prefetches"] += 1
@@ -307,17 +344,21 @@ class SharedExpertPool:
         *,
         output_dtypes: tuple[torch.dtype, ...] | None = None,
         published_slots: int | None = None,
+        prefer_buffered: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Sum borrowed gradients into the expert producer's home gradients."""
+        if self.pipeline is not None:
+            self.pipeline.invalidate()
         with _ordered_transfers(self):
             home = reduce_banks(
                 gradients,
-                self.leased_banks,
+                self._generic_banks(),
                 copies,
                 self.rank,
                 self.blocks,
                 output_dtypes,
                 published_slots=published_slots,
+                prefer_buffered=prefer_buffered,
             )
         self.generation += 1
         self.statistics["gradient_returns"] += 1
@@ -361,16 +402,46 @@ class ExpertWeightBinding:
     snapshot: Any = None
     generation: int | None = None
     staged_generation: int | None = None
+    fused: bool = False
+    return_in_kernel: bool = True
+    bf16_partials: bool = False
+    token: object = field(default_factory=object)
+    transfers: tuple = ()
+    gradient_storage: tuple = ()
+    gradient_outputs: tuple = ()
+    prefetch_table: torch.Tensor | None = None
+    fused_slots: InitVar[int | None] = None
+
+    def __post_init__(self, fused_slots):
+        self.edges = self.pool.pipeline.plan(self.placement, fused_slots) if self.fused else None
+
+    @property
+    def fused_gradients(self):
+        return self.fused and self.return_in_kernel
+
+    @property
+    def owns_returns(self):
+        return self.fused_gradients and bool(self.edges[2])
 
     def prepare_replay(self) -> None:
         """Restore the saved suffix while the framework replays attention and routing."""
-        if self.snapshot is not None:
+        # Only the agreed replay can overwrite the fused prefix. Early staging
+        # can run locally before EP agrees that parameter versions still match.
+        if self.snapshot is not None and not self.fused:
             self.staged_generation = self.pool.stage_snapshot(self.layout, self.snapshot)
 
-    def acquire(self, weights: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    def acquire(
+        self, weights: tuple[torch.Tensor, ...], *, backward: bool = False, replay_snapshot=None,
+    ) -> tuple[torch.Tensor, ...]:
         """Lease reusable banks and publish this graph's saved owner weights."""
         self.pool.claim(self.layout)
         try:
+            if self.fused:
+                with _ordered_transfers(self.pool):
+                    result = self.pool.pipeline.begin(weights, self, backward, replay_snapshot=replay_snapshot)
+                stats = self.pool.statistics
+                stats["fused_prefetches"] = stats.get("fused_prefetches", 0) + 1
+                return result
             if self.generation is not None and self.generation == self.pool.generation:
                 self.pool.statistics["backward_cache_hits"] += 1
                 return self.pool.active_weights(self.placement.borrowed_capacity)
@@ -382,31 +453,61 @@ class ExpertWeightBinding:
             self.generation = self.pool.generation
             return borrowed
         except BaseException:
-            self.pool.release()
+            try:
+                if self.fused:
+                    self.pool.pipeline.resident = None
+                    self.pool.pipeline.complete(self)
+            finally:
+                self.pool.release()
             raise
 
-    def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
-        """Keep only the borrowed suffix from the original checkpoint forward."""
-        start = self.pool.local_experts
+    def runtime(self, ordinary, gradients=None):
+        """Select split weights and optional in-kernel dW for this launch."""
+        if not self.fused:
+            return None
+        return self.pool.pipeline.runtime(ordinary, self, gradients if self.fused_gradients else None)
+
+    def capture_snapshot(self, weights: tuple[torch.Tensor, ...], *, maximum_bytes: int | None = None):
+        """Copy the leased guests without changing the binding's bank generation."""
+        start = 0 if self.fused else self.pool.local_experts
         used = self.placement.published_slots
         stop = start + (self.placement.borrowed_capacity if used is None else used)
-        tails = tuple(weight[start:stop].detach().clone() for weight in weights)
+        views = tuple(weight[start:stop].detach() for weight in weights)
+        if maximum_bytes is not None and sum(view.nbytes for view in views) > maximum_bytes:
+            return None
+        tails = tuple(view.clone() for view in views)
         ready = torch.npu.Event()
         ready.record(torch.npu.current_stream(tails[0].device))
-        self.snapshot = tails, ready
+        return tails, ready
+
+    def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
+        """Retain the borrowed weights for the existing reentrant checkpoint path."""
+        self.snapshot = self.capture_snapshot(weights)
         self.generation = None
 
     def gradients(
         self, gradients: tuple[torch.Tensor, ...], weights: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
         """Return partial expert gradients to owners before casting parameter gradients."""
+        if self.fused_gradients:
+            stats = self.pool.statistics
+            stats["fused_gradient_returns"] = stats.get("fused_gradient_returns", 0) + 1
+            return self.gradient_outputs if self.pool.pipeline.device_prefetch else gradients
+        if self.fused:
+            # Both dX projections for every populated guest have waited for
+            # their incoming weights. Drain outgoing copies on the same
+            # stream before the ordered reducer reuses the bank for FP32 dW.
+            self.pool.pipeline.complete(self)
         return self.pool.return_generated_gradients(
             gradients, self.placement.copies, output_dtypes=tuple(w.dtype for w in weights),
             published_slots=self.placement.published_slots,
+            prefer_buffered=self.fused,
         )
 
     def release(self) -> None:
         """Record completion after both expert compute and peer gradient reads."""
+        if self.fused:
+            self.pool.pipeline.complete(self)
         self.pool.release()
 
     def track_graph(self, ctx: Any) -> None:

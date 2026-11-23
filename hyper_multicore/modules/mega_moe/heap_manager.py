@@ -41,6 +41,7 @@ from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
 
 
 _HEAP_GRANULARITY_BYTES = 2 * 1024 * 1024
+_HEAP_SIZE_ENV = "HYPER_MULTICORE_SHMEM_HEAP_SIZE"
 _HEAP_MANAGER = None
 
 
@@ -57,6 +58,7 @@ class _WorkspaceLayout:
     collective_signature: tuple[Any, ...]
     receive_capacity: int
     token_capacity: int | None = None
+    borrows_receive_buffer: bool = False
 
 
 @dataclass
@@ -100,6 +102,8 @@ def _workspace_layout(
     dtype: torch.dtype,
     capacity: int | None = None,
     token_capacity: int | None = None,
+    *,
+    borrows_receive_buffer: bool = False,
 ) -> _WorkspaceLayout:
     """Describe one MegaMoe symmetric workspace reservation."""
     physical = dict(specification)
@@ -113,10 +117,12 @@ def _workspace_layout(
         )
     signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
     return _WorkspaceLayout(
-        required_bytes=_spec_workspace_bytes(physical, dtype, receive_capacity=capacity),
+        required_bytes=_spec_workspace_bytes(physical, dtype, receive_capacity=capacity,
+                                             borrows_receive_buffer=borrows_receive_buffer),
         collective_signature=signature,
         receive_capacity=capacity,
         token_capacity=physical["local_num_tokens"] if specification.get("auto_tokens", False) else None,
+        borrows_receive_buffer=borrows_receive_buffer,
     )
 
 
@@ -169,21 +175,29 @@ class _HeapManager:
         reservations: tuple[tuple[Mapping[str, Any], _WorkspaceLayout], ...],
         *,
         allow_resize: bool,
-        initial_headroom: int = 0,
+        workspace_growth: tuple[MegaMoeWorkspace, int, int] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         """Add lazy reservations and resize an attached Runtime when required."""
         with self.access():
             previous_count = len(self.entries)
             previous_configuration = self._configured, self.heap_limit, self.heap_bytes
             added_specifications = self._reserve(reservations)
-            layouts = [entry.layout for entry in self.entries]
             try:
-                configured = os.getenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
+                layouts = [entry.layout for entry in self.entries]
+                growth = None
+                if workspace_growth is not None:
+                    if not self._runtime_attached:
+                        raise RuntimeError("Workspace growth requires an attached SHMEM Runtime")
+                    workspace, tokens, received = workspace_growth
+                    growth = self._token_growth_layouts(self._entry_for_workspace(workspace), tokens, received)
+                    if growth is not None:
+                        _, layouts = growth
                 if not self._configured:
+                    configured = os.getenv(_HEAP_SIZE_ENV)
                     self._run_and_check_consistency(
-                        lambda: self._configure(configured, initial_headroom),
+                        lambda: self._configure(configured),
                         stage="Configuration",
-                        value=(configured, str(self.dtype), tuple(layouts), initial_headroom),
+                        value=(configured, str(self.dtype), tuple(layouts)),
                     )
                     self._configured = True
                 else:
@@ -193,10 +207,10 @@ class _HeapManager:
                         value=tuple(layouts),
                     )
                     required = self._required_bytes(layouts)
-                    if required > self.heap_bytes:
-                        if self.workspaces and not allow_resize:
-                            raise RuntimeError("Create all resources before initializing a fixed SHMEM layout")
+                    if required > self.heap_bytes or growth is not None:
                         heap_bytes = self._budget(required)
+                        if self.workspaces and not allow_resize:
+                            raise RuntimeError("Cannot grow SHMEM while a static Pull workspace is bound")
                         if self._runtime_attached:
                             self._restart(layouts, heap_bytes)
                         else:
@@ -327,16 +341,15 @@ class _HeapManager:
             entry = self._entry_for_workspace(workspace)
             if entry.bound_spec is None:
                 raise RuntimeError("SHMEM Heap workspace has no bound MegaMoe specification")
-            capacity, minimum = _grow_receive_capacity(
+            capacity = _grow_receive_capacity(
                 entry.bound_spec,
                 entry.layout.receive_capacity,
                 maximum_received_slots,
             )
-            layout = _workspace_layout(entry.specification, self.dtype, capacity, entry.layout.token_capacity)
-            layouts = [layout if item is entry else item.layout for item in self.entries]
-            if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
-                layout = _workspace_layout(entry.specification, self.dtype, minimum, entry.layout.token_capacity)
-                layouts = [layout if item is entry else item.layout for item in self.entries]
+            tokens = entry.layout.token_capacity
+            _, layouts = self._growth_layouts(
+                entry, capacity, tokens, minimum=(_align_capacity(maximum_received_slots), tokens),
+            )
             self._restart(layouts, self._budget(self._required_bytes(layouts)))
 
     def ensure_token_capacity(self, workspace: MegaMoeWorkspace, tokens: int, received: int) -> MegaMoeSpec:
@@ -352,36 +365,240 @@ class _HeapManager:
         """
         with self.access():
             entry = self._entry_for_workspace(workspace)
-            spec = entry.bound_spec
-            if spec is None or not spec.auto_tokens:
-                raise RuntimeError("Automatic token growth requires an automatic workspace")
-            grow_source = tokens > spec.local_num_tokens
-            grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
-            if not grow_source and not grow_receive:
-                return spec
-            factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
-            token_limit = ((2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128) * 128
-            token_capacity = (_align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
-                              if grow_source else spec.local_num_tokens)
-            receive_capacity = entry.layout.receive_capacity
-            if grow_receive:
-                receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
-            layout = _workspace_layout(entry.specification, self.dtype, receive_capacity, token_capacity)
-            layouts = [layout if item is entry else item.layout for item in self.entries]
-            if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
-                layout = _workspace_layout(entry.specification, self.dtype,
-                                           max(entry.layout.receive_capacity, _align_capacity(received)),
-                                           max(spec.local_num_tokens, tokens))
-                layouts = [layout if item is entry else item.layout for item in self.entries]
-            self._restart(layouts, self._budget(self._required_bytes(layouts)))
+            growth = self._token_growth_layouts(entry, tokens, received)
+            if growth is None:
+                return entry.bound_spec
+            layout, layouts = growth
+            required = self._required_bytes(layouts)
+            heap_bytes = self._budget(required)
+            if not self._grow_a5_push_storage(entry, layout, required, heap_bytes):
+                self._restart(layouts, heap_bytes)
             return entry.bound_spec
+
+    def borrow_mx_receive_buffer(self, workspace: MegaMoeWorkspace) -> None:
+        """Retire the virtual receive allocation after home has materialized its larger buffer."""
+        with self.access():
+            entry = self._entry_for_workspace(workspace)
+            owner = workspace.lease_owner
+            layout = _workspace_layout(
+                entry.specification, self.dtype, entry.layout.receive_capacity, entry.layout.token_capacity,
+                borrows_receive_buffer=True,
+            )
+            started = time.perf_counter()
+
+            def prepare() -> None:
+                if (owner is workspace or owner.in_use or workspace.expert_buffer is None
+                        or owner.expert_buffer is None or owner.expert_capacity < layout.receive_capacity):
+                    raise RuntimeError("MX Push receive sharing requires a quiescent, sufficiently large home buffer")
+                if owner.used:
+                    owner.completion_event.synchronize()
+
+            owner_index = next(index for index, candidate in enumerate(self.entries) if candidate is entry)
+            self._run_and_check_consistency(
+                prepare, stage="MX Push receive sharing", value=(owner_index, entry.layout, layout),
+            )
+            try:
+                shmem.free(workspace.expert_buffer)
+            except Exception:
+                self.state = "failed"
+                raise
+            workspace.expert_buffer = None
+            workspace.borrows_receive_buffer = True
+            entry.layout = layout
+            self.epoch += 1
+            self.growth_records.append({
+                "epoch": self.epoch, "mode": "mx_push_shared_receive", "heap_bytes": self.heap_bytes,
+                "old_heap_bytes": self.heap_bytes, "total_ms": (time.perf_counter() - started) * 1000,
+                "capacities": [item.layout.receive_capacity for item in self.entries],
+            })
+
+    def _token_growth_layouts(
+        self, entry: _HeapEntry, tokens: int, received: int,
+    ) -> tuple[_WorkspaceLayout, list[_WorkspaceLayout]] | None:
+        """Project one dynamic workspace growth against all pending reservations."""
+        spec = entry.bound_spec
+        if spec is None or not spec.auto_tokens:
+            raise RuntimeError("Automatic token growth requires an automatic workspace")
+        grow_source = tokens > spec.local_num_tokens
+        grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
+        if not grow_source and not grow_receive:
+            return None
+        factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
+        token_limit = ((2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128) * 128
+        token_capacity = (_align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
+                          if grow_source else spec.local_num_tokens)
+        receive_capacity = entry.layout.receive_capacity
+        if grow_receive:
+            receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
+        minimum_tokens = _align_capacity(tokens) if grow_source else spec.local_num_tokens
+        minimum_received = _align_capacity(received) if grow_receive else entry.layout.receive_capacity
+        return self._growth_layouts(
+            entry, receive_capacity, token_capacity, minimum=(minimum_received, minimum_tokens),
+        )
+
+    def _grow_a5_push_storage(
+        self, entry: _HeapEntry, layout: _WorkspaceLayout, required: int, heap_bytes: int,
+    ) -> bool:
+        """Grow Ascend950 Push scratch inside the attached heap."""
+        spec = entry.bound_spec
+        workspace = entry.workspace
+        if (not self._runtime_attached or heap_bytes != self.heap_bytes
+                or spec.architecture != 3510 or spec.precision not in ("bf16", "mxfp8")
+                or spec.dispatch_mode != "push" or spec.apply_probs_before_fc2):
+            return False
+        new_spec = self._layout_spec(entry, layout)
+        replacements = workspace.describe_restart_allocations(new_spec, self.dtype, layout.receive_capacity)
+        # Push saves owned activations and reads current scratch when backward
+        # launches. Event storage and expert banks keep their allocations.
+        old_layout = entry.layout
+        data_fields = {id(workspace.expert_buffer): "expert_buffer", id(workspace.routed_buffer): "routed_buffer"}
+        changed = tuple((data_fields[id(item.current)], item) for item in replacements
+                        if id(item.current) in data_fields and tuple(item.current.shape) != item.target.shape)
+        temporary_bytes = sum(item.current.numel() * self.element_size for _, item in changed)
+        release_first = required + temporary_bytes > self.heap_bytes
+        if release_first and (spec.precision != "mxfp8"
+                              or tuple(name for name, _ in changed) != ("expert_buffer",)):
+            return False
+
+        started = time.perf_counter()
+
+        def prepare() -> None:
+            workspace.validate_restart_allocations(spec, self.dtype, old_layout.receive_capacity, replacements)
+            owner = workspace.lease_owner
+            if changed and owner.used:
+                owner.completion_event.synchronize()
+
+        owner_index = next(index for index, candidate in enumerate(self.entries) if candidate is entry)
+        signature = (release_first, tuple((name, item.target) for name, item in changed))
+        self._run_and_check_consistency(
+            prepare, stage="Ascend950 Push growth preflight", value=(owner_index, old_layout, layout, signature),
+        )
+        try:
+            if release_first:
+                stages_ms = self._replace_mx_push_receive(workspace, changed[0][1])
+                if stages_ms is None:
+                    return False
+            else:
+                stages_ms = self._replace_push_buffers(workspace, changed)
+        except Exception:
+            self.state = "failed"
+            raise
+        if replacements:
+            workspace.expert_capacity = layout.receive_capacity
+            workspace.routed_slots = new_spec.routed_slots
+        workspace.capacity_floor = layout.receive_capacity
+        entry.bound_spec = new_spec
+        entry.layout = layout
+        self.epoch += 1
+        self.growth_records.append({
+            "epoch": self.epoch,
+            "mode": "mx_push_storage" if spec.precision == "mxfp8" else "bf16_push_storage",
+            "old_heap_bytes": self.heap_bytes,
+            "heap_bytes": self.heap_bytes,
+            "old_receive": old_layout.receive_capacity,
+            "receive": layout.receive_capacity,
+            "old_source": spec.local_num_tokens,
+            "source": new_spec.local_num_tokens,
+            "replaced": [name for name, _ in changed],
+            "release_first": release_first,
+            "total_ms": (time.perf_counter() - started) * 1000,
+            "stages_ms": stages_ms,
+            "capacities": [item.layout.receive_capacity for item in self.entries],
+        })
+        return True
+
+    @torch.inference_mode(False)
+    def _replace_mx_push_receive(
+        self, workspace: MegaMoeWorkspace, replacement: _lifecycle._AllocationReplacement,
+    ) -> dict[str, float] | None:
+        """Retire quiescent receive scratch before allocating its larger buffer."""
+        current, target = replacement.current, replacement.target
+        old_shape, old_dtype = tuple(current.shape), current.dtype
+
+        def release() -> None:
+            shmem.free(current)
+            workspace.expert_buffer = None
+
+        def allocate(shape: tuple[int, ...], dtype: torch.dtype) -> None:
+            workspace.expert_buffer = shmem.empty(shape, dtype=dtype, alignment=target.alignment_bytes)
+
+        started = time.perf_counter()
+        _collective.collective_call(release, stage="MX Push receive release", group=self.root_group)
+        released = time.perf_counter()
+        failure = None
+        recoverable = False
+        local_error = None
+        try:
+            allocate(target.shape, target.dtype)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            local_error = error
+            failure = _collective.failure_report(error)
+            # A null result from the native aligned allocator did not register a new Allocation.
+            recoverable = (failure[1].startswith(
+                "[HYPER_MULTICORE_SHMEM_ERROR] error_code=CANN_ERROR operation=Allocate phase=CannCall "
+            ) and _lifecycle._runtime_is_healthy())
+        peers = _collective.exchange((failure, recoverable), group=self.root_group,
+                                     failure_prefix="MX Push receive allocation failed while converging Root ranks")
+        if all(item[0] is None for item in peers):
+            return {"release_ms": (released - started) * 1000,
+                    "allocate_ms": (time.perf_counter() - released) * 1000}
+        if all(item[1] for item in peers):
+            # Restore the committed scratch shape before the usual whole-heap fallback.
+            _collective.collective_call(lambda: allocate(old_shape, old_dtype),
+                                        stage="MX Push receive restoration", group=self.root_group)
+            return None
+        failures = _collective.format_collective_failures([item[0] for item in peers])
+        raise RuntimeError(f"MX Push receive allocation failed on {failures}") from local_error
+
+    @staticmethod
+    def _replace_push_buffers(
+        workspace: MegaMoeWorkspace, changed: tuple[tuple[str, _lifecycle._AllocationReplacement], ...],
+    ) -> dict[str, float]:
+        """Allocate replacements before releasing quiescent scratch tensors."""
+        started = time.perf_counter()
+        staged = []
+        try:
+            for name, item in changed:
+                target = item.target
+                tensor = shmem.empty(target.shape, dtype=target.dtype, alignment=target.alignment_bytes)
+                staged.append((name, tensor))
+        except Exception:
+            for _, tensor in reversed(staged):
+                shmem.free(tensor)
+            raise
+        bound = time.perf_counter()
+        # Publish before freeing so a failed collective free cannot strand
+        # the new Allocation outside its sole workspace owner.
+        for name, tensor in staged:
+            setattr(workspace, name, tensor)
+        for _, item in changed:
+            shmem.free(item.current)
+        return {"allocate_ms": (bound - started) * 1000, "release_ms": (time.perf_counter() - bound) * 1000}
+
+    def _replacement_layout(self, entry: _HeapEntry, received: int, tokens: int | None) -> _WorkspaceLayout:
+        """Retain the event stride across capacity growth."""
+        return _workspace_layout(entry.specification, self.dtype, received, tokens,
+                                 borrows_receive_buffer=entry.layout.borrows_receive_buffer)
+
+    def _growth_layouts(
+        self, entry: _HeapEntry, received: int, tokens: int | None, *, minimum: tuple[int, int | None],
+    ) -> tuple[_WorkspaceLayout, list[_WorkspaceLayout]]:
+        """Try exact route capacity if geometric headroom exceeds the configured heap."""
+        layout = self._replacement_layout(entry, received, tokens)
+        layouts = [layout if item is entry else item.layout for item in self.entries]
+        if (self.heap_limit is not None and (received, tokens) != minimum
+                and self._required_bytes(layouts) > self.heap_limit):
+            layout = self._replacement_layout(entry, *minimum)
+            layouts = [layout if item is entry else item.layout for item in self.entries]
+        return layout, layouts
 
     @staticmethod
     def _layout_spec(entry: _HeapEntry, layout: _WorkspaceLayout) -> MegaMoeSpec:
         """Project candidate capacities without modifying a committed specification."""
+        spec = entry.bound_spec
         if layout.token_capacity is None:
-            return entry.bound_spec
-        return replace(entry.bound_spec, local_num_tokens=layout.token_capacity,
+            return spec
+        return replace(spec, local_num_tokens=layout.token_capacity,
                        receive_capacity=layout.receive_capacity)
 
     @staticmethod
@@ -390,34 +607,27 @@ class _HeapManager:
         return _round_heap_bytes(sum(layout.required_bytes for layout in layouts))
 
     def _budget(self, required: int) -> int:
-        """Apply the explicit limit or preserve the grow-only physical Heap size."""
-        if self.heap_limit is not None and required > self.heap_limit:
-            raise RuntimeError(
-                f"SHMEM growth exceeds explicit Heap budget: required={required}, limit={self.heap_limit}"
-            )
-        return self.heap_limit if self.heap_limit is not None else max(self.heap_bytes, required)
+        """Use the configured heap size or grow an automatic heap to fit."""
+        if self.heap_limit is None:
+            return max(self.heap_bytes, required)
+        if required > self.heap_limit:
+            raise RuntimeError(f"MegaMoE layout exceeds {_HEAP_SIZE_ENV}: "
+                               f"required={required} bytes, limit={self.heap_limit} bytes")
+        return self.heap_limit
 
-    def _configure(self, configured: str | None, headroom: int = 0) -> None:
-        """Validate the explicit Heap limit and budget unbound reservations."""
-        required = _round_heap_bytes(sum(entry.layout.required_bytes for entry in self.entries) + headroom)
+    def _configure(self, configured: str | None) -> None:
+        """Freeze the configured limit before the first runtime attach."""
         if configured is not None:
             try:
-                self.heap_limit = int(configured)
+                limit = int(configured)
             except ValueError as error:
-                raise ValueError(
-                    "HYPER_MULTICORE_SHMEM_HEAP_SIZE must be a positive integer number of bytes"
-                ) from error
-            if self.heap_limit <= 0:
-                raise ValueError("HYPER_MULTICORE_SHMEM_HEAP_SIZE must be positive")
-            if self.heap_limit < required:
-                raise RuntimeError(
-                    f"HYPER_MULTICORE_SHMEM_HEAP_SIZE is too small: requires at least {required} bytes"
-                )
-            if self.heap_limit % _HEAP_GRANULARITY_BYTES:
-                raise ValueError(
-                    "HYPER_MULTICORE_SHMEM_HEAP_SIZE must be a multiple of the 2 MiB physical page size"
-                )
-        self.heap_bytes = self._budget(required)
+                raise ValueError(f"{_HEAP_SIZE_ENV} must be a positive integer number of bytes") from error
+            if limit <= 0:
+                raise ValueError(f"{_HEAP_SIZE_ENV} must be positive")
+            if limit % _HEAP_GRANULARITY_BYTES:
+                raise ValueError(f"{_HEAP_SIZE_ENV} must be a multiple of the 2 MiB physical page size")
+            self.heap_limit = limit
+        self.heap_bytes = self._budget(self._required_bytes([entry.layout for entry in self.entries]))
 
     def _reserve(
         self,

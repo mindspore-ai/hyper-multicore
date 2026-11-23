@@ -61,12 +61,15 @@ struct OpCommand {
 """,
     "acl/acl.h": """
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include "launch_test_state.h"
 constexpr int ACL_SUCCESS = 0;
 // Mirror an older PTA header: the attribute type exists, the arch enum name does not.
 enum aclrtDevAttr { ACL_DEV_ATTR_VECTOR_CORE_NUM = 1 };
 constexpr int ACL_RT_THREAD_LEVEL = 0;
+constexpr int ACL_MEMCPY_DEVICE_TO_DEVICE = 3;
+inline int aclrtMemcpyAsync(void*, std::size_t, const void*, std::size_t, int, void*) { return ACL_SUCCESS; }
 inline int aclrtGetDeviceInfo(int, aclrtDevAttr attr, int64_t* value) {
     *value = static_cast<int>(attr) == 601 ? launch_test::npu_arch : 40;
     return ACL_SUCCESS;

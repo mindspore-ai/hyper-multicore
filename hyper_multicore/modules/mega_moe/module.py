@@ -191,8 +191,9 @@ class MegaMoeExperts(MulticoreModule):
                 weighting. Options specify the clamp limit and its position relative
                 to SiLU, plus the probability position relative to FC2. The before-FC2
                 path rounds activations to BF16 both before and after FP32 weighting.
-            expert_placement: Placement strategy and planner. Adaptive placement
-                requires A3 BF16 push execution and a multi-rank EP group.
+            expert_placement: Placement strategy and planner for multi-rank execution.
+                Adaptive placement supports BF16 Push on Ascend910_93 and BF16 Push and Pull on Ascend950.
+                Ascend950 MXFP8 requires Push, the built-in planner and FP32 partial weight gradients.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.
                 Options are validated and copied into the instance configuration;
@@ -203,11 +204,26 @@ class MegaMoeExperts(MulticoreModule):
         """
         numerics, tuning, scheduler = _resolve_expert_options(precision, numerics_options, tuning_options)
         planner = _placement_planner(expert_placement)
-        if planner is not None and (precision != "bf16" or tuning.dispatch_mode != "push"):
-            raise ValueError("HotReplica requires BF16 precision and push dispatch")
-        source_bound = planner.source_token_bound if planner is not None else None
         planner_key = None
+        replica_slots_per_rank = None
+        receive_capacity_percent = None
         if planner is not None:
+            from ..hot_replica.planner import HotReplicaPlanner  # pylint: disable=import-outside-toplevel
+
+            if isinstance(planner, HotReplicaPlanner):
+                replica_slots_per_rank = planner.replica_slots_per_rank
+                receive_capacity_percent = planner.receive_capacity_percent
+            if receive_capacity_percent is not None and (precision != "bf16" or tuning.dispatch_mode != "push"):
+                raise ValueError("An explicit HotReplica receive capacity percentage requires BF16 Push")
+            if precision == "mxfp8":
+                if replica_slots_per_rank is not None:
+                    raise ValueError("An explicit HotReplica guest budget requires BF16")
+                if tuning.dispatch_mode != "push":
+                    raise ValueError("MXFP8 HotReplica requires push dispatch")
+                if type(planner) is not HotReplicaPlanner:
+                    raise ValueError("MXFP8 HotReplica requires the built-in planner")
+                if numerics.partial_weight_grad_dtype != "float32":
+                    raise ValueError("MXFP8 HotReplica requires float32 partial weight gradients")
             settings = planner.configuration_key()
             if not isinstance(settings, str):
                 raise TypeError("Planner configuration_key() must return a string")
@@ -232,7 +248,8 @@ class MegaMoeExperts(MulticoreModule):
             "precision": precision,
             "hot_replica": planner is not None,
             "planner_key": planner_key,
-            "source_token_bound": source_bound,
+            "replica_slots_per_rank": replica_slots_per_rank,
+            "receive_capacity_percent": receive_capacity_percent,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",
@@ -242,10 +259,6 @@ class MegaMoeExperts(MulticoreModule):
         }
         if planner is not None and specification["ep_size"] <= 1:
             raise ValueError("HotReplica requires an explicit EP group with more than one rank")
-        if source_bound is not None:
-            limit = (2**31 - 1) // max(hidden_size, top_k) // _COMMUNICATION_SPLIT * _COMMUNICATION_SPLIT
-            if source_bound > limit:
-                raise ValueError(f"HotReplica source_token_bound exceeds {limit} rows")
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
@@ -528,8 +541,10 @@ class MegaMoeExperts(MulticoreModule):
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
-        with prepare_expert_invocation(hidden_flat, topk_ids, topk_weights, tokens_per_expert,
-                                       weights, resources, weight_error=weight_error, planner=self._planner) as route:
+        with prepare_expert_invocation(
+            hidden_flat, topk_ids, topk_weights, tokens_per_expert, weights, resources,
+            weight_error=weight_error, planner=self._planner, training=self.training,
+        ) as route:
             return self._backend.forward(
                 self, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route,
             )

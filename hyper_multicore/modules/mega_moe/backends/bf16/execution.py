@@ -15,12 +15,25 @@
 """BF16 autograd launch and restoration over the common invocation lifecycle."""
 from typing import Any, TYPE_CHECKING
 import torch
+from hyper_multicore.modules.hot_replica.checkpoint import forward_copy_phase, guest_weight_replay
+
 from ...route import PreparedTopKRoute, restore_topk_output
 
 from .autograd import _CheckpointedPushFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 
 if TYPE_CHECKING:
     from .resources import BF16Resources
+
+
+def _checkpoint_replay(spec) -> bool | None:
+    """Select a checkpoint phase only for the validated A3 Push layout."""
+    replay = forward_copy_phase()
+    if replay is not None and (
+        spec.dispatch_mode == "push" and not spec.apply_probs_before_fc2 and spec.architecture == 2201
+        and spec.expert_weight_layout == "EOI" and spec.transport_engine == "mte"
+    ):
+        return replay
+    return None
 
 
 def forward(
@@ -33,46 +46,63 @@ def forward(
     del module
     module_resources = resources
     resources = route.execution_resources or resources
-    if route.weight_binding is None:
-        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
-    else:
-        placement = route.weight_binding.placement
-        num_experts = placement.counts_by_source.shape[1]
-        placement_owner = module_resources.placement
-        home = module_resources.spec.local_experts
-        nominal = (
-            placement_owner.source_bound is not None
-            and home >= 2 * resources.spec.num_cube_cores and resources.spec.intermediate_size < 2048
-            and resources.spec.lowering != "dense" and resources.spec.ready_depth is None
-        )
+    pull = resources.spec.dispatch_mode == "pull"
+    binding = route.weight_binding
+    ordinary_options = {}
+    if binding is not None:
+        route_experts = binding.placement.counts_by_source.shape[1]
+        if route_experts != resources.spec.num_experts:
+            ordinary_options["route_experts"] = route_experts
+        if resources.spec.architecture == 3510:
+            # Preserve the precision of the owner and guest partials through the bank reduction.
+            ordinary_options["weight_grad_dtype"] = torch.float32
+    if binding is not None and binding.fused:
         plan = resources.plan_for_tokens(
             route.metadata.plan_tokens, hidden_flat.device,
-            weight_grad_dtype=torch.float32 if placement_owner.source_bound is not None else None,
-            route_experts=num_experts, nominal_schedule=nominal,
-            batch_experts=nominal and route.metadata.plan_tokens * resources.spec.top_k <= 128 * home,
+            weight_grad_dtype=(torch.float32 if binding.fused_gradients and not binding.bf16_partials
+                               else ordinary_options.get("weight_grad_dtype")),
+            route_experts=ordinary_options.get("route_experts"),
+            replica_pipeline=True, reserve_merge_workers=binding.owns_returns or resources.spec.architecture == 3510,
         )
-    pull = resources.spec.dispatch_mode == "pull"
+        if plan.fwd_diagnostics.is_tensor_dump_active:
+            binding.fused = False
+    if binding is None or not binding.fused:
+        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **ordinary_options)
     before_fc2 = resources.spec.apply_probs_before_fc2
     options = {} if route.weight_binding is None else {"weight_binding": route.weight_binding}
     record = route.checkpoint_record
     if not torch.is_grad_enabled():
         save = None
-        if record is not None and before_fc2 and hidden_flat.shape[0]:
+        if record is not None and not pull and before_fc2 and hidden_flat.shape[0]:
             save = _save_replay_activations(record, plan.spec, route, hidden_flat, topk_weights)
         return _execute_mega_moe_without_autograd(
             topk_weights, *weights, route, plan, resources.workspace,
             workspace_claimed=pull, save_activation=save, **options).reshape_as(hidden_states)
-    if record is not None and record.allow_activation:
+    if record is not None and not pull and record.allow_activation:
         module_resources.placement.statistics["skipped_recomputes"] += 1
         return _CheckpointedPushFunction.apply(
             hidden_flat, *weights, route.metadata, plan, resources.workspace,
             record.activation, topk_weights, False, route.weight_binding,
         ).reshape_as(hidden_states)
+    # Replay may replan and have no route record. Keep the same saved-tensor
+    # layout in F and R for this checkpoint independent of route cache hits.
+    checkpoint_replay = _checkpoint_replay(resources.spec)
+    if checkpoint_replay is not None:
+        options["checkpoint_replay"] = checkpoint_replay
+    if binding is not None and binding.fused and resources.spec.architecture == 2201:
+        guest_weights = guest_weight_replay(record)
+        if guest_weights is not None:
+            options["guest_weights"] = guest_weights
+    integrated_unpermute = pull or before_fc2 or checkpoint_replay is not None
     output = execute_mega_moe_with_permutation(
         hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
-        topk_weights=topk_weights if pull or before_fc2 else None,
+        topk_weights=topk_weights if integrated_unpermute else None,
         workspace_claimed=pull, **options)
-    if not pull and not before_fc2:
+    if checkpoint_replay is False and module_resources.placement is not None:
+        stats = module_resources.placement.statistics
+        for field in ("original_dispatch_copies_skipped", "original_combine_copies_skipped"):
+            stats[field] = stats.get(field, 0) + 1
+    if not integrated_unpermute:
         output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
     return output.reshape_as(hidden_states)
 

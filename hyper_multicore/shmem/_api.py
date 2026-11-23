@@ -198,6 +198,12 @@ def put(remote_dst: torch.Tensor, local_src: torch.Tensor, target_pe: int) -> No
 
 
 @_runtime_access
+def _put_sdma(remote_dst: torch.Tensor, local_src: torch.Tensor, target_pe: int) -> None:
+    """Transfer directly to a mapped symmetric peer on the current stream."""
+    _load_native()._put(remote_dst, local_src, target_pe, use_sdma=True)  # pylint: disable=protected-access
+
+
+@_runtime_access
 def get(local_dst: torch.Tensor, remote_src: torch.Tensor, source_pe: int) -> None:
     """Enqueue a byte-for-byte Get from one Root WORLD PE.
 

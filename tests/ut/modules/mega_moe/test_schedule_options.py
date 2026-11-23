@@ -78,9 +78,13 @@ def test_bf16_token_bucket_preserves_bound_lowering_options():
                                  batch_experts=True, nominal_schedule=True)
     resources._token_capacity = 512
     resources._plans = {}
-    with patch.object(bf16, 'build_mega_moe_plan', side_effect=lambda spec, _: SimpleNamespace(spec=spec)):
+    with patch.object(bf16, 'build_mega_moe_plan', side_effect=lambda spec, _, **kwargs: SimpleNamespace(spec=spec)):
         plan = resources.plan_for_tokens(384, 'cpu')
         assert plan.spec.batch_experts and plan.spec.nominal_schedule
+        assert resources.plan_for_tokens(384, 'cpu') is plan
+        fused = resources.plan_for_tokens(384, 'cpu', replica_pipeline=True)
+        assert not fused.spec.batch_experts and fused.spec.nominal_schedule
+        assert resources.plan_for_tokens(384, 'cpu', replica_pipeline=True) is fused
         assert resources.plan_for_tokens(384, 'cpu') is plan
 
 

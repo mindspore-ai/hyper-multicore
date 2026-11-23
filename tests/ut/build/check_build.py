@@ -198,10 +198,25 @@ class BuildChecks(unittest.TestCase):
         self.assertIn(record["id"], record["torch_so"])
         replica_calls = [call for call in commands.calls if "--phase" in call
                       and any(str(value).endswith("/hot_replica/build.py") for value in call)]
-        self.assertEqual([call[call.index("--phase") + 1] for call in replica_calls],
-                         ["common", "adapter"])
-        self.assertEqual(record["hot_replica"]["soc"], "ascend910_93")
-        self.assertEqual(replica_calls[1][replica_calls[1].index("--cxx-standard") + 1], "20")
+        targets = {"arch22": ("ascend910_93", "hot_replica", "2201"),
+                   "arch35": ("ascend950", "hot_replica_bf16_arch35", "3510")}
+        expected = [(backend, target) for backend, target in targets.items()
+                    if target[0] in sdks.get(backend, {}).get("soc_list", ())]
+        phases = [call[call.index("--phase") + 1] for call in replica_calls]
+        self.assertEqual(phases.count("common"), len(expected))
+        self.assertEqual(phases.count("adapter"), len(expected))
+        self.assertEqual(phases.count("mx-host"), int("arch35" in sdks))
+        for backend, (soc, key, arch) in expected:
+            self.assertEqual(record[key]["soc"], soc)
+            device = common / f"shmem/lib/{backend}/hot_replica"
+            common_call = next(call for call in replica_calls if "--npu-arch" in call and str(device) in call)
+            self.assertEqual(common_call[common_call.index("--npu-arch") + 1], arch)
+            adapter = next(call for call in replica_calls if "--device-root" in call and str(device) in call)
+            self.assertEqual(adapter[adapter.index("--cxx-standard") + 1], "20")
+        if "arch35" in sdks:
+            mx_host = replica_calls[-1]
+            output = Path(mx_host[mx_host.index("--output-dir") + 1])
+            self.assertEqual(output.parts[-2:], ("arch35", "hot_replica"))
         for backend in sdks:
             flag = "-DHP_SHMEM_SOC_TYPE=" + sdks[backend]["sdk_soc_type"]
             binding = next(call for call in configured if flag in call)
@@ -212,7 +227,8 @@ class BuildChecks(unittest.TestCase):
         """Share Torch once and compile every requested binding against its own SDK."""
         previous_common = None
         for socs, mismatch in (("ascend910b,ascend910_93,ascend950", False),
-                               ("ascend910_93", False), ("ascend950", True)):
+                               ("ascend910_93", False), ("ascend950", False),
+                               ("ascend950", True)):
             args = BUILD.parse_arguments(["--soc-list", socs, "--jobs", "1"])
             handoff = {name: {"install_root": str(self.root / name),
                               "sdk_soc_type": BUILD.ARCHITECTURES[name]["sdk_soc_type"],

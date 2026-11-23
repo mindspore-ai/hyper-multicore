@@ -73,15 +73,16 @@ class TestNativeLoading(unittest.TestCase):
                      "payload_sha256": hashes,
                      "native_sha256": {name: value for name, value in hashes.items() if name.endswith(".so")}}
 
-    def _add_hot_replica_artifacts(self):
+    def _add_hot_replica_artifacts(self, *, with_allocator=False):
         """Extend the ordinary fixture with signed common kernels and variant bridges."""
         replica = {
             "soc": "ascend910_93", "kernels": "shmem/lib/arch22/hot_replica/libhmc_hot_replica_kernels.so",
-            "allocator": "adapters/fixture/shmem/arch22/hot_replica/_a3_allocator.so",
             "bridge": "adapters/fixture/shmem/arch22/hot_replica/_hot_replica_shared_bridge.so",
         }
+        if with_allocator:
+            replica["allocator"] = "adapters/fixture/shmem/arch22/hot_replica/_a3_allocator.so"
         self.variant["hot_replica"] = replica
-        for key in ("kernels", "allocator", "bridge"):
+        for key in (key for key in replica if key != "soc"):
             path = self.root / replica[key]
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"synthetic HotReplica")
@@ -100,6 +101,11 @@ class TestNativeLoading(unittest.TestCase):
         (self.root / replica["kernels"]).write_bytes(b"unexpected replacement")
         with self.assertRaisesRegex(ValueError, "Changed payload"):
             manifest.check_integrity(self.root, self.info, index)
+
+    def test_hot_replica_still_loads_packaged_allocator_manifests(self):
+        """Retain support for existing wheels during the source transition."""
+        self._add_hot_replica_artifacts(with_allocator=True)
+        manifest.check_integrity(self.root, self.info, manifest.read_manifest(self.root))
 
     def test_hot_replica_requires_complete_selected_artifacts(self):
         """The capability cannot claim support when its framework bridge is missing."""

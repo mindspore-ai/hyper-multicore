@@ -20,7 +20,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -44,6 +44,7 @@ from hyper_multicore.modules.mega_moe.route import (
     _publish_staged_pull,
     _read_cached_route,
     _read_dynamic_route,
+    _read_packed_dynamic_route,
     _resolve_counts,
     _upload_route_tensor,
     _validate_dynamic_rows,
@@ -265,11 +266,12 @@ class TestMegaMoeRoute(unittest.TestCase):
         payload = torch.cat((header, counts), dim=1)
         for rank in range(2):
             spec = replace(self._spec(ep_size=2, rank_id=rank), max_local_num_tokens=257)
-            capacity, plan_tokens, maximum = _dynamic_summary(payload, spec)
-            self.assertEqual((capacity, plan_tokens), ((4, 128) if rank == 0 else (2, 128)))
-            self.assertEqual(maximum, 4)
+            summary = _dynamic_summary(payload, spec)
+            self.assertEqual((summary.capacity, summary.plan_tokens), (4, 128) if rank == 0 else (2, 128))
+            self.assertEqual(summary.maximum, 4)
+            self.assertEqual(summary.all_experts_active, rank == 0)
             received = counts[:, rank * 2:rank * 2 + 2]
-            meta = _compute_route_metadata(counts[rank], counts, received, spec, capacity)
+            meta = _compute_route_metadata(counts[rank], counts, received, spec, summary.capacity)
             self.assertEqual(meta.dispatch_src_off.tolist(), [0, 0, 0, 0] if rank == 0 else [0, 3, 4, 6])
             self.assertEqual(meta.group_list.tolist(), [3, 4] if rank == 0 else [2, 2])
             self.assertEqual(int(meta.dispatch_size.sum()), 0 if rank == 0 else 6)
@@ -583,13 +585,15 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         return torch.tensor(rows, dtype=dtype)
 
     @staticmethod
-    def _reference(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int]:
+    def _reference(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int, bool]:
         """Use tensor reductions to independently check the Host list implementation."""
         counts = payload[:, 3:]
         loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum((0, 2))
         maximum_tokens = int(payload[:, 1].max())
         schedule = max(128, (maximum_tokens + 127) // 128 * 128)
-        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max())
+        first = spec.rank_id * spec.local_experts
+        incoming = counts[:, first:first + spec.local_experts].sum(0)
+        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max()), bool((incoming > 0).all())
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
@@ -598,7 +602,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         """Feature: dynamic count summary.
 
         Description: Cross table sizes, integer widths, transports and empty-source ranks.
-        Expectation: Every policy preserves exact destination loads and aligned schedules.
+        Expectation: Every policy preserves destination loads, aligned schedules and expert activity.
         """
         for experts in (24, 256, 260, 512, 1024, 2048):
             for dtype in (torch.int32, torch.int64):
@@ -609,6 +613,58 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                         self.assertEqual(
                             _read_dynamic_route(payload, spec)[0], self._reference(payload, spec)
                         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_queued_summary_respects_mode_and_preserves_validation(self) -> None:
+        """Route only eligible MXFP8 tables through the queued summary."""
+        spec = replace(self._spec(768), architecture=3510, precision="mxfp8")
+        data = self._payload(spec.num_experts, torch.int32)
+        wire = MagicMock(spec=torch.Tensor)
+        wire.device = SimpleNamespace(type="npu")
+        wire.dtype = torch.int32
+        wire.is_contiguous.return_value = True
+        wire.__getitem__.side_effect = data.__getitem__
+        counts = data[:, 3:]
+        owner = counts.sum(0).reshape(spec.ep_size, spec.local_experts)
+        summary = torch.cat((data[:, :3], counts.sum(1, keepdim=True), counts.amin(1, keepdim=True),
+                             counts.amax(1, keepdim=True), owner.sum(1, keepdim=True), owner.amin(1, keepdim=True)), 1)
+        expected = self._reference(data, spec)
+        with patch.object(route_module.multicore_ops, "mx_route_summary", return_value=summary) as native:
+            with patch.dict("os.environ", {"HYPER_MULTICORE_MX_ROUTE_SUMMARY": ""}):
+                self.assertEqual(expected, _dynamic_summary(wire, spec))
+                native.assert_not_called()
+            for mode, nddma in (("warp", False), ("nddma", True)):
+                with self.subTest(mode=mode), patch.dict("os.environ", {"HYPER_MULTICORE_MX_ROUTE_SUMMARY": mode}):
+                    source_rows = []
+                    self.assertEqual(expected, _dynamic_summary(wire, spec, source_rows))
+                    self.assertEqual(counts.sum(1).tolist(), source_rows)
+                    native.assert_called_once_with(wire, nddma=nddma)
+                    native.reset_mock()
+                    self.assertEqual(expected, _dynamic_summary(wire, replace(spec, precision="bf16")))
+                    native.assert_not_called()
+            summary[1, 2] = 0
+            with (patch.dict("os.environ", {"HYPER_MULTICORE_MX_ROUTE_SUMMARY": "warp"}),
+                  self.assertRaisesRegex(RuntimeError, "autograd participation")):
+                _dynamic_summary(wire, spec)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_packed_summary_requests_offset_workers_only_when_enabled(self) -> None:
+        """Preserve the native declaration that a packed launch cannot fit."""
+        spec = replace(self._spec(768), architecture=3510, precision="mxfp8")
+        wire = self._payload(spec.num_experts, torch.int32)
+        with (patch.object(route_module, "_packed_route_ub", return_value=192 * 1024),
+              patch.object(route_module.multicore_ops, "route_offsets_and_summary", return_value=(None, None, None))
+              as prepare):
+            for mode, selected, reuse in (("", spec, False), ("attached", spec, True),
+                                          ("attached", replace(spec, precision="bf16"), False)):
+                with self.subTest(mode=mode, precision=selected.precision), patch.dict(
+                        "os.environ", {"HYPER_MULTICORE_MX_PACKED_SUMMARY": mode}):
+                    self.assertIsNone(_read_packed_dynamic_route(wire, selected, 0))
+                    prepare.assert_called_once_with(wire, selected.rank_id, 192 * 1024, selected.hidden_size,
+                                                    reuse_offset_aiv=reuse)
+                    prepare.reset_mock()
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
@@ -1005,29 +1061,35 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         spec = self._spec(experts, rank=1)
         payload = self._payload(experts, torch.int32)
         workspace = SimpleNamespace(route_cache=None, route_cache_probe_after=0)
-        summary, raw, _ = _read_cached_route(payload, spec, workspace, "cpu")
-        metadata = _dynamic_route_metadata(payload[1, 3:], payload, raw, spec, summary[0])
-        _cache_host_route(workspace, spec, raw, summary, metadata, "cpu")
+
+        def _prepare(wire):
+            count = wire[spec.rank_id, 3:]
+            summary, raw, metadata = _read_cached_route(wire, spec, workspace, "cpu")
+            permuted = torch.empty(0, 16), torch.empty(0, dtype=torch.int32)
+            return route_module._finalize_dynamic_route(
+                permuted, count, summary, raw, metadata, None, wire, spec, workspace, "cpu", int(wire[1, 1]),
+            ).metadata
+
+        _prepare(payload)
         payload[1, 3 + 3] -= 1
         payload[1, 3 + 5] += 1
-        changed, raw, _ = _read_cached_route(payload, spec, workspace, "cpu")
-        metadata = _dynamic_route_metadata(payload[1, 3:], payload, raw, spec, changed[0])
-        _cache_host_route(workspace, spec, raw, changed, metadata, "cpu")
+        metadata = _prepare(payload)
         self.assertEqual(workspace.route_cache_probe_after, _ROUTE_CACHE_REPROBE_STEPS)
-        with (patch.object(payload, "tolist", side_effect=AssertionError("unexpected full Host table read")),
-              patch.object(route_module, "_dynamic_summary", wraps=_dynamic_summary) as device_summary):
+        empty = payload.clone()
+        expert = spec.rank_id * spec.local_experts
+        empty[:, 3 + expert - 1] += empty[:, 3 + expert]
+        empty[:, 3 + expert] = 0
+        with patch.object(route_module, "_dynamic_summary", wraps=_dynamic_summary) as device_summary:
             for remaining in range(_ROUTE_CACHE_REPROBE_STEPS - 1, -1, -1):
-                observed, host, cached = _read_cached_route(payload, spec, workspace, "cpu")
-                self.assertEqual(observed, changed)
-                self.assertIsNone(host)
-                self.assertIsNone(cached)
+                wire = empty if remaining % 2 else payload
+                with patch.object(wire, "tolist", side_effect=AssertionError("unexpected full Host table read")):
+                    # A changing route must not inherit the previous route's activity.
+                    observed = _prepare(wire)
+                self.assertEqual(observed.all_experts_active, wire is payload)
+                self.assertEqual(observed.for_kernel(spec.hidden_size).all_experts_active, wire is payload)
                 self.assertEqual(workspace.route_cache_probe_after, remaining)
             self.assertEqual(device_summary.call_count, _ROUTE_CACHE_REPROBE_STEPS)
-        _, raw, cached = _read_cached_route(payload, spec, workspace, "cpu")
-        self.assertIs(cached, metadata)
-        _cache_host_route(workspace, spec, raw, changed, metadata, "cpu")
-        _, _, cached = _read_cached_route(payload, spec, workspace, "cpu")
-        self.assertIs(cached, metadata)
+        self.assertIs(_prepare(payload), metadata)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

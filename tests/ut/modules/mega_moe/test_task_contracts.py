@@ -16,16 +16,27 @@
 from dataclasses import replace
 import unittest
 
+from hyper_multicore.modules.mega_moe.backends.bf16.backward.tiling_tables import get_swiglu_grad_tiling_bytes
+from hyper_multicore.modules.mega_moe.backends.bf16.forward.tiling_tables import get_swiglu_tiling_bytes
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts, _build_task_values
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.schedule_policy import MegaMoeSchedulePolicy, pipeline_cube_queue
 from hyper_multicore.modules.mega_moe.task_options import validate_task_options
-from hyper_multicore.scheduler.config import TaskDescC, TaskType
+from hyper_multicore.scheduler.config import SwiGluTilingDataC, TaskDescC, TaskType
 from hyper_multicore.scheduler.runtime import copy_runtime_config, serialize_runtime_config
 
 
 class TestTaskContracts(unittest.TestCase):
     """Exercise the production lowering and serialization boundaries."""
+
+    def test_swiglu_tiling_uses_byte_copies_for_unaligned_bf16_rows(self):
+        """Both SwiGLU kernels derive the copy unit from the actual row stride."""
+        for build in (get_swiglu_tiling_bytes, get_swiglu_grad_tiling_bytes):
+            for width in (1792, 1793, 1800):
+                with self.subTest(build=build.__name__, width=width):
+                    data = SwiGluTilingDataC.from_buffer_copy(build(32, intermediate_size=width))
+                    self.assertEqual(data.colLen, width)
+                    self.assertEqual(data.is32BAligned, int(width % 16 == 0))
 
     @staticmethod
     def spec(mode: str = "push", weighted: bool = True) -> MegaMoeSpec:

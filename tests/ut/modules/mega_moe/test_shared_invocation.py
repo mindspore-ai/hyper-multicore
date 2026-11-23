@@ -21,8 +21,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from hyper_multicore.modules.mega_moe import invocation
-from hyper_multicore.modules.mega_moe.route import _INVALID_WEIGHT_MASK
+from hyper_multicore.modules.mega_moe import invocation, route
+from hyper_multicore.modules.mega_moe.route import _INVALID_WEIGHT_MASK, PreparedTopKRoute
 from hyper_multicore.modules.mega_moe.backends.mxfp8 import backend
 from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -47,6 +47,66 @@ def test_error_converges_in_existing_route_and_releases_source_lease(mode):
                 pytest.fail('invalid roots must never reach a backend')
     route.assert_called_once()
     assert resources.workspace.release.call_count == int(mode == 'pull')
+
+
+@pytest.mark.parametrize("fail_publication", [False, True])
+def test_placed_pull_leases_selected_workspace(fail_publication):
+    """Publish virtual IDs and release the child lease even if permutation fails."""
+    hidden = torch.ones(1, 64)
+    ids, virtual_ids, probs = torch.zeros(1, 1), torch.ones(1, 1), torch.ones(1, 1)
+    spec = SimpleNamespace(dispatch_mode="pull", auto_tokens=True, precision="bf16", top_k=1)
+    table = torch.tensor([[0, 1, 0, 0], [0, 0, 0, 0]])
+    workspace = Mock(in_use=False, source_buffer=torch.empty(8, 64))
+    child = SimpleNamespace(
+        spec=SimpleNamespace(dispatch_mode="pull", rank_id=0, num_experts=4, top_k=1),
+        workspace=workspace,
+        prepare_auto_workspace=Mock(side_effect=lambda *args: setattr(workspace, "in_use", True)),
+    )
+    placement = SimpleNamespace(counts_by_source=table, virtual_ids=virtual_ids, route_metadata=None,
+                                receive_capacity=1, received_rows=lambda rank: 1)
+    binding = object()
+    resources = SimpleNamespace(
+        spec=spec, workspace=Mock(), prepare_auto_workspace=Mock(),
+        placement=Mock(uses_placement_wire=Mock(return_value=False),
+                       select=Mock(return_value=(child, placement, binding))),
+    )
+
+    def prepare(*args, **options):
+        return route._prepare_placed_route(
+            hidden, ids, spec, resources.workspace, None, table[0, :2], torch.zeros(2, 5),
+            None, None, options["prepare_workspace"], options["select_placement"],
+        )
+
+    def publish(values, selected_ids, output):
+        assert selected_ids is virtual_ids and workspace.in_use
+        assert output.data_ptr() == workspace.source_buffer.data_ptr()
+        if fail_publication:
+            raise RuntimeError("source publication failed")
+        return output.copy_(values), torch.zeros(1, dtype=torch.int32)
+
+    def exercise():
+        with invocation.prepare_expert_invocation(
+                hidden, ids, probs, None, (hidden, hidden), resources, planner=object()) as prepared:
+            assert prepared.execution_resources is child and prepared.weight_binding is binding
+            torch.testing.assert_close(prepared.routed_tokens, hidden)
+            workspace.release.assert_not_called()
+
+    with (
+        patch.object(invocation, "prepare_topk_route", side_effect=prepare),
+        patch.object(route, "_read_cached_route", return_value=(route._RouteSummary(1, 128, 2), None, None)),
+        patch.object(route, "_permute_topk_input_out", side_effect=publish),
+        patch.object(route, "_finalize_dynamic_route", side_effect=lambda pair, *args: PreparedTopKRoute(
+            pair[0], pair[1], table[0], table, None)),
+    ):
+        if fail_publication:
+            with pytest.raises(RuntimeError, match="source publication failed"):
+                exercise()
+        else:
+            exercise()
+    child.prepare_auto_workspace.assert_called_once_with(128, 1, hidden)
+    resources.prepare_auto_workspace.assert_not_called()
+    workspace.release.assert_called_once()
+    resources.workspace.release.assert_not_called()
 
 
 @pytest.mark.parametrize('mode', ['push', 'pull'])

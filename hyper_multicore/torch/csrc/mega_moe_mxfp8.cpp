@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #include <ATen/ATen.h>
 #include <torch/library.h>
+#include <vector>
 #include "csrc/cached_op_api.h"
 
 namespace {
@@ -25,6 +26,19 @@ void MegaMoeMxfp8(at::TensorList buffers, const at::Tensor& runtime, const at::T
   int64_t count = buffers.size();
   HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8, buffers, runtime, events, diagnostic, launch, buffers, count);
 }
+
+void MegaMoeMxfp8TypedForward(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
+                             const at::Tensor& diagnostic, const at::Tensor& launch) {
+  std::vector<at::Tensor> aliases;
+  aliases.reserve(buffers.size());
+  for (const auto& buffer : buffers) {
+    TORCH_CHECK(buffer.is_contiguous(), "MXFP8 MoE buffers must be contiguous");
+    auto bytes = buffer.scalar_type() == at::kByte ? buffer : buffer.view(at::kByte);
+    aliases.push_back(bytes.dim() == 1 ? bytes : bytes.view({-1}));
+  }
+  MegaMoeMxfp8(at::TensorList(aliases), runtime, events, diagnostic, launch);
+}
+
 void MegaMoeMxfp8Grad(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
                        const at::Tensor& diagnostic, const at::Tensor& launch) {
   ValidateMoeBuffers(buffers, runtime, events, diagnostic, launch);
@@ -36,11 +50,14 @@ void MegaMoeMxfp8Grad(at::TensorList buffers, const at::Tensor& runtime, const a
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
   m.def("mega_moe_mxfp8(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
         "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
+  m.def("mega_moe_mxfp8.typed_forward(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
+        "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
   m.def("mega_moe_mxfp8_grad(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
         "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
   m.def("mega_moe_mxfp8_abi_version() -> int", []() -> int64_t { return 3; });
 }
 TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
   m.impl("mega_moe_mxfp8", &MegaMoeMxfp8);
+  m.impl("mega_moe_mxfp8.typed_forward", &MegaMoeMxfp8TypedForward);
   m.impl("mega_moe_mxfp8_grad", &MegaMoeMxfp8Grad);
 }

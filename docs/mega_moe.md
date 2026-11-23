@@ -83,6 +83,7 @@ MegaMoE 不接受 TP 大小参数。
 | --- | --- | --- |
 | `MegaMoeExperts` | 配置模型尺寸和 EP 组，执行专家前反向并管理执行资源 | 公开稳定 API；专家参数由调用方持有，每次 forward 传入。 |
 | `MegaMoeNumericsOptions` | 配置 SwiGLU 裁剪、路由概率的应用位置及 partial dW 精度 | 公开稳定 API；通过 `numerics_options=` 传入，按来源模型选择数值语义。 |
+| `MegaMoePlacementOptions` | 配置专家放置策略 | 通过 `expert_placement=` 传入，默认使用原属 rank。 |
 | `MegaMoeTuningOptions` | 配置通信模式、容量、分片和可选调度 | 公开实验 API；通过 `tuning_options=` 传入。字段、可选值及默认执行策略不保证跨版本兼容，升级时须重新验证。 |
 | `MegaMoeSchedulerOptions` | 配置数学任务顺序、就绪扫描和 lowering | 公开实验 API；作为 `MegaMoeTuningOptions(scheduler=...)` 传入。 |
 
@@ -100,6 +101,7 @@ MegaMoE 不接受 TP 大小参数。
 | `ep_group` | `None` | 独立单 rank 可省略；分布式作业显式指定 EP 组 |
 | `precision` | `"bf16"` | 可选 `"bf16"` 或 `"mxfp8"`，硬件与权重要求见精度支持 |
 | `numerics_options` | `None` | 默认不裁剪、FC2 后加权，完整字段见数值配置 |
+| `expert_placement` | `None` | 默认使用原属 rank，可选[自适应专家放置](#自适应专家放置) |
 | `tuning_options` | `None` | 使用默认执行策略，公开实验配置见执行调优 |
 
 本地专家数为 E/EP，专家归属按组内 rank 顺序确定。同一进程的 SHMEM 同时只能绑定一组有序的 EP 成员。
@@ -144,6 +146,58 @@ output = experts(
     tokens_per_expert=tokens_per_expert,
 )
 ```
+
+### 自适应专家放置
+
+为多 rank EP 启用热点专家副本时，将下列配置传给 `MegaMoeExperts` 的 `expert_placement`。
+
+```python
+from hyper_multicore import MegaMoePlacementOptions
+from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
+
+placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner())
+```
+
+- `ascend910_93` 支持 BF16 EIO 和 EOI。A3 MTE Push 在槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
+  自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。
+  对指定负载，可用 `HotReplicaPlanner(receive_capacity_percent=102)` 进一步限制每 rank 的计划接收行数。
+  参数为不小于 `100` 的整数。按当前 EP 实际平均路由行数取整，再按 `128` 行向上对齐，并取与内置上限的较小值。
+  该选项适用于 BF16 Push。计划在分配前和分配后均检查收益，无法在给定副本预算内满足上限或代价过高时继续使用原属专家路由。
+  `receive_capacity_percent="auto"` 会在内置上限以及按实际平均行数计算的 `110%` 和 `102%` 间评估放置。
+  以计划的最忙 rank 行数、实际权重复制及梯度返回估算代价，再为最优的正收益计划生成派发表。
+  Reentrant checkpoint 在初次前向保存放置。重算时，EP 各 rank 的 Top-K 顺序、Router 提供的精确计数和重放状态一致后复用该放置。
+  首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
+  BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
+  A3 EIO MTE Push 的活跃放置在发布权重前绑定核内 dW。中间梯度带长度取 32 字节的倍数，末带按实际元素数读写。
+  单专家矩阵元素数无法按 16 元素对齐时，原独立回传使用的默认 BF16 partial 在窄槽也继续使用。
+  显式 FP32 partial 在专家矩阵元素数和本地专家数均为奇数时补一个 BF16 bank 记录，以保持 FP32 尾区地址对齐。
+  若放置需要 BF16 partial 协议，应加载支持该协议的 A3 制品。捕获实际张量的 tensor dump 使用其专用捕获路径。
+  副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
+- `ascend950` 的 BF16 Push 和 UDMA Pull 在带核内协议的制品上按投影预取权重，并在主算子内按固定 peer 和 slot 顺序归并梯度。
+  MTE Pull 及其他不满足核内布局条件的调用使用独立预取和归并。Pull 的执行 rank 从对称源区拉取 token。
+  激活副本时以 FP32 计算和归并原属专家及借用专家的局部权重梯度，写回时转换为公开参数类型。
+  Push 与满足核内条件的 UDMA Pull 按已交换的计数选择有界配额。其他 Pull 继续使用原有准入策略。BF16 可通过
+  `HotReplicaPlanner(replica_slots_per_rank=2)` 设置每 rank 的借用上限。
+  使用 FC2 后加权且堆内可以同时容纳新旧缓冲区时，动态增长只替换变大的 Push 缓冲区。
+- `ascend950` 支持 MXFP8 EIO Push，要求设备报告 32 个 Cube 核，使用内置 planner 的默认配置，
+  并设置 `MegaMoeNumericsOptions(partial_weight_grad_dtype="float32")`。各 rank 启动前设置
+  `HCCL_OP_EXPANSION_MODE=AICPU_CacheDisable`，SHMEM 使用 `mte_udma`，
+  `HYPER_MULTICORE_SHMEM_UDMA_QP_NUM` 设置为 8、16 或 32。
+  每 rank 可借用的槽位上限为两个，且不超过本地专家数。
+
+每次正向按实际路由决定是否启用副本。模型继续持有原属专家参数、优化器状态和 checkpoint，
+反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
+测量稳态性能前应覆盖代表性的路由和容量。
+
+### 从旧 HotReplica 配置迁移
+
+旧的独立 `HotReplica` 和 `plan_native()` 调用迁到 `MegaMoeExperts(expert_placement=placement)`。
+如需自定义策略，实现 `BasePlanner.plan(request)`，通过 `MegaMoePlacementOptions` 传入。
+权重和优化器状态仍由模型持有，同一批次的路由与权重通过 MegaMoE 的 forward 入口传递。
+
+构造 planner 时移除 `source_token_bound`，由 MegaMoE 根据实际 token 和路由安排工作区。
+`replica_slots_per_rank` 控制每 rank 的借槽数。固定 SHMEM 字节预算通过
+`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 设置。
 
 ## 精度支持
 
@@ -323,8 +377,11 @@ d_a = BF16(FP32(d_fc2_input) * p)
 
 即使 token 数固定，热点也可能触发 push 接收区扩容。扩容可能集体重启同一 SHMEM root 的 runtime，
 再恢复受管 workspace；外部专家参数不移动。
-`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 可设置固定字节预算；预算不足或不能安全重启时明确失败。
-容量策略、固定预算和失败恢复的完整契约见 [SHMEM runtime restart](shmem.md#runtime-restart)。
+`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 为每 rank 的 SHMEM 堆大小上限（字节数，须为 2 MiB 的整数倍）。
+设置后 MegaMoE 按该大小建立固定堆。路由和新增资源仍可在堆内调整布局。若本次布局的最小容量超过上限，
+执行器在申请或重建前报错，并报告所需字节数与配置值。未设置时，MegaMoE 根据实际布局选择堆大小并按需增长。
+堆分配失败或无法安全重启时同样会报错。
+容量策略和失败恢复见 [SHMEM runtime restart](shmem.md#runtime-restart)。
 
 ### 资源共享与关闭
 
@@ -337,12 +394,24 @@ MegaMoeExperts.share_execution_resources(layer.mlp.experts.executor for layer in
 ```
 
 共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
+A3 BF16 共用有界副本规划的串行层可在同一个物理 workspace 中切换副本槽宽，调用仍使用各自的计划。
 共享组内的层必须具有相同的具体类型、规范化有效配置和权重布局；各 EP rank 对应层也须一致。
 配置比较使用规范化后的字段值，不依赖 `MegaMoeNumericsOptions` 或 `MegaMoeTuningOptions`
 的对象身份；省略配置与显式默认配置可以共享。
 概率位置、clamp 位置和上限参与配置匹配，数值语义不同的层不能共享同一执行资源组。
 支持 non-reentrant checkpoint 和 `retain_graph=True`。默认由运行时托管 workspace，无需显式
 关闭。
+
+使用 A3 BF16 EOI MTE Push、FC2 后加权时，eager 非重入 checkpoint 的适配器可为单次调用创建
+`ReplayCheckpoint(parameter_version, defer_forward_copies=True)`，分别通过 `scope(False)` 和
+`scope(True)` 进入原始前向与重算。调用方需将两者绑定到同一次 checkpoint 调用，启用梯度，并以一次反向消费完整重算。
+原始前向在 workspace 租约内消费 Combine 结果。重算为反向保存完整的 dispatch 和 Combine 张量，
+包括重新规划路由的调用。需要直接使用原始前向保存张量的调用沿用默认策略。
+
+A3 BF16 MTE Push 的融合副本还可通过 `ReplayCheckpoint(..., guest_snapshot_bytes=...)` 保存原始前向的 guest 权重。
+该参数是每次专家调用在每 rank 上的快照字节上限，默认为 `0`。多个在途 checkpoint 分别持有各自的快照。
+重算时，只有 EP 全组的权重版本、路由和快照就绪状态均通过一致性检查，才恢复本地副本。
+快照超预算或路由、参数变化时沿用该次调用的正常权重传输。此选项可独立于前向拷贝延期启用。
 
 GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图引用仍会占用内存，heap 受显式预算或物理 HBM 容量约束。
 
@@ -407,6 +476,13 @@ experts = MegaMoeExperts(
 参数、checkpoint 与优化器状态由外层模型管理，接入方式见
 [Checkpoint 与参数归属](../examples/README.md#checkpoint与参数归属)。
 
+### Ascend950 MXFP8 路由调优
+
+使用带对应原生算子的 wheel 后，可为同一 EP 组的所有进程设置下列实验选项。
+
+- `HYPER_MULTICORE_MX_ROUTE_SUMMARY=warp` 或 `nddma` 为实际进入独立摘要的大表选择设备归约。省略此变量时使用标准张量归约。
+- `HYPER_MULTICORE_MX_PACKED_SUMMARY=attached` 允许普通路由在 offset 已占满 AIV 且计数表满足 UB 预算时复用 offset worker 生成摘要。已有专用摘要槽时使用正常的合并提交。
+
 ### 调度选项
 
 `MegaMoeSchedulerOptions` 从 `hyper_multicore.experimental` 导入，通过
@@ -418,7 +494,7 @@ experts = MegaMoeExperts(
 | --- | --- | --- | --- |
 | `policy` | `None`（默认）、`"two_expert_pipeline"`、`"builder_order"` | 用 `None`，由 lowering 选择队列。指定策略名会报错。 | `None` 等同 `"two_expert_pipeline"`，交错相邻专家的数学阶段。`"builder_order"` 保留建图时的数学任务相对顺序。两者保持相同的任务覆盖、核归属和通信队列。 |
 | `queue_ready_lookahead` | `None`（默认）、整数 `0`、`1`、`8` | compact 的窗口只作用于 Vector 队列，`None` 保留默认 `256`，Cube 始终 FIFO。dense 使用 FIFO，接受 `None` 或 `0`。 | `None` 等同 `0`。窗口作用于 Cube 和数学 Vector 队列，通信 Vector 始终 FIFO。 |
-| `batch_experts` | `None`（默认）、`False`、`True` | `None` 等同 `False`。`True` 将每个 GMM 阶段的逐专家描述符合并为批处理，取消逐专家流水重排。dense 与 compact 均可用，compact 保留 Vector 就绪扫描。 | 接受 `None` 或 `False`。`True` 会报错。 |
+| `batch_experts` | `None`（默认）、`False`、`True` | `None` 等同 `False`。`True` 将每个 GMM 阶段的逐专家描述符合并为批处理，取消逐专家流水重排。dense 与 compact 均可用，compact 保留 Vector 就绪扫描。启用融合副本的 step 使用逐专家任务，以便独立预取各投影的权重。 | 接受 `None` 或 `False`。`True` 会报错。 |
 | `nominal_schedule` | `None`（默认）、`False`、`True` | `None` 等同 `False`。`True` 按名义均分行数限制 compact 的 lane 数，并跳过描述符压缩倍率门槛。要求 Push、`intermediate_size < 2048` 且 lowering 为 `"auto"` 或 `"compact"`。 | 接受 `None` 或 `False`。`True` 会报错。 |
 | `lowering` | `"auto"`（默认）、`"dense"`、`"compact"` | `"dense"` 保留固定分片。`"auto"` 在 Push、`intermediate_size < 2048` 且预计描述符数至少压缩四倍时选 compact，否则用 dense。显式 `"compact"` 要求满足这些条件，`nominal_schedule=True` 时免于倍率判定。 | `"auto"` 与 `"dense"` 都使用逐专家 dense。`"compact"` 会报错。 |
 
