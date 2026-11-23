@@ -19,10 +19,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 
+import numpy as np
+
+from ._dispatch import intersect_source_intervals
 from .admission import reduction_basis_points
 from .mx_host import _aligned_dispatch, _search_aligned as _search_aligned_native
 from .capacity import ExpertReplicaConfig, _integer
-from .plan import ExpertExecutionPlan
+from .plan import ExpertExecutionPlan, physical_replica_slots
 from .planner import _counts_matrix
 from .topology import _validate_rank_nodes
 
@@ -236,15 +239,15 @@ def _select_aligned(totals, config, limit, minimum_rows, threshold, minimum_save
 
     slots, spans, loads = [], [], []
     for rank in range(config.ep_size):
-        logical = list(range(rank * home, (rank + 1) * home))
-        for expert in logical:
+        for expert in range(rank * home, (rank + 1) * home):
             spans.append((0, selected[expert][1] if expert in selected else totals[expert]))
+        guests = []
         for expert, (target, cut) in sorted(selected.items()):
             if target == rank:
-                logical.append(expert)
+                guests.append(expert)
                 spans.append((cut, totals[expert]))
-        spans.extend([(0, 0)] * (width - len(logical)))
-        slots.append(tuple(logical + [-1] * (width - len(logical))))
+        spans.extend([(0, 0)] * (config.replica_slots_per_rank - len(guests)))
+        slots.append(physical_replica_slots(config, rank, guests))
         loads.append(sum(stop - start for start, stop in spans[-width:]))
     return _AlignedGeometry(tuple(slots), tuple(spans), tuple(loads))
 
@@ -256,6 +259,15 @@ def _materialize_aligned(matrix, config, slots, spans):
                                         config.home_experts, config.slots_per_rank)
     if native_dispatch is not None:
         return AlignedExpertExecutionPlan(config, matrix, frozen_slots, native_dispatch, frozen_spans)
+    if sum(map(sum, matrix)) <= np.iinfo(np.int32).max:
+        counts = np.asarray(matrix, dtype=np.int32)
+        owners = np.asarray(frozen_slots, dtype=np.int32).reshape(-1)
+        starts, ends = np.asarray(frozen_spans, dtype=np.int32).T
+        dispatch = intersect_source_intervals(counts, owners, starts, ends).tolist()
+        plan = AlignedExpertExecutionPlan(config, matrix, frozen_slots, dispatch, frozen_spans)
+        plan.validate()
+        return plan
+    # CPU-only plans can represent counts beyond the native INT32 quota ABI.
     dispatch = [[0] * config.physical_experts for _ in matrix]
     for slot, expert in enumerate(e for row in slots for e in row):
         if expert < 0:

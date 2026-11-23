@@ -4,7 +4,7 @@
 from functools import lru_cache
 
 from .aligned import _AlignedGeometry, _aligned_inputs, _materialize_aligned, _select_aligned
-from .topology import charge_replica_endpoints
+from .topology import charge_replica_endpoints, limiting_stage_work
 
 
 def mx_guest_transfer_rows(intermediate_size):
@@ -122,10 +122,8 @@ def _weighted_rank_peak(loads, slots, home, nodes, charge, cross_node_cost=None)
         # One MX axis carries 33 bytes per 32 values. Backward also
         # returns FP32 dW (128 bytes). Keep separate F and B endpoints.
         phase_bytes = 2 * 33 + 128
-        forward = max(phase_bytes * rows + 3 * 33 * charge * copies for rows, copies in zip(loads, traffic))
-        backward = max(2 * phase_bytes * rows + 3 * (33 + 128) * charge * copies
-                       for rows, copies in zip(loads, traffic))
-        return (forward + backward) / (3 * phase_bytes), len(edges), 0
+        stages = ((phase_bytes, 3 * 33 * charge), (2 * phase_bytes, 3 * (33 + 128) * charge))
+        return limiting_stage_work(loads, traffic, stages) / (3 * phase_bytes), len(edges), 0
     charged = list(loads)
     edges, cross = 0, 0
     for target, bank in enumerate(slots):

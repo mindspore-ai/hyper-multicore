@@ -28,7 +28,7 @@ from ._selection import _admitted_uncalibrated_copies, _optional_peak_is_useful
 from .admission import reduction_basis_points
 from .capacity import ExpertReplicaConfig, _integer
 from .plan import ExpertExecutionPlan
-from .topology import _validate_rank_nodes, charge_replica_endpoints
+from .topology import _validate_rank_nodes, charge_replica_endpoints, limiting_stage_work
 
 
 def _counts_matrix(counts: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
@@ -97,7 +97,8 @@ def _critical_quota_work(copies, config, nodes, row_credit, cross_node_cost):
     edges = ((expert // home, rank) for rank, row in enumerate(copies)
              for expert, rows in row.items() if rows and expert // home != rank)
     charges = charge_replica_endpoints(config.ep_size, edges, nodes, cross_node_cost)
-    return max(sum(row.values()) + row_credit * charge for row, charge in zip(copies, charges))
+    loads = [sum(row.values()) for row in copies]
+    return limiting_stage_work(loads, charges, ((1, row_credit),))
 
 
 def _traffic_work_is_useful(copies, loads, config, resident, row_credit, minimum_rows, nodes, cross_node_cost):

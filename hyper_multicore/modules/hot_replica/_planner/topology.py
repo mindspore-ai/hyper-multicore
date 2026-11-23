@@ -38,3 +38,11 @@ def charge_replica_endpoints(ranks: int, edges, nodes: tuple[int, ...], cross_no
         charges[owner] += charge
         charges[guest] += charge
     return charges
+
+
+def limiting_stage_work(loads, charges, stages):
+    """Sum each phase's limiting rank work using its compute and copy weights."""
+    return sum(
+        max(compute * rows + transfer * copies for rows, copies in zip(loads, charges))
+        for compute, transfer in stages
+    )

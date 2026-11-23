@@ -17,12 +17,21 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
 
 from .capacity import ExpertReplicaConfig, _integer
+
+
+def physical_replica_slots(config: ExpertReplicaConfig, rank: int, guests: Sequence[int] = ()) -> tuple[int, ...]:
+    """Place the ordered owner slice and guest prefix in the common slot layout."""
+    if len(guests) > config.replica_slots_per_rank:
+        raise ValueError("replica layout exceeds the physical guest slot cap")
+    home = config.home_experts
+    owners = tuple(range(rank * home, (rank + 1) * home))
+    return owners + tuple(guests) + (-1,) * (config.replica_slots_per_rank - len(guests))
 
 
 def _destination_counts_from_dispatch(

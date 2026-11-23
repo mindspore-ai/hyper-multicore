@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 
 from .capacity import ExpertReplicaConfig
-from .plan import ExpertExecutionPlan
+from .plan import ExpertExecutionPlan, physical_replica_slots
 
 
 class ReplicaCapacityError(ValueError):
@@ -97,11 +97,7 @@ def _slot_quotas(copies: list[dict[int, int]], config: ExpertReplicaConfig, sour
             guests.sort()
         else:
             guests.sort(key=lambda expert: (row[expert], expert), reverse=True)
-        if len(guests) > config.replica_slots_per_rank:
-            raise ValueError("replica layout exceeds the physical guest slot cap")
-        slots = list(range(rank * home, (rank + 1) * home)) + guests
-        slots.extend([-1] * (width - len(slots)))
-        slot_map.append(tuple(slots))
+        slot_map.append(physical_replica_slots(config, rank, guests))
         for slot, expert in enumerate(guests, start=home):
             by_expert.setdefault(expert, []).append([rank * width + slot, row[expert]])
     return tuple(slot_map), by_expert
@@ -148,8 +144,19 @@ def _assign_expert(
     _fill_remaining(quotas, pending, dispatch)
 
 
+def intersect_source_intervals(counts, logical_slots, destination_starts, destination_ends):
+    """Intersect each physical slot's quota with the original source order."""
+    logical = np.maximum(logical_slots, 0)
+    source_ends = counts.cumsum(axis=0, dtype=np.int32)
+    ends = np.minimum(source_ends[:, logical], destination_ends)
+    starts = np.maximum((source_ends - counts)[:, logical], destination_starts)
+    table = np.maximum(ends - starts, 0).astype(np.int32, copy=False)
+    table[:, logical_slots < 0] = 0
+    return table
+
+
 def _ordered_dispatch(counts, slots, copies):
-    """Intersect source and destination intervals in EP rank order."""
+    """Build ordered destination intervals before intersecting source quotas."""
     ranks, experts = counts.shape
     owners = np.asarray(slots, dtype=np.int32).reshape(-1)
     destination = np.repeat(np.arange(ranks), len(slots[0]))
@@ -159,12 +166,7 @@ def _ordered_dispatch(counts, slots, copies):
         allocation[rank, list(quotas)] = list(quotas.values())
     destination_ends = allocation.cumsum(axis=0, dtype=np.int32)[destination, logical]
     destination_starts = destination_ends - allocation[destination, logical]
-    source_ends = counts.cumsum(axis=0, dtype=np.int32)
-    ends = np.minimum(source_ends[:, logical], destination_ends)
-    starts = np.maximum((source_ends - counts)[:, logical], destination_starts)
-    table = np.maximum(ends - starts, 0).astype(np.int32, copy=False)
-    table[:, owners < 0] = 0
-    return table
+    return intersect_source_intervals(counts, owners, destination_starts, destination_ends)
 
 
 def _materialize(
@@ -188,10 +190,7 @@ def _materialize(
         expert // home != rank and count for rank, row in enumerate(copies) for expert, count in row.items()
     )
     if not has_guests:
-        slots = tuple(
-            tuple(range(rank * home, (rank + 1) * home)) + (-1,) * config.replica_slots_per_rank
-            for rank in range(config.ep_size)
-        )
+        slots = tuple(physical_replica_slots(config, rank) for rank in range(config.ep_size))
         dispatch = tuple(map(tuple, _pad_owner_rows(counts, config))) if config.replica_slots_per_rank else counts
         plan = ExpertExecutionPlan(config, counts, slots, dispatch)
         return _capacity_checked_plan(plan, capacity_limit, copies=copies)
