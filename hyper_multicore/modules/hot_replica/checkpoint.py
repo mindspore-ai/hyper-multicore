@@ -64,13 +64,16 @@ class ReplayCheckpoint:
         self.prepare_replay = prepare_replay
         self.records: list[ReplayRecord] = []
         self.forward_version = None
+        self.started = False
 
     @contextmanager
     def scope(self, replay: bool) -> Iterator[None]:
         """Enter the tape before running any operator of the checkpointed block."""
         version = self.parameter_version()
         if not replay:
-            self.records.clear()
+            if self.started:
+                raise RuntimeError("Create a separate wrap_checkpoint wrapper for each original forward")
+            self.started = True
             self.forward_version = version
         state = _CheckpointScope(self.records, replay, version is not None and version == self.forward_version)
         token = _ACTIVE.set(state)

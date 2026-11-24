@@ -27,6 +27,9 @@ import torch.multiprocessing as mp
 from hyper_multicore.experimental import BasePlanner, ExpertPlacement, PlacementRequest
 from hyper_multicore.modules.hot_replica import bounded_placement
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources
+from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, ReplicaExecutionMode
+from hyper_multicore.modules.mega_moe import route
+from hyper_multicore.modules.mega_moe.heap_manager import _HeapCapacityError
 
 from hyper_multicore.modules.hot_replica import shmem_transfer
 
@@ -104,3 +107,47 @@ def test_custom_planner_converges_quota_and_token_errors(tmp_path):
     """Reject asymmetric dispatch and wrong token identities before binding a bank."""
     mp.start_processes(_exercise_quota_agreement, args=((tmp_path / "rendezvous").as_uri(),),
                        nprocs=2, start_method="fork")
+
+
+@pytest.mark.parametrize("mandatory", [False, True])
+def test_existing_bank_growth_respects_hard_receive_limit(mandatory):
+    """A failed placed growth may retry the original route only when allowed."""
+    hidden = torch.empty((1, 4))
+    ids = torch.zeros((1, 1), dtype=torch.int32)
+    spec = SimpleNamespace()
+    placement = SimpleNamespace(receive_capacity=4)
+    selected = SimpleNamespace(placement=placement, mandatory=mandatory)
+    prepare = Mock(side_effect=[_HeapCapacityError("fixed heap"), None])
+    original = route._RouteSummary(2, 128, 2)
+
+    def choose():
+        return route._prepare_placed_route(
+            hidden, ids, spec, None, None, None, None, None, None, prepare, Mock(return_value=selected),
+        )
+
+    with (
+        patch.object(route, "_read_cached_route", return_value=(original, None, None)),
+        patch.object(route, "_materialize_route_permutation", return_value=(hidden, ids)),
+        patch.object(route, "_finalize_dynamic_route", return_value="home") as finalize,
+    ):
+        if mandatory:
+            with pytest.raises(_HeapCapacityError, match="fixed heap"):
+                choose()
+            prepare.assert_called_once_with(128, 4)
+            finalize.assert_not_called()
+        else:
+            assert choose() == "home"
+            assert [call.args for call in prepare.call_args_list] == [(128, 4), (128, 2)]
+
+
+def test_tensor_dump_preserves_the_original_replay_binding():
+    """Materialize diagnostic operands without replacing the saved band protocol."""
+    pool, placement = Mock(), Mock()
+    snapshot = object()
+    binding = ExpertWeightBinding(pool, placement, "EOI", snapshot=snapshot,
+                                  execution_mode=ReplicaExecutionMode.FP32_BAND)
+    diagnostic = binding.for_tensor_dump()
+    assert diagnostic.mode is ReplicaExecutionMode.STAGED and not diagnostic.fused
+    assert diagnostic.snapshot is snapshot and diagnostic.placement is placement
+    assert diagnostic.token is not binding.token
+    assert binding.mode is ReplicaExecutionMode.FP32_BAND and binding.fused_gradients

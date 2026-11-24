@@ -166,15 +166,20 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
   各 rank 根据同一份逐源逻辑计数返回一致的 Host 配额与 guest 槽映射，无需借槽时均返回 `None`。
   每个 source 的行按目的 rank、home 槽、guest 槽的顺序排列。空槽用 -1 表示，接收行数为零。
   执行器在申请副本 bank 前校验所有 source 的逻辑专家守恒、逐位置 Top-K 身份、物理槽直方图和全组配额一致性。
-  Reentrant checkpoint 可使用同一实验命名空间的 `wrap_checkpoint`。省略 `tokens_per_expert` 时，全 EP 验证 Top-K 顺序、参数代际和流后可复用原落位。
+  Reentrant checkpoint 可使用同一实验命名空间的 `wrap_checkpoint`。每次原前向创建一个 wrapper。
+  省略 `tokens_per_expert` 时，全 EP 验证 Top-K 顺序、参数代际和流后可复用原落位。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。固定字节预算优先容纳这次调用所需的对齐布局。
   副本布局超出固定预算时，可以在原属布局符合接收行数要求且放得下的情况下沿用原属布局。两种布局都超预算，或显式行数上限要求使用副本时，调用报错。
-  BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
+  `partial_weight_grad_dtype="float32"` 要求被拆专家的 partial 从 GEMM 产出起为 FP32。显式 FP32 配置预留 3L bank。
+  默认 `native` 预留 2L，可在窄槽选择 FP32 band，并在需要保留 BF16 舍入或处于真宽槽时选择 BF16 band。
+  两种 band 协议都以 FP32 按固定顺序归并，最后转换为参数梯度 dtype。
   A3 EIO MTE 的活跃放置在发布权重前绑定核内 dW。中间梯度带长度取 32 字节的倍数，末带按实际元素数读写。
   单专家矩阵元素数无法按 16 元素对齐时，原独立回传使用的默认 BF16 partial 在窄槽也继续使用。
   显式 FP32 partial 在专家矩阵元素数和本地专家数均为奇数时补一个 BF16 bank 记录，以保持 FP32 尾区地址对齐。
   若放置需要 BF16 partial 协议，应加载支持该协议的 A3 制品。捕获实际张量的 tensor dump 使用其专用捕获路径。
   副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
+- 同一 EP/heap 上，尺寸、dtype、执行协议和标志布局兼容的层串行租用一份 bank。
+  `MegaMoeTuningOptions(replica_bank="dedicated", expert_placement=...)` 为该执行资源组预留一份独占 bank。
 
 每次正向按实际路由决定是否启用副本。模型继续持有原属专家参数、优化器状态和 checkpoint，
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，

@@ -29,6 +29,7 @@ import torch.distributed as dist
 from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
+from .heap_manager import _HeapCapacityError
 from .route_metadata import RouteMetadata
 from .spec import MegaMoeSpec, _align_capacity
 
@@ -968,7 +969,6 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
         host_rows = None
         selected = select_placement(hidden, ids, gathered, summary, snapshot.source_rows,
                                     inverse, autograd_mask, snapshot=snapshot)
-        metadata = snapshot.ordinary_metadata(spec, hidden) if selected is None else None
     else:
         source_rows = []
         summary, host_rows, metadata = _read_cached_route(
@@ -976,7 +976,16 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
         selected = select_placement(
             hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, host_rows=host_rows,
         )
+    if selected is not None:
+        try:
+            prepare_workspace(summary.plan_tokens, selected.placement.receive_capacity)
+        except _HeapCapacityError:
+            if selected.mandatory:
+                raise
+            selected = None
     if selected is None:
+        if reuse_placement_geometry:
+            metadata = snapshot.ordinary_metadata(spec, hidden)
         prepare_workspace(summary.plan_tokens, summary.maximum)
         permuted = _materialize_route_permutation(hidden, ids, spec, workspace, permuted)
         return _finalize_dynamic_route(
@@ -991,7 +1000,6 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     virtual_table = gathered if metadata is not None else torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
     local_load = placement.local_receive_capacity
     virtual_summary = _RouteSummary(max(1, local_load), summary.plan_tokens, placement.receive_capacity)
-    prepare_workspace(virtual_summary.plan_tokens, virtual_summary.maximum)
     virtual_tokens = _materialize_route_permutation(hidden, placement.virtual_ids, virtual_spec, workspace)
     route = _finalize_dynamic_route(
         virtual_tokens, virtual_counts, virtual_summary, None, metadata, None, virtual_table,

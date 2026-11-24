@@ -32,10 +32,10 @@ from ..base_planner import BasePlanner, PlacementRequest
 from ._planner.receive import receive_limit
 from .bounded_placement import BoundedPlacement, PlacementWire, render_geometry, supports_bounded_placement
 from .checkpoint import is_checkpointing
-from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline, uses_wider_gradient_bands
+from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline
 from .placement import _LoweredPlacement, validate_lowered_ids, validate_quotas
 from .planner import HotReplicaPlanner, replica_slot_budget
-from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
+from .shmem_transfer import ExpertWeightBinding, ReplicaExecutionMode, SharedExpertPool
 
 if TYPE_CHECKING:
     from hyper_multicore.modules.mega_moe.route import _RouteSummary
@@ -56,10 +56,10 @@ def _get_mega_bank(
     """Register a HotReplica allocation in the existing MegaMoE heap transaction."""
     spec = parent.spec
     manager = parent.heap_manager
-    dedicated = pipeline and owner.dedicated_pipeline
+    dedicated = owner.dedicated_bank
     owner_id = id(owner) if dedicated else None
     extent = owner.bank_extent if pipeline else None
-    cube_cores = spec.num_cube_cores if pipeline else None
+    cube_cores = spec.num_cube_cores
     key = (spec.local_experts, spec.hidden_size, spec.intermediate_size, hidden.dtype, owner_id, extent,
            cube_cores)
     with manager.access():
@@ -69,22 +69,20 @@ def _get_mega_bank(
             pool = SharedExpertPool(
                 hidden, spec.ep_group, spec.local_experts, spec.intermediate_size,
                 spec.num_cube_cores, spec.expert_weight_layout, root=manager, access=manager.access,
-                pipeline=dedicated,
+                pipeline=pipeline and dedicated,
             )
             reservation = {
                 "kind": pool.pool_kind, "layout": spec.expert_weight_layout, "local_experts": spec.local_experts,
             }
             signature = (
                 pool.pool_kind, spec.local_experts, spec.hidden_size, spec.intermediate_size,
-                str(hidden.dtype), spec.expert_weight_layout,
+                str(hidden.dtype), spec.expert_weight_layout, cube_cores,
             )
             if pipeline:
                 if not dedicated:
                     pool.pipeline = ReplicaPipeline(pool, shared_layouts=True)
                 pool.bank_experts = extent
                 signature += (pool.bank_experts,)
-                if cube_cores is not None:
-                    signature += (cube_cores,)
             layout = _WorkspaceLayout(pool.allocation_bytes, signature, spec.local_experts)
             added = manager.reserve(
                 ((reservation, layout),), allow_resize=True,
@@ -142,7 +140,8 @@ class PlacementResources:
                         if supported else None)
         self.bf16_partials = False
         self.prefer_bf16_partials = False
-        self.pipeline_enabled = self.dedicated_pipeline = False
+        self.pipeline_enabled = False
+        self.dedicated_bank = specification.get("replica_bank") == "dedicated"
         if can_split_weights:
             fp32_partials = self._uses_fp32_partials()
             self.bf16_partials = bf16_partials and not fp32_partials
@@ -152,11 +151,6 @@ class PlacementResources:
             self.pipeline_enabled = (
                 self.bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent, bf16_partials=True)
                 or not self.prefer_bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
-            )
-            # Keep the default path's resident weights and share banks for
-            # optional schedules, custom plans and larger projections.
-            self.dedicated_pipeline = (
-                supported and not spec.batch_experts and not uses_wider_gradient_bands(spec)
             )
         self.statistics = {
             "invocations": 0, "placements": 0,
@@ -213,7 +207,7 @@ class PlacementResources:
                 host_rows=host_rows, limit=limit, resident=resident,
             )
         mandatory = limit is not None and summary.maximum > limit
-        return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled,
+        return self.bind(hidden, placement, tokens=summary.plan_tokens,
                          mandatory=mandatory)
 
     def _select_custom(self, planner, request, hidden, ids, inverse, limit, *, mandatory):
@@ -265,7 +259,7 @@ class PlacementResources:
         )
 
     def bind(
-        self, hidden: torch.Tensor, placement: _LoweredPlacement | None, *, tokens: int, fused: bool = False,
+        self, hidden: torch.Tensor, placement: _LoweredPlacement | None, *, tokens: int,
         mandatory: bool = False,
     ) -> ExpertWeightBinding | None:
         """Use a prepared placement to bind the existing BF16 runtime."""
@@ -275,15 +269,11 @@ class PlacementResources:
         experts = spec.num_experts + spec.ep_size * placement.borrowed_capacity
         if tuple(placement.counts_by_source.shape) != (spec.ep_size, experts):
             raise ValueError("Expert placement counts must match the EP group and borrowed capacity")
-        slots = 0
-        bf16_partials = False
-        if fused and placement.copies_by_rank:
-            if not self.prefer_bf16_partials:
-                slots = fused_replica_slots(spec, placement, bank_experts=self.bank_extent)
-            if not slots and self.bf16_partials:
-                slots = fused_replica_slots(spec, placement, bank_experts=self.bank_extent, bf16_partials=True)
-                bf16_partials = bool(slots)
-        if self.requires_fused_return and not slots:
+        mode, slots = self._execution_mode(placement)
+        if self.requires_fused_return and mode not in (ReplicaExecutionMode.FP32_BAND, ReplicaExecutionMode.BF16_BAND):
+            if not mandatory:
+                self.statistics["protocol_rejections"] = self.statistics.get("protocol_rejections", 0) + 1
+                return None
             if not self.bf16_partials and not self._uses_fp32_partials():
                 raise RuntimeError("A3 EIO HotReplica needs an A3 wheel with BF16 partial dW support for this placement")
             raise RuntimeError("No fused dW protocol fits the active A3 EIO HotReplica placement")
@@ -303,21 +293,32 @@ class PlacementResources:
                 if mandatory:
                     raise
                 return None
-        return_in_kernel = False
-        if fused and self.pool.pipeline is not None and placement.copies_by_rank and self.pool.blocks == spec.num_cube_cores:
-            return_in_kernel = bool(slots)
-            if not slots:
-                slots = placement.borrowed_capacity
-        else:
-            slots = 0
-            bf16_partials = False
-        if self.requires_fused_return and not return_in_kernel:
-            raise RuntimeError("A3 EIO HotReplica bank did not bind the selected fused dW plan")
+        if mode is not ReplicaExecutionMode.STAGED and (
+                self.pool.pipeline is None or self.pool.blocks != spec.num_cube_cores):
+            raise RuntimeError("The selected HotReplica protocol does not match its bank")
         self.statistics["placements"] += 1
+        mode_key = mode.value + "_bindings"
+        self.statistics[mode_key] = self.statistics.get(mode_key, 0) + 1
         return ExpertWeightBinding(
-            self.pool, placement, spec.expert_weight_layout, fused=bool(slots), fused_slots=slots,
-            return_in_kernel=return_in_kernel, bf16_partials=bf16_partials,
+            self.pool, placement, spec.expert_weight_layout, mandatory=mandatory,
+            execution_mode=mode, fused_slots=slots,
         )
+
+    def _execution_mode(self, placement):
+        """Select the protocol from the bank extent, numerics and active guest slots."""
+        if not self.pipeline_enabled or not placement.copies_by_rank:
+            return ReplicaExecutionMode.STAGED, None
+        spec = self.parent.spec
+        extent = self.bank_extent
+        if not self.prefer_bf16_partials:
+            slots = fused_replica_slots(spec, placement, bank_experts=extent)
+            if slots:
+                return ReplicaExecutionMode.FP32_BAND, slots
+        if self.bf16_partials:
+            slots = fused_replica_slots(spec, placement, bank_experts=extent, bf16_partials=True)
+            if slots:
+                return ReplicaExecutionMode.BF16_BAND, slots
+        return ReplicaExecutionMode.WEIGHT_PIPELINE, placement.borrowed_capacity
 
     def _uses_fp32_partials(self):
         """Use the same partial-gradient dtype as the ordinary placed launch."""

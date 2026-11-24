@@ -45,13 +45,6 @@ def _band_layout(shape):
     return rows_per_band, (rows + rows_per_band - 1) // rows_per_band
 
 
-def uses_wider_gradient_bands(spec):
-    """Identify projections requiring more rows per signal than the default band budget."""
-    return any(rows > _MAX_BANDS * _target_band_rows(columns)
-               for rows, columns in projection_shapes(spec.hidden_size, spec.intermediate_size,
-                                                       spec.expert_weight_layout))
-
-
 def _pipeline_capacity(spec, bank_experts=None, *, bf16_partials=False):
     """Limit guest weights and dW to disjoint bank spans."""
     h, i = spec.hidden_size, spec.intermediate_size
@@ -168,6 +161,9 @@ class ReplicaPipeline:
                 stats["fused_snapshot_restores"] = stats.get("fused_snapshot_restores", 0) + 1
             binding.weight_epoch = self.epoch
             self.resident = binding.token
+        else:
+            stats = pool.statistics
+            stats["fused_backward_resident_hits"] = stats.get("fused_backward_resident_hits", 0) + 1
         binding.launch = (_LAUNCH_MAGIC, pool.local_experts, binding.weight_epoch,
                           *(entry.data_ptr() for entry in ready), *(w.data_ptr() for w in weights),
                           *(w.data_ptr() for w in bank))
@@ -217,6 +213,11 @@ class ReplicaPipeline:
                         shmem._api._put_sdma(ready[matrix, slot, :1], value, peer)
         finally:
             binding.transfers = tuple(copies.values())
+        if backward:
+            remote = sum(peer != pool.rank for peer, _, _ in owned)
+            weight_bytes = sum(weight.numel() // weight.shape[0] * weight.element_size() for weight in weights)
+            stats = pool.statistics
+            stats["fused_backward_weight_bytes"] = stats.get("fused_backward_weight_bytes", 0) + remote * weight_bytes
 
     def complete(self, binding):
         """Keep local parameter lifetimes and bank reuse ordered with the peer copies."""
@@ -228,20 +229,19 @@ class ReplicaPipeline:
         binding.transfers = ()
         binding.gradient_storage = ()
 
-    def runtime(self, base, binding, gradients=None):
+    def runtime(self, base, binding, gradients=None, *, bf16_partials=False):
         """Encode the current projection addresses after the ordinary queue table."""
         gradients_address = 0
         if gradients is not None:
-            gradients_address = self._gradient_table(binding, gradients).data_ptr()
+            gradients_address = self._gradient_table(binding, gradients, bf16_partials=bf16_partials).data_ptr()
         words = (*binding.launch, gradients_address)
         extension = _words_tensor(words, self.pool.device, -base.numel() % 8)
         return torch.cat((base.view(torch.uint8), extension))
 
-    def _gradient_table(self, binding, gradients):
+    def _gradient_table(self, binding, gradients, *, bf16_partials=False):
         pool = self.pool
         home, cubes = pool.local_experts, pool.blocks
         slots, received, owned = binding.edges
-        bf16_partials = binding.bf16_partials
         if bf16_partials:
             # Group owners while keeping their contributions in peer/slot order.
             owned = sorted(owned, key=lambda edge: edge[2])

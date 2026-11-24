@@ -28,13 +28,13 @@ from hyper_multicore.modules.hot_replica.bounded_placement import render_geometr
 from hyper_multicore.modules.hot_replica.pipeline import (
     ReplicaPipeline, _band_layout, fused_replica_slots, supports_pipeline,
 )
-from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, SharedExpertPool
+from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, ReplicaExecutionMode, SharedExpertPool
 from hyper_multicore.modules.mega_moe.heap_manager import _HeapCapacityError, _HeapManager
 
 
-def _builtin_placement(parent, *, bf16_partials=False):
+def _builtin_placement(parent, *, bf16_partials=False, replica_bank="shared"):
     planner = mega_moe_adapter.HotReplicaPlanner
-    options = {"planner_key": (planner.__module__, planner.__qualname__)}
+    options = {"planner_key": (planner.__module__, planner.__qualname__), "replica_bank": replica_bank}
     return mega_moe_adapter.PlacementResources(parent, options, shared=False, bf16_partials=bf16_partials)
 
 
@@ -64,7 +64,7 @@ def test_serial_replica_widths_use_the_same_workspace_and_bank(home):
     with patch.object(mega_moe_adapter, "_get_mega_bank") as bank:
         for width in (1, 2, home):
             table = torch.empty((spec.ep_size, spec.num_experts + spec.ep_size * width))
-            placement = SimpleNamespace(borrowed_capacity=width, receive_capacity=33792, counts_by_source=table)
+            placement = SimpleNamespace(borrowed_capacity=width, receive_capacity=33792, counts_by_source=table, copies_by_rank=())
             binding = owner.bind(hidden, placement, tokens=4096)
             assert binding.pool is bank.return_value and binding.placement is placement
     bank.assert_called_once_with(hidden, parent, owner, tokens=4096, received=33792,
@@ -79,7 +79,7 @@ def test_fixed_heap_declines_only_optional_placements(mandatory):
     parent = SimpleNamespace(spec=spec)
     owner = mega_moe_adapter.PlacementResources(parent, {}, True, bf16_partials=True)
     hidden = torch.empty(1, spec.hidden_size, dtype=torch.bfloat16)
-    placement = SimpleNamespace(borrowed_capacity=1, receive_capacity=16384, counts_by_source=torch.empty(2, 10))
+    placement = SimpleNamespace(borrowed_capacity=1, receive_capacity=16384, counts_by_source=torch.empty(2, 10), copies_by_rank=())
     with patch.object(mega_moe_adapter, "_get_mega_bank", side_effect=_HeapCapacityError("budget exceeded")) as reserve:
         if mandatory:
             with pytest.raises(_HeapCapacityError, match="budget exceeded"):
@@ -150,7 +150,7 @@ def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layo
     parent = SimpleNamespace(spec=spec, heap_manager=manager, workspace=object())
     owner = mega_moe_adapter.PlacementResources.__new__(mega_moe_adapter.PlacementResources)
     owner.parent = parent
-    owner.dedicated_pipeline = dedicated
+    owner.dedicated_bank = dedicated
     extent = 3 * home if partial_dtype == "float32" else 2 * home
     with (patch("torch.distributed.get_rank", return_value=0),
           patch("torch.distributed.get_world_size", return_value=32),
@@ -166,10 +166,10 @@ def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layo
     assert all(bank.shape[0] == 2 * home for bank in pool._generic_banks())
 
 
-def test_optional_replica_banks_share_only_matching_partial_formats():
+def test_replica_banks_share_only_compatible_owners():
     """Reuse one bank across serial owners with the same physical gradient extent."""
     spec = SimpleNamespace(
-        architecture=2201, batch_experts=True, dispatch_mode="push", transport_engine="mte",
+        architecture=2201, batch_experts=False, dispatch_mode="push", transport_engine="mte",
         ep_group=None, ep_size=4, local_experts=6, num_experts=24, hidden_size=256,
         intermediate_size=128, num_cube_cores=24, expert_weight_layout="EIO",
         partial_weight_grad_dtype=None,
@@ -181,14 +181,16 @@ def test_optional_replica_banks_share_only_matching_partial_formats():
           patch.object(manager, "reserve"), patch.object(manager, "bind"),
           patch.object(SharedExpertPool, "allocate")):
         owners, pools = [], []
-        for layout, partial_dtype in [("EIO", None), ("EOI", None), ("EOI", "float32")]:
+        for layout, partial_dtype, policy in [("EIO", None, "shared"), ("EOI", None, "shared"),
+                                              ("EOI", "float32", "shared"), ("EOI", None, "dedicated")]:
             current = SimpleNamespace(**{**vars(spec), "expert_weight_layout": layout,
                                          "partial_weight_grad_dtype": partial_dtype})
             parent = SimpleNamespace(spec=current, heap_manager=manager, workspace=object())
-            owners.append(_builtin_placement(parent, bf16_partials=True))
+            owners.append(_builtin_placement(parent, bf16_partials=True, replica_bank=policy))
             pools.append(mega_moe_adapter._get_mega_bank(hidden, parent, owners[-1], tokens=4096, received=32768, pipeline=True))
     assert pools[0] is pools[1]
-    assert [pool.bank_experts for pool in pools] == [12, 12, 18]
+    assert [pool.bank_experts for pool in pools] == [12, 12, 18, 12]
+    assert all(pools[3] is not pool for pool in pools[:3])
     assert pools[0].pipeline.shared_layouts
 
 
@@ -214,12 +216,13 @@ def test_bf16_partial_return_only_replaces_wide_native_routes(home, layout):
             placement = SimpleNamespace(borrowed_capacity=home, copies_by_rank=(incoming, empty),
                                         counts_by_source=torch.empty((2, 4 * home)))
             if used == home and layout == "EIO" and not capability:
+                assert owner.bind(hidden, placement, tokens=4096) is None
                 with pytest.raises(RuntimeError, match="wheel with BF16 partial dW"):
-                    owner.bind(hidden, placement, tokens=4096, fused=owner.pipeline_enabled)
+                    owner.bind(hidden, placement, tokens=4096, mandatory=True)
                 continue
-            binding = owner.bind(hidden, placement, tokens=4096, fused=owner.pipeline_enabled)
+            binding = owner.bind(hidden, placement, tokens=4096)
             assert binding.fused
-            assert (binding.fused_gradients, binding.bf16_partials) == mode
+            assert (binding.fused_gradients, binding.mode is ReplicaExecutionMode.BF16_BAND) == mode
 
 
 @pytest.mark.parametrize(("hidden", "intermediate"), [(5120, 1800), (5120, 1793), (5112, 1792), (5112, 1793)])
@@ -246,8 +249,8 @@ def test_a3_eio_unaligned_narrow_bank_preserves_bf16_partial_rounding():
     placement = SimpleNamespace(borrowed_capacity=1, copies_by_rank=((5,), (-1,)),
                                 counts_by_source=torch.empty((2, 12)))
     hidden = torch.empty((0, spec.hidden_size), dtype=torch.bfloat16)
-    binding = owner.bind(hidden, placement, tokens=4096, fused=owner.pipeline_enabled)
-    assert binding.fused_gradients and binding.bf16_partials
+    binding = owner.bind(hidden, placement, tokens=4096)
+    assert binding.mode is ReplicaExecutionMode.BF16_BAND
 
 
 def test_a3_eio_full_fp32_bank_aligns_its_suffix_for_odd_expert_strides():
@@ -267,7 +270,7 @@ def test_fused_backward_invalidates_a_generic_bank_generation_even_with_resident
     """Retiring the BF16 weight lease also covers FP32 dW writes into the same bank."""
     bank = (torch.empty((4, 4, 8)), torch.empty((4, 8, 2)))
     pool = SimpleNamespace(local_experts=2, ranks=2, rank=0, hidden=8, intermediate=2, blocks=2,
-                           expert_weight_layout="EOI", leased_banks=bank, generation=0)
+                           expert_weight_layout="EOI", leased_banks=bank, generation=0, statistics={})
     pipeline = ReplicaPipeline(pool)
     pipeline.storage = torch.empty(pipeline.signal_words, dtype=torch.int32)
     binding = SimpleNamespace(token=object(), edges=(0, (), ()), snapshot=None,
@@ -296,7 +299,7 @@ def test_fused_bank_rebuilds_flags_and_restores_a_retained_binding(home, layout)
     placement = SimpleNamespace(
         borrowed_capacity=home, published_slots=home, copies_by_rank=((-1,) * home,) * 2,
     )
-    binding = ExpertWeightBinding(pool, placement, layout, fused=True)
+    binding = ExpertWeightBinding(pool, placement, layout, execution_mode=ReplicaExecutionMode.FP32_BAND)
     with (patch("torch.npu.Event"), patch("torch.npu.current_stream"), patch.object(torch.Tensor, "record_stream"),
           patch("hyper_multicore.shmem.barrier") as barrier):
         binding.save_snapshot(pool.weights)
@@ -371,13 +374,13 @@ def test_weight_only_pipeline_drains_projection_copies_before_ordered_gradient_r
     pool = Mock()
     pool.pipeline.plan.return_value = (5, (), ((1, 0, 0),))
     placement = SimpleNamespace(copies=object(), published_slots=5)
-    binding = ExpertWeightBinding(pool, placement, "EOI", fused=True, fused_slots=5, return_in_kernel=False)
+    binding = ExpertWeightBinding(pool, placement, "EOI", execution_mode=ReplicaExecutionMode.WEIGHT_PIPELINE, fused_slots=5)
     weights = (torch.empty(1, dtype=torch.bfloat16), torch.empty(1, dtype=torch.bfloat16))
     gradients = (object(), object())
     ordinary = object()
     assert not binding.owns_returns
     assert binding.runtime(ordinary, gradients) == pool.pipeline.runtime.return_value
-    pool.pipeline.runtime.assert_called_once_with(ordinary, binding, None)
+    pool.pipeline.runtime.assert_called_once_with(ordinary, binding, None, bf16_partials=False)
     pool.reset_mock()
     assert binding.gradients(gradients, weights) == pool.return_generated_gradients.return_value
     assert [call[0] for call in pool.method_calls] == ["pipeline.complete", "return_generated_gradients"]

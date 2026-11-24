@@ -170,6 +170,10 @@ class MegaMoeExperts(MulticoreModule):
         planner = tuning.expert_placement
         if planner is not None and not isinstance(planner, BasePlanner):
             raise TypeError("expert_placement must be a BasePlanner or None")
+        if tuning.replica_bank not in ("shared", "dedicated"):
+            raise ValueError("replica_bank must be shared or dedicated")
+        if tuning.replica_bank == "dedicated" and planner is None:
+            raise ValueError("A dedicated replica bank requires expert_placement")
         ep_size = _resolve_ep_size(ep_group)
         planner_key = None
         replica_slots_per_rank = None
@@ -216,6 +220,7 @@ class MegaMoeExperts(MulticoreModule):
             "precision": precision,
             "hot_replica": planner is not None,
             "planner_key": planner_key,
+            "replica_bank": tuning.replica_bank,
             "replica_slots_per_rank": replica_slots_per_rank,
             "cross_node_cost": cross_node_cost,
             "receive_capacity_percent": receive_capacity_percent,

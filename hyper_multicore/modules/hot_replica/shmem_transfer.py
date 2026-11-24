@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import InitVar, dataclass, field
+from enum import Enum
 import threading
 import weakref
 from typing import Any
@@ -390,6 +391,15 @@ class SharedExpertPool:
             self.closed = True
 
 
+class ReplicaExecutionMode(Enum):
+    """The weight and dW protocol selected before an invocation launches."""
+
+    STAGED = "staged"
+    WEIGHT_PIPELINE = "weight_pipeline"
+    FP32_BAND = "fp32_band"
+    BF16_BAND = "bf16_band"
+
+
 @dataclass
 class ExpertWeightBinding:
     """Per-call ownership; the autograd function saves current owner parameters."""
@@ -400,20 +410,34 @@ class ExpertWeightBinding:
     snapshot: Any = None
     generation: int | None = None
     staged_generation: int | None = None
-    fused: bool = False
-    return_in_kernel: bool = True
-    bf16_partials: bool = False
+    mandatory: bool = False
     token: object = field(default_factory=object)
     transfers: tuple = ()
     gradient_storage: tuple = ()
+    execution_mode: InitVar[ReplicaExecutionMode] = ReplicaExecutionMode.STAGED
     fused_slots: InitVar[int | None] = None
 
-    def __post_init__(self, fused_slots):
+    def __post_init__(self, execution_mode, fused_slots):
+        self._mode = execution_mode
         self.edges = self.pool.pipeline.plan(self.placement, fused_slots) if self.fused else None
 
     @property
-    def fused_gradients(self):
-        return self.fused and self.return_in_kernel
+    def mode(self) -> ReplicaExecutionMode:
+        """Return the protocol fixed when this binding was created."""
+        return self._mode
+
+    @property
+    def fused(self) -> bool:
+        return self.mode is not ReplicaExecutionMode.STAGED
+
+    @property
+    def fused_gradients(self) -> bool:
+        return self.mode in (ReplicaExecutionMode.FP32_BAND, ReplicaExecutionMode.BF16_BAND)
+
+    def for_tensor_dump(self) -> ExpertWeightBinding:
+        """Use materialized bank operands without changing a saved binding."""
+        return ExpertWeightBinding(self.pool, self.placement, self.layout,
+                                   snapshot=self.snapshot, mandatory=self.mandatory)
 
     @property
     def owns_returns(self):
@@ -435,7 +459,6 @@ class ExpertWeightBinding:
             if self.fused:
                 with _ordered_transfers(self.pool):
                     result = self.pool.pipeline.begin(weights, self, backward)
-                stats = self.pool.statistics
                 stats["fused_prefetches"] = stats.get("fused_prefetches", 0) + 1
                 return result
             if self.generation is not None and self.generation == self.pool.generation:
@@ -461,7 +484,10 @@ class ExpertWeightBinding:
         """Select split weights and optional in-kernel dW for this launch."""
         if not self.fused:
             return None
-        return self.pool.pipeline.runtime(ordinary, self, gradients if self.fused_gradients else None)
+        return self.pool.pipeline.runtime(
+            ordinary, self, gradients if self.fused_gradients else None,
+            bf16_partials=self.mode is ReplicaExecutionMode.BF16_BAND,
+        )
 
     def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
         """Retain borrowed weights for the reentrant checkpoint path."""

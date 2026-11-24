@@ -33,7 +33,7 @@ from hyper_multicore.modules.hot_replica._planner.receive import ReplicaCost
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica import bounded_placement
 from hyper_multicore.modules.hot_replica.bounded_placement import _placement_metadata, read_placement_wire
-from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
+from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionMode, SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
     ExpertWeightBinding, PlacementResources, _get_mega_bank,
 )
@@ -225,7 +225,7 @@ def test_failed_weight_publication_releases_bank():
 def test_failed_split_publication_drains_streams_before_bank_release():
     pool = Mock()
     pool.pipeline.begin.side_effect = RuntimeError("peer copy failed")
-    binding = ExpertWeightBinding(pool, Mock(), "EIO", fused=True)
+    binding = ExpertWeightBinding(pool, Mock(), "EIO", execution_mode=ReplicaExecutionMode.FP32_BAND)
     with patch("hyper_multicore.modules.hot_replica.shmem_transfer._ordered_transfers",
                return_value=nullcontext()), pytest.raises(RuntimeError, match="peer copy failed"):
         binding.acquire((object(), object()))
@@ -380,8 +380,9 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     binding.prepare_replay.assert_not_called()
     assert wrapped() == (True, True)
     binding.prepare_replay.assert_called_once_with()
-    with torch.no_grad():
+    with torch.no_grad(), pytest.raises(RuntimeError, match="separate wrap_checkpoint"):
         wrapped()
+    assert wrapped() == (True, True)
     binding.prepare_replay.reset_mock()
     assert wrapped(torch.tensor([1, 1])) == (False, False)
     version[0] += 1

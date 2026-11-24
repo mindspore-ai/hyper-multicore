@@ -170,7 +170,7 @@ class _MegaMoeExecutionResources:
                   "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
-                  "batch_experts", "nominal_schedule", "hot_replica", "planner_key")
+                  "batch_experts", "nominal_schedule", "hot_replica", "planner_key", "replica_bank")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))

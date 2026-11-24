@@ -320,8 +320,6 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
     if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
       GET_TILING_DATA_MEMBER(GMMTilingData, mmTilingData, task_tiling, input_list[task_desc.tiling_data_position]);
-      const uint32_t output = task_desc.outputs[0].input_position;
-      const auto gradient = (output == 6 || output == 18) ? gradient_bands_[output == 6 ? 0 : 1] : nullptr;
       MulticoreBf16::ExecuteGmmTask<DTYPE_HIDDEN_DW>(task_desc, input_list, this->core_num, task_tiling);
       return;
     }

@@ -69,6 +69,8 @@ class MegaMoeTuningOptions:
         scheduler: Optional per-instance math scheduling and lowering options.
         expert_placement: A3 BF16 HotReplica planner for a multi-rank EP group.
             None keeps experts on their home ranks.
+        replica_bank: "shared" leases one compatible bank across serial layers.
+            "dedicated" reserves a separate bank for this executor's resource group.
     """
 
     dispatch_mode: Literal["push", "pull"] = "push"
@@ -78,3 +80,4 @@ class MegaMoeTuningOptions:
     combine_split: int = 128
     scheduler: MegaMoeSchedulerOptions | None = None
     expert_placement: BasePlanner | None = None
+    replica_bank: Literal["shared", "dedicated"] = "shared"
