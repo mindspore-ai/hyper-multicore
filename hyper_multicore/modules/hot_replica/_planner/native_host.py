@@ -24,16 +24,6 @@ def load_replica_planner(library: Path) -> None:
     _backend = module
 
 
-def prefix_candidates(totals, ranks, slots, quantum, target, nodes, multiplier, phases, counts):
-    """Use the adapter's row/aligned loop when its count bounds cover this invocation."""
-    native = getattr(_backend, "prefix_candidates", None)
-    if native is None or target > 2**30 or quantum > 2**30:
-        return None
-    if not isinstance(counts, tuple) or not isinstance(counts[0], tuple):
-        counts = tuple(map(tuple, counts))
-    return native(tuple(totals), counts, ranks, slots, quantum, target, nodes or (0,) * ranks, multiplier, phases)
-
-
 def select_prefix(totals, counts, config, quantum, levels, nodes, multiplier, prices, capacity, resident, resize):
     """Parse the counts once and return the winning moves and best visited peak."""
     native = getattr(_backend, "select_prefix", None)

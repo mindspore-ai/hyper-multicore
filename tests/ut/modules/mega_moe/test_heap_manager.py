@@ -229,6 +229,35 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             manager.ensure_token_capacity(workspace, 512, 1792)
             restart.assert_called_once()
 
+    def test_fixed_heap_distinguishes_required_and_preferred_receive_for_first_bank(self) -> None:
+        """Commit the exact layout when it fits, and roll back a bank that cannot fit."""
+        page = 2 * 1024**2
+        tokens, required, preferred = 32768, 32768, 81920
+        bank = self._layout(page, 1, name="replica bank")
+        for shortfall in (0, page):
+            with self.subTest(shortfall=shortfall):
+                manager, workspace, _ = self._automatic_workspace("push")
+                manager._runtime_attached = True
+                home = manager.entries[0]
+                exact = _workspace_layout(home.specification, torch.bfloat16, required, tokens)
+                desired = _workspace_layout(home.specification, torch.bfloat16, preferred, tokens)
+                minimum = manager._required_bytes([exact, bank])
+                self.assertGreater(manager._required_bytes([desired, bank]), minimum)
+                manager.heap_bytes = manager.heap_limit = minimum - shortfall
+                with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+                    if shortfall:
+                        with self.assertRaisesRegex(RuntimeError, f"required={minimum} bytes"):
+                            manager.reserve((({"kind": "replica"}, bank),), allow_resize=True,
+                                            workspace_growth=(workspace, tokens, required), preferred_receive=preferred)
+                        self.assertEqual(len(manager.entries), 1)
+                        restart.assert_not_called()
+                    else:
+                        manager.reserve((({"kind": "replica"}, bank),), allow_resize=True,
+                                        workspace_growth=(workspace, tokens, required), preferred_receive=preferred)
+                        self.assertEqual(len(manager.entries), 2)
+                        self.assertEqual(workspace.capacity_floor, required)
+                        restart.assert_called_once()
+
     def setUp(self) -> None:
         """Install one-rank lifecycle and configuration boundaries."""
         self.reference = SimpleNamespace(

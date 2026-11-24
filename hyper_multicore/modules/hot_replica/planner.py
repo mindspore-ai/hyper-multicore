@@ -15,15 +15,14 @@
 """Plan one expert placement over validated EP counts."""
 from __future__ import annotations
 
-from collections import OrderedDict
 from sys import float_info
-from typing import Any, Literal
+from typing import Literal
 
 import torch
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from ._planner.receive import ReplicaCost, receive_limit
-from .placement import build_placement, placement_benefit_seconds
+from ._planner.receive import SourceQuota, bf16_cost, receive_limit
+from .placement import build_placement, replica_slot_budget
 
 
 class HotReplicaPlanner(BasePlanner):
@@ -50,7 +49,6 @@ class HotReplicaPlanner(BasePlanner):
         self._replica_slots_per_rank = replica_slots_per_rank
         self._receive_capacity_percent = "auto" if receive_capacity_percent is None else receive_capacity_percent
         self._cross_node_cost = cross_node_cost
-        self._rejected_routes: OrderedDict[tuple[Any, ...], None] = OrderedDict()
 
     @property
     def replica_slots_per_rank(self) -> int | None:
@@ -81,52 +79,19 @@ class HotReplicaPlanner(BasePlanner):
     @torch.no_grad()
     def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
         """Return a placement if saved work repays movement."""
-        return self._plan_by_cost(request, self._build)
-
-    def _plan_by_cost(self, request, build):
-        """Keep the observed movement break-even while sharing geometry preparation."""
-        counts = request.counts_by_source
-        ranks, experts = counts.shape
-        local = experts // ranks
-        hidden = request.hidden.shape[-1]
-        size = request.hidden.element_size()
-        maximum = request.maximum_received
+        ranks, experts = request.counts_by_source.shape
+        prices = bf16_cost(
+            request.hidden.shape[-1], request.intermediate_size, request.cube_cores, request.training,
+            dispatch_mode=request.dispatch_mode, transport_engine=request.transport_engine,
+        )
         limit = receive_limit(self.receive_capacity_percent, request.total_rows, ranks)
-        mandatory = limit is not None and maximum > limit
         resident = request.ordinary_receive_capacity
-        key = (request.count_key, request.rank_nodes, resident) if request.count_key is not None else None
-        if not mandatory and key is not None and key in self._rejected_routes:
-            self._rejected_routes.move_to_end(key)
+        if prices.keep_home(request.maximum_received, request.total_rows, ranks, limit=limit, resident=resident):
             return None
-        weight_elements = 3 * local * hidden * request.intermediate_size
-
-        def estimate(after, transfers):
-            return placement_benefit_seconds(
-                maximum, after, hidden, request.intermediate_size, request.cube_cores, weight_elements * size,
-                projection_flops=12 if request.training else 6, ep_size=ranks, local_experts=local,
-                gradient_bytes=weight_elements * 4 if request.training else 0,
-                backward_prefetch_weight_bytes=weight_elements * size if request.training else 0,
-                transfer_experts=transfers,
-            )
-
-        if ReplicaCost().keep_home(maximum, request.total_rows, ranks, self.receive_capacity_percent, score=estimate, resident=resident):
-            return None
-        placement = build(request, limit, score=estimate, receive_capacity_percent=self.receive_capacity_percent,
-                          resident=resident)
-        if placement is not None:
-            return placement
-        if mandatory:
-            raise ValueError(f"No placement found within receive limit {limit} rows")
-        if key is not None:
-            self._rejected_routes[key] = None
-            if len(self._rejected_routes) > 32:
-                self._rejected_routes.popitem(last=False)
-        return None
-
-    def _build(self, request: PlacementRequest, target: int | None, **options) -> ExpertPlacement | None:
+        budget = replica_slot_budget(experts // ranks, self.replica_slots_per_rank, request.dispatch_mode)
         return build_placement(
-            request.hidden, request.ids, request.counts_by_source,
-            target, request.rank, source_inverse=request.source_inverse,
-            replica_slots_per_rank=self.replica_slots_per_rank,
-            nodes=request.rank_nodes, cross_node_cost=self.cross_node_cost, **options,
+            request.hidden, request.ids, request.counts_by_source, None, request.rank,
+            source_inverse=request.source_inverse, replica_slots_per_rank=budget, prices=prices,
+            source_quota=SourceQuota.LOCAL, receive_capacity_percent=self.receive_capacity_percent,
+            nodes=request.rank_nodes, cross_node_cost=self.cross_node_cost, resident=resident,
         )

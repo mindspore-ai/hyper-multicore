@@ -69,25 +69,3 @@ class ExpertReplicaConfig:
     def physical_experts(self) -> int:
         """Return the backend's physical route-ID range."""
         return self.ep_size * self.slots_per_rank
-
-    def maximum_receive_rows(self, local_num_tokens: int, top_k: int, *, alignment: int = 128) -> int:
-        """Bound every distinct-TopK route without requiring full preallocation.
-
-        The planner retains floor(B * moved_rows / H) of each balanced transfer,
-        with at most one incoming owner per rank. Integer
-        truncation costs at most ep_size - 1 rows. B >= H admits exact balance.
-        """
-        _integer(local_num_tokens, "local_num_tokens")
-        _integer(top_k, "top_k")
-        if top_k > self.num_experts:
-            raise ValueError("top_k must not exceed num_experts")
-        home = self.home_experts
-        budget = min(self.replica_slots_per_rank, home)
-        average = local_num_tokens * top_k
-        upper = self.ep_size * local_num_tokens * min(top_k, home)
-        if budget == home:
-            upper = average
-        elif budget:
-            mixed = ((home - budget) * upper + budget * average + home - 1) // home
-            upper = min(upper, mixed + self.ep_size - 1)
-        return align_capacity(upper, alignment)

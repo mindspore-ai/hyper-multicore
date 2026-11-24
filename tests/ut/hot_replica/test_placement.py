@@ -31,47 +31,6 @@ class TestHotReplicaPlacement(unittest.TestCase):
         self.assertEqual(receive_limit(102, 525, 4), 134)
         self.assertEqual(receive_limit(100, 525, 4), 132)
 
-    def test_cost_charges_gradient_wire_bytes_and_peer_fanout(self) -> None:
-        """Identical arithmetic must not ignore larger gradients or more peers."""
-        geometry = (11000, 4000, 5120, 1792, 24, 3 * 3 * 5120 * 1792 * 2)
-        common = {"projection_flops": 12, "local_experts": 3}
-        bf16 = geometry[-1]
-        self.assertTrue(placement.placement_is_profitable(*geometry, ep_size=2, gradient_bytes=bf16, **common))
-        self.assertFalse(placement.placement_is_profitable(*geometry, ep_size=8, gradient_bytes=2 * bf16, **common))
-
-    def test_cost_scales_with_expert_parameter_size_not_imbalance_ratio(self) -> None:
-        """The same rank imbalance can justify small experts but not large experts."""
-        base = {
-            "maximum_received": 300000,
-            "target_load": 131000,
-            "hidden_size": 2560,
-            "intermediate_size": 768,
-            "cube_cores": 24,
-            "projection_flops": 12,
-            "ep_size": 8,
-        }
-        one = 3 * 2560 * 768 * 2
-        self.assertTrue(
-            placement.placement_is_profitable(**base, local_experts=64, weight_bytes=64 * one, gradient_bytes=128 * one)
-        )
-        self.assertFalse(
-            placement.placement_is_profitable(
-                **base, local_experts=64, weight_bytes=256 * one, gradient_bytes=512 * one
-            )
-        )
-
-    def test_cost_rejects_invalid_transfer_extents(self) -> None:
-        with self.assertRaisesRegex(ValueError, "gradient traffic"):
-            placement.placement_is_profitable(100, 20, 64, 32, 24, 1024, gradient_bytes=-1)
-        with self.assertRaisesRegex(ValueError, "cost geometry"):
-            placement.placement_is_profitable(100, 20, 64, 32, 24, 1024, ep_size=0)
-
-    def test_ungated_cost_accounts_for_two_projections(self) -> None:
-        """A marginal gated saving must not enable borrowing for a cheaper ungated FFN."""
-        geometry = (300000, 0, 512, 128, 20, 0)
-        self.assertTrue(placement.placement_is_profitable(*geometry, projection_flops=6))
-        self.assertFalse(placement.placement_is_profitable(*geometry, projection_flops=4))
-
     def test_capacity_placement_preserves_source_intervals(self) -> None:
         """Split the same logical expert in source-rank order for both wire dtypes."""
         for dtype in (torch.int32, torch.int64):
@@ -117,7 +76,7 @@ class TestHotReplicaPlacement(unittest.TestCase):
         ):
             with self.subTest(shape=counts.shape, rank=rank):
                 with (
-                    patch("hyper_multicore.modules.hot_replica.placement.search_ordered_plan") as allocate,
+                    patch("hyper_multicore.modules.hot_replica.placement.select_replica_plan") as allocate,
                     self.assertRaises(ValueError),
                 ):
                     placement.build_placement(

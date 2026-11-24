@@ -427,14 +427,14 @@ class ExpertWeightBinding:
             self.staged_generation = self.pool.stage_snapshot(self.layout, self.snapshot)
 
     def acquire(
-        self, weights: tuple[torch.Tensor, ...], *, backward: bool = False, replay_snapshot=None,
+        self, weights: tuple[torch.Tensor, ...], *, backward: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Lease reusable banks and publish this graph's saved owner weights."""
         self.pool.claim(self.layout)
         try:
             if self.fused:
                 with _ordered_transfers(self.pool):
-                    result = self.pool.pipeline.begin(weights, self, backward, replay_snapshot=replay_snapshot)
+                    result = self.pool.pipeline.begin(weights, self, backward)
                 stats = self.pool.statistics
                 stats["fused_prefetches"] = stats.get("fused_prefetches", 0) + 1
                 return result
@@ -463,22 +463,15 @@ class ExpertWeightBinding:
             return None
         return self.pool.pipeline.runtime(ordinary, self, gradients if self.fused_gradients else None)
 
-    def capture_snapshot(self, weights: tuple[torch.Tensor, ...], *, maximum_bytes: int | None = None):
-        """Copy the live guest weights while their bank is leased."""
+    def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
+        """Retain borrowed weights for the reentrant checkpoint path."""
         start = 0 if self.fused else self.pool.local_experts
         used = self.placement.published_slots
         stop = start + (self.placement.borrowed_capacity if used is None else used)
-        views = tuple(weight[start:stop].detach() for weight in weights)
-        if maximum_bytes is not None and sum(view.nbytes for view in views) > maximum_bytes:
-            return None
-        tails = tuple(view.clone() for view in views)
+        tails = tuple(weight[start:stop].detach().clone() for weight in weights)
         ready = torch.npu.Event()
         ready.record(torch.npu.current_stream(tails[0].device))
-        return tails, ready
-
-    def save_snapshot(self, weights: tuple[torch.Tensor, ...]) -> None:
-        """Retain borrowed weights for the reentrant checkpoint path."""
-        self.snapshot = self.capture_snapshot(weights)
+        self.snapshot = tails, ready
         self.generation = None
 
     def gradients(

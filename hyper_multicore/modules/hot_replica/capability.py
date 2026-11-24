@@ -14,6 +14,9 @@
 # ============================================================================
 """Validate the actual input device and selected HotReplica artifacts before allocation."""
 
+from pathlib import Path
+import socket
+
 import torch
 from hyper_multicore import _collective
 from hyper_multicore._loader import load_torch_npu, query_npu_arch, validate_native_compatibility
@@ -49,20 +52,26 @@ def _require_a3(tensor, *, dispatch_mode: str = "push") -> bool:
 def require_capability(
     tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *,
     dispatch_mode: str = "push",
-) -> bool:
-    """Validate artifacts and agree on the A3 BF16 partial protocol before transfer."""
+) -> tuple[bool, tuple[int, ...]]:
+    """Agree on the device artifacts and node labels before planning any route."""
     local_error = None
     bf16_partials = False
     try:
         bf16_partials = _require_a3(tensor, dispatch_mode=dispatch_mode)
     except Exception as error:  # pylint: disable=broad-exception-caught
         local_error = error
+    try:
+        node = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        node = ""
     failure = None if local_error is None else _collective.failure_report(local_error)
     reports = _collective.exchange(
-        (bf16_partials, failure), group=group, failure_prefix="HotReplica capability failed while converging ranks",
+        (bf16_partials, node or socket.gethostname(), failure), group=group,
+        failure_prefix="HotReplica capability failed while converging ranks",
     )
-    capabilities, failures = zip(*reports)
+    capabilities, nodes, failures = zip(*reports)
     if any(failure is not None for failure in failures):
         details = _collective.format_collective_failures(failures)
         raise RuntimeError(f"HotReplica capability failed on {details}") from local_error
-    return all(capabilities)
+    labels = {node: rank for rank, node in enumerate(dict.fromkeys(nodes))}
+    return all(capabilities), tuple(labels[node] for node in nodes)

@@ -71,44 +71,6 @@ bool ReadCountMatrix(PyObject *matrix, int ranks, int experts, std::vector<Rows>
 
 }  // namespace
 
-PyObject *PrefixCandidates(PyObject *, PyObject *args) {
-  PyObject *totals = nullptr, *matrix = nullptr, *topology = nullptr, *phase_tuple = nullptr;
-  int ranks = 0, budget = 0, quantum = 0;
-  long long target = 0;
-  double multiplier = 0;
-  if (!PyArg_ParseTuple(args, "OOiiiLOdO", &totals, &matrix, &ranks, &budget, &quantum, &target,
-                        &topology, &multiplier, &phase_tuple)) return nullptr;
-  try {
-    Rows weights, nodes;
-    std::vector<Rows> counts;
-    PhasePrices phases;
-    if (target < 0 || quantum < 1 ||
-        !ReadSearch(totals, topology, ranks, budget, &weights, &nodes) ||
-        !ReadCountMatrix(matrix, ranks, weights.size(), &counts)) Py_RETURN_NONE;
-    if (!ReadPhases(phase_tuple, &phases)) {
-      if (PyErr_Occurred()) return nullptr;
-      Py_RETURN_NONE;
-    }
-    const auto moves = SearchPrefixes(weights, HomeLoads(weights, weights.size() / ranks, ranks),
-                                      nodes, counts, budget, quantum, target, multiplier, phases);
-    PyObject *result = PyList_New(moves.size());
-    if (result == nullptr) return nullptr;
-    for (size_t i = 0; i < moves.size(); ++i) {
-      const auto &m = moves[i];
-      PyObject *row = Py_BuildValue("((iiiLL)Lddd)", m.owner, m.guest, m.expert, static_cast<long long>(m.first),
-                                    static_cast<long long>(m.last), static_cast<long long>(m.peak), m.sent, m.received, m.charge);
-      if (row == nullptr) {
-        Py_DECREF(result);
-        return nullptr;
-      }
-      PyList_SET_ITEM(result, i, row);
-    }
-    return result;
-  } catch (const std::bad_alloc &) {
-    return PyErr_NoMemory();
-  }
-}
-
 PyObject *SelectPrefix(PyObject *, PyObject *args) {
   PyObject *totals, *matrix, *levels, *topology, *phase_tuple;
   int ranks, slots, quantum;
@@ -186,7 +148,6 @@ PyObject *SelectPrefix(PyObject *, PyObject *args) {
 namespace {
 PyMethodDef methods[] = {
   {"select_prefix", ReplicaHost::SelectPrefix, METH_VARARGS, "Choose a capacity-legal prefix across target loads."},
-  {"prefix_candidates", ReplicaHost::PrefixCandidates, METH_VARARGS, "Enumerate topology-priced row or aligned moves."},
   {nullptr, nullptr, 0, nullptr},
 };
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "_replica_host", nullptr, -1, methods, nullptr, nullptr, nullptr};

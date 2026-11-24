@@ -47,9 +47,10 @@ class _MegaMoeExecutionResources:
         # Agree on optional stages before any HotReplica-only collective.
         placement = specification.get("hot_replica", False)
         replica_bf16_partials = False
+        rank_nodes = ()
         if placement:
             from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
-            replica_bf16_partials = require_capability(
+            replica_bf16_partials, rank_nodes = require_capability(
                 tensor, specification["ep_group"],
                 dispatch_mode=self.spec.dispatch_mode,
             )
@@ -104,7 +105,9 @@ class _MegaMoeExecutionResources:
         self.placement = None
         if placement:
             from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources  # pylint: disable=import-outside-toplevel
-            self.placement = PlacementResources(self, specification, shared, bf16_partials=replica_bf16_partials)
+            self.placement = PlacementResources(
+                self, specification, shared, bf16_partials=replica_bf16_partials, rank_nodes=rank_nodes,
+            )
 
     def _route_spec(self, experts: int | None) -> MegaMoeSpec:
         """Change the graph's logical width within the same physical workspace."""
@@ -167,7 +170,7 @@ class _MegaMoeExecutionResources:
                   "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
                   "ep_size", "auto_tokens",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
-                  "batch_experts", "nominal_schedule", "hot_replica", "planner_key", "indexed_push")
+                  "batch_experts", "nominal_schedule", "hot_replica", "planner_key")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16", self.spec.expert_weight_layout, self.spec.architecture,
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))

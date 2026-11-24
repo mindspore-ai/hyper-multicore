@@ -90,7 +90,6 @@ class ReplicaPipeline:
     def __init__(self, pool, *, shared_layouts=False):
         self.pool = pool
         self.shared_layouts = shared_layouts
-        self.ready_parts = 1
         self.storage = None
         self.epoch = 0
         self.resident = None
@@ -144,7 +143,7 @@ class ReplicaPipeline:
                       for slot, source in enumerate(row[:slots]) if source >= 0 and source // home == pool.rank)
         return slots, received, owned
 
-    def begin(self, weights, binding, backward, *, replay_snapshot=None):
+    def begin(self, weights, binding, backward):
         """Publish projection epochs directly to their current guest consumers."""
         pool = self.pool
         self.epoch += 1
@@ -155,11 +154,11 @@ class ReplicaPipeline:
         pool.generation += 1
         rank_lines = pool.ranks * pool.local_experts * _LINE_WORDS
         ready = self.storage[3 * rank_lines:3 * rank_lines + 2 * pool.local_experts * _LINE_WORDS]
-        ready = ready.view(2, pool.local_experts, self.ready_parts * _LINE_WORDS)
+        ready = ready.view(2, pool.local_experts, _LINE_WORDS)
         bank = pool.leased_banks
         if not backward or self.resident is not binding.token:
             self.resident = None
-            snapshot = binding.snapshot if replay_snapshot is None else replay_snapshot
+            snapshot = binding.snapshot
             if snapshot is None:
                 self._publish_weights(weights, binding, ready, rank_lines, backward)
             else:

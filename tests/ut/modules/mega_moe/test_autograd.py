@@ -161,7 +161,6 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         context.weight_binding = None
         context.has_unpermute = False
-        context.defer_forward_copies = False
         context.needs_input_grad = (False,) * 9
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
@@ -242,7 +241,7 @@ class TestMegaMoeFunction(unittest.TestCase):
             def operation(values: Any, first: Any, second: Any) -> Any:
                 prepared = SimpleNamespace(
                     routed_tokens=values.detach().repeat_interleave(2, dim=0),
-                    metadata=route, unpermute_mapping=mapping, indexed_dispatch_offsets=None,
+                    metadata=route, unpermute_mapping=mapping,
                 )
                 return function_module.execute_mega_moe_with_permutation(
                     values, ids, first, second, prepared, plan, workspace,

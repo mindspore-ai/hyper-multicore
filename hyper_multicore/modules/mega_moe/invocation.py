@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Per-invocation routing and leases shared by all expert precision backends."""
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
 from collections.abc import Iterator
@@ -62,17 +62,12 @@ def prepare_expert_invocation(
             from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
 
             record, replay = route_record(resources)
-            if replay and record is not None and record.route_only:
-                if record.route is None or record.route_state != record.route_signature(weights):
-                    record = None
             if replay and agree_replay(
                     record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
                 placement.statistics["route_replays"] += 1
                 route = record.route
                 resources.workspace.wait_for_reuse()
-                if route.indexed_dispatch_offsets is not None:
-                    route = replace(route, routed_tokens=hidden, count_fence=record.replay_count_fence)
-                elif pull or not record.allow_activation:
+                if pull or not record.allow_activation:
                     with torch.inference_mode(False), torch.no_grad():
                         if pull:
                             prepare_workspace(route.metadata.plan_tokens, route.maximum_received_slots)
@@ -82,9 +77,7 @@ def prepare_expert_invocation(
                             hidden, virtual_ids, resources.spec, resources.workspace,
                         )
                     route = replace(route, routed_tokens=rows, unpermute_mapping=mapping)
-                if not record.route_only and (counts is None or record.guest_snapshot_bytes):
-                    route = replace(route, checkpoint_record=record)
-                yield route
+                yield replace(route, checkpoint_record=record)
                 return
             if replay:
                 placement.statistics["route_replay_misses"] += 1
@@ -92,13 +85,8 @@ def prepare_expert_invocation(
 
         options = {"autograd_mask": mask}
         if planner is not None:
-            checkpointing = record is not None or replay
-            options["select_placement"] = partial(
-                placement.select, planner=planner, checkpointing=checkpointing,
-            )
-            if record is not None and not replay and counts is None and mask & 1 and placement.indexed_push:
-                options["indexed_placement"] = True
-            if placement.uses_placement_wire(checkpointing):
+            options["select_placement"] = partial(placement.select, planner=planner)
+            if placement.uses_placement_wire():
                 options["reuse_placement_geometry"] = resources.spec.ep_size * resources.spec.num_experts <= 16384
         if resources.spec.auto_tokens:
             options["prepare_workspace"] = prepare_workspace
@@ -107,36 +95,25 @@ def prepare_expert_invocation(
                 resources.workspace.ensure(resources.spec, hidden.dtype, hidden.device)
             resources.workspace.claim()
             leased_workspace = resources.workspace
-        snapshot = nullcontext()
-        if record is not None and not weight_error:
+        if record is not None and counts is None and not weight_error:
             record.stream = torch.npu.current_stream(hidden.device)
-            if counts is not None:
-                snapshot = record.save_supplied_route(ids, counts)
-        with torch.inference_mode(False), torch.no_grad(), snapshot:
+        with torch.inference_mode(False), torch.no_grad():
             route = prepare_topk_route(hidden, ids, probs, resources.spec, counts,
                                        workspace=resources.workspace, **options)
         if not pull and not resources.spec.auto_tokens:
             with torch.inference_mode(False):
                 resources.ensure_capacity(route.maximum_received_slots)
-        yield _record_checkpoint_route(route, record, counts, ids, weights)
+        yield _record_checkpoint_route(route, record, counts, ids)
     finally:
         if leased_workspace is not None:
             leased_workspace.release()
 
 
-def _record_checkpoint_route(route, record, counts, ids, weights):
+def _record_checkpoint_route(route, record, counts, ids):
     """Keep the route descriptors and placement with the checkpoint invocation."""
-    if record is None:
+    if record is None or counts is not None:
         return route
-    mapping = route.unpermute_mapping if route.indexed_dispatch_offsets is not None else None
-    record.route = replace(route, routed_tokens=None, unpermute_mapping=mapping, count_fence=None)
-    if record.route_only:
-        record.route_state = record.route_signature(weights)
-        if counts is None:
-            record.ids = ids.detach().clone()
-        return route
-    if counts is not None:
-        return replace(route, checkpoint_record=record) if record.guest_snapshot_bytes else route
+    record.route = replace(route, routed_tokens=None, unpermute_mapping=None)
     record.ids = ids.detach().clone()
     record.weight_binding = route.weight_binding
     return replace(route, checkpoint_record=record)

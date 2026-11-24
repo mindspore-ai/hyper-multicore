@@ -43,6 +43,8 @@ class PlacementRequest:
     apply_probs_before_fc2: bool = True
     count_key: tuple[Any, ...] | None = None
     rank_nodes: tuple[int, ...] = ()
+    dispatch_mode: str = "push"
+    transport_engine: str | None = "mte"
 
 
 @dataclass(frozen=True)
@@ -136,4 +138,8 @@ class BasePlanner(ABC):
 
     @abstractmethod
     def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
-        """Return a group-consistent placement or None to keep ordinary routing."""
+        """Return one globally consistent counts and copy table on every EP rank.
+
+        The virtual IDs describe this rank's tokens in original Top-K order.
+        Return None on every rank to keep ordinary routing.
+        """

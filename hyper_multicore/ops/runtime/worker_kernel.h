@@ -138,12 +138,11 @@ class KernelWorkerBase {
                               ? this->vector_num : this->vector_num / 2;
   }
 
-  __aicore__ inline void Process(bool counts_fenced = false) {
+  __aicore__ inline void Process() {
     ReadyHandshakeMeta meta;
     bool has_ready = LoadReadyHandshakeMeta(&meta);
     pull_protocol_ = meta.completion_event != 0;
-    if (counts_fenced && (!has_ready || pull_protocol_)) AscendC::Trap();
-    if (has_ready && !counts_fenced) {
+    if (has_ready) {
       WaitForDeviceReady(meta);
     }
     const auto mode = getDiagnosticMode(this->runtimeConfigPtr);

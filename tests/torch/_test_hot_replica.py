@@ -39,7 +39,7 @@ class SkewPlanner(BasePlanner):
         if request.total_rows == 0 or 4 * ranks * request.maximum_received < 5 * request.total_rows:
             return None
         target = (request.total_rows + ranks - 1) // ranks
-        placement = build_placement(
+        self.last_placement = placement = build_placement(
             request.hidden, request.ids, request.counts_by_source, target, request.rank,
             source_inverse=request.source_inverse,
         )

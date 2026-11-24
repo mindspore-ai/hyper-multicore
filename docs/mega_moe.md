@@ -163,12 +163,14 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
   EP 组内须使用相同值，省略时沿用原策略。
 - BF16 Push 的 `receive_capacity_percent="auto"` 默认按预计净收益选点，已有接收区影响扩容代价。
   显式 `receive_capacity_percent=102` 将各 rank 的实际接收行数限制在 EP 均值的 102%，向上取整到一行。
-  EP 组内使用相同设置。槽位不足或搜索无法找到合规计划时，调用报错。
+  两种设置共用评分和源端配额规则。EP 组内使用相同设置。槽位不足或搜索无法找到合规计划时，调用报错。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   Pull 需要支持按实际行数切分 GET 的 A3 制品。默认放置策略沿用 Push 的配额计算，由执行 rank 从对称源区拉取 token。
-  自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。
-  Reentrant checkpoint 在初次前向保存放置。重算时，EP 各 rank 的 Top-K 顺序、Router 提供的精确计数和重放状态一致后复用该放置。
-  首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。
+  自定义 `BasePlanner` 须在所有 EP rank 返回相同的全局计数和副本表，各 rank 的 virtual IDs 对应本地原始 Top-K 顺序。
+  无需借槽时所有 rank 都返回 `None`。运行时在申请资源前校验标量、槽位范围、源行总数和分配所需的一致性。
+  Reentrant checkpoint 可以沿用 `wrap_checkpoint`。省略 `tokens_per_expert` 时，Top-K 顺序、参数代际和流在全 EP 验证通过后可复用原落位。
+  首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。固定字节预算优先容纳这次调用所需的对齐布局。
+  副本布局超出固定预算时，可以在原属布局符合接收行数要求且放得下的情况下沿用原属布局。两种布局都超预算，或显式行数上限要求使用副本时，调用报错。
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
   A3 EIO MTE 的活跃放置在发布权重前绑定核内 dW。中间梯度带长度取 32 字节的倍数，末带按实际元素数读写。
   单专家矩阵元素数无法按 16 元素对齐时，原独立回传使用的默认 BF16 partial 在窄槽也继续使用。
@@ -179,26 +181,6 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 每次正向按实际路由决定是否启用副本。模型继续持有原属专家参数、优化器状态和 checkpoint，
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
 测量稳态性能前应覆盖代表性的路由和容量。
-
-#### A3 的原行 Indexed Push 与 non-reentrant 重算
-
-在单机 `ascend910_93` EP16/E128、H4096/I1408/K8 的 BF16 EOI MTE Push 上，可以在构造执行器前为组内所有进程设置
-`HMC_A3_INDEXED_PUSH=1`。符合条件的 checkpoint 原前向使用随包构建的有序计数，并从原始输入行发送 token。
-重算沿用已确认的索引和同代际事件。声明的有序计数能力、老库兼容判断及拓扑确认在执行资源初始化时完成。
-普通路由、超出容量场景、重算未命中和 SHMEM 改绑沿用各自的常规路径。
-
-应用可以在最终 Top-K ID 的生产流上，调用 `hyper_multicore.modules.mega_moe.a3_indexed.note_source_ready(topk_ids)`，
-并将同一个张量交给执行器。有这个事件且调用满足 Indexed Push 条件时，原前向可以在旁流上提交计数和交换，
-与主流的权重物化并行。
-
-应用使用 non-reentrant checkpoint 时可以给每个 checkpoint 调用创建一个 `ReplayCheckpoint`，通过
-`context_fn` 分别返回该对象的 `scope(False)` 和 `scope(True)`，并提供真实的参数代际回调。
-`defer_forward_copies=True` 在 A3 BF16 EOI Push 上将两份反向保存延后至重算，同时保持输出的概率加权位置。
-`guest_snapshot_bytes` 设置每 rank 每次调用的 guest 权重快照字节预算，EP 全员通过同次参数代际和完整路由检查后才复用。
-
-重入式 checkpoint 可以用 `wrap_checkpoint(function, parameter_version, route_only=True)` 包装一次 checkpoint 的函数。
-重算以本次输入、概率和权重执行。完整有序 Top-K、显式计数、参数版本、stream 和工作区代际经全 EP 校验后沿用前向路由描述。
-为每次 checkpoint 调用创建独立包装，并使用实际优化器更新代际。
 
 ### 从旧 HotReplica 配置迁移
 

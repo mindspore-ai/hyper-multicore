@@ -29,7 +29,7 @@ from hyper_multicore.modules.hot_replica.pipeline import (
     ReplicaPipeline, _band_layout, fused_replica_slots, supports_pipeline,
 )
 from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, SharedExpertPool
-from hyper_multicore.modules.mega_moe.heap_manager import _HeapManager
+from hyper_multicore.modules.mega_moe.heap_manager import _HeapCapacityError, _HeapManager
 
 
 def _builtin_placement(parent, *, bf16_partials=False):
@@ -67,7 +67,28 @@ def test_serial_replica_widths_use_the_same_workspace_and_bank(home):
             placement = SimpleNamespace(borrowed_capacity=width, receive_capacity=33792, counts_by_source=table)
             binding = owner.bind(hidden, placement, tokens=4096)
             assert binding.pool is bank.return_value and binding.placement is placement
-    bank.assert_called_once_with(hidden, parent, owner, tokens=4096, received=33792, pipeline=True)
+    bank.assert_called_once_with(hidden, parent, owner, tokens=4096, received=33792,
+                                 preferred_receive=None, pipeline=True)
+
+
+@pytest.mark.parametrize("mandatory", [False, True])
+def test_fixed_heap_declines_only_optional_placements(mandatory):
+    """Budget rejection may only return to a home route that respects receive limits."""
+    spec = _a3_push_spec(4, "EOI", 4096, 1408, ep_size=2, top_k=2,
+                         num_experts=8, initial_capacity_factor=1.25, partial_weight_grad_dtype=None)
+    parent = SimpleNamespace(spec=spec)
+    owner = mega_moe_adapter.PlacementResources(parent, {}, True, bf16_partials=True)
+    hidden = torch.empty(1, spec.hidden_size, dtype=torch.bfloat16)
+    placement = SimpleNamespace(borrowed_capacity=1, receive_capacity=16384, counts_by_source=torch.empty(2, 10))
+    with patch.object(mega_moe_adapter, "_get_mega_bank", side_effect=_HeapCapacityError("budget exceeded")) as reserve:
+        if mandatory:
+            with pytest.raises(_HeapCapacityError, match="budget exceeded"):
+                owner.bind(hidden, placement, tokens=8192, mandatory=True)
+        else:
+            assert owner.bind(hidden, placement, tokens=8192) is None
+    reserve.assert_called_once_with(hidden, parent, owner, tokens=8192, received=16384,
+                                    preferred_receive=20480, pipeline=True)
+    assert owner.pool is None and owner.statistics["placements"] == 0
 
 
 @pytest.mark.parametrize(("first", "second"), [("EIO", "EOI"), ("EOI", "EIO")])
@@ -318,7 +339,6 @@ def test_fusion_accepts_an_empty_tail_in_the_padded_copy_table(layout, used, bat
     placement = SimpleNamespace(published_slots=0, borrowed_capacity=geometry.width, copies_by_rank=geometry.owners)
     slots = fused_replica_slots(spec, placement)
     assert slots == (used if used <= 5 else 0)
-    assert mega_moe_adapter._live_slot_extent(placement) == used
     assert fused_replica_slots(spec, placement, bank_experts=max(2 * home, 3 * used)) == used
     if slots:
         pipeline = ReplicaPipeline(SimpleNamespace(local_experts=home, rank=1))

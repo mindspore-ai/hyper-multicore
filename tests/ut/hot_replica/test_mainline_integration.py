@@ -30,6 +30,7 @@ from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.mega_moe import route, resources as resource_module
 from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica._planner.receive import ReplicaCost
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica import bounded_placement
 from hyper_multicore.modules.hot_replica.bounded_placement import _placement_metadata, read_placement_wire
@@ -119,10 +120,10 @@ def test_a3_bf16_pull_requires_runtime_row_get(tmp_path, runtime_rows):
         patch.object(capability, "validate_native_compatibility", return_value=selected),
         patch.object(capability._collective, "exchange", side_effect=lambda value, **_: [value, value]),
     ):
-        assert capability.require_capability(tensor, None)
+        assert capability.require_capability(tensor, None) == (True, (0, 0))
         expected = nullcontext() if runtime_rows else pytest.raises(RuntimeError, match="runtime-row GET support")
         with expected:
-            assert capability.require_capability(tensor, None, dispatch_mode="pull")
+            assert capability.require_capability(tensor, None, dispatch_mode="pull") == (True, (0, 0))
 
 
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
@@ -340,29 +341,6 @@ def test_configuration_mismatch_fails_before_optional_capability_collective():
     heap.assert_not_called()
 
 
-def test_rejected_transfer_cost_reuses_only_identical_count_snapshots():
-    """Reuse negative cost decisions without caching routes or current weights."""
-    spec = SimpleNamespace(
-        architecture=0, ep_size=2, local_experts=4, top_k=2, hidden_size=8,
-        intermediate_size=4, num_cube_cores=24, rank_id=0, apply_probs_before_fc2=True, dispatch_mode="push",
-    )
-    owner = PlacementResources(SimpleNamespace(spec=spec), {}, False)
-    hidden, ids, gathered = torch.empty(2, 8), torch.zeros(2, 2), torch.zeros(2, 11)
-    planner = HotReplicaPlanner()
-    module = "hyper_multicore.modules.hot_replica.planner"
-    with (
-        patch(module + ".placement_benefit_seconds", return_value=1.0) as cost,
-        patch(module + ".build_placement", return_value=None) as build,
-    ):
-        arguments = (hidden, ids, gathered, route._RouteSummary(8, 128, 8), [4, 4], torch.zeros(4), 1)
-        assert owner.select(*arguments, planner=planner, host_rows=[[1, 2, 1, 4]]) is None
-        assert owner.select(*arguments, planner=planner, host_rows=[[1, 2, 1, 4]]) is None
-        assert build.call_count == cost.call_count == 1
-        assert owner.select(*arguments, planner=planner, host_rows=[[1, 2, 1, 3]]) is None
-        assert build.call_count == cost.call_count == 2
-    assert owner.pool is None
-
-
 @pytest.mark.parametrize(("mode", "requested", "expected"), [
     ("push", None, 12), ("push", 8, 8), ("push", 2, 2), ("pull", None, 6),
 ])
@@ -373,8 +351,13 @@ def test_a3_bounded_planning_uses_the_configured_push_slot_budget(mode, requeste
     placement = bounded_placement.BoundedPlacement(spec, replica_slots_per_rank=requested)
     placement.nodes = (0,) * 8 + (1,) * 8
     counts = np.zeros((16, 192), dtype=np.int32)
+    hidden = torch.empty(512, 1)
+    ids = torch.empty(512, spec.top_k, dtype=torch.int32)
     with patch.object(bounded_placement, "select_replica_plan", return_value=None) as build:
-        placement._build("cpu", counts, 3, None, 512, None)
+        for _ in range(2):
+            assert placement.select(hidden, ids, torch.from_numpy(counts), [512*spec.top_k]*spec.ep_size,
+                                    None, ReplicaCost()) is None
+    build.assert_called_once()
     assert build.call_args.args[1].replica_slots_per_rank == expected
 
 
@@ -397,8 +380,7 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
                 record, hidden, ids, probabilities, counts, spec, 15, weight_error=False,
             )
             return route_matches, record.allow_activation
-        record.ids, record.stream = ids.clone(), "s"
-        record.route = SimpleNamespace(indexed_dispatch_offsets=None)
+        record.ids, record.stream, record.route = ids.clone(), "s", object()
         record.weight_binding = binding
         record.inputs = hidden.detach(), probabilities.detach()
         record.input_versions = (0, 0)
@@ -420,79 +402,51 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     binding.prepare_replay.assert_called_once_with()
 
 
-@pytest.mark.parametrize("dispatch_mode", ("push", "pull"))
-@pytest.mark.parametrize("change", ("none", "order", "counts", "omit_counts", "peer", "stream", "parameters"))
-def test_checkpoint_replays_supplied_router_counts(monkeypatch, dispatch_mode, change):
-    """Reuse the forward placement only for identical Router inputs on all ranks."""
+@pytest.mark.parametrize("supplied", [False, True])
+@pytest.mark.parametrize("bad_weight_rank", [None, 0, 1])
+def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, supplied, bad_weight_rank):
+    """An invalid rank votes against reuse, then both ranks reach route validation."""
     from hyper_multicore.modules.mega_moe import invocation
 
-    stream = ["forward"]
-    version = [0]
-    peer_matches = [True]
-    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: stream[0])
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
+    ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    counts = torch.ones(2, dtype=torch.int32)
+    hidden, probs = torch.ones(1, 2), torch.ones(1, 2)
+    weights = (torch.ones(1, 2), torch.ones(1, 2))
+    route_counts = counts if supplied else None
+    for rank in (0, 1):
+        spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, top_k=2)
+        placement = SimpleNamespace(statistics={"route_replays": 0, "route_replay_misses": 0})
+        resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=placement, ensure_capacity=Mock())
+        votes = []
+        def gather(out, local, **_kwargs):
+            votes.append(int(local))
+            out[:] = 0 if supplied else 1
+            if bad_weight_rank is not None:
+                out[bad_weight_rank] = 0
+            assert int(out[rank]) == int(local)
+        def prepare(hidden, *_args, **options):
+            if votes and bad_weight_rank is not None:
+                rows = [[0, 1, 1, 2, 1, 1, 2] for _ in range(2)]
+                rows[bad_weight_rank][2] = route._INVALID_WEIGHT_MASK
+                assert options["autograd_mask"] == rows[rank][2]
+                route._validate_dynamic_rows(rows, spec)
+            return route.PreparedTopKRoute(hidden, ids, counts, counts, object())
 
-    def gather(out, local, **_):
-        out[:] = local
-        if not peer_matches[0]:
-            out[1] = 0
-
-    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
-    spec = SimpleNamespace(precision="bf16", dispatch_mode=dispatch_mode, auto_tokens=True, ep_size=2,
-                           ep_group=object(), num_experts=4)
-    placement = Mock(statistics={"route_replays": 0, "route_replay_misses": 0})
-    placement.uses_placement_wire.return_value = False
-    resources = SimpleNamespace(spec=spec, placement=placement, workspace=Mock(), prepare_auto_workspace=Mock())
-    hidden, probs, weights = torch.ones(2, 4), torch.ones(2, 1), (torch.ones(1), torch.ones(1))
-    ids = torch.arange(4, dtype=torch.int64)[::2].view(2, 1)
-    counts = torch.tensor([1, 9, 0, 9, 1, 9, 0, 9], dtype=torch.int64)[::2]
-    virtual_ids = ids + 4
-    binding = Mock(placement=SimpleNamespace(virtual_ids=virtual_ids))
-    prepared = route.PreparedTopKRoute(hidden, ids, counts, counts, SimpleNamespace(plan_tokens=128),
-                                      maximum_received_slots=4, weight_binding=binding)
-
-    def prepare(*_, select_placement, prepare_workspace, **__):
-        prepare_workspace(128, 4)
-        select_placement()
-        return prepared
-
-    prepare_route = Mock(side_effect=prepare)
-    rematerialize = Mock(return_value=(hidden.clone(), ids.flip(0)))
-    monkeypatch.setattr(invocation, "prepare_topk_route", prepare_route)
-    monkeypatch.setattr(invocation, "_materialize_route_permutation", rematerialize)
-
-    def run(current_ids, current_counts):
-        with invocation.prepare_expert_invocation(hidden, current_ids, probs, current_counts, weights, resources,
-                                                  planner=HotReplicaPlanner()) as result:
-            return result
-
-    wrapped = replay.wrap_checkpoint(run, lambda: version[0], prepare_replay=True)
-    with torch.no_grad():
-        assert wrapped(ids, counts) is prepared
-
-    current_ids = ids.flip(0) if change == "order" else ids.clone()
-    current_counts = counts.roll(1) if change == "counts" else counts.clone()
-    if change == "omit_counts":
-        current_counts = None
-    peer_matches[0] = change != "peer"
-    if change == "stream":
-        stream[0] = "other"
-    if change == "parameters":
-        version[0] += 1
-
-    result = wrapped(current_ids, current_counts)
-    if change == "none":
-        assert result.weight_binding is binding and result.metadata is prepared.metadata
-        assert result.routed_tokens is rematerialize.return_value[0]
-        assert result.unpermute_mapping is rematerialize.return_value[1]
-        rematerialize.assert_called_once_with(hidden, virtual_ids, spec, resources.workspace)
-        assert placement.statistics == {"route_replays": 1, "route_replay_misses": 0}
-        assert prepare_route.call_count == placement.select.call_count == 1
-    else:
-        rematerialize.assert_not_called()
-        assert placement.statistics == {"route_replays": 0, "route_replay_misses": 1}
-        assert prepare_route.call_count == placement.select.call_count == 2
-    binding.prepare_replay.assert_not_called()
-    assert resources.workspace.release.call_count == (2 if dispatch_mode == "pull" else 0)
+        monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+        monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
+        monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda *args: (hidden, ids))
+        tape = replay.ReplayCheckpoint(lambda: 1)
+        with tape.scope(False), invocation.prepare_expert_invocation(hidden, ids, probs, route_counts, weights, resources):
+            pass
+        local_error = rank == bad_weight_rank
+        current = (None, weights[1]) if local_error else weights
+        expected = pytest.raises((TypeError, ValueError), match="expert weights") if bad_weight_rank is not None else nullcontext()
+        with tape.scope(True), expected, invocation.prepare_expert_invocation(
+                hidden, ids, probs, route_counts, current, resources, weight_error=local_error):
+            pass
+        assert len(votes) == 1
+        assert placement.statistics["route_replays"] == (not supplied and bad_weight_rank is None)
 
 
 def test_early_weight_restore_uses_bank_generation(monkeypatch):
@@ -558,7 +512,7 @@ def test_forward_uses_injected_planner_after_count_exchange():
     hidden, ids = torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int32)
     probs, roots = torch.ones(2, 1), (torch.empty(2, 8, 8), torch.empty(2, 4, 8))
     spec = SimpleNamespace(architecture=0, auto_tokens=True, dispatch_mode="push", precision="bf16",
-                           intermediate_size=4, rank_id=0,
+                           intermediate_size=4, rank_id=0, ep_size=2, ep_group=None, transport_engine="mte",
                            num_cube_cores=24, apply_probs_before_fc2=True)
     owner = SimpleNamespace(spec=spec, workspace=Mock(), prepare_auto_workspace=Mock())
     # pylint: disable-next=protected-access
@@ -610,36 +564,36 @@ def test_custom_placement_derives_fused_rows_from_counts(guest_count):
     """Require a producer for every published guest on both EP ranks."""
     copies = torch.tensor([[2, -1], [-1, -1]], dtype=torch.int32)
     counts = torch.tensor([[3, 2, guest_count, 0, 4, 5, 0, 0], [1, 0, 0, 0, 2, 1, 0, 0]])
-    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 12)
+    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 16)
     bound = [
-        _bind_custom_copy_rows(SimpleNamespace(local_experts=2, ep_size=2, rank_id=rank), placement)
+        _bind_custom_copy_rows(SimpleNamespace(local_experts=2, ep_size=2, rank_id=rank, num_experts=4), placement)
         for rank in range(2)
     ]
     if guest_count:
         assert [result.copies_by_rank for result in bound] == [((2, -1), (-1, -1))] * 2
         assert [(result.owner_rows, result.published_slots) for result in bound] == [((4, 2), 1), ((6, 6), 0)]
     else:
-        assert all(not result.copies_by_rank for result in bound)
+        assert bound == [None, None]
 
 
 def test_a3_eio_custom_placement_keeps_active_local_slots_and_ignores_idle_guests():
     """Only real guest producers contribute to the fused return schedule."""
     copies = torch.tensor([[0, 3], [-1, -1]], dtype=torch.int32)
     counts = torch.tensor([[3, 2, 3, 0, 4, 5, 0, 0], [1, 0, 0, 0, 2, 1, 0, 0]])
-    spec = SimpleNamespace(local_experts=2, ep_size=2, rank_id=0)
-    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 12)
-    bound = _bind_custom_copy_rows(spec, placement, fused_return=True)
+    spec = SimpleNamespace(local_experts=2, ep_size=2, rank_id=0, num_experts=4)
+    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 16)
+    bound = _bind_custom_copy_rows(spec, placement)
     assert bound.copies_by_rank == ((0, -1), (-1, -1))
     assert bound.published_slots == 1
     assert bound.owner_rows == (4, 2)
     counts[0, 2] = 0
-    assert _bind_custom_copy_rows(spec, placement, fused_return=True) is None
+    assert _bind_custom_copy_rows(spec, placement) is None
 
 
 def test_checkpoint_request_is_training_with_automatic_capacity():
     """Request a training plan even during the no-grad checkpoint forward."""
     spec = SimpleNamespace(architecture=0, rank_id=0, intermediate_size=4, num_cube_cores=24,
-                           apply_probs_before_fc2=True, dispatch_mode="push")
+                           apply_probs_before_fc2=True, dispatch_mode="push", transport_engine="mte")
     owner = SimpleNamespace(spec=spec)
     resources = PlacementResources(owner, {}, False)
     ids = torch.tensor([[0]])
@@ -650,91 +604,38 @@ def test_checkpoint_request_is_training_with_automatic_capacity():
     assert request.ordinary_receive_capacity is None
 
 
-@pytest.mark.parametrize("home", [4, 5, 8, 12, 16])
 @pytest.mark.parametrize("batch_experts", [False, True])
-def test_a3_saved_route_uses_shared_quota_geometry(home, batch_experts):
-    """Use the same quotas for the policy, checkpoint and batch lowering."""
-    spec = SimpleNamespace(
-        architecture=2201, batch_experts=batch_experts, dispatch_mode="push", transport_engine="mte",
-        ep_size=2, rank_id=0, num_experts=2 * home, local_experts=home, hidden_size=32, intermediate_size=64,
-        top_k=2, num_cube_cores=24, apply_probs_before_fc2=True, expert_weight_layout="EOI",
-        partial_weight_grad_dtype=None,
-    )
-    owner = SimpleNamespace(spec=spec)
-    planner = HotReplicaPlanner()
-    resources = PlacementResources(owner, {
-        "planner_key": (HotReplicaPlanner.__module__, HotReplicaPlanner.__qualname__),
-    }, False, bf16_partials=True)
-    resources.bounded.nodes = (0, 0)
-    ids = torch.arange(2, dtype=torch.int32).expand(2048, 2).contiguous()
-    source_counts = [1, 2048, 12, 2048, 2048] + [0] * (2 * home - 2)
-    wire = torch.tensor([source_counts] * 2, dtype=torch.int32)
-    hidden = torch.empty(2048, 32, dtype=torch.bfloat16)
-    summary = route._RouteSummary(8192, 2048, 8192)
-    inverse = ids.flatten().argsort(stable=True).argsort().view_as(ids)
-    rows = wire.tolist()
-    with (
-        patch("hyper_multicore.modules.hot_replica.planner.placement_benefit_seconds",
-              side_effect=lambda _before, after, *_args, **_kwargs: (8192 - after) * 1e-6),
-        patch.object(resources, "bind") as bind,
-        patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True),
-    ):
-        request = resources.request(hidden, ids, wire, summary, [4096, 4096], inverse, 12, host_rows=rows)
-        expected = planner.plan(request)
-        with patch.object(planner, "plan", side_effect=AssertionError("generic planner called")):
-            resources.select(hidden, ids, wire, summary, [4096, 4096], inverse, 12, planner=planner,
-                             checkpointing=not batch_experts, host_rows=rows)
-    actual = bind.call_args.args[1]
-    assert actual is not None and expected is not None
-    torch.testing.assert_close(actual.virtual_ids, expected.virtual_ids)
-    torch.testing.assert_close(actual.counts_by_source, expected.counts_by_source)
-    torch.testing.assert_close(actual.copies, expected.copies)
-    assert (actual.receive_capacity, actual.transfer_experts) == (
-        expected.receive_capacity, expected.transfer_experts,
-    )
-    assert resources.bounded.geometry is None
-    assert bind.call_args.kwargs["fused"]
+def test_a3_wide_receive_limit_uses_the_same_plan_as_auto(batch_experts):
+    """Keep the same geometry in training, checkpoint and nonbinding-cap calls."""
+    spec = MegaMoeSpec(128, 4096, 1408, 8, 2, 1.25, 384, 2, None, 0, 24,
+                       expert_weight_layout="EOI", batch_experts=batch_experts, auto_tokens=True)
+    parent = SimpleNamespace(spec=spec, workspace=SimpleNamespace(capacity_floor=384))
+    tokens = 12288
+    hidden = torch.empty(1, spec.hidden_size, dtype=torch.bfloat16).expand(tokens, -1)
+    ids = torch.arange(2, dtype=torch.int32).expand(tokens, -1).contiguous()
+    counts = [tokens, tokens, 0, 0, 0, 0, 0, 0]
+    wire = torch.tensor([[0, tokens, 13, *counts]]*2, dtype=torch.int32)
+    snapshot = read_placement_wire(wire, spec, parent.workspace, None)
 
-
-@pytest.mark.parametrize("changed", [None, "weights", "workspace"])
-def test_route_only_checkpoint_rejects_changed_geometry_and_keeps_current_inputs(monkeypatch, changed):
-    """Use the saved geometry only when weights and allocations remain compatible."""
-    from hyper_multicore.modules.mega_moe import invocation
-
-    spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=False)
-    workspace = SimpleNamespace(wait_for_reuse=Mock())
-    placement = SimpleNamespace(statistics={"route_replays": 0, "route_replay_misses": 0})
-    resources = SimpleNamespace(spec=spec, workspace=workspace, placement=placement,
-                                heap_manager=SimpleNamespace(epoch=0), _closed=False, ensure_capacity=Mock())
-    ids = torch.tensor([[0, 1]], dtype=torch.int32)
-    counts = torch.ones(2, dtype=torch.int32)
-    probs = torch.ones((1, 2))
-    weights = (torch.ones((1, 2)), torch.ones((1, 2)))
-    original = torch.zeros((1, 2))
-    current = torch.ones_like(original).requires_grad_()
-    metadata = object()
-
-    def prepare(hidden, *args, **kwargs):
-        return route.PreparedTopKRoute(hidden, ids, counts, counts, metadata)
-
-    built = Mock(side_effect=prepare)
-    monkeypatch.setattr(invocation, "prepare_topk_route", built)
-    monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda hidden, *args: (hidden, ids))
-    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
-    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", lambda out, flag, **_: out.copy_(flag.expand_as(out)))
-    tape = replay.ReplayCheckpoint(lambda: 1, route_only=True)
-    with tape.scope(False), invocation.prepare_expert_invocation(original, ids, probs, counts, weights, resources):
-        pass
-    if changed == "weights":
-        weights[0].add_(1)
-    if changed == "workspace":
-        resources.heap_manager.epoch += 1
-    with tape.scope(True), invocation.prepare_expert_invocation(current, ids, probs, counts, weights, resources) as result:
-        assert result.routed_tokens is current
-        assert result.checkpoint_record is None
-    assert placement.statistics["route_replays"] == (changed is None)
-    assert placement.statistics["route_replay_misses"] == (changed is not None)
-    assert built.call_count == (1 if changed is None else 2)
+    def select(percent, checkpointing, mask):
+        planner = HotReplicaPlanner(receive_capacity_percent=percent)
+        options = {"planner_key": (type(planner).__module__, type(planner).__qualname__),
+                   "receive_capacity_percent": planner.receive_capacity_percent}
+        resources = PlacementResources(parent, options, False, bf16_partials=True, rank_nodes=(0, 0))
+        with (
+            patch.object(resources, "bind", side_effect=lambda _, placement, **_kwargs: placement),
+            patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=checkpointing),
+        ):
+            return resources.select(hidden, ids, wire, snapshot.summary, snapshot.source_rows, None,
+                                    mask, planner=planner, snapshot=snapshot)
+    auto = select("auto", False, 13)
+    assert auto is not None
+    for percent, checkpointing, mask in (("auto", True, 0), (200, False, 13), (200, True, 0)):
+        placed = select(percent, checkpointing, mask)
+        assert placed is not None
+        assert (placed.receive_capacity, placed.borrowed_capacity) == (auto.receive_capacity, auto.borrowed_capacity)
+        for field in ("virtual_ids", "counts_by_source", "copies"):
+            torch.testing.assert_close(getattr(placed, field), getattr(auto, field))
 
 
 def test_manifest_checks_custom_policy_settings():

@@ -18,7 +18,6 @@
 #include "log/log.h"
 #include "../op_kernel/hyper_mega_moe_tiling_key.h"
 #include "hyper_mega_moe_tiling.h"
-#include "common/mega_moe/a3_indexed_push.h"
 
 namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
@@ -74,14 +73,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   const int64_t ep = *epAttr;
   const int64_t expertNum = *expertNumAttr;
   const int64_t hiddenSize = *hiddenSizeAttr;
-  const int64_t encodedSeq = *seqSizeAttr;
-  if (encodedSeq == INT64_MIN) return ge::GRAPH_FAILED;
-  const bool indexed = encodedSeq < 0;
-  using namespace MulticoreMoE;
-  const int64_t marker = indexed ? -encodedSeq : 0;
-  const int64_t seqSize = indexed ? marker >> A3_INDEXED_SOURCE_BITS : encodedSeq;
-  const int64_t sourceRows = marker & A3_INDEXED_SOURCE_MASK;
-  const bool routeFenced = (marker & A3_INDEXED_ROUTE_FENCED) != 0;
+  const int64_t seqSize = *seqSizeAttr;
   if (rankId < 0 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 || hiddenSize <= 0 || seqSize <= 0) {
     OP_LOGE(context->GetNodeName(),
             "Invalid topology: rankId=%ld, ep=%ld, expertNum=%ld, hiddenSize=%ld, seqSize=%ld.", rankId, ep,
@@ -108,34 +100,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   }
   tiling.set_runtimeConfigBytes(runtimeBytes);
   tiling.set_eventCounterBytes(eventBytes);
-  if (indexed) {
-    auto indices = context->GetInputShape(3);
-    auto source = context->GetInputShape(2);
-    OP_CHECK_NULL_WITH_CONTEXT(context, indices);
-    OP_CHECK_NULL_WITH_CONTEXT(context, source);
-    const auto expectedElements = sourceRows * hiddenSize;
-    const auto expectedWords = expertNum + sourceRows * A3_INDEXED_TOP_K / 2;
-    const auto sourceStorage = source->GetStorageShape().GetShapeSize();
-    const auto sourceOrigin = source->GetOriginShape().GetShapeSize();
-    const auto indexStorage = indices->GetStorageShape().GetShapeSize();
-    const auto indexOrigin = indices->GetOriginShape().GetShapeSize();
-    const bool sourceFits = sourceStorage >= expectedElements &&
-                            (sourceStorage == expectedElements || sourceOrigin == expectedElements);
-    const bool indexFits = indexStorage >= expectedWords &&
-                           (indexStorage == expectedWords || indexOrigin == expectedWords);
-    if (input0DType != ge::DT_BF16 || ep != 16 || expertNum < 128 || expertNum > 256 ||
-        hiddenSize != 4096 || sourceRows <= 0 || sourceRows > A3_INDEXED_MAX_TOKENS ||
-        sourceRows > seqSize || !sourceFits || !indexFits) {
-      OP_LOGE(context->GetNodeName(),
-              "Invalid A3 indexed dispatch: dtype=%d ep=%ld experts=%ld hidden=%ld tokens=%ld plan=%ld "
-              "source=%ld/%ld (expected %ld) offsets=%ld/%ld (expected %ld).",
-              static_cast<int>(input0DType), ep, expertNum, hiddenSize, sourceRows, seqSize,
-              sourceStorage, sourceOrigin, expectedElements, indexStorage, indexOrigin, expectedWords);
-      return ge::GRAPH_FAILED;
-    }
-  }
-  tiling.set_indexedSourceRows(sourceRows);
-  tiling.set_indexedRouteFenced(routeFenced);
 
   auto rawTilingData = context->GetRawTilingData();
   OP_CHECK_NULL_WITH_CONTEXT(context, rawTilingData);

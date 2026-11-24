@@ -24,7 +24,7 @@ import numpy as np
 
 from ._dispatch import ReplicaCapacityError, _materialize
 from .capacity import ExpertReplicaConfig, _integer
-from .native_host import prefix_candidates, select_prefix
+from .native_host import select_prefix
 from .topology import _validate_rank_nodes
 
 
@@ -48,47 +48,31 @@ class ReplicaCost:
     phases: tuple[tuple[float, float], ...] = ()
     compute: float = 1.
 
-    @classmethod
-    def from_benefit(cls, estimate, peak, mean):
-        """Express an affine compute/staging estimate in the same units as the rank scores."""
-        one = estimate(mean, 1)
-        per_row = one - estimate(mean + 1, 1)
-        edge = max(0., one - estimate(mean, 2))
-        if per_row > 0:
-            edge_rows = edge / per_row
-            return cls(peak - mean - one / per_row - edge_rows, ((edge_rows, edge_rows),))
-        return cls(-one - edge, ((edge, edge),), 0.)
-
     def transfer(self, sent, received):
         return sum(max(owner * sent, guest * received) for owner, guest in self.phases)
 
-    def keep_home(self, peak, total, ranks, percent, score=None, resident=None):
-        """Skip count readback only if even perfect balance cannot repay activation."""
-        limit = receive_limit(percent, total, ranks)
+    def keep_home(self, peak, total, ranks, *, limit=None, resident=None):
+        """Skip the search when even perfect balance cannot repay activation."""
         if limit is not None and peak > limit:
             return False
         mean = (total + ranks - 1) // ranks
         if resident is not None and mean <= resident < peak:
             return False
-        return peak == mean or (score(mean, 0) <= 0 if score else (peak - mean) * self.compute <= self.setup)
+        return (peak - mean) * self.compute <= self.setup
 
 
-def bf16_cost(spec, training):
+def bf16_cost(hidden_size, intermediate_size, cube_cores, training, *, dispatch_mode="push", transport_engine="mte"):
     """Translate exposed latency and expert bytes to rows at the given GEMM geometry.
 
     Effective rates come from the EP16 PanGu BF16 alternating-route calibration.
     FP32 return accumulates at the owner; its guest only publishes the partial.
     """
-    if spec.architecture == 3510:
-        cube_flops, exposed_bandwidth, setup_seconds = 6.2e12, 2.8e10, .001
-    else:
-        cube_flops, exposed_bandwidth, setup_seconds = 7.4e12, 5.9e11, .0035
-        if (spec.architecture == 2201 and getattr(spec, "dispatch_mode", None) == "push"
-                and getattr(spec, "transport_engine", None) == "mte"):
-            # EP16 Push Trainer calibration changes the exposed endpoint cost independently of topology.
-            exposed_bandwidth /= 8
-    area = spec.hidden_size * spec.intermediate_size
-    rows_per_second = spec.num_cube_cores * cube_flops / (6 * area)
+    cube_flops, exposed_bandwidth, setup_seconds = 7.4e12, 5.9e11, .0035
+    if dispatch_mode == "push" and transport_engine == "mte":
+        # EP16 Push Trainer calibration changes the exposed endpoint cost independently of topology.
+        exposed_bandwidth /= 8
+    area = hidden_size * intermediate_size
+    rows_per_second = cube_cores * cube_flops / (6 * area)
     edge = rows_per_second * (6 * area / exposed_bandwidth)
     phases = ((edge / 2, edge / 2), (edge / 2, edge / 4)) if training else ((edge, edge),)
     return ReplicaCost(rows_per_second * setup_seconds, phases)
@@ -120,11 +104,6 @@ def _tail(remaining, wanted, room, quantum):
 
 def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices, source_counts):
     """Drain the busiest owner first. Intermediate equal-peak moves can clear a plateau."""
-    native = prefix_candidates(totals, config.ep_size, config.replica_slots_per_rank, quantum, target,
-                               nodes, multiplier, prices.phases, source_counts)
-    if native is not None:
-        yield from native
-        return
     after = loads.copy()
     remaining = list(totals)
     sent, received = [0.] * len(loads), [0.] * len(loads)
