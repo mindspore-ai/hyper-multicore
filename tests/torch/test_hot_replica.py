@@ -47,4 +47,4 @@ def test_placement_edge_cases(monkeypatch, tmp_path, ranks):
     monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         run_multicore_case(str(Path(__file__).with_name("_test_hot_replica_edge_cases.py")),
-                           "main", num_proc=ranks, timeout=600)
+                           "test_placement_edge_cases", num_proc=ranks, timeout=600)

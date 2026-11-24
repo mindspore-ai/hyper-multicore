@@ -120,7 +120,7 @@ def _configurations(ranks):
     return [c for c in configs if len(c) == 5 and c[4] == mode] if mode else configs
 
 
-def main() -> None:
+def test_placement_edge_cases() -> None:
     """Run every requested geometry and graph lifecycle on the assigned NPU ranks."""
     rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(rank)
@@ -199,4 +199,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    test_placement_edge_cases()
