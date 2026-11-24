@@ -24,7 +24,7 @@ import torch_npu
 
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.experimental import MegaMoeTuningOptions
-from hyper_multicore.scheduler.runtime import RUNTIME_HEADER_BYTES
+from hyper_multicore.scheduler.runtime import RUNTIME_HEADER_BYTES, TASK_DESC_SIZE
 from tests.common.multicore._mega_moe_utils import (
     memory_sample,
     start_shmem_lifetime,
@@ -40,7 +40,7 @@ def _runtime_metadata(tensor: torch.Tensor) -> dict:
     """Inspect the actual uploaded image, including the last queued descriptor."""
     image = tensor.cpu().numpy().tobytes()
     tasks, _, capacity, events = struct.unpack_from("<4I", image)
-    counts_offset = RUNTIME_HEADER_BYTES + events * 20 + capacity * 576
+    counts_offset = RUNTIME_HEADER_BYTES + events * 20 + capacity * TASK_DESC_SIZE
     counts = struct.unpack_from("<3i", image, counts_offset)
     queues = [
         struct.unpack_from(f"<{count}i", image, counts_offset + 16 + index * capacity * 4)
@@ -49,7 +49,7 @@ def _runtime_metadata(tensor: torch.Tensor) -> dict:
     last_id = max(task_id for queue in queues for task_id in queue)
     assert tasks > FORMER_TASK_LIMIT, f"actual task count {tasks} must exceed {FORMER_TASK_LIMIT}."
     assert last_id > FORMER_TASK_LIMIT, f"queue must execute past {FORMER_TASK_LIMIT}, got {last_id}."
-    task_types = [struct.unpack_from("<I", image, RUNTIME_HEADER_BYTES + events * 4 + task_id * 576)[0]
+    task_types = [struct.unpack_from("<I", image, RUNTIME_HEADER_BYTES + events * 4 + task_id * TASK_DESC_SIZE)[0]
                   for task_id in range(FORMER_TASK_LIMIT, last_id)]
     assert any(task_types), "queued descriptors above the old bound must include compute work."
     return {"task_num": tasks, "capacity": capacity, "event_capacity": events,

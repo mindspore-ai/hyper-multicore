@@ -21,6 +21,7 @@ from typing import Any
 
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.scheduler.config import (
+    ACTIVATION_TASKS,
     TaskType,
 )
 from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
@@ -160,7 +161,7 @@ def _resolve_alltoall(context: L1TensorViewContext) -> L1TensorView:
 def _resolve_probability_workspace(context: L1TensorViewContext) -> L1TensorView:
     """Capture only the stable local scalar slice used or produced by this task."""
     task_type = int(context.task_desc.task_type)
-    if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
+    if task_type in ACTIVATION_TASKS:
         source_row, rows = _swiglu_rows(context)
     else:
         source_row, rows, _ = _alltoall_rows(context)
@@ -187,7 +188,7 @@ def resolve_mega_moe_l1_tensor_view(context: Any) -> L1TensorView:
     task_type = int(context.task_desc.task_type)
     if task_type == TaskType.TASK_GROUPED_MATMUL:
         return _resolve_grouped_matmul(context)
-    if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
+    if task_type in ACTIVATION_TASKS:
         return _resolve_swiglu(context)
     if task_type in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
         return _resolve_alltoall(context)

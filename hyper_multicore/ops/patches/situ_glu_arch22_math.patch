@@ -1,0 +1,118 @@
+--- a/activation/situ_glu/op_kernel/situ_glu.hpp
++++ b/activation/situ_glu/op_kernel/situ_glu.hpp
+@@ -70,6 +70,8 @@
+ 
+     /* ascendc variable */
+     TPipe* pipe_ = nullptr;
++    TBuf<TPosition::VECCALC> scaledInput_;
++    TBuf<TPosition::VECCALC> mathScratch_;
+     TQue<QuePosition::VECIN, DB_BUFFER> xQueue_;
+     TQue<QuePosition::VECOUT, 1> yQueue_;
+     TBuf<TPosition::VECCALC> tmpBuf1_;
+@@ -112,6 +114,10 @@
+     dimH_ = dim2H_ / SWI_FACTOR;
+     isLongH_ = tl_->isLongH;
+     ubMaxPair_ = tl_->ubMaxPair;
++    // arch22 high-level math requires nonoverlapping tensors and task-local scratch.
++    const auto mathBytes = AlignBytes(ubMaxPair_ * sizeof(float));
++    pipe_->InitBuffer(scaledInput_, mathBytes);
++    pipe_->InitBuffer(mathScratch_, mathBytes);
+     beta_ = tl_->beta;
+     linearBeta_ = tl_->linearBeta;
+     activateLeft_ = tl_->activateLeft;
+@@ -264,22 +270,22 @@
+                                                 LocalTensor<float> tmp2, LocalTensor<float> y, int64_t n)
+ {
+     // situ_a = beta * tanh(gate/beta) * sigmoid(gate)
+-    Muls(tmp1, gate, 1.0f / beta_, n);
+-    PipeBarrier<PIPE_V>();
+-    Tanh(tmp1, tmp1, n);
++    Muls(scaledInput_.Get<float>(), gate, 1.0f / beta_, n);
++    PipeBarrier<PIPE_V>();
++    Tanh(tmp1, scaledInput_.Get<float>(), mathScratch_.Get<uint8_t>(), n);
+     PipeBarrier<PIPE_V>();
+     Muls(tmp1, tmp1, beta_, n);
+     PipeBarrier<PIPE_V>();
+ 
+-    Sigmoid(tmp2, gate, n);
++    Sigmoid(tmp2, gate, mathScratch_.Get<uint8_t>(), n);
+     PipeBarrier<PIPE_V>();
+     Mul(y, tmp1, tmp2, n);
+     PipeBarrier<PIPE_V>();
+ 
+     if (linearBeta_ > 0.0f) {
+-        Muls(tmp1, up, 1.0f / linearBeta_, n);
+-        PipeBarrier<PIPE_V>();
+-        Tanh(tmp1, tmp1, n);
++        Muls(scaledInput_.Get<float>(), up, 1.0f / linearBeta_, n);
++        PipeBarrier<PIPE_V>();
++        Tanh(tmp1, scaledInput_.Get<float>(), mathScratch_.Get<uint8_t>(), n);
+         PipeBarrier<PIPE_V>();
+         Muls(tmp1, tmp1, linearBeta_, n);
+         PipeBarrier<PIPE_V>();
+--- a/activation/situ_glu_grad/op_kernel/situ_glu_grad.hpp
++++ b/activation/situ_glu_grad/op_kernel/situ_glu_grad.hpp
+@@ -86,6 +86,8 @@
+     GlobalTensor<T> gradXGm_;
+ 
+     TPipe* pipe_ = nullptr;
++    TBuf<TPosition::VECCALC> scaledInput_;
++    TBuf<TPosition::VECCALC> mathScratch_;
+     TQue<QuePosition::VECIN, DB_BUFFER> gradYQueue_;
+     TQue<QuePosition::VECIN, DB_BUFFER> xQueue_;
+     TQue<QuePosition::VECOUT, 1> gradXQueue_;
+@@ -130,6 +132,10 @@
+     dimH_ = dim2H_ / SWI_FACTOR;
+     isLongH_ = tl_->isLongH;
+     ubMaxPair_ = tl_->ubMaxPair;
++    // arch22 high-level math requires nonoverlapping tensors and task-local scratch.
++    const auto mathBytes = AlignBytes(ubMaxPair_ * sizeof(float));
++    pipe_->InitBuffer(scaledInput_, mathBytes);
++    pipe_->InitBuffer(mathScratch_, mathBytes);
+     beta_ = tl_->beta;
+     linearBeta_ = tl_->linearBeta;
+     activateLeft_ = tl_->activateLeft;
+@@ -314,13 +320,13 @@
+                                                     int64_t n)
+ {
+     // 1. t = tanh(gate / beta)
+-    Muls(tmp1, gate, 1.0f / beta_, n);
+-    PipeBarrier<PIPE_V>();
+-    Tanh(tmp1, tmp1, n);
++    Muls(scaledInput_.Get<float>(), gate, 1.0f / beta_, n);
++    PipeBarrier<PIPE_V>();
++    Tanh(tmp1, scaledInput_.Get<float>(), mathScratch_.Get<uint8_t>(), n);
+     PipeBarrier<PIPE_V>();
+ 
+     // 2. s = sigmoid(gate)
+-    Sigmoid(tmp2, gate, n);
++    Sigmoid(tmp2, gate, mathScratch_.Get<uint8_t>(), n);
+     PipeBarrier<PIPE_V>();
+     // tmp2 = s = sigmoid(gate)
+ 
+@@ -333,9 +339,9 @@
+ 
+     // 4. up_prime
+     if (linearBeta_ > 0.0f) {
+-        Muls(tmp4, up, 1.0f / linearBeta_, n);
+-        PipeBarrier<PIPE_V>();
+-        Tanh(tmp4, tmp4, n);
++        Muls(scaledInput_.Get<float>(), up, 1.0f / linearBeta_, n);
++        PipeBarrier<PIPE_V>();
++        Tanh(tmp4, scaledInput_.Get<float>(), mathScratch_.Get<uint8_t>(), n);
+         PipeBarrier<PIPE_V>();
+         Muls(tmp4, tmp4, linearBeta_, n);
+         PipeBarrier<PIPE_V>();
+@@ -396,9 +402,9 @@
+     // 8. grad_up
+     if (linearBeta_ > 0.0f) {
+         // t_u = tanh(up / linear_beta) in gradY (reused)
+-        Muls(gradY, up, 1.0f / linearBeta_, n);
+-        PipeBarrier<PIPE_V>();
+-        Tanh(gradY, gradY, n);
++        Muls(scaledInput_.Get<float>(), up, 1.0f / linearBeta_, n);
++        PipeBarrier<PIPE_V>();
++        Tanh(gradY, scaledInput_.Get<float>(), mathScratch_.Get<uint8_t>(), n);
+         PipeBarrier<PIPE_V>();
+         // gradY = t_u
+ 

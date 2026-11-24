@@ -55,6 +55,10 @@ __aicore__ inline bool IsProbabilityOperandValid(const TaskDesc &task, bool weig
          aux.input_position == probability_position;
 }
 
+__aicore__ inline bool IsSituGluTask(const TaskDesc &task) {
+  return task.task_type == TaskType::TASK_SITU_GLU || task.task_type == TaskType::TASK_SITU_GLU_GRAD;
+}
+
 __aicore__ inline bool IsActivationTaskOptionsValid(const TaskDesc &task, uint32_t probability_position) {
   constexpr uint32_t allowed = static_cast<uint32_t>(SwiGluTaskIteration::PERSISTENT_LANES) |
       static_cast<uint32_t>(SwiGluClampPosition::AFTER_SILU) |
@@ -62,7 +66,9 @@ __aicore__ inline bool IsActivationTaskOptionsValid(const TaskDesc &task, uint32
   if ((task.extra_value_1 & ~allowed) != 0) return false;
   if ((GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU) && task.extra_value_0 == 0) return false;
   const bool weighted = GetMegaMoeActivationWeighting(task) == MegaMoeActivationWeighting::BEFORE_FC2;
-  const uint32_t inputs = task.task_type == TaskType::TASK_SWI_GLU ? 1U : 2U;
+  if (IsSituGluTask(task) && (task.extra_value_0 != 0 || (task.extra_value_1 & 1U) != 0)) return false;
+  const bool forward = task.task_type == TaskType::TASK_SWI_GLU || task.task_type == TaskType::TASK_SITU_GLU;
+  const uint32_t inputs = forward ? 1U : 2U;
   return IsProbabilityOperandValid(task, weighted, inputs, probability_position);
 }
 
@@ -87,6 +93,8 @@ __aicore__ inline bool IsMoeTaskOptionsValid(const TaskDesc &task, uint32_t prob
              task.num_inputs == 3 && task.num_outputs == 1;
     case TaskType::TASK_SWI_GLU:
     case TaskType::TASK_SWI_GLU_GRAD:
+    case TaskType::TASK_SITU_GLU:
+    case TaskType::TASK_SITU_GLU_GRAD:
       return IsActivationTaskOptionsValid(task, probability_position);
     case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
     case TaskType::TASK_SHMEM_GET_MEM:

@@ -74,6 +74,13 @@ class SiTUGLUParameters:
         if self.linear_beta > 0:
             _check_positive_float32("linear_beta", self.linear_beta)
 
+    def validate_bf16(self) -> None:
+        """Check the FP32 reciprocal used by the BF16 device implementation."""
+        min_normal = 2.0 ** -126
+        for name, bound in (("beta", self.beta), ("linear_beta", self.linear_beta)):
+            if bound > 0 and not min_normal <= bound <= 1.0 / min_normal:
+                raise ValueError(f"SiTUGLU {name} and its reciprocal must be normal FP32 values")
+
 
 @dataclass(frozen=True)
 class MegaMoeNumericsOptions:

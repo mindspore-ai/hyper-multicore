@@ -18,8 +18,8 @@ from typing import Any
 
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.tasks.alltoall import ShmemTaskPartition, ShmemTransferEngine
-from hyper_multicore.scheduler.config import TaskType
-from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
+from hyper_multicore.scheduler.config import ACTIVATION_TASKS, SITU_TASKS, TaskType
+from hyper_multicore.tasks.activation import SwiGluClampPosition, ActivationTaskIteration
 from .probability_abi import PROBABILITY_POSITION_BACKWARD, PROBABILITY_POSITION_FORWARD, ProbabilityLayout
 
 
@@ -36,19 +36,21 @@ class MegaMoeTransportPayload(IntEnum):
     TOKENS_WITH_PROBABILITY_GRADIENTS = 8
 
 
-_ACTIVATION_MASK = int(SwiGluTaskIteration.PERSISTENT_LANES | SwiGluClampPosition.AFTER_SILU
+_ACTIVATION_MASK = int(ActivationTaskIteration.PERSISTENT_LANES | SwiGluClampPosition.AFTER_SILU
                        | MegaMoeActivationWeighting.BEFORE_FC2)
 _TRANSPORT_MASK = int(ShmemTaskPartition.RUNTIME_ROWS | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITIES
                       | MegaMoeTransportPayload.TOKENS_WITH_PROBABILITY_GRADIENTS | ShmemTransferEngine.UDMA)
 _GMM_MODES = frozenset(GroupedMatmulTaskMode)
 _ACTIVATION_PORT = {TaskType.TASK_SWI_GLU: PROBABILITY_POSITION_FORWARD,
-                    TaskType.TASK_SWI_GLU_GRAD: PROBABILITY_POSITION_BACKWARD}
+                    TaskType.TASK_SWI_GLU_GRAD: PROBABILITY_POSITION_BACKWARD,
+                    TaskType.TASK_SITU_GLU: PROBABILITY_POSITION_FORWARD,
+                    TaskType.TASK_SITU_GLU_GRAD: PROBABILITY_POSITION_BACKWARD}
 
 
 def activation_weighting(task: Any) -> MegaMoeActivationWeighting:
     """Decode activation options only for activation tasks."""
-    if task.task_type not in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
-        raise ValueError("activation weighting requires a SwiGLU task")
+    if task.task_type not in ACTIVATION_TASKS:
+        raise ValueError("activation weighting requires an activation task")
     return MegaMoeActivationWeighting(task.extra_value_1 & 4)
 
 
@@ -60,6 +62,13 @@ def transport_payload(task: Any) -> MegaMoeTransportPayload:
 
 
 def _activation_options(task: Any) -> bool:
+    """Validate activation task options and return whether routing weights are applied before FC2."""
+    if task.task_type in SITU_TASKS:
+        if task.extra_value_0 or task.extra_value_1 & SwiGluClampPosition.AFTER_SILU:
+            raise ValueError("SiTUGLU cannot carry clipping options")
+        expected = 18 if task.task_type == TaskType.TASK_SITU_GLU else 24
+        if task.tiling_data_position != expected or task.tiling_data_offset != 0:
+            raise ValueError("invalid SiTUGLU tiling location")
     if task.extra_value_1 & ~_ACTIVATION_MASK:
         raise ValueError(f"invalid activation flags {task.extra_value_1:#x}")
     if task.extra_value_1 & SwiGluClampPosition.AFTER_SILU and task.extra_value_0 == 0:
@@ -93,7 +102,8 @@ def validate_task_options(task: Any) -> None:
     if kind == TaskType.TASK_GROUPED_MATMUL:
         if task.extra_value_1 not in _GMM_MODES or task.num_inputs != 3 or task.num_outputs != 1:
             raise ValueError("invalid grouped matmul task mode or operands")
-    elif kind in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
-        _validate_operands(task, _activation_options(task), 1 if kind == TaskType.TASK_SWI_GLU else 2)
+    elif kind in ACTIVATION_TASKS:
+        forward = _ACTIVATION_PORT[kind] == PROBABILITY_POSITION_FORWARD
+        _validate_operands(task, _activation_options(task), 1 if forward else 2)
     elif kind in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
         _validate_operands(task, _transport_options(task), 4)

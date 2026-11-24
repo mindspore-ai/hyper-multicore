@@ -1,0 +1,46 @@
+--- a/activation/situ_glu/op_kernel/situ_glu.hpp
++++ b/activation/situ_glu/op_kernel/situ_glu.hpp
+@@ -47,7 +47,7 @@
+ 
+ public:
+     __aicore__ inline SituGluBase(TPipe* pipe) { pipe_ = pipe; };
+-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, const SituGluTilingData* tilingData);
++    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, const SituGluTilingData* tilingData, int32_t logicalIndex = -1);
+     __aicore__ inline int64_t AlignBytes(int64_t number);
+     __aicore__ inline void Process();
+     __aicore__ inline void CalTilingParam();
+@@ -103,8 +103,9 @@
+ };
+ 
+ template <typename T>
+-__aicore__ inline void SituGluBase<T>::Init(GM_ADDR x, GM_ADDR y, const SituGluTilingData* tilingData)
+-{
++__aicore__ inline void SituGluBase<T>::Init(GM_ADDR x, GM_ADDR y, const SituGluTilingData* tilingData, int32_t logicalIndex)
++{
++    blockIdx_ = logicalIndex < 0 ? GetBlockIdx() : logicalIndex;
+     tl_ = tilingData;
+     dimBatchSize_ = tl_->dimBatchSize;
+     dim2H_ = tl_->dim2H;
+--- a/activation/situ_glu_grad/op_kernel/situ_glu_grad.hpp
++++ b/activation/situ_glu_grad/op_kernel/situ_glu_grad.hpp
+@@ -53,7 +53,7 @@
+ 
+ public:
+     __aicore__ inline SituGluGradBase(TPipe* pipe) { pipe_ = pipe; };
+-    __aicore__ inline void Init(GM_ADDR gradY, GM_ADDR x, GM_ADDR gradX, const SituGluGradTilingData* tilingData);
++    __aicore__ inline void Init(GM_ADDR gradY, GM_ADDR x, GM_ADDR gradX, const SituGluGradTilingData* tilingData, int32_t logicalIndex = -1);
+     __aicore__ inline int64_t AlignBytes(int64_t number);
+     __aicore__ inline void Process();
+     __aicore__ inline void CalTilingParam();
+@@ -121,8 +121,9 @@
+ 
+ template <typename T>
+ __aicore__ inline void SituGluGradBase<T>::Init(GM_ADDR gradY, GM_ADDR x, GM_ADDR gradX,
+-                                                const SituGluGradTilingData* tilingData)
+-{
++                                                const SituGluGradTilingData* tilingData, int32_t logicalIndex)
++{
++    blockIdx_ = logicalIndex < 0 ? GetBlockIdx() : logicalIndex;
+     tl_ = tilingData;
+     dimBatchSize_ = tl_->dimBatchSize;
+     dim2H_ = tl_->dim2H;

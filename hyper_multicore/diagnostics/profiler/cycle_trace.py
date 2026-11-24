@@ -18,7 +18,7 @@ from __future__ import annotations
 
 __all__ = []
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 import struct
@@ -36,6 +36,7 @@ from hyper_multicore.scheduler.config import (
 from hyper_multicore.diagnostics.common.graph import _scheduled_task_ids
 from hyper_multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
 from hyper_multicore.scheduler.runtime import runtime_cube_worker_capacity
+from hyper_multicore.scheduler.worker_queues import WorkerQueueC
 
 
 # Minimum AIC/AIV profile slots.
@@ -76,6 +77,8 @@ TASK_TYPE_NAMES = {
     104: "GroupedMatMul",
     105: "ShmemPutMemSignal",
     106: "SwiGLUGrad",
+    147: "SiTUGLU",
+    148: "SiTUGLUGrad",
     107: "MhcPost",
     108: "MhcNormCast",
     109: "MhcProjection",
@@ -296,8 +299,8 @@ def _calculate_event_driven_profile_layout(
         num_workers // vector_worker_stride,
     )
     if runtime_config.queue_layout == 2:
-        def queue_records(record, indices):
-            # At most one idle episode is emitted between two completed tasks.
+        def queue_records(record: WorkerQueueC, indices: Sequence[int]) -> int:
+            """Count task records and one possible idle episode between completed tasks."""
             return sum(_records_for_task(runtime_config.all_tasks[indices[i]]) + 1
                        for i in range(record.begin, record.end, record.stride))
         aic_required_records = max((queue_records(q, runtime_config.cube_task_indices)

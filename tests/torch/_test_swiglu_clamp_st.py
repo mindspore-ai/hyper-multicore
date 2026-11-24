@@ -125,6 +125,16 @@ def _new_layers(
     return common, mega
 
 
+def _clipped_activation(gate: torch.Tensor, up: torch.Tensor, limit: float, after_silu: bool) -> torch.Tensor:
+    """Keep the identity gradient at both clip boundaries, as specified by MegaMoE."""
+    gate = gate.float()
+    up = up.float()
+    gate = F.silu(gate) if after_silu else gate
+    gate = torch.where(gate <= limit, gate, limit)
+    up = torch.where(up >= -limit, torch.where(up <= limit, up, limit), -limit)
+    return (gate if after_silu else F.silu(gate)) * up
+
+
 def _run_reference(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -148,11 +158,7 @@ def _run_reference(
     if limit is None:
         activation = (F.silu(gate.float()) * up.float()).to(hidden.dtype)
     else:
-        activation = (
-            (F.silu(gate.float()).clamp(max=limit) if clamp_after_silu
-             else F.silu(gate.float().clamp(max=limit)))
-            * up.float().clamp(min=-limit, max=limit)
-        ).to(hidden.dtype)
+        activation = _clipped_activation(gate, up, limit, clamp_after_silu).to(hidden.dtype)
     if before_fc2:
         routed_probs = route_weights.new_zeros(route_weights.numel()).scatter(
             0, mapping.long(), route_weights.flatten()).to(activation.device)
@@ -255,10 +261,7 @@ def _run_routed_reference(
     if swiglu_limit is None:
         activation = (F.silu(gate.float()) * up.float()).to(routed.dtype)
     else:
-        activation = (
-            F.silu(gate.float().clamp(max=swiglu_limit))
-            * up.float().clamp(min=-swiglu_limit, max=swiglu_limit)
-        ).to(routed.dtype)
+        activation = _clipped_activation(gate, up, swiglu_limit, False).to(routed.dtype)
     output = grouped_matmul(
         activation,
         baseline._local_tensor(layer.w2).transpose(1, 2),

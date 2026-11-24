@@ -25,7 +25,7 @@ from pathlib import Path
 import hyper_multicore
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.tasks.alltoall import ShmemTaskPartition
-from hyper_multicore.tasks.swiglu import SwiGluClampPosition, SwiGluTaskIteration
+from hyper_multicore.tasks.activation import SwiGluClampPosition, ActivationTaskIteration
 from hyper_multicore.modules.mega_moe.probability import (
     ProbabilityPlane, ProbabilityLayout, PROBABILITY_PLANES, PROBABILITY_DTYPE_BYTES,
     PROBABILITY_POSITION_FORWARD, PROBABILITY_POSITION_BACKWARD,
@@ -248,7 +248,7 @@ class TestRuntimeCppReader(unittest.TestCase):
         self.reader.read_task_option_values.restype = None
         self.reader.read_task_option_values(values)
         expected = tuple(int(value) for value in (
-            *GroupedMatmulTaskMode, *SwiGluClampPosition, *SwiGluTaskIteration, *ShmemTaskPartition,
+            *GroupedMatmulTaskMode, *SwiGluClampPosition, *ActivationTaskIteration, *ShmemTaskPartition,
             *MegaMoeActivationWeighting, *MegaMoeTransportPayload,
         ))
         self.assertEqual(expected, (0, 1, 2, 3, 0, 1, 0, 2, 0, 2, 0, 4, 0, 4, 8))
@@ -348,7 +348,7 @@ class TestRuntimeCppReader(unittest.TestCase):
     def _round_trip(self, cfg) -> None:
         """Compare every TaskDesc field, queues, events, dynamic data and tail."""
         index = int(cfg.task_num) - 1
-        record = struct.pack("<144I", *range(144))
+        record = struct.pack(f"<{TASK_DESC_SIZE // 4}I", *range(TASK_DESC_SIZE // 4))
         ctypes.memmove(ctypes.addressof(cfg.all_tasks[index]), record, TASK_DESC_SIZE)
         cfg.task_index_num[0] = 1
         cfg.cube_task_indices[0] = index
@@ -472,8 +472,11 @@ class TestRuntimeCppReader(unittest.TestCase):
         # Bytes 40..47 now explicitly describe optional per-worker queues.
         data[48:RUNTIME_HEADER_BYTES] = bytes([255]) * (RUNTIME_HEADER_BYTES - 48)
         self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
-        struct.pack_into("<I", data, 36, 2)
+        struct.pack_into("<I", data, 36, 4)
         self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
+        for version in (0, 1, 2, 3):
+            struct.pack_into("<I", data, 36, version)
+            self.assertTrue(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(data)), len(data), 4096))
 
     def test_ready_header_and_persistent_storage_bounds(self) -> None:
         """Read ready metadata without tags and bound the persistent tail."""
@@ -497,6 +500,11 @@ class TestRuntimeCppReader(unittest.TestCase):
                 self.assertEqual(cfg.completion_event > 0, mode == "pull")
                 self.assertEqual(self.reader.read_ready_event(buffer), cfg.ready_event)
                 self.assertTrue(self.reader.valid_ready_runtime(buffer, len(data), event_bytes, ep_size))
+                for version, valid in ((2 + int(mode == "pull"), True), (4, False)):
+                    modified = bytearray(data)
+                    struct.pack_into("<I", modified, RuntimeConfigC.protocol_version.offset, version)
+                    self.assertEqual(self.reader.valid_ready_runtime(
+                        ctypes.create_string_buffer(bytes(modified)), len(data), event_bytes, ep_size), valid)
                 self.assertFalse(self.reader.valid_ready_runtime(buffer, len(data), event_bytes - 1, ep_size))
                 self.assertFalse(self.reader.valid_ready_runtime(buffer, len(data), event_bytes, 1))
                 for invalid_event in (events - 7, 0xFFFFFFFF):

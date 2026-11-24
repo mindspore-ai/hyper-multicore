@@ -14,6 +14,7 @@
 # ============================================================================
 """Malformed task rejection and graph-declared probability effects."""
 from dataclasses import replace
+import struct
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ from hyper_multicore.modules.mega_moe.backends.bf16.forward import graph as forw
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import (
     _build_runtime_artifacts, _build_task_values, build_mega_moe_plan,
 )
+from hyper_multicore import SiTUGLUParameters
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.schedule_policy import MegaMoeSchedulePolicy, pipeline_cube_queue
 from hyper_multicore.modules.mega_moe.task_options import validate_task_options
@@ -39,6 +41,30 @@ class TestTaskContracts(unittest.TestCase):
         return MegaMoeSpec(256, 128, 512, 12, 2, 1.25 if mode == "push" else None,
                            640, 4, None, 0, 20, dispatch_mode=mode,
                            apply_probs_before_fc2=weighted)
+
+    def test_situglu_tiling_and_protocol(self):
+        """SiTUGLU parameters belong to the shared tiling, including weighted backward."""
+        for mode, version in (("push", 2), ("pull", 3)):
+            for bound in (-2.0, 1e-30, 25.0):
+                spec = replace(self.spec(mode), activation_parameters=SiTUGLUParameters(beta=4, linear_beta=bound))
+                plan = build_mega_moe_plan(spec, "cpu")
+                payload = struct.pack("<ff", 4, max(0.0, bound))
+                self.assertEqual(bytes(plan.swiglu_tiling.tolist()), payload)
+                self.assertEqual(bytes(plan.swiglu_grad_tiling.tolist()), payload)
+                fwd, fc, bwd, bc = _build_runtime_artifacts(spec)
+                for graph, cfg, kind, port, label in (
+                    (fwd, fc, TaskType.TASK_SITU_GLU, 18, "SiTUGLU"),
+                    (bwd, bc, TaskType.TASK_SITU_GLU_GRAD, 24, "SiTUGLUGrad"),
+                ):
+                    self.assertEqual(cfg.protocol_version, version)
+                    self.assertEqual(graph.get_op("activation").diagnostic_name, label)
+                    task = next(task for task in cfg.all_tasks if task.task_type == kind)
+                    self.assertEqual((task.tiling_data_position, task.tiling_data_offset), (port, 0))
+                    self.assertEqual(task.extra_value_0, 0)
+                    self.assertEqual(task.extra_value_1 & 4, 4)
+                    task.tiling_data_offset = 4
+                    with self.assertRaisesRegex(ValueError, "tiling location"):
+                        serialize_runtime_config(cfg)
 
     def test_probability_effects_exist_before_diagnostics(self):
         """Same graph operand drives execution, effects and diagnostic views."""

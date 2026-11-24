@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, TensorEffect
-from hyper_multicore.scheduler.config import TaskType
+from hyper_multicore.scheduler.config import ACTIVATION_TASKS, TaskType
 
 from .task_options import (
     MegaMoeActivationWeighting, MegaMoeTransportPayload, activation_weighting, transport_payload, validate_task_options,
@@ -44,7 +44,7 @@ def probability_stride(spec: Any) -> int:
 
 def probability_layout_for_task(task: Any) -> ProbabilityLayout | None:
     """Read an optional MegaMoe probability operand from an already scheduled task."""
-    if task.task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
+    if task.task_type in ACTIVATION_TASKS:
         present = activation_weighting(task) == MegaMoeActivationWeighting.BEFORE_FC2
     elif task.task_type in (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, TaskType.TASK_SHMEM_GET_MEM):
         present = transport_payload(task) != MegaMoeTransportPayload.TOKENS

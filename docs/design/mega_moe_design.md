@@ -63,7 +63,8 @@ combine 需要 dX。实际允许的并行度还取决于任务填充、任务依
 
 公开 `activation` 在构造时确定，内部以不可变 `activation_parameters` 经资源配置传入 spec 和 plan。
 [BF16 激活模块](../../hyper_multicore/modules/mega_moe/backends/bf16/activation.py) 负责前后向节点构建和在线 tiling，现有 DAG 继续连接相同的张量端口。
-执行器在构造时拒绝尚未接入的 SiTUGLU。EP 配置一致性检查比较激活参数，反向保留对应前向的 plan。
+BF16 worker 使用对应的上游激活内核。SiTUGLU 前反向任务通过各自的激活 tiling 读取两个 FP32 参数，动态尾块只调整任务内的实际行数。
+任务描述符保持 576 字节；普通计划的 push/pull 协议号为 0/1，包含 SiTUGLU 的计划为 2/3。EP 配置一致性检查比较激活参数，反向保留对应前向的 plan。
 
 BF16 的 plan 将实际 H/I 传给 GMM 与 SwiGLU tiling 准备逻辑。
 当前[前向 tiling](../../hyper_multicore/modules/mega_moe/backends/bf16/forward/tiling_tables.py)和

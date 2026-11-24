@@ -25,7 +25,8 @@ constexpr uint32_t MIN_EVENT_CAPACITY = 1024;
 constexpr uint32_t MIN_CUBE_WORKER_CAPACITY = 24;
 constexpr uint32_t MIN_GROUP_LIST_CAPACITY = 512;
 constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
-constexpr uint32_t RUNTIME_PROTOCOL_VERSION = 1;
+constexpr uint32_t SITU_RUNTIME_PROTOCOL_VERSION = 2;
+constexpr uint32_t RUNTIME_PROTOCOL_VERSION = 3;
 
 constexpr uint32_t GROUP_LIST_CACHE_LINE_BYTES = 128;
 
@@ -108,6 +109,8 @@ enum class TaskType : uint32_t {
   TASK_MX_QUANT = 143,
   TASK_MX_SWIGLU_QUANT = 145,
   TASK_MX_SWIGLU_GRAD_QUANT = 146,
+  TASK_SITU_GLU = 147,
+  TASK_SITU_GLU_GRAD = 148,
 };
 
 enum class EventType : uint32_t {
@@ -253,20 +256,11 @@ __aicore__ inline uint32_t getAllTasksOffset(__gm__ uint8_t *tiling) {
 }
 
 __aicore__ inline uint32_t getAllEventsOffset(__gm__ uint8_t *tiling) {
-  uint32_t start_size = getAllTasksOffset(tiling);
-
-  uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
-  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
-                            MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
-
-  return start_size + task_desc_size * getRuntimeTaskCapacity(tiling);
+  return getAllTasksOffset(tiling) + sizeof(TaskDesc) * getRuntimeTaskCapacity(tiling);
 }
 
 __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData, uint32_t index_size) {
-  uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
-  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
-                            MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
-  uint32_t size = getAllTasksOffset(tiling) + index_size * task_desc_size;
+  uint32_t size = getAllTasksOffset(tiling) + index_size * sizeof(TaskDesc);
 
   tilingData->task_type = (*(__gm__ TaskType *)(tiling + size));
   tilingData->task_aicore_type = (*(__gm__ TaskAiCoreType *)(tiling + size + UINT32_T_SIZE));
@@ -349,18 +343,12 @@ __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData,
 }
 
 __aicore__ inline uint32_t getTaskProfileDescId(__gm__ uint8_t *tiling, uint32_t index_size) {
-  uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
-  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
-                            MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
-  uint32_t size = getAllTasksOffset(tiling) + (index_size + 1) * task_desc_size - UINT32_T_SIZE * 2;
+  uint32_t size = getAllTasksOffset(tiling) + index_size * sizeof(TaskDesc) + offsetof(TaskDesc, profile_desc_id);
   return (*(__gm__ uint32_t *)(tiling + size));
 }
 
 __aicore__ inline uint32_t getTaskProfileOwnerId(__gm__ uint8_t *tiling, uint32_t index_size) {
-  uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
-  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
-                            MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
-  uint32_t size = getAllTasksOffset(tiling) + (index_size + 1) * task_desc_size - UINT32_T_SIZE;
+  uint32_t size = getAllTasksOffset(tiling) + index_size * sizeof(TaskDesc) + offsetof(TaskDesc, profile_owner_id);
   return (*(__gm__ uint32_t *)(tiling + size));
 }
 
@@ -545,7 +533,8 @@ __aicore__ inline bool isRuntimeStorageValid(__gm__ uint8_t *tiling, uint64_t ru
   if (runtime_bytes < sizeof(RuntimeHeader) || runtime_bytes >= RUNTIME_ADDRESS_SPACE_BYTES) {
     return false;
   }
-  if (*(__gm__ uint32_t *)(tiling + 9 * UINT32_T_SIZE) > RUNTIME_PROTOCOL_VERSION) {
+  const auto *header = reinterpret_cast<__gm__ RuntimeHeader *>(tiling);
+  if (header->protocol_version > RUNTIME_PROTOCOL_VERSION) {
     return false;
   }
   uint64_t capacity = getRuntimeTaskCapacity(tiling);
