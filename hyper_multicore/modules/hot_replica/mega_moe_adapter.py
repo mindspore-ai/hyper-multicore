@@ -198,7 +198,7 @@ class PlacementResources:
         else:
             prices, limit, keep_home = planner._policy(  # pylint: disable=protected-access
                 spec.hidden_size, spec.intermediate_size, spec.num_cube_cores, training,
-                spec.dispatch_mode, spec.transport_engine, summary.maximum, total, spec.ep_size, resident,
+                spec.transport_engine, summary.maximum, total, spec.ep_size, resident,
             )
             if keep_home:
                 return None

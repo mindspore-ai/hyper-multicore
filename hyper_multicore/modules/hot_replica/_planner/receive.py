@@ -61,15 +61,15 @@ class ReplicaCost:
         return (peak - mean) * self.compute <= self.setup
 
 
-def bf16_cost(hidden_size, intermediate_size, cube_cores, training, *, dispatch_mode="push", transport_engine="mte"):
+def bf16_cost(hidden_size, intermediate_size, cube_cores, training, *, transport_engine="mte"):
     """Translate exposed latency and expert bytes to rows at the given GEMM geometry.
 
     Effective rates come from the EP16 PanGu BF16 alternating-route calibration.
     FP32 return accumulates at the owner; its guest only publishes the partial.
     """
     cube_flops, exposed_bandwidth, setup_seconds = 7.4e12, 5.9e11, .0035
-    if dispatch_mode == "push" and transport_engine == "mte":
-        # EP16 Push Trainer calibration changes the exposed endpoint cost independently of topology.
+    if transport_engine == "mte":
+        # The exposed replica matrix rate is independent of token dispatch and topology.
         exposed_bandwidth /= 8
     area = hidden_size * intermediate_size
     rows_per_second = cube_cores * cube_flops / (6 * area)

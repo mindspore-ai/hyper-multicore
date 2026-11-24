@@ -76,11 +76,11 @@ class HotReplicaPlanner(BasePlanner):
             settings.append(f"cross_node_cost={self.cross_node_cost}")
         return ",".join(settings)
 
-    def _policy(self, hidden_size, intermediate_size, cube_cores, training, dispatch_mode,
-                transport_engine, peak, total, ranks, resident):
+    def _policy(self, hidden_size, intermediate_size, cube_cores, training, transport_engine,
+                peak, total, ranks, resident):
         """Use one cost, capacity and home-admission rule for both planner callers."""
         prices = bf16_cost(hidden_size, intermediate_size, cube_cores, training,
-                           dispatch_mode=dispatch_mode, transport_engine=transport_engine)
+                           transport_engine=transport_engine)
         limit = receive_limit(self.receive_capacity_percent, total, ranks)
         return prices, limit, prices.keep_home(peak, total, ranks, limit=limit, resident=resident)
 
@@ -99,7 +99,7 @@ class HotReplicaPlanner(BasePlanner):
         resident = request.ordinary_receive_capacity
         prices, limit, keep_home = self._policy(
             request.hidden_size, request.intermediate_size, request.cube_cores, request.training,
-            request.dispatch_mode, request.transport_engine, request.maximum_received, request.total_rows,
+            request.transport_engine, request.maximum_received, request.total_rows,
             ranks, resident,
         )
         if keep_home:
