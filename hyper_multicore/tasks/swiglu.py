@@ -48,7 +48,7 @@ class SwiGluTaskIteration(IntEnum):
     PERSISTENT_LANES = 2
 
 
-def _encode_clamp_limit(clamp_limit: float | None) -> int:
+def encode_swiglu_clamp_limit(clamp_limit: float | None) -> int:
     """Encode a positive float32 clamp limit, reserving zero for no clamp."""
     if clamp_limit is None:
         return 0
@@ -98,7 +98,7 @@ class SwiGLUFillConfig(FillConfig):
         """
         task_type = (TaskType.TASK_SWI_GLU if op.op_type == OpType.SWIGLU
                      else TaskType.TASK_SWI_GLU_GRAD)
-        clamp_bits = _encode_clamp_limit(self.clamp_limit)
+        clamp_bits = encode_swiglu_clamp_limit(self.clamp_limit)
 
         num_triggers = getattr(op, "compact_lanes", tsv.per_expert_seq // op.split_value)
         task_num     = op.task_num

@@ -154,7 +154,7 @@ output = experts(
 | token 规格 | 按调用自动管理 | 按调用自动管理 |
 | 权重 | 模型持有，每次 forward 传入 `expert_weights`；EIO/EOI | 模型持有的外部 MX root；EIO |
 | H / I | 正整数；尺寸支持范围见下文 | 均须为 64 的正整数倍 |
-| 激活与概率位置 | 支持 SiLU 前后裁剪、FC2 前或后加权 | 普通 SwiGLU、FC2 后加权；`activation.clamp_limit` 必须为 `None`，拒绝 FC2 前加权 |
+| 激活与概率位置 | 支持 SiLU 前后裁剪、FC2 前或后加权 | 支持 SiLU 前裁剪、FC2 后加权 |
 | 调度选择 | arch22 支持 compact、nominal 和专家批处理；arch35 使用逐专家 dense | arch35 逐专家 dense；拒绝 compact、nominal 和 batching |
 | 诊断 | task profiler 与适配范围内的 tensor dump | task profiler；不支持 tensor dump |
 | `dispatch_mode` | `push` / `pull` | `push` / `pull` |
@@ -231,7 +231,8 @@ M 和 N 必须均为 64 的倍数。root 上的物理字段按以下布局解释
 | `SiTUGLUParameters.linear_beta` | `0.0` | 有限数值；非正值关闭 up 分支 tanh，正值需转换为有效 FP32 正数。 |
 
 当前可独立构造 `SiTUGLUParameters`。设备实现接入前，将它传给 `MegaMoeExperts` 会在构造时抛出
-`NotImplementedError`。MXFP8 当前只支持普通 SwiGLU。
+`NotImplementedError`。MXFP8 使用 CANN 9.2 SwiGLU GroupQuant 前反向。通过
+`SwiGLUParameters(clamp_limit=7.0)` 启用 SiLU 前裁剪，SiLU 后裁剪和 FC2 前概率加权限于 BF16。
 
 `MegaMoeNumericsOptions` 通过 `numerics_options=` 配置通用数值选项：
 

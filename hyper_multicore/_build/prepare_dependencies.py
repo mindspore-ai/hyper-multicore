@@ -222,7 +222,9 @@ def _git_output(source_dir: Path, *args: str) -> str:
 def _git_archive_sha256(source_dir: Path, commit: str, archive_prefix: str) -> str:
     """Hash a deterministic uncompressed Git archive without creating a tarball."""
     with subprocess.Popen(
-        ["git", "archive", "--format=tar", f"--prefix={archive_prefix}", commit],
+        # Hash committed LFS pointers regardless of local LFS caches or filter settings.
+        ["git", "-c", "filter.lfs.process=", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.required=false",
+         "archive", "--format=tar", f"--prefix={archive_prefix}", commit],
         cwd=source_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

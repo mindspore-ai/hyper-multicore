@@ -15,7 +15,7 @@
 """Compose forward/backward expert DAGs from standard MX mathematical tasks."""
 from dataclasses import dataclass
 from typing import Any
-from hyper_multicore.modules.mega_moe.numerics import SwiGLUParameters
+from hyper_multicore.modules.mega_moe.numerics import validate_mxfp8_activation
 from hyper_multicore.scheduler.config import (TaskSplitValue,
     init_task_split_value, configure_ready_handshake, validate_runtime_config, mega_moe_event_capacity)
 from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, TensorSpec, SplitSpec
@@ -25,6 +25,7 @@ from hyper_multicore.tasks.alltoall import AllToAllFillConfig, AllToAllType
 from hyper_multicore.tasks.gmm_mxfp8 import Mxfp8GmmFillConfig, serialize_mx_gmm_descriptors
 from hyper_multicore.tasks.quantization_mxfp8 import (MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK,
     Mxfp8QuantFillConfig, serialize_mx_quant_descriptors)
+from hyper_multicore.tasks.swiglu import encode_swiglu_clamp_limit
 from hyper_multicore.tasks.swiglu_mxfp8 import Mxfp8SwiGLUFillConfig
 from hyper_multicore.tasks.utils import add_dynamic_data, add_terminate
 from ...spec import MegaMoeSpec
@@ -117,8 +118,8 @@ def _buffer_specs(spec: MegaMoeSpec, forward: bool) -> dict[int, TensorSpec]:
 def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool) -> MXFP8Runtime:
     """Wire per-expert dependencies; preserve adopted math, transport and task boundaries."""
     activation_parameters = spec.activation_parameters
-    if not isinstance(activation_parameters, SwiGLUParameters) or activation_parameters.clamp_limit is not None:
-        raise ValueError("MX tasks currently require unclamped SwiGLU")
+    validate_mxfp8_activation(activation_parameters)
+    clamp_bits = encode_swiglu_clamp_limit(activation_parameters.clamp_limit)
     values = _MXTaskValues(tp=1, ep=spec.ep_size, seq_size=spec.local_num_tokens,
                            all_expert_num=spec.num_experts, top_k=spec.top_k,
                            compute_stages=4 if forward else 6, dispatch_mode=spec.dispatch_mode)
@@ -129,9 +130,11 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool) -> MXFP8Runtime:
     glist, gtable, qtable = (6, 25, 26) if forward else (19, 31, 32)
 
     def quant(name, kind, columns, inputs, outputs, first=False):
-        _add_compute(graph, name, specs, inputs + [glist, qtable], outputs,
-                     (Mxfp8QuantFillConfig if kind == MX_QUANT_TASK else Mxfp8SwiGLUFillConfig)(
-                         kind, columns, vectors, first, quants), vectors,
+        if kind == MX_QUANT_TASK:
+            fill = Mxfp8QuantFillConfig(kind, columns, vectors, first, quants)
+        else:
+            fill = Mxfp8SwiGLUFillConfig(kind, columns, vectors, first, quants, clamp_bits)
+        _add_compute(graph, name, specs, inputs + [glist, qtable], outputs, fill, vectors,
                      {MX_QUANT_TASK: OpType.QUANTIZE, MX_SWIGLU_TASK: OpType.SWIGLU_QUANT,
                       MX_SWIGLU_GRAD_TASK: OpType.SWIGLU_GRAD_QUANT}[kind])
 
