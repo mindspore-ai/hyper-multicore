@@ -39,7 +39,6 @@ from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
 )
-from .placement_options import MegaMoePlacementOptions
 from .transport import requested_transport
 from .schedule import validate_schedule_options
 
@@ -61,23 +60,6 @@ def _resolve_ep_size(ep_group: Any | None) -> int:
     if dist.is_initialized() and dist.get_world_size() > 1:
         raise ValueError("Pass ep_group explicitly for distributed MegaMoeExperts")
     return 1
-
-
-def _placement_planner(options: MegaMoePlacementOptions | None) -> BasePlanner | None:
-    """Validate the placement strategy before allocating any EP resources."""
-    if options is None:
-        return None
-    if not isinstance(options, MegaMoePlacementOptions):
-        raise TypeError("expert_placement must be MegaMoePlacementOptions or None")
-    if options.strategy == "none":
-        if options.planner is not None:
-            raise ValueError("placement strategy 'none' requires planner=None")
-        return None
-    if options.strategy != "adaptive":
-        raise ValueError(f"Unsupported expert placement strategy: {options.strategy!r}")
-    if not isinstance(options.planner, BasePlanner):
-        raise TypeError("placement strategy 'adaptive' requires a BasePlanner instance")
-    return options.planner
 
 
 def _validate_precision_schedule(precision, scheduler):
@@ -156,7 +138,6 @@ class MegaMoeExperts(MulticoreModule):
         activation: SwiGLUParameters | SiTUGLUParameters | None = None,
         numerics_options: MegaMoeNumericsOptions | None = None,
         tuning_options: MegaMoeTuningOptions | None = None,
-        expert_placement: MegaMoePlacementOptions | None = None,
     ) -> None:
         """Initialize a parameterless lazy execution owner.
 
@@ -174,12 +155,11 @@ class MegaMoeExperts(MulticoreModule):
                 Passing SiTUGLUParameters raises NotImplementedError at construction.
             numerics_options: Probability placement and partial-gradient precision.
                 None uses after-FC2 probability weighting and native partial dW.
-            expert_placement: Adaptive placement supports Ascend910_93 BF16 Push and MTE Pull
-                with a multi-rank EP group. Pull requires a wheel with runtime-row GET support.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.
                 Options are validated and copied into the instance configuration;
-                they do not change the chosen probability or clamp semantics.
+                An expert_placement planner enables A3 BF16 MTE Push or Pull on a
+                multi-rank EP group. Pull requires a wheel with runtime-row GET support.
 
         Numerical choices and tuning options are fixed for this instance.
         Construct another executor to change them.
@@ -187,7 +167,10 @@ class MegaMoeExperts(MulticoreModule):
         numerics, tuning, scheduler, activation_parameters = _resolve_expert_options(
             precision, activation, numerics_options, tuning_options,
         )
-        planner = _placement_planner(expert_placement)
+        planner = tuning.expert_placement
+        if planner is not None and not isinstance(planner, BasePlanner):
+            raise TypeError("expert_placement must be a BasePlanner or None")
+        ep_size = _resolve_ep_size(ep_group)
         planner_key = None
         replica_slots_per_rank = None
         cross_node_cost = None
@@ -195,10 +178,14 @@ class MegaMoeExperts(MulticoreModule):
         if planner is not None:
             if precision != "bf16":
                 raise ValueError("HotReplica requires BF16 precision")
-            from ..hot_replica.planner import HotReplicaPlanner  # pylint: disable=import-outside-toplevel
+            from ..hot_replica.planner import HotReplicaPlanner, replica_slot_budget  # pylint: disable=import-outside-toplevel
 
+            if ep_size <= 1:
+                raise ValueError("HotReplica requires an explicit EP group with more than one rank")
             if isinstance(planner, HotReplicaPlanner):
                 replica_slots_per_rank = planner.replica_slots_per_rank
+                if replica_slots_per_rank is not None and type(num_experts) is int and num_experts % ep_size == 0:
+                    replica_slot_budget(num_experts // ep_size, replica_slots_per_rank, tuning.dispatch_mode)
                 cross_node_cost = planner.cross_node_cost
                 if planner.receive_capacity_percent != "auto":
                     receive_capacity_percent = planner.receive_capacity_percent
@@ -219,7 +206,7 @@ class MegaMoeExperts(MulticoreModule):
             "partial_weight_grad_dtype": numerics.partial_weight_grad_dtype,
             "activation_parameters": activation_parameters,
             "apply_probs_before_fc2": numerics.apply_probs_before_fc2,
-            "ep_size": _resolve_ep_size(ep_group),
+            "ep_size": ep_size,
             "ep_group": ep_group,
             "dispatch_mode": tuning.dispatch_mode,
             "initial_capacity_factor": tuning.initial_capacity_factor,
@@ -239,8 +226,6 @@ class MegaMoeExperts(MulticoreModule):
             "nominal_schedule": bool(scheduler.nominal_schedule),
             "lowering": scheduler.lowering,
         }
-        if planner is not None and specification["ep_size"] <= 1:
-            raise ValueError("HotReplica requires an explicit EP group with more than one rank")
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(

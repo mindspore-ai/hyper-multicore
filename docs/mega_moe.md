@@ -83,8 +83,7 @@ MegaMoE 不接受 TP 大小参数。
 | --- | --- | --- |
 | `MegaMoeExperts` | 配置模型尺寸和 EP 组，执行专家前反向并管理执行资源 | 公开稳定 API；专家参数由调用方持有，每次 forward 传入。 |
 | `MegaMoeNumericsOptions` | 配置路由概率的应用位置及 partial dW 精度 | 公开稳定 API；通过 `numerics_options=` 传入，按来源模型选择数值语义。 |
-| `MegaMoePlacementOptions` | 配置专家放置策略 | 通过 `expert_placement=` 传入，默认使用原属 rank。 |
-| `MegaMoeTuningOptions` | 配置通信模式、容量、分片和可选调度 | 公开实验 API；通过 `tuning_options=` 传入。字段、可选值及默认执行策略不保证跨版本兼容，升级时须重新验证。 |
+| `MegaMoeTuningOptions` | 配置通信模式、容量、专家放置和可选调度 | 公开实验 API；通过 `tuning_options=` 传入。字段、可选值及默认执行策略不保证跨版本兼容，升级时须重新验证。 |
 | `MegaMoeSchedulerOptions` | 配置数学任务顺序、就绪扫描和 lowering | 公开实验 API；作为 `MegaMoeTuningOptions(scheduler=...)` 传入。 |
 
 实验 API 同样校验参数和支持范围；API 稳定性不等于跨硬件或跨版本逐 bit 数值一致。
@@ -101,7 +100,6 @@ MegaMoE 不接受 TP 大小参数。
 | `ep_group` | `None` | 独立单 rank 可省略；分布式作业显式指定 EP 组 |
 | `precision` | `"bf16"` | 可选 `"bf16"` 或 `"mxfp8"`，硬件与权重要求见精度支持 |
 | `numerics_options` | `None` | 默认不裁剪、FC2 后加权，完整字段见数值配置 |
-| `expert_placement` | `None` | 默认使用原属 rank，可选[自适应专家放置](#自适应专家放置) |
 | `tuning_options` | `None` | 使用默认执行策略，公开实验配置见执行调优 |
 
 本地专家数为 E/EP，专家归属按组内 rank 顺序确定。同一进程的 SHMEM 同时只能绑定一组有序的 EP 成员。
@@ -149,26 +147,26 @@ output = experts(
 
 ### 自适应专家放置
 
-为多 rank EP 启用热点专家副本时，将下列配置传给 `MegaMoeExperts` 的 `expert_placement`。
+在多 rank EP 上，通过 `MegaMoeExperts(tuning_options=tuning)` 启用热点专家副本。
 
 ```python
-from hyper_multicore import MegaMoePlacementOptions
-from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
+from hyper_multicore.experimental import HotReplicaPlanner, MegaMoeTuningOptions
 
-placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner())
+tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 ```
 
-- Push 的默认副本槽上限等于每 rank 的原属专家数 `num_experts / ep_size`。实际借用数量由路由、接收容量和放置代价决定。
-- `HotReplicaPlanner(cross_node_cost=1.0)` 将 A3 BF16 常规有界 Push 的跨节点与同节点副本按相同代价计入。
-  EP 组内须使用相同值，省略时沿用原策略。
+- 省略 `expert_placement` 时使用原属路由。Push 的默认槽上限是每 rank 的原属专家数 L，内置 Pull 默认为 `min(L, 6)`。显式请求超出相应范围时，构造执行器会报告所请求的宽度和适用上限。
+- `cross_node_cost` 表示跨节点副本矩阵搬运的相对代价。`None` 和 `1.0` 的倍率相同。显式设置适用于 Push，组内使用相同配置。
 - BF16 Push 的 `receive_capacity_percent="auto"` 默认按预计净收益选点，已有接收区影响扩容代价。
   显式 `receive_capacity_percent=102` 将各 rank 的实际接收行数限制在 EP 均值的 102%，向上取整到一行。
   两种设置共用评分和源端配额规则。EP 组内使用相同设置。槽位不足或搜索无法找到合规计划时，调用报错。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   Pull 需要支持按实际行数切分 GET 的 A3 制品。默认放置策略沿用 Push 的配额计算，由执行 rank 从对称源区拉取 token。
-  自定义 `BasePlanner` 须在所有 EP rank 返回相同的全局计数和副本表，各 rank 的 virtual IDs 对应本地原始 Top-K 顺序。
-  无需借槽时所有 rank 都返回 `None`。运行时在申请资源前校验标量、槽位范围、源行总数和分配所需的一致性。
-  Reentrant checkpoint 可以沿用 `wrap_checkpoint`。省略 `tokens_per_expert` 时，Top-K 顺序、参数代际和流在全 EP 验证通过后可复用原落位。
+  自定义策略从 `hyper_multicore.experimental` 导入 `BasePlanner`、`PlacementRequest` 和 `ExpertPlacement`。
+  各 rank 根据同一份逐源逻辑计数返回一致的 Host 配额与 guest 槽映射，无需借槽时均返回 `None`。
+  每个 source 的行按目的 rank、home 槽、guest 槽的顺序排列。空槽用 -1 表示，接收行数为零。
+  执行器在申请副本 bank 前校验所有 source 的逻辑专家守恒、逐位置 Top-K 身份、物理槽直方图和全组配额一致性。
+  Reentrant checkpoint 可使用同一实验命名空间的 `wrap_checkpoint`。省略 `tokens_per_expert` 时，全 EP 验证 Top-K 顺序、参数代际和流后可复用原落位。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。固定字节预算优先容纳这次调用所需的对齐布局。
   副本布局超出固定预算时，可以在原属布局符合接收行数要求且放得下的情况下沿用原属布局。两种布局都超预算，或显式行数上限要求使用副本时，调用报错。
   BF16 partial 使用每 rank 本地专家数两倍的连续 bank，FP32 partial 使用三倍。支持 BF16 核内回传的 A3 制品在真宽槽时按现有顺序用 FP32 归并。
@@ -182,15 +180,12 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
 测量稳态性能前应覆盖代表性的路由和容量。
 
-### 从旧 HotReplica 配置迁移
+### 旧 HotReplica 接口退役
 
-旧的独立 `HotReplica` 和 `plan_native()` 调用迁到 `MegaMoeExperts(expert_placement=placement)`。
-如需自定义策略，实现 `BasePlanner.plan(request)`，通过 `MegaMoePlacementOptions` 传入。
-权重和优化器状态仍由模型持有，同一批次的路由与权重通过 MegaMoE 的 forward 入口传递。
-
-构造 planner 时移除 `source_token_bound`，由 MegaMoE 根据实际 token 和路由安排工作区。
-`replica_slots_per_rank` 控制每 rank 的借槽数。固定 SHMEM 字节预算通过
-`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 设置。
+独立 Native EP 的 `HotReplica`、`plan_native()` 和旧输入预留参数 `source_token_bound` 已退役。
+采用 MegaMoE 的调用方可把 planner 放入 `MegaMoeTuningOptions`，模型继续持有权重和优化器状态。
+执行器依据本次路由估计 workspace。`receive_capacity_percent` 控制本次接收行数，
+`HYPER_MULTICORE_SHMEM_HEAP_SIZE` 控制物理 SHMEM 字节。
 
 ## 精度支持
 

@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Two-rank Ascend 910_93 HotReplica placement and checkpoint regression."""
-from dataclasses import replace
 import gc
 import json
 import os
@@ -24,26 +23,26 @@ import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
-from hyper_multicore import BasePlanner, MegaMoeExperts, MegaMoeNumericsOptions, MegaMoePlacementOptions
-from hyper_multicore.experimental import MegaMoeTuningOptions
-from hyper_multicore.modules.hot_replica.checkpoint import wrap_checkpoint
-from hyper_multicore.modules.hot_replica.placement import build_placement
-from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore.experimental import BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions, wrap_checkpoint
+from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica._planner.receive import SourceQuota, select_replica_plan
+from hyper_multicore.modules.hot_replica.planner import as_placement
 
 
 class SkewPlanner(BasePlanner):
     """Replicate when peak load reaches 125% of average load."""
 
     def plan(self, request):
-        ranks = request.counts_by_source.shape[0]
+        counts = request.counts_by_source
+        ranks, experts = len(counts), len(counts[0])
         if request.total_rows == 0 or 4 * ranks * request.maximum_received < 5 * request.total_rows:
             return None
         target = (request.total_rows + ranks - 1) // ranks
-        self.last_placement = placement = build_placement(
-            request.hidden, request.ids, request.counts_by_source, target, request.rank,
-            source_inverse=request.source_inverse,
-        )
-        return replace(placement, local_receive_capacity=None) if placement is not None else None
+        plan = select_replica_plan(counts, ExpertReplicaConfig(experts, ranks, experts // ranks),
+                                   soft_target=target, source_quota=SourceQuota.RANK_ORDER)
+        self.last_placement = None if plan is None else as_placement(plan)
+        return self.last_placement
 
 
 def test_placement_checkpoint_and_close():
@@ -74,9 +73,9 @@ def test_placement_checkpoint_and_close():
             replica = planner is not None
             op = MegaMoeExperts(hidden_size=hidden, intermediate_size=intermediate, num_experts=8, top_k=2,
                                 ep_group=dist.group.WORLD,
-                                expert_placement=(MegaMoePlacementOptions("adaptive", planner)
-                                                  if replica else None),
-                                tuning_options=MegaMoeTuningOptions(dispatch_mode=dispatch_mode if replica else "push"),
+                                tuning_options=MegaMoeTuningOptions(
+                                    dispatch_mode=dispatch_mode if replica else "push", expert_placement=planner,
+                                ),
                                 numerics_options=MegaMoeNumericsOptions(apply_probs_before_fc2=True))
             def run(h: torch.Tensor, p: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
                 """Pass current owner parameters through the ordinary expert API."""

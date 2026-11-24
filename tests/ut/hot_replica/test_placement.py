@@ -15,12 +15,16 @@
 """CPU contracts for planner count formats and optional execution dependencies."""
 
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from hyper_multicore.modules.hot_replica import placement
-from hyper_multicore.modules.hot_replica._planner.receive import receive_limit
+from hyper_multicore.experimental import HotReplicaPlanner, PlacementRequest
+from hyper_multicore.modules.hot_replica.bounded_placement import render_geometry
+from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica._planner.receive import SourceQuota, receive_limit, select_replica_plan
 
 
 class TestHotReplicaPlacement(unittest.TestCase):
@@ -36,11 +40,11 @@ class TestHotReplicaPlacement(unittest.TestCase):
         for dtype in (torch.int32, torch.int64):
             with self.subTest(dtype=dtype):
                 counts = torch.tensor([[4, 0], [2, 0]], dtype=dtype)
-                result = placement.build_placement(
-                    torch.empty(4, 4), torch.zeros(4, 1, dtype=torch.int32),
-                    counts, 3, 0, source_inverse=torch.arange(4, dtype=torch.int32),
-                )
-                self.assertIsNotNone(result)
+                plan = select_replica_plan(counts.numpy(), ExpertReplicaConfig(2, 2, 1), soft_target=3,
+                                           source_quota=SourceQuota.RANK_ORDER)
+                ids = torch.zeros(4, 1, dtype=torch.int32)
+                geometry = render_geometry(plan, SimpleNamespace(rank_id=0), ids.device, 4, prepare_metadata=False)
+                result = geometry.lower(torch.empty(4, 4), ids, torch.arange(4, dtype=torch.int32))
                 torch.testing.assert_close(result.virtual_ids, torch.tensor([[0], [0], [0], [3]], dtype=torch.int32))
                 torch.testing.assert_close(result.counts_by_source,
                                            torch.tensor([[3, 0, 0, 1], [0, 0, 0, 2]], dtype=torch.int32))
@@ -48,42 +52,28 @@ class TestHotReplicaPlacement(unittest.TestCase):
                 self.assertEqual((result.receive_capacity, result.published_slots), (3, 0))
 
     def test_capacity_placement_honors_an_explicit_guest_budget(self) -> None:
-        counts = torch.tensor([[4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0],
-                               [4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0]], dtype=torch.int32)
-        ids = torch.arange(6, dtype=torch.int32).repeat_interleave(4).view(-1, 1)
-        hidden = torch.empty(24, 4)
-        inverse = torch.arange(24, dtype=torch.int32)
-        ordinary = placement.build_placement(hidden, ids, counts, 24, 1, source_inverse=inverse)
-        capped = placement.build_placement(
-            hidden, ids, counts, 24, 1, source_inverse=inverse, replica_slots_per_rank=2,
-        )
-        self.assertEqual((ordinary.published_slots, ordinary.receive_capacity), (3, 24))
-        self.assertEqual((capped.borrowed_capacity, capped.published_slots, capped.receive_capacity), (2, 2, 32))
-        self.assertEqual(capped.counts_by_source.sum().item(), ids.numel() * 2)
+        counts = ((4,) * 6 + (0,) * 6,) * 2
+        ordinary = select_replica_plan(counts, ExpertReplicaConfig(12, 2, 6), soft_target=24)
+        capped = select_replica_plan(counts, ExpertReplicaConfig(12, 2, 2), soft_target=24)
+        self.assertEqual((ordinary.replica_slots_used[1], max(ordinary.destination_loads)), (3, 24))
+        self.assertEqual((capped.compact_borrowed_width, capped.replica_slots_used[1],
+                          max(capped.destination_loads)), (2, 2, 32))
+        self.assertEqual(sum(capped.destination_loads), 48)
 
     def test_wide_counts_reject_overflow_before_allocator(self) -> None:
         """A large INT64 wire count must never wrap to a negative planner value."""
-        counts = torch.tensor([[2**31, 0], [0, 0]], dtype=torch.int64)
+        request = PlacementRequest(((2**31, 0), (0, 0)), 2**31, 2**31, 0, 4, 4, 24, False)
         with self.assertRaisesRegex(ValueError, "INT32 planner limit"):
-            placement.build_placement(torch.empty(0, 4), torch.empty(0, 1, dtype=torch.int32), counts, 1, 0)
+            HotReplicaPlanner().plan(request)
 
     def test_invalid_topologies_fail_before_allocator(self) -> None:
         """An invalid rank or expert extent cannot launch an asymmetric plan."""
-        for counts, rank in (
-            (torch.zeros(2, 3, dtype=torch.int32), 0),
-            (torch.zeros(2, 4, dtype=torch.int32), 2),
-            (torch.zeros(4, dtype=torch.int32), 0),
-        ):
-            with self.subTest(shape=counts.shape, rank=rank):
+        request = PlacementRequest(((0, 0), (0, 0)), 0, 0, 0, 4, 4, 24, False)
+        for changes in ({"counts_by_source": ((0, 0, 0),) * 2}, {"rank": 2}, {"counts_by_source": ()}):
+            with self.subTest(changes=changes):
                 with (
-                    patch("hyper_multicore.modules.hot_replica.placement.select_replica_plan") as allocate,
+                    patch("hyper_multicore.modules.hot_replica.planner.select_replica_plan") as allocate,
                     self.assertRaises(ValueError),
                 ):
-                    placement.build_placement(
-                        torch.empty(0, 4),
-                        torch.empty(0, 1, dtype=torch.int32),
-                        counts,
-                        1,
-                        rank,
-                    )
+                    HotReplicaPlanner().plan(replace(request, **changes))
                 allocate.assert_not_called()

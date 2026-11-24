@@ -12,24 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Expert placement for the existing MegaMoE BF16 executor."""
+"""Validate custom quotas and materialize MegaMoE's virtual routes."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
-from ..base_planner import ExpertPlacement
-from ..mega_moe.route import _permute_topk_input, _upload_route_tensor
+from ..base_planner import ExpertPlacement, PlacementRequest
+from ..mega_moe.route_metadata import RouteMetadata
+from ..mega_moe.route import _permute_topk_input
 from ._planner.capacity import ExpertReplicaConfig
-from ._planner.receive import ReplicaCost, SourceQuota, select_replica_plan
-from ._planner.plan import ExpertExecutionPlan
-from .render import render_plan
+from ._planner.plan import ExpertExecutionPlan, physical_replica_slots
 
 
-def replica_slot_budget(home: int, requested: int | None, dispatch_mode: str) -> int:
-    """Clamp the requested guest budget to the current BF16 transport."""
-    budget = home if requested is None else min(home, requested)
-    return min(budget, 6) if dispatch_mode == "pull" else budget
+@dataclass(frozen=True)
+class _LoweredPlacement:
+    """Per-invocation route and weight-copy metadata owned by MegaMoE."""
+
+    virtual_ids: torch.Tensor
+    counts_by_source: torch.Tensor
+    copies: torch.Tensor
+    borrowed_capacity: int
+    receive_capacity: int
+    local_receive_capacity: int
+    published_slots: int
+    copies_by_rank: tuple[tuple[int, ...], ...]
+    owner_rows: tuple[int, ...]
+    route_metadata: RouteMetadata | None
+
+
+def validate_quotas(result, request: PlacementRequest, *, slots: int) -> ExpertExecutionPlan | None:
+    """Check custom quotas against the count exchange before binding resources."""
+    if not isinstance(result, ExpertPlacement):
+        raise TypeError("A planner must return ExpertPlacement or None")
+    ranks = len(request.counts_by_source)
+    copies = result.copies_by_rank
+    if len(copies) != ranks:
+        raise ValueError("Expert placement needs a copy row for every EP rank")
+    width = len(copies[0])
+    if width > slots or any(len(row) != width for row in copies):
+        raise ValueError(f"Expert placement must use a uniform width within the {slots} available guest slots")
+    if any(type(expert) is not int for row in copies for expert in row):
+        raise ValueError("Guest slots must identify integer logical experts")
+
+    config = ExpertReplicaConfig(len(request.counts_by_source[0]), ranks, width)
+    physical = tuple(physical_replica_slots(config, rank, row) for rank, row in enumerate(copies))
+    plan = ExpertExecutionPlan(config, request.counts_by_source, physical, result.dispatch_counts)
+    plan.validate()
+    if max(plan.destination_loads) > 2**31 - 1:
+        raise ValueError("Expert placement counts must fit the INT32 dispatch limit")
+    home = config.home_experts
+    # A zero-row guest has no producer. Use this same normalized table for
+    # host agreement, device copy targets and the published slot range.
+    active = tuple(row[:home] + tuple(expert if count else -1
+                                     for expert, count in zip(row[home:], loads[home:]))
+                   for row, loads in zip(physical, plan.destination_counts))
+    if not any(expert >= 0 for row in active for expert in row[home:]):
+        return None
+    return ExpertExecutionPlan(config, request.counts_by_source, active, plan.dispatch_counts)
 
 
 def remap_expert_ids(hidden, ids, sorted_ids, inverse):
@@ -45,82 +87,17 @@ def remap_expert_ids(hidden, ids, sorted_ids, inverse):
     return remapped.view_as(ids)
 
 
-@torch.no_grad()
-def build_placement(
-    hidden: torch.Tensor,
-    topk_ids: torch.Tensor,
-    counts_by_source: torch.Tensor,
-    capacity: int | None,
-    rank: int,
-    *,
-    source_inverse: torch.Tensor | None = None,
-    replica_slots_per_rank: int | None = None,
-    prices: ReplicaCost = ReplicaCost(),
-    source_quota: SourceQuota = SourceQuota.RANK_ORDER,
-    receive_capacity_percent=None, nodes=(), cross_node_cost=None, resident=None,
-) -> ExpertPlacement | None:
-    """Borrow experts and render their virtual IDs without changing the router.
-
-    Each virtual rank owns its home expert slots followed by optional borrowed slots.
-    Original expert parameters and optimizer ownership stay unchanged.
-    The caller supplies its existing count table and load target; this function
-    performs no additional count collective or expert computation.
-
-    Args:
-        hidden: Local token rows on the active NPU.
-        topk_ids: Original selected global expert IDs, shaped [tokens, Top-K].
-        counts_by_source: Current [EP, global experts] source-count table.
-        capacity: Positive target routed rows per rank for the allocator.
-        rank: Rank within this ordered EP group.
-        replica_slots_per_rank: Optional cap on guests, defaulting to the number of home experts.
-        prices: Shared cost model for this execution path.
-        source_quota: Order used to assign the selected rows to source ranks.
-
-    Returns:
-        A per-invocation placement, or None when no expert needs to be borrowed.
-    """
-    if counts_by_source.ndim != 2:
-        raise ValueError("HotReplica counts must be a source-by-expert matrix")
-    ranks, experts = counts_by_source.shape
-    if ranks < 1 or experts < 1 or experts % ranks or not 0 <= rank < ranks:
-        raise ValueError("HotReplica counts must describe a valid ordered EP topology")
-    if counts_by_source.dtype not in (torch.int32, torch.int64):
-        raise TypeError("HotReplica counts must use INT32 or INT64")
-    wire = counts_by_source.cpu().numpy()
-    home = experts // ranks
-    budget = home if replica_slots_per_rank is None else min(home, replica_slots_per_rank)
-    config = ExpertReplicaConfig(experts, ranks, budget)
-    if wire.min() < 0 or wire.max() > 2**31 - 1 or wire.sum(dtype="int64") > 2**31 - 1:
-        raise ValueError("HotReplica counts must be nonnegative and within the INT32 planner limit")
-    plan = select_replica_plan(
-        wire, config, soft_target=capacity, receive_capacity_percent=receive_capacity_percent,
-        source_quota=source_quota, prices=prices, nodes=nodes, cross_node_cost=cross_node_cost, resident=resident,
-    )
-    if plan is None:
-        return None
-    return render_placement(hidden, topk_ids, plan, rank, source_inverse=source_inverse)
-
-
-def render_placement(
-    hidden: torch.Tensor,
-    topk_ids: torch.Tensor,
-    plan: ExpertExecutionPlan,
-    rank: int,
-    *,
-    source_inverse: torch.Tensor | None = None,
-) -> ExpertPlacement:
-    """Render the admitted source quotas using the existing device permutation."""
-    used = max(plan.replica_slots_used)
-    borrowed = min(plan.config.replica_slots_per_rank, 1 << (used - 1).bit_length())
-    device = topk_ids.device
-    ordered, table, owners = render_plan(plan, rank, borrowed)
-    if ordered.size != topk_ids.numel():
-        raise ValueError("HotReplica counts must describe the local Top-K routes")
-    sorted_ids = _upload_route_tensor(torch.from_numpy(ordered), device)
-    ids = remap_expert_ids(hidden, topk_ids, sorted_ids, source_inverse)
-    copies = _upload_route_tensor(torch.tensor(owners, dtype=torch.int32), device)
-    table = _upload_route_tensor(torch.from_numpy(table), device)
-    loads = plan.destination_loads
-    return ExpertPlacement(ids, table, copies, borrowed, max(loads), loads[rank],
-                           plan.maximum_transfer_degree, plan.replica_slots_used[rank], copies_by_rank=owners,
-                           owner_rows=plan.destination_counts[rank][:plan.config.home_experts])
+def validate_lowered_ids(ids: torch.Tensor, virtual_ids: torch.Tensor, plan: ExpertExecutionPlan, rank: int) -> None:
+    """Check the generated token order and all physical quotas on this source."""
+    if (virtual_ids.shape != ids.shape or virtual_ids.device != ids.device
+            or virtual_ids.dtype not in (torch.int32, torch.int64)):
+        raise ValueError("Lowered IDs must be integers on the source Top-K shape and device")
+    physical = virtual_ids.flatten().to(device="cpu", dtype=torch.int64)
+    if physical.numel() and (int(physical.min()) < 0 or int(physical.max()) >= plan.config.physical_experts):
+        raise ValueError("Lowered IDs exceed the physical expert range")
+    logical = torch.tensor(plan.physical_to_logical, dtype=torch.int64)
+    if not torch.equal(logical[physical], ids.flatten().to(device="cpu", dtype=torch.int64)):
+        raise ValueError("Lowered IDs changed the logical expert at a source Top-K position")
+    histogram = physical.bincount(minlength=plan.config.physical_experts)
+    if tuple(histogram.tolist()) != plan.dispatch_counts[rank]:
+        raise ValueError("Lowered IDs disagree with the source's physical dispatch quotas")

@@ -129,6 +129,12 @@ class ExpertExecutionPlan:
         home = self.config.home_experts
         return tuple(sum(expert >= 0 for expert in row[home:]) for row in self.slot_to_logical)
 
+    @property
+    def compact_borrowed_width(self) -> int:
+        """Round active prefix slots without exceeding the configured budget."""
+        used = max(self.replica_slots_used)
+        return min(self.config.replica_slots_per_rank, 1 << (used - 1).bit_length()) if used else 0
+
     @cached_property
     def transfers(self) -> tuple[ExpertReplicaTransfer, ...]:
         """Return transfers in globally identical target/slot order."""

@@ -17,6 +17,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from hyper_multicore.modules.base_planner import BasePlanner
+
 
 @dataclass(frozen=True)
 class MegaMoeSchedulerOptions:
@@ -65,6 +67,8 @@ class MegaMoeTuningOptions:
             integer multiple of 128, excluding bool.
         combine_split: Combine tile rows, with the same constraints as dispatch.
         scheduler: Optional per-instance math scheduling and lowering options.
+        expert_placement: A3 BF16 HotReplica planner for a multi-rank EP group.
+            None keeps experts on their home ranks.
     """
 
     dispatch_mode: Literal["push", "pull"] = "push"
@@ -73,3 +77,4 @@ class MegaMoeTuningOptions:
     dispatch_split: int = 128
     combine_split: int = 128
     scheduler: MegaMoeSchedulerOptions | None = None
+    expert_placement: BasePlanner | None = None

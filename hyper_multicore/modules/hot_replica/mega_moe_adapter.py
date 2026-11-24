@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
+from hashlib import sha256
 import weakref
 from typing import Any, TYPE_CHECKING
 
@@ -28,12 +28,13 @@ from hyper_multicore import _collective
 from hyper_multicore.modules.mega_moe.heap_manager import _HeapCapacityError, _WorkspaceLayout
 from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_capacity, _resolve_receive_capacity
 
-from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from ._planner.receive import bf16_cost, receive_limit
-from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
+from ..base_planner import BasePlanner, PlacementRequest
+from ._planner.receive import receive_limit
+from .bounded_placement import BoundedPlacement, PlacementWire, render_geometry, supports_bounded_placement
 from .checkpoint import is_checkpointing
 from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline, uses_wider_gradient_bands
-from .planner import HotReplicaPlanner
+from .placement import _LoweredPlacement, validate_lowered_ids, validate_quotas
+from .planner import HotReplicaPlanner, replica_slot_budget
 from .shmem_transfer import ExpertWeightBinding, SharedExpertPool
 
 if TYPE_CHECKING:
@@ -117,39 +118,6 @@ def _release_mega_bank(parent, owner):
                 manager.close_workspace(pool)
 
 
-def _bind_custom_copy_rows(spec, placement):
-    """Validate the copy table and derive the physical loads before binding weights."""
-    home, ranks = spec.local_experts, spec.ep_size
-    borrowed = placement.borrowed_capacity
-    if tuple(placement.counts_by_source.shape) != (ranks, ranks * (home + borrowed)):
-        raise ValueError("Expert placement counts must match the EP group and borrowed capacity")
-    if not borrowed:
-        return None
-    loads = placement.counts_by_source.sum(dim=0).view(ranks, home + borrowed)
-    rows = torch.cat((placement.copies, loads), dim=1).tolist()
-    received = [sum(row[borrowed:]) for row in rows]
-    peak, local = max(received), received[spec.rank_id]
-    if peak > min(placement.receive_capacity, 2**31 - 1):
-        raise ValueError("Expert placement receive capacity is smaller than the routed rows")
-    if placement.local_receive_capacity not in (None, local):
-        raise ValueError("Expert placement local receive capacity disagrees with the actual routed rows")
-
-    for row in rows:
-        for slot, count in enumerate(row[borrowed + home:]):
-            owner = row[slot]
-            if not -1 <= owner < spec.num_experts or (count > 0 and owner < 0):
-                raise ValueError("An active guest needs a valid logical expert in the copy table")
-            if count == 0:
-                row[slot] = -1
-    copies = tuple(tuple(row[:borrowed]) for row in rows)
-    if not any(owner >= 0 for row in copies for owner in row):
-        return None
-    published = max((i + 1 for i, owner in enumerate(copies[spec.rank_id]) if owner >= 0), default=0)
-    return replace(placement, copies_by_rank=copies, published_slots=published, route_metadata=None,
-                   owner_rows=tuple(rows[spec.rank_id][borrowed:borrowed + home]),
-                   receive_capacity=peak, local_receive_capacity=local)
-
-
 class PlacementResources:
     """Select BF16 routes and own their lazy expert bank."""
 
@@ -157,7 +125,6 @@ class PlacementResources:
                  bf16_partials: bool = False, rank_nodes: tuple[int, ...] = ()) -> None:
         """Attach lazy placement resources to one existing BF16 owner."""
         self.parent = parent
-        self.specification = specification
         self.shared = shared
         self.pool = None
         self.replica_slots_per_rank = specification.get("replica_slots_per_rank")
@@ -226,51 +193,50 @@ class PlacementResources:
         self.statistics["invocations"] += 1
         spec = self.parent.spec
         total = sum(source_rows)
-        limit = receive_limit(self.receive_capacity_percent, total, spec.ep_size)
-        mandatory = limit is not None and summary.maximum > limit
+        checkpointing = is_checkpointing()
+        training = checkpointing or (autograd_mask & 13) == 13
+        resident = self.shared_receive_rows()
         if self.bounded is None:
-            request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
-                                   host_rows=host_rows)
-            placement = self._select_custom(planner, request, limit, mandatory)
+            limit = receive_limit(self.receive_capacity_percent, total, spec.ep_size)
+            request = self.request(hidden, gathered, summary, total, training, checkpointing, resident, host_rows)
+            placement = self._select_custom(planner, request, hidden, ids, inverse, limit,
+                                            mandatory=limit is not None and summary.maximum > limit)
         else:
-            training = is_checkpointing() or (autograd_mask & 13) == 13
-            prices = bf16_cost(
+            prices, limit, keep_home = planner._policy(  # pylint: disable=protected-access
                 spec.hidden_size, spec.intermediate_size, spec.num_cube_cores, training,
-                dispatch_mode=spec.dispatch_mode, transport_engine=spec.transport_engine,
+                spec.dispatch_mode, spec.transport_engine, summary.maximum, total, spec.ep_size, resident,
             )
-            resident = self.shared_receive_rows()
-            if prices.keep_home(summary.maximum, total, spec.ep_size, limit=limit, resident=resident):
+            if keep_home:
                 return None
             placement = self.bounded.select(
                 hidden, ids, gathered[:, 3:], source_rows, inverse, prices, snapshot,
                 host_rows=host_rows, limit=limit, resident=resident,
             )
+        mandatory = limit is not None and summary.maximum > limit
         return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled,
                          mandatory=mandatory)
 
-    def _select_custom(self, planner, request, limit, mandatory):
-        """Converge planner failures and agree on the resources needed by its result."""
+    def _select_custom(self, planner, request, hidden, ids, inverse, limit, *, mandatory):
+        """Converge bad quotas and verify that every EP rank will execute the same dispatch."""
         placement, signature, failure = None, None, None
         try:
-            placement = planner.plan(request)
-            if placement is not None:
+            result = planner.plan(request)
+            if result is not None:
                 spec = self.parent.spec
-                slots = min(spec.local_experts, self.replica_slots_per_rank or spec.local_experts)
-                if not isinstance(placement, ExpertPlacement) or placement.borrowed_capacity > slots:
-                    raise ValueError(f"Expert placement must fit the {slots} available guest slots")
-                if placement.virtual_ids.shape != request.ids.shape or placement.virtual_ids.device != request.ids.device:
-                    raise ValueError("Expert placement IDs must match the source Top-K shape and device")
-                counts = placement.counts_by_source
-                if int(counts.min()) < 0 or not torch.equal(counts.sum(1), request.counts_by_source.sum(1)):
-                    raise ValueError("Expert placement must preserve each source rank's routed row count")
-                ids = placement.virtual_ids
-                if ids.numel() and ((ids < 0) | (ids >= counts.shape[1])).any():
-                    raise ValueError("Expert placement IDs exceed the physical expert range")
-                placement = _bind_custom_copy_rows(spec, placement)
-                if placement is not None:
-                    if limit is not None and placement.receive_capacity > limit:
+                slots = spec.local_experts
+                if isinstance(planner, HotReplicaPlanner):
+                    slots = replica_slot_budget(slots, planner.replica_slots_per_rank, spec.dispatch_mode)
+                plan = validate_quotas(result, request, slots=slots)
+                if plan is not None:
+                    peak = max(plan.destination_loads)
+                    if limit is not None and peak > limit:
                         raise ValueError(f"Expert placement exceeds receive limit {limit} rows")
-                    signature = (placement.borrowed_capacity, placement.receive_capacity, placement.copies_by_rank)
+                    width = plan.config.replica_slots_per_rank
+                    geometry = render_geometry(plan, spec, ids.device, 0, borrowed=width, prepare_metadata=False)
+                    placement = geometry.lower(hidden, ids, inverse)
+                    validate_lowered_ids(ids, placement.virtual_ids, plan, spec.rank_id)
+                    counts_digest = sha256(plan._dispatch_counts_bytes).digest()  # pylint: disable=protected-access
+                    signature = (width, placement.copies_by_rank, counts_digest)
             if mandatory and placement is None:
                 raise ValueError(f"No expert placement found within receive limit {limit} rows")
         except Exception as error:  # pylint: disable=broad-exception-caught
@@ -287,29 +253,19 @@ class PlacementResources:
             raise ValueError("HotReplica planner placement differs across EP ranks")
         return placement
 
-    def request(
-        self, hidden: torch.Tensor, ids: torch.Tensor, gathered: torch.Tensor, summary: _RouteSummary,
-        source_rows: list[int], inverse: torch.Tensor | None, autograd_mask: int, *,
-        host_rows: list[list[int]] | None,
-    ) -> PlacementRequest:
-        """Expose counts and available capacity from one validated MegaMoE route."""
+    def request(self, hidden, gathered, summary, total, training, checkpointing, resident, host_rows):
+        """Pass immutable logical counts from the count exchange to the custom planner."""
         spec = self.parent.spec
-        checkpointing = is_checkpointing()
-        key = (
-            (autograd_mask, checkpointing, hidden.shape[-1], hidden.element_size(), ids.shape[-1],
-             spec.intermediate_size, spec.num_cube_cores, tuple(tuple(row) for row in host_rows))
-            if host_rows is not None else None
-        )
+        rows = gathered[:, 3:].tolist() if host_rows is None else [row[3:] for row in host_rows]
         return PlacementRequest(
-            hidden, ids, gathered[:, 3:], inverse, summary.maximum, sum(source_rows), spec.rank_id,
-            spec.intermediate_size, spec.num_cube_cores, checkpointing or bool(autograd_mask & 1),
-            checkpointing=checkpointing, apply_probs_before_fc2=spec.apply_probs_before_fc2,
-            ordinary_receive_capacity=self.shared_receive_rows(), count_key=key, rank_nodes=self.rank_nodes,
-            dispatch_mode=spec.dispatch_mode, transport_engine=spec.transport_engine,
+            tuple(tuple(row) for row in rows), summary.maximum, total, spec.rank_id, hidden.shape[-1],
+            spec.intermediate_size, spec.num_cube_cores, training, checkpointing=checkpointing,
+            apply_probs_before_fc2=spec.apply_probs_before_fc2, ordinary_receive_capacity=resident,
+            rank_nodes=self.rank_nodes, dispatch_mode=spec.dispatch_mode, transport_engine=spec.transport_engine,
         )
 
     def bind(
-        self, hidden: torch.Tensor, placement: ExpertPlacement | None, *, tokens: int, fused: bool = False,
+        self, hidden: torch.Tensor, placement: _LoweredPlacement | None, *, tokens: int, fused: bool = False,
         mandatory: bool = False,
     ) -> ExpertWeightBinding | None:
         """Use a prepared placement to bind the existing BF16 runtime."""

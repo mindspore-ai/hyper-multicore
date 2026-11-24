@@ -14,7 +14,8 @@ from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
 from ._planner.capacity import ExpertReplicaConfig
 from ._planner.receive import ReplicaCost, select_replica_plan
-from .placement import ExpertPlacement, remap_expert_ids, replica_slot_budget
+from .placement import _LoweredPlacement, remap_expert_ids
+from .planner import replica_slot_budget
 from .render import render_plan
 
 
@@ -116,15 +117,22 @@ class _Geometry:
     metadata: RouteMetadata | None
     owner_rows: tuple[int, ...]
     published_slots: int
-    transfer_experts: int
+
+    def lower(self, hidden, ids, inverse):
+        """Remap this call's original Top-K order against the cached geometry."""
+        remapped = remap_expert_ids(hidden, ids, self.sorted_ids, inverse)
+        return _LoweredPlacement(
+            remapped, self.counts, self.copies, self.width, self.peak, self.local,
+            self.published_slots, self.owners, self.owner_rows, self.metadata,
+        )
 
 
-def _render_geometry(plan, spec, device, maximum, *, prepare_metadata=True):
+def render_geometry(plan, spec, device, maximum, *, borrowed=None, prepare_metadata=True):
     """Pack count rows and only active guest columns in the common route format."""
     config = plan.config
     rank = spec.rank_id
-    used = max(plan.replica_slots_used)
-    borrowed = min(config.replica_slots_per_rank, 1 << (used - 1).bit_length())
+    if borrowed is None:
+        borrowed = plan.compact_borrowed_width
     sorted_ids, table, owners = render_plan(plan, rank, borrowed)
     items = (sorted_ids, table, np.asarray(owners, dtype=np.int32))
     ids, counts, copies = (_upload_route_tensor(torch.from_numpy(item), device) for item in items)
@@ -133,9 +141,9 @@ def _render_geometry(plan, spec, device, maximum, *, prepare_metadata=True):
     if prepare_metadata:
         metadata = _placement_metadata(table, spec, max(1, receive[rank]),
                                        max(128, ((maximum + 127) // 128) * 128), len(items[0]) // spec.top_k, device)
+    published = max((slot + 1 for slot, expert in enumerate(owners[rank]) if expert >= 0), default=0)
     return _Geometry(ids, counts, copies, owners, borrowed, max(receive), receive[rank], metadata,
-                     plan.destination_counts[rank][:config.home_experts], plan.replica_slots_used[rank],
-                     plan.maximum_transfer_degree)
+                     plan.destination_counts[rank][:config.home_experts], published)
 
 
 class BoundedPlacement:
@@ -156,7 +164,7 @@ class BoundedPlacement:
         self, hidden: torch.Tensor, ids: torch.Tensor, counts: torch.Tensor, source_rows: list[int],
         inverse: torch.Tensor | None, prices: ReplicaCost, snapshot: PlacementWire | None = None,
         *, host_rows: list[list[int]] | None = None, limit: int | None = None, resident: int | None = None,
-    ) -> ExpertPlacement | None:
+    ) -> _LoweredPlacement | None:
         """Choose and materialize one plan for the agreed counts and receive budget."""
         spec = self.spec
         if snapshot is not None:
@@ -174,16 +182,8 @@ class BoundedPlacement:
                 limit=limit, resident=resident,
             )
             maximum = max(source_rows) // spec.top_k
-            geometry = None if plan is None else _render_geometry(
+            geometry = None if plan is None else render_geometry(
                 plan, spec, hidden.device, maximum, prepare_metadata=not spec.batch_experts,
             )
             self.key, self.snapshot, self.geometry = key, wire.copy(), geometry
-        geometry = self.geometry
-        if geometry is None:
-            return None
-        remapped = remap_expert_ids(hidden, ids, geometry.sorted_ids, inverse)
-        return ExpertPlacement(
-            remapped, geometry.counts, geometry.copies, geometry.width, geometry.peak, geometry.local,
-            transfer_experts=geometry.transfer_experts, published_slots=geometry.published_slots,
-            copies_by_rank=geometry.owners, route_metadata=geometry.metadata, owner_rows=geometry.owner_rows,
-        )
+        return None if self.geometry is None else self.geometry.lower(hidden, ids, inverse)

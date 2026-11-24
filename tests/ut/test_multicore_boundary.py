@@ -40,8 +40,14 @@ class TestMulticoreBoundary(unittest.TestCase):
 import sys
 import hyper_multicore
 assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
-from hyper_multicore.experimental import MegaMoeTuningOptions
+from hyper_multicore.experimental import (
+    BasePlanner, ExpertPlacement, HotReplicaPlanner, MegaMoeTuningOptions, PlacementRequest, wrap_checkpoint,
+)
 import hyper_multicore.experimental as experimental
+assert isinstance(HotReplicaPlanner(), BasePlanner)
+assert callable(wrap_checkpoint) and ExpertPlacement and PlacementRequest
+assert not hasattr(hyper_multicore, 'BasePlanner')
+assert not hasattr(hyper_multicore, 'MegaMoePlacementOptions')
 assert MegaMoeTuningOptions().dispatch_mode == 'push'
 assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
 assert 'MegaMoeTuningOptions' not in hyper_multicore.__all__
@@ -65,17 +71,16 @@ assert 'torch_npu' not in sys.modules
 
         Feature: Multicore public exports.
         Description: Inspect the HyperMulticore public package symbols.
-        Expectation: The package exports its business modules, placement contracts and diagnostic helpers.
+        Expectation: The package exports its business modules and diagnostic helpers.
         """
         self.assertCountEqual(multicore.__all__, [
-            "BasePlanner", "ExpertPlacement", "PlacementRequest",
-            "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaMoePlacementOptions",
+            "MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions",
             "MegaKernelDiagnostics", "SwiGLUParameters", "SiTUGLUParameters",
             "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
         ])
         self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))
-        for name in ("MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions", "MegaMoePlacementOptions",
-                     "BasePlanner", "ExpertPlacement", "PlacementRequest", "SwiGLUParameters", "SiTUGLUParameters"):
+        for name in ("MegaMhc", "MegaGate", "MegaMoeExperts", "MegaMoeNumericsOptions",
+                     "SwiGLUParameters", "SiTUGLUParameters"):
             self.assertTrue(callable(getattr(multicore, name)))
         for name in ("MhcState", "MegaMhcOutput", "GateOutput", "GateBackend"):
             self.assertFalse(hasattr(multicore, name))

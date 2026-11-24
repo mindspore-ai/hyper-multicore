@@ -989,7 +989,7 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     virtual_counts = table[virtual_spec.rank_id].contiguous()
     metadata = placement.route_metadata
     virtual_table = gathered if metadata is not None else torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
-    local_load = placement.received_rows(virtual_spec.rank_id)
+    local_load = placement.local_receive_capacity
     virtual_summary = _RouteSummary(max(1, local_load), summary.plan_tokens, placement.receive_capacity)
     prepare_workspace(virtual_summary.plan_tokens, virtual_summary.maximum)
     virtual_tokens = _materialize_route_permutation(hidden, placement.virtual_ids, virtual_spec, workspace)

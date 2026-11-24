@@ -24,9 +24,8 @@ import numpy as np
 import pytest
 import torch
 
-from hyper_multicore import BasePlanner, ExpertPlacement, MegaMoePlacementOptions, MegaMoeExperts, PlacementRequest
-from hyper_multicore.experimental import MegaMoeTuningOptions
-from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
+from hyper_multicore import MegaMoeExperts
+from hyper_multicore.experimental import BasePlanner, ExpertPlacement, HotReplicaPlanner, MegaMoeTuningOptions, PlacementRequest
 from hyper_multicore.modules.mega_moe import route, resources as resource_module
 from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
@@ -36,9 +35,10 @@ from hyper_multicore.modules.hot_replica import bounded_placement
 from hyper_multicore.modules.hot_replica.bounded_placement import _placement_metadata, read_placement_wire
 from hyper_multicore.modules.hot_replica.shmem_transfer import SharedExpertPool
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
-    ExpertWeightBinding, PlacementResources, _bind_custom_copy_rows, _get_mega_bank,
+    ExpertWeightBinding, PlacementResources, _get_mega_bank,
 )
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_multicore.modules.hot_replica.placement import validate_quotas
 
 
 @pytest.mark.parametrize(
@@ -58,20 +58,8 @@ def test_unsupported_configuration_fails_before_binding(precision, mode, value, 
             num_experts=4,
             top_k=2,
             precision=precision,
-            tuning_options=MegaMoeTuningOptions(dispatch_mode=mode),
-            expert_placement=MegaMoePlacementOptions(strategy="adaptive", planner=value),
+            tuning_options=MegaMoeTuningOptions(dispatch_mode=mode, expert_placement=value),
         )
-
-
-@pytest.mark.parametrize(("options", "error"), [
-    (True, TypeError),
-    (MegaMoePlacementOptions(strategy="unknown"), ValueError),
-    (MegaMoePlacementOptions(strategy="adaptive"), TypeError),
-    (MegaMoePlacementOptions(strategy="none", planner=HotReplicaPlanner()), ValueError),
-])
-def test_invalid_placement_strategy_fails_before_binding(options, error):
-    with pytest.raises(error):
-        MegaMoeExperts(hidden_size=128, intermediate_size=128, num_experts=4, top_k=2, expert_placement=options)
 
 
 def test_placement_requires_multiple_ranks():
@@ -81,7 +69,7 @@ def test_placement_requires_multiple_ranks():
             intermediate_size=128,
             num_experts=4,
             top_k=2,
-            expert_placement=MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlanner()),
+            tuning_options=MegaMoeTuningOptions(expert_placement=HotReplicaPlanner()),
         )
 
 
@@ -92,8 +80,7 @@ def test_bf16_pull_accepts_adaptive_placement():
     with patch.object(module, "_resolve_ep_size", return_value=2):
         expert = MegaMoeExperts(
             hidden_size=128, intermediate_size=128, num_experts=4, top_k=2,
-            tuning_options=MegaMoeTuningOptions(dispatch_mode="pull"),
-            expert_placement=MegaMoePlacementOptions("adaptive", HotReplicaPlanner()),
+            tuning_options=MegaMoeTuningOptions(dispatch_mode="pull", expert_placement=HotReplicaPlanner()),
         )
     try:
         assert expert._resource_group.specification["dispatch_mode"] == "pull"  # pylint: disable=protected-access
@@ -161,9 +148,9 @@ def test_placement_wire_is_reused_only_for_equal_agreed_counts():
     assert workspace.placement_wire is second
 
 
-@pytest.mark.parametrize("options", [None, MegaMoePlacementOptions(strategy="none")])
+@pytest.mark.parametrize("options", [None, MegaMoeTuningOptions()])
 def test_default_keeps_placement_disabled(options):
-    expert = MegaMoeExperts(hidden_size=128, intermediate_size=128, num_experts=4, top_k=2, expert_placement=options)
+    expert = MegaMoeExperts(hidden_size=128, intermediate_size=128, num_experts=4, top_k=2, tuning_options=options)
     try:
         assert expert._resource_group.specification["hot_replica"] is False  # pylint: disable=protected-access
     finally:
@@ -507,8 +494,8 @@ def test_forward_uses_injected_planner_after_count_exchange():
 
     planner = RecordingPlanner()
     with patch.object(module, "_resolve_ep_size", return_value=2):
-        options = MegaMoePlacementOptions(strategy="adaptive", planner=planner)
-        expert = MegaMoeExperts(hidden_size=8, intermediate_size=4, num_experts=4, top_k=1, expert_placement=options)
+        options = MegaMoeTuningOptions(expert_placement=planner)
+        expert = MegaMoeExperts(hidden_size=8, intermediate_size=4, num_experts=4, top_k=1, tuning_options=options)
     hidden, ids = torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int32)
     probs, roots = torch.ones(2, 1), (torch.empty(2, 8, 8), torch.empty(2, 4, 8))
     spec = SimpleNamespace(architecture=0, auto_tokens=True, dispatch_mode="push", precision="bf16",
@@ -544,62 +531,38 @@ def test_forward_uses_injected_planner_after_count_exchange():
             assert expert(hidden, ids, probs, expert_weights=roots) is hidden
         exchange.assert_called_once()
         read.assert_called_once()
-        torch.testing.assert_close(planner.seen.counts_by_source, counts[:, 3:])
+        assert planner.seen.counts_by_source == ((2, 0, 0, 0), (0, 0, 0, 2))
         assert forward.call_args.args[-1] is ordinary
     finally:
         expert.close()
 
 
-def test_public_placement_hints_and_omitted_local_capacity():
-    """Resolve public types and sum destination columns across all source ranks."""
-    assert get_type_hints(MegaMoePlacementOptions)["planner"] == BasePlanner | None
-    assert get_type_hints(ExpertPlacement)["route_metadata"] == route.RouteMetadata | None
-    placement = ExpertPlacement(torch.tensor([[0]]), torch.tensor([[2, 0, 1, 3], [1, 0, 2, 1]]),
-                                torch.tensor([[1], [0]], dtype=torch.int32), 1, 7)
-    assert [placement.received_rows(rank) for rank in range(2)] == [3, 7]
+def test_experimental_placement_uses_host_quotas():
+    """Resolve the public type and derive a single canonical copy table."""
+    assert get_type_hints(MegaMoeTuningOptions)["expert_placement"] == BasePlanner | None
+    request = PlacementRequest(((3, 2, 7, 5), (1, 0, 2, 1)), 15, 21, 0, 128, 64, 24, True)
+    quotas = ExpertPlacement(((2, 3), (-1, -1)),
+                             ((3, 2, 3, 0, 4, 5, 0, 0), (1, 0, 0, 0, 2, 1, 0, 0)))
+    plan = validate_quotas(quotas, request, slots=2)
+    assert plan.destination_loads == (9, 12)
+    assert plan.slot_to_logical == ((0, 1, 2, -1), (2, 3, -1, -1))
 
 
-@pytest.mark.parametrize("guest_count", [0, 3])
-def test_custom_placement_derives_fused_rows_from_counts(guest_count):
-    """Require a producer for every published guest on both EP ranks."""
-    copies = torch.tensor([[2, -1], [-1, -1]], dtype=torch.int32)
-    counts = torch.tensor([[3, 2, guest_count, 0, 4, 5, 0, 0], [1, 0, 0, 0, 2, 1, 0, 0]])
-    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 16)
-    bound = [
-        _bind_custom_copy_rows(SimpleNamespace(local_experts=2, ep_size=2, rank_id=rank, num_experts=4), placement)
-        for rank in range(2)
-    ]
-    if guest_count:
-        assert [result.copies_by_rank for result in bound] == [((2, -1), (-1, -1))] * 2
-        assert [(result.owner_rows, result.published_slots) for result in bound] == [((4, 2), 1), ((6, 6), 0)]
-    else:
-        assert bound == [None, None]
-
-
-def test_a3_eio_custom_placement_keeps_active_local_slots_and_ignores_idle_guests():
-    """Only real guest producers contribute to the fused return schedule."""
-    copies = torch.tensor([[0, 3], [-1, -1]], dtype=torch.int32)
-    counts = torch.tensor([[3, 2, 3, 0, 4, 5, 0, 0], [1, 0, 0, 0, 2, 1, 0, 0]])
-    spec = SimpleNamespace(local_experts=2, ep_size=2, rank_id=0, num_experts=4)
-    placement = ExpertPlacement(torch.tensor([[2]]), counts, copies, 2, 16)
-    bound = _bind_custom_copy_rows(spec, placement)
-    assert bound.copies_by_rank == ((0, -1), (-1, -1))
-    assert bound.published_slots == 1
-    assert bound.owner_rows == (4, 2)
-    counts[0, 2] = 0
-    assert _bind_custom_copy_rows(spec, placement) is None
-
-
-def test_checkpoint_request_is_training_with_automatic_capacity():
-    """Request a training plan even during the no-grad checkpoint forward."""
+def test_checkpoint_request_uses_the_agreed_training_phase():
+    """A no-grad checkpoint forward uses the cost of subsequent training."""
     spec = SimpleNamespace(architecture=0, rank_id=0, intermediate_size=4, num_cube_cores=24,
-                           apply_probs_before_fc2=True, dispatch_mode="push", transport_engine="mte")
-    owner = SimpleNamespace(spec=spec)
-    resources = PlacementResources(owner, {}, False)
+                           apply_probs_before_fc2=True, dispatch_mode="push", transport_engine="mte",
+                           ep_size=2)
+    resources = PlacementResources(SimpleNamespace(spec=spec), {}, False)
     ids = torch.tensor([[0]])
-    with patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True):
-        request = resources.request(torch.zeros(1, 4), ids, torch.zeros(2, 5), route._RouteSummary(1, 128, 1),
-                                    [1, 1], ids, 0, host_rows=None)
+    planner = Mock()
+    with (
+        patch.object(resources, "_select_custom", return_value=None) as select,
+        patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=True),
+    ):
+        resources.select(torch.zeros(1, 4), ids, torch.zeros(2, 5, dtype=torch.int32),
+                         route._RouteSummary(1, 128, 1), [1, 1], None, 0, planner=planner)
+    request = select.call_args.args[1]
     assert request.training and request.checkpointing
     assert request.ordinary_receive_capacity is None
 

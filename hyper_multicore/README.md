@@ -37,7 +37,8 @@ from hyper_multicore.diagnostics import dump, profiler
 `MegaKernelDiagnostics` 仍从 `hyper_multicore.diagnostics` 公开导出，用于组件接入诊断运行时，
 不是用户开启采集的入口，也未单独承诺跨版本兼容性。接入方式见[诊断设计](../docs/design/diagnostics_design.md#组件接入)。
 
-`MegaMoeTuningOptions` 与 `MegaMoeSchedulerOptions` 从 `hyper_multicore.experimental` 导入，属于公开实验 API。
+`MegaMoeTuningOptions`、`MegaMoeSchedulerOptions`、HotReplica planner 协议及 `wrap_checkpoint`
+从 `hyper_multicore.experimental` 导入，属于公开实验 API。
 字段、可选值及默认执行策略不保证跨版本兼容，升级时需要重新验证。配置入口与支持范围见
 [MegaMoE 调优配置](../docs/mega_moe.md#公开实验性调优配置)。
 

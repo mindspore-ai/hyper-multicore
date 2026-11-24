@@ -33,7 +33,7 @@ from hyper_multicore import _collective, shmem
 from hyper_multicore.shmem import _lifecycle
 
 from .bank_ops import prefetch_banks, reduce_banks
-from .placement import ExpertPlacement
+from .placement import _LoweredPlacement
 from .pipeline import ReplicaPipeline, projection_shapes
 
 @contextmanager
@@ -395,7 +395,7 @@ class ExpertWeightBinding:
     """Per-call ownership; the autograd function saves current owner parameters."""
 
     pool: SharedExpertPool
-    placement: ExpertPlacement
+    placement: _LoweredPlacement
     layout: str
     snapshot: Any = None
     generation: int | None = None

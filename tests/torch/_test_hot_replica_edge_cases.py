@@ -24,9 +24,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
-from hyper_multicore import MegaMoePlacementOptions, MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
-from hyper_multicore.experimental import MegaMoeTuningOptions
-from hyper_multicore.modules.hot_replica.checkpoint import wrap_checkpoint
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
+from hyper_multicore.experimental import MegaMoeTuningOptions, wrap_checkpoint
 from hyper_multicore.modules.hot_replica.pipeline import _band_layout, projection_shapes
 from tests.torch._test_hot_replica import SkewPlanner
 
@@ -162,9 +161,8 @@ def test_placement_edge_cases() -> None:
                         apply_probs_before_fc2=before,
                         partial_weight_grad_dtype=dw,
                     ),
-                    expert_placement=MegaMoePlacementOptions("adaptive", planner) if planner is not None else None,
                     tuning_options=MegaMoeTuningOptions(
-                        dispatch_split=split, combine_split=split,
+                        dispatch_split=split, combine_split=split, expert_placement=planner,
                     ),
                 )
                 leaves = [v.detach().clone().requires_grad_() for v in values]

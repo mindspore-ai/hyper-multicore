@@ -18,11 +18,11 @@ from __future__ import annotations
 from sys import float_info
 from typing import Literal
 
-import torch
+import numpy as np
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from ._planner.receive import SourceQuota, bf16_cost, receive_limit
-from .placement import build_placement, replica_slot_budget
+from ._planner.capacity import ExpertReplicaConfig
+from ._planner.receive import bf16_cost, receive_limit, select_replica_plan
 
 
 class HotReplicaPlanner(BasePlanner):
@@ -76,22 +76,58 @@ class HotReplicaPlanner(BasePlanner):
             settings.append(f"cross_node_cost={self.cross_node_cost}")
         return ",".join(settings)
 
-    @torch.no_grad()
+    def _policy(self, hidden_size, intermediate_size, cube_cores, training, dispatch_mode,
+                transport_engine, peak, total, ranks, resident):
+        """Use one cost, capacity and home-admission rule for both planner callers."""
+        prices = bf16_cost(hidden_size, intermediate_size, cube_cores, training,
+                           dispatch_mode=dispatch_mode, transport_engine=transport_engine)
+        limit = receive_limit(self.receive_capacity_percent, total, ranks)
+        return prices, limit, prices.keep_home(peak, total, ranks, limit=limit, resident=resident)
+
     def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
-        """Return a placement if saved work repays movement."""
-        ranks, experts = request.counts_by_source.shape
-        prices = bf16_cost(
-            request.hidden.shape[-1], request.intermediate_size, request.cube_cores, request.training,
-            dispatch_mode=request.dispatch_mode, transport_engine=request.transport_engine,
-        )
-        limit = receive_limit(self.receive_capacity_percent, request.total_rows, ranks)
-        resident = request.ordinary_receive_capacity
-        if prices.keep_home(request.maximum_received, request.total_rows, ranks, limit=limit, resident=resident):
-            return None
+        """Return host quotas if saved work repays movement."""
+        counts = np.asarray(request.counts_by_source)
+        if counts.ndim != 2 or counts.size == 0:
+            raise ValueError("HotReplica counts must describe an ordered EP topology")
+        ranks, experts = counts.shape
+        if not 0 <= request.rank < ranks or not np.issubdtype(counts.dtype, np.integer):
+            raise ValueError("HotReplica requires integer counts and a valid EP rank")
+        if counts.min() < 0 or counts.max() > 2**31 - 1 or counts.sum(dtype=np.int64) > 2**31 - 1:
+            raise ValueError("HotReplica counts must be nonnegative and within the INT32 planner limit")
         budget = replica_slot_budget(experts // ranks, self.replica_slots_per_rank, request.dispatch_mode)
-        return build_placement(
-            request.hidden, request.ids, request.counts_by_source, None, request.rank,
-            source_inverse=request.source_inverse, replica_slots_per_rank=budget, prices=prices,
-            source_quota=SourceQuota.LOCAL, receive_capacity_percent=self.receive_capacity_percent,
-            nodes=request.rank_nodes, cross_node_cost=self.cross_node_cost, resident=resident,
+        config = ExpertReplicaConfig(experts, ranks, budget)
+        resident = request.ordinary_receive_capacity
+        prices, limit, keep_home = self._policy(
+            request.hidden_size, request.intermediate_size, request.cube_cores, request.training,
+            request.dispatch_mode, request.transport_engine, request.maximum_received, request.total_rows,
+            ranks, resident,
         )
+        if keep_home:
+            return None
+        plan = select_replica_plan(counts, config, prices=prices, limit=limit, resident=resident,
+                                   nodes=request.rank_nodes, cross_node_cost=self.cross_node_cost)
+        if plan is None:
+            return None
+        return as_placement(plan)
+
+
+
+def replica_slot_budget(home: int, requested: int | None, dispatch_mode: str) -> int:
+    """Return the effective slot cap and reject out-of-range explicit requests."""
+    limit = min(home, 6) if dispatch_mode == "pull" else home
+    if requested is not None and requested > limit:
+        raise ValueError(f"Requested {requested} guest slots, but {dispatch_mode} supports at most {limit} per rank")
+    return limit if requested is None else requested
+
+
+def as_placement(plan) -> ExpertPlacement:
+    """Expose compact quotas without generating per-token device metadata."""
+    config = plan.config
+    stop = config.home_experts + plan.compact_borrowed_width
+    stride = config.slots_per_rank
+    copies = tuple(row[config.home_experts:stop] for row in plan.slot_to_logical)
+    dispatch = tuple(
+        tuple(count for offset in range(0, len(row), stride) for count in row[offset:offset + stop])
+        for row in plan.dispatch_counts
+    )
+    return ExpertPlacement(copies, dispatch)

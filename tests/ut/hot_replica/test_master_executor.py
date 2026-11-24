@@ -24,7 +24,7 @@ import torch
 from hyper_multicore.modules.hot_replica import mega_moe_adapter
 from hyper_multicore.modules.hot_replica._planner._dispatch import _materialize
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
-from hyper_multicore.modules.hot_replica.bounded_placement import _render_geometry, supports_bounded_placement
+from hyper_multicore.modules.hot_replica.bounded_placement import render_geometry, supports_bounded_placement
 from hyper_multicore.modules.hot_replica.pipeline import (
     ReplicaPipeline, _band_layout, fused_replica_slots, supports_pipeline,
 )
@@ -328,7 +328,7 @@ def test_fusion_accepts_an_empty_tail_in_the_padded_copy_table(layout, used, bat
         quotas[0][expert] = quotas[1][expert] = 2
     plan = _materialize(counts, quotas, config)
     plan.validate()
-    geometry = _render_geometry(plan, spec, "cpu", config.num_experts * 2)
+    geometry = render_geometry(plan, spec, "cpu", config.num_experts * 2)
     assert geometry.width == width
     assert geometry.owners == tuple(row[home:home+width] for row in plan.slot_to_logical)
     expected = torch.tensor(plan.dispatch_counts).reshape(ranks, ranks, config.slots_per_rank)
