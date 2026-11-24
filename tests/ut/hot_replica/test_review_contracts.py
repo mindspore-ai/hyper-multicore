@@ -14,6 +14,7 @@
 # ============================================================================
 """Exercise the placement and resource cleanup without starting a device runtime."""
 
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
@@ -151,3 +152,17 @@ def test_tensor_dump_preserves_the_original_replay_binding():
     assert diagnostic.snapshot is snapshot and diagnostic.placement is placement
     assert diagnostic.token is not binding.token
     assert binding.mode is ReplicaExecutionMode.FP32_BAND and binding.fused_gradients
+
+
+def test_successful_fused_weight_acquire_records_prefetch_and_returns_operands():
+    """Exercise the successful projection-ready path as well as failure cleanup."""
+    pool, placement = Mock(), Mock()
+    pool.statistics = {}
+    binding = ExpertWeightBinding(pool, placement, "EOI", execution_mode=ReplicaExecutionMode.FP32_BAND)
+    weights = (torch.empty(1), torch.empty(1))
+    with patch.object(shmem_transfer, "_ordered_transfers", return_value=nullcontext()):
+        assert binding.acquire(weights) is pool.pipeline.begin.return_value
+        binding.release()
+    pool.pipeline.begin.assert_called_once_with(weights, binding, False)
+    assert pool.statistics["fused_prefetches"] == 1
+    pool.release.assert_called_once_with()

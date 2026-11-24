@@ -459,6 +459,7 @@ class ExpertWeightBinding:
             if self.fused:
                 with _ordered_transfers(self.pool):
                     result = self.pool.pipeline.begin(weights, self, backward)
+                stats = self.pool.statistics
                 stats["fused_prefetches"] = stats.get("fused_prefetches", 0) + 1
                 return result
             if self.generation is not None and self.generation == self.pool.generation:
