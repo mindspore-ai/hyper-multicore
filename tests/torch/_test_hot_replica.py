@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import weakref
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
@@ -127,6 +128,66 @@ def test_placement_checkpoint_and_close():
             (Path(result_dir) / f"rank{rank}.json").write_text(json.dumps({
                 "rank": rank, "dispatch_mode": dispatch_mode, "layout": layout, "placements": placement_records,
             }))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_wide_placement_and_hard_receive_limit():
+    """Force eight guest slots, then reject an impossible seven-slot plan."""
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(rank)
+    dist.init_process_group("hccl")
+    device = torch.device("npu", rank)
+    tokens, hidden, intermediate, experts, top_k = 2048, 512, 256, 32, 8
+    receipts = []
+    try:
+        torch.manual_seed(713 + rank)
+        positions = torch.arange(tokens * top_k, device=device, dtype=torch.int32)
+        ids = (positions % (experts // 2)).reshape(tokens, top_k)
+        x = (torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16) * .02).requires_grad_()
+        probs = torch.rand(tokens, top_k, device=device).softmax(-1).requires_grad_()
+        weights = tuple((torch.randn(shape, device=device, dtype=torch.bfloat16) * .02).requires_grad_()
+                        for shape in ((experts // 2, hidden, 2 * intermediate),
+                                      (experts // 2, intermediate, hidden)))
+        upstream = torch.randn_like(x)
+        reference = None
+        for mode in ("push", "pull"):
+            for slots in (7, 8):
+                planner = HotReplicaPlanner(replica_slots_per_rank=slots, receive_capacity_percent=100,
+                                            cross_node_cost=1.5)
+                op = MegaMoeExperts(
+                    hidden_size=hidden, intermediate_size=intermediate, num_experts=experts, top_k=top_k,
+                    ep_group=dist.group.WORLD,
+                    tuning_options=MegaMoeTuningOptions(
+                        dispatch_mode=mode, capacity_growth_factor=1.0, initial_capacity_factor=2.5,
+                        expert_placement=planner,
+                    ),
+                    numerics_options=MegaMoeNumericsOptions(apply_probs_before_fc2=True),
+                )
+                try:
+                    if slots == 7:
+                        with pytest.raises(ValueError, match="receive limit"):
+                            op(x, ids, probs, expert_weights=weights)
+                        continue
+                    out = op(x, ids, probs, expert_weights=weights)
+                    gradients = torch.autograd.grad(out, (x, probs, *weights), upstream)
+                    owner = op._resource_group.resources.placement  # pylint: disable=protected-access
+                    geometry = owner.bounded.geometry
+                    assert geometry.width == 8 and geometry.peak == tokens * top_k
+                    assert owner.statistics["placements"] == 1
+                    assert owner.pool.statistics["fused_gradient_returns"] == 1
+                    received = tuple(t.detach().cpu() for t in (out, *gradients))
+                    if reference is None:
+                        reference = received
+                    else:
+                        for observed, expected in zip(received, reference, strict=True):
+                            torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+                    receipts.append({"mode": mode, "actual_slots": geometry.width,
+                                     "peak_rows": geometry.peak, "fused_returns": 1})
+                finally:
+                    op.close()
+        if result_dir := os.environ.get("HOT_REPLICA_TEST_RESULTS"):
+            (Path(result_dir) / f"rank{rank}.json").write_text(json.dumps({"rank": rank, "placements": receipts}))
     finally:
         dist.destroy_process_group()
 
