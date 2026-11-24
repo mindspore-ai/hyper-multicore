@@ -202,7 +202,8 @@ class MegaMoeExperts(MulticoreModule):
             if isinstance(planner, HotReplicaPlanner):
                 replica_slots_per_rank = planner.replica_slots_per_rank
                 cross_node_cost = planner.cross_node_cost
-                receive_capacity_percent = planner.receive_capacity_percent
+                if planner.receive_capacity_percent != "auto":
+                    receive_capacity_percent = planner.receive_capacity_percent
                 indexed_push = (type(planner) is HotReplicaPlanner and a3_indexed.requested())
             if cross_node_cost is not None and tuning.dispatch_mode != "push":
                 raise ValueError("An explicit HotReplica cross_node_cost requires Push")

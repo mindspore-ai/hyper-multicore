@@ -62,6 +62,9 @@ def prepare_expert_invocation(
             from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
 
             record, replay = route_record(resources)
+            if replay and record is not None and record.route_only:
+                if record.route is None or record.route_state != record.route_signature(weights):
+                    record = None
             if replay and agree_replay(
                     record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
                 placement.statistics["route_replays"] += 1
@@ -79,7 +82,9 @@ def prepare_expert_invocation(
                             hidden, virtual_ids, resources.spec, resources.workspace,
                         )
                     route = replace(route, routed_tokens=rows, unpermute_mapping=mapping)
-                yield replace(route, checkpoint_record=record) if counts is None or record.guest_snapshot_bytes else route
+                if not record.route_only and (counts is None or record.guest_snapshot_bytes):
+                    route = replace(route, checkpoint_record=record)
+                yield route
                 return
             if replay:
                 placement.statistics["route_replay_misses"] += 1
@@ -113,18 +118,23 @@ def prepare_expert_invocation(
         if not pull and not resources.spec.auto_tokens:
             with torch.inference_mode(False):
                 resources.ensure_capacity(route.maximum_received_slots)
-        yield _record_checkpoint_route(route, record, counts, ids)
+        yield _record_checkpoint_route(route, record, counts, ids, weights)
     finally:
         if leased_workspace is not None:
             leased_workspace.release()
 
 
-def _record_checkpoint_route(route, record, counts, ids):
+def _record_checkpoint_route(route, record, counts, ids, weights):
     """Keep the route descriptors and placement with the checkpoint invocation."""
     if record is None:
         return route
     mapping = route.unpermute_mapping if route.indexed_dispatch_offsets is not None else None
     record.route = replace(route, routed_tokens=None, unpermute_mapping=mapping, count_fence=None)
+    if record.route_only:
+        record.route_state = record.route_signature(weights)
+        if counts is None:
+            record.ids = ids.detach().clone()
+        return route
     if counts is not None:
         return replace(route, checkpoint_record=record) if record.guest_snapshot_bytes else route
     record.ids = ids.detach().clone()

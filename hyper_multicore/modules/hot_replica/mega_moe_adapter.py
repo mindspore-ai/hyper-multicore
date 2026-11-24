@@ -28,7 +28,8 @@ from hyper_multicore.modules.mega_moe.heap_manager import _WorkspaceLayout
 from hyper_multicore.modules.mega_moe.spec import _COMMUNICATION_SPLIT, _align_capacity, _resolve_receive_capacity
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from .bounded_placement import BoundedPlacement, PlacementWire, supports_bounded_placement
+from ._planner.receive import bf16_cost
+from .bounded_placement import BoundedPlacement, PlacementWire, _rank_nodes, supports_bounded_placement
 from .checkpoint import is_checkpointing
 from .placement import render_placement
 from .pipeline import ReplicaPipeline, fused_replica_slots, supports_pipeline, uses_wider_gradient_bands
@@ -168,6 +169,7 @@ class PlacementResources:
         self.replica_slots_per_rank = specification.get("replica_slots_per_rank")
         self.cross_node_cost = specification.get("cross_node_cost")
         self.receive_capacity_percent = specification.get("receive_capacity_percent")
+        self.rank_nodes = None
         self.indexed_push = a3_indexed.qualify(parent.spec, specification.get("indexed_push", False))
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
@@ -175,7 +177,8 @@ class PlacementResources:
         self.requires_fused_return = can_split_weights and spec.expert_weight_layout == "EIO"
         supported = built_in and can_split_weights
         self.bounded = (BoundedPlacement(spec, replica_slots_per_rank=self.replica_slots_per_rank,
-                                        cross_node_cost=self.cross_node_cost)
+                                        cross_node_cost=self.cross_node_cost,
+                                        receive_capacity_percent=self.receive_capacity_percent)
                         if supported else None)
         self.bf16_partials = False
         self.prefer_bf16_partials = False
@@ -204,6 +207,14 @@ class PlacementResources:
         """Use the count wire for ordinary per-expert dispatch descriptors."""
         return self.bounded is not None and not self.parent.spec.batch_experts and not checkpointing
 
+    def shared_receive_rows(self) -> int | None:
+        """Read the committed token workspace used by both ordinary and placed Push routes."""
+        if self.parent.spec.dispatch_mode == "push":
+            workspace = getattr(self.parent, "workspace", None)
+            if workspace is not None:
+                return workspace.capacity_floor or None
+        return None
+
     def select(
         self,
         hidden: torch.Tensor,
@@ -223,12 +234,16 @@ class PlacementResources:
         """Choose a virtual route only after the existing count exchange validates it."""
         spec = self.parent.spec
         if (self.bounded is None or checkpointing or spec.batch_experts
-                or self.receive_capacity_percent is not None):
-            if snapshot is not None:
-                host_rows = snapshot.wire.tolist()
+                or type(self.receive_capacity_percent) is int):
+            if snapshot is not None and host_rows is None:
+                host_rows = snapshot.wire
             request = self.request(hidden, ids, gathered, summary, source_rows, inverse, autograd_mask,
                                    host_rows=host_rows)
             if self.bounded is None:
+                if self.cross_node_cost is not None and _uses_builtin_planner(self.specification):
+                    if self.rank_nodes is None:
+                        self.rank_nodes = _rank_nodes(spec.ep_group, spec.ep_size)
+                    request = replace(request, rank_nodes=self.rank_nodes)
                 placement = planner.plan(request)
                 if placement is not None and (self.pipeline_enabled or self.requires_fused_return):
                     placement = _bind_custom_copy_rows(spec, placement, fused_return=self.requires_fused_return)
@@ -242,13 +257,15 @@ class PlacementResources:
                 placement = planner._plan_by_cost(request, build)
             return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
         self.statistics["invocations"] += 1
-        peak = summary.maximum
-        average = (sum(source_rows) + spec.ep_size - 1) // spec.ep_size
         projections = 2 * bool(autograd_mask & 4) + bool(autograd_mask & 8) if autograd_mask & 1 else 0
-        saved = peak - average
-        if not saved or (4 * saved < peak if projections == 3 else 5 * saved < 2 * peak):
+        resident = self.shared_receive_rows()
+        if bf16_cost(spec, projections == 3).keep_home(
+            summary.maximum, sum(source_rows), spec.ep_size, self.receive_capacity_percent, resident=resident,
+        ):
             return None
-        placement = self.bounded.select(hidden, ids, gathered[:, 3:], source_rows, inverse, projections, snapshot)
+        placement = self.bounded.select(
+            hidden, ids, gathered[:, 3:], source_rows, inverse, projections, snapshot, resident=resident,
+        )
         return self.bind(hidden, placement, tokens=summary.plan_tokens, fused=self.pipeline_enabled)
 
     def request(
@@ -268,7 +285,8 @@ class PlacementResources:
         return PlacementRequest(
             hidden, ids, gathered[:, 3:], inverse, summary.maximum, sum(source_rows), spec.rank_id,
             spec.intermediate_size, spec.num_cube_cores, replay or bool(autograd_mask & 1),
-            checkpointing=replay, apply_probs_before_fc2=spec.apply_probs_before_fc2, count_key=key,
+            checkpointing=replay, apply_probs_before_fc2=spec.apply_probs_before_fc2,
+            ordinary_receive_capacity=self.shared_receive_rows(), count_key=key,
         )
 
     def bind(

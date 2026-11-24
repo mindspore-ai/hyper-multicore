@@ -17,13 +17,13 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from sys import float_info
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from ._planner.capacity import align_capacity
-from .placement import build_placement, placement_is_profitable, placement_receive_limit
+from ._planner.receive import ReplicaCost, receive_limit
+from .placement import build_placement, placement_benefit_seconds
 
 
 class HotReplicaPlanner(BasePlanner):
@@ -31,23 +31,24 @@ class HotReplicaPlanner(BasePlanner):
 
     def __init__(
         self, *, replica_slots_per_rank: int | None = None,
+        receive_capacity_percent: int | Literal["auto"] | None = "auto",
         cross_node_cost: float | None = None,
-        receive_capacity_percent: int | None = None,
     ) -> None:
-        """Set optional guest, receive-capacity and inter-node cost constraints."""
+        """Set optional guest and receive limits and a relative inter-node replica charge."""
         if replica_slots_per_rank is not None and (
             type(replica_slots_per_rank) is not int or replica_slots_per_rank <= 0
         ):
             raise ValueError("replica_slots_per_rank must be a positive integer")
+        if receive_capacity_percent is not None and receive_capacity_percent != "auto" and (
+            type(receive_capacity_percent) is not int or receive_capacity_percent < 100
+        ):
+            raise ValueError('receive_capacity_percent must be an integer at least 100 or "auto"')
         if cross_node_cost is not None:
             if type(cross_node_cost) not in (int, float) or not 0 < cross_node_cost <= float_info.max:
                 raise ValueError("cross_node_cost must be a finite positive multiplier")
             cross_node_cost = float(cross_node_cost)
-        if receive_capacity_percent is not None and (
-                type(receive_capacity_percent) is not int or receive_capacity_percent < 100):
-            raise ValueError("receive_capacity_percent must be an integer at least 100")
-        self._receive_capacity_percent = receive_capacity_percent
         self._replica_slots_per_rank = replica_slots_per_rank
+        self._receive_capacity_percent = "auto" if receive_capacity_percent is None else receive_capacity_percent
         self._cross_node_cost = cross_node_cost
         self._rejected_routes: OrderedDict[tuple[Any, ...], None] = OrderedDict()
 
@@ -57,24 +58,24 @@ class HotReplicaPlanner(BasePlanner):
         return self._replica_slots_per_rank
 
     @property
+    def receive_capacity_percent(self) -> int | Literal["auto"]:
+        """Return the configured receive policy relative to the actual routed rows."""
+        return self._receive_capacity_percent
+
+    @property
     def cross_node_cost(self) -> float | None:
         """Return the optional cross-node replica transfer multiplier."""
         return self._cross_node_cost
-
-    @property
-    def receive_capacity_percent(self) -> int | None:
-        """Return the explicit percentage of the average routed rows."""
-        return self._receive_capacity_percent
 
     def configuration_key(self) -> str:
         """Include the explicit limits in the configuration agreed by EP ranks."""
         settings = []
         if self.replica_slots_per_rank is not None:
             settings.append(f"replica_slots_per_rank={self.replica_slots_per_rank}")
+        if self.receive_capacity_percent != "auto":
+            settings.append(f"receive_capacity_percent={self.receive_capacity_percent}")
         if self.cross_node_cost is not None:
             settings.append(f"cross_node_cost={self.cross_node_cost}")
-        if self.receive_capacity_percent is not None:
-            settings.append(f"receive_capacity_percent={self.receive_capacity_percent}")
         return ",".join(settings)
 
     @torch.no_grad()
@@ -89,20 +90,18 @@ class HotReplicaPlanner(BasePlanner):
         local = experts // ranks
         hidden = request.hidden.shape[-1]
         size = request.hidden.element_size()
-        target = (request.total_rows + ranks - 1) // ranks
         maximum = request.maximum_received
-        receive_limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
-        percent = self.receive_capacity_percent
-        if percent is not None:
-            receive_limit = min(receive_limit, align_capacity((target * percent + 99) // 100))
-        key = request.count_key
-        if key is not None and key in self._rejected_routes:
+        limit = receive_limit(self.receive_capacity_percent, request.total_rows, ranks)
+        mandatory = limit is not None and maximum > limit
+        resident = request.ordinary_receive_capacity
+        key = (request.count_key, request.rank_nodes, resident) if request.count_key is not None else None
+        if not mandatory and key is not None and key in self._rejected_routes:
             self._rejected_routes.move_to_end(key)
             return None
         weight_elements = 3 * local * hidden * request.intermediate_size
 
-        def estimate(calculator, after, transfers=None):
-            return calculator(
+        def estimate(after, transfers):
+            return placement_benefit_seconds(
                 maximum, after, hidden, request.intermediate_size, request.cube_cores, weight_elements * size,
                 projection_flops=12 if request.training else 6, ep_size=ranks, local_experts=local,
                 gradient_bytes=weight_elements * 4 if request.training else 0,
@@ -110,24 +109,24 @@ class HotReplicaPlanner(BasePlanner):
                 transfer_experts=transfers,
             )
 
-        if not estimate(placement_is_profitable, receive_limit):
+        if ReplicaCost().keep_home(maximum, request.total_rows, ranks, self.receive_capacity_percent, score=estimate, resident=resident):
             return None
-        placement = build(request, receive_limit)
-        if placement is None:
-            return None
-        within_limit = percent is None or placement.receive_capacity <= receive_limit
-        if within_limit and estimate(placement_is_profitable, placement.receive_capacity, placement.transfer_experts):
+        placement = build(request, limit, score=estimate, receive_capacity_percent=self.receive_capacity_percent,
+                          resident=resident)
+        if placement is not None:
             return placement
+        if mandatory:
+            raise ValueError(f"No placement found within receive limit {limit} rows")
         if key is not None:
             self._rejected_routes[key] = None
             if len(self._rejected_routes) > 32:
                 self._rejected_routes.popitem(last=False)
         return None
 
-    def _build(self, request: PlacementRequest, target: int, **options) -> ExpertPlacement | None:
+    def _build(self, request: PlacementRequest, target: int | None, **options) -> ExpertPlacement | None:
         return build_placement(
             request.hidden, request.ids, request.counts_by_source,
             target, request.rank, source_inverse=request.source_inverse,
             replica_slots_per_rank=self.replica_slots_per_rank,
-            **options,
+            nodes=request.rank_nodes, cross_node_cost=self.cross_node_cost, **options,
         )

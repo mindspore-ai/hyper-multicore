@@ -138,18 +138,36 @@ def build_adapters(output: Path, sdk: Path, device_root: Path, standard: int) ->
         ],
         check=True,
     )
+    build_host_planner(output)
+
+
+def build_host_planner(output: Path) -> None:
+    """Build the portable CPU selector with the target interpreter's headers."""
+    source = Path(__file__).parent / "csrc" / "replica_planner.cpp"
+    output.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            *shlex.split(os.environ.get("CXX", "g++")),
+            "-shared", "-fPIC", "-O3", "-std=c++17", "-Wl,-z,relro,-z,now,-z,noexecstack",
+            f"-I{sysconfig.get_path('include')}", str(source), "-o", str(output / "_replica_host.so"),
+        ],
+        check=True,
+    )
 
 
 def main() -> None:
     """Build isolated artifacts; the enclosing build publishes and hashes them."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("common", "adapter"), required=True)
+    parser.add_argument("--phase", choices=("common", "adapter", "planner"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sdk-root", type=Path)
     parser.add_argument("--device-root", type=Path)
     parser.add_argument("--cxx-standard", type=int, default=17)
     parser.add_argument("--npu-arch", type=int, choices=(2201,), default=2201)
     args = parser.parse_args()
+    if args.phase == "planner":
+        build_host_planner(args.output_dir)
+        return
     if args.sdk_root is None:
         parser.error("--sdk-root is required for BF16 HotReplica builds")
     if args.phase == "common":

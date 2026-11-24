@@ -49,6 +49,19 @@ class ReplayRecord:
     guest_weight_snapshot: Any = None
     allow_guest_restore: bool = False
     replay_count_fence: a3_indexed.CountFence | None = None
+    route_only: bool = False
+    route_state: tuple | None = None
+
+    def route_signature(self, weights) -> tuple:
+        """Capture the weight and allocation generations used by this route."""
+        owner = self.owner
+        binding = self.route.weight_binding
+        generations = (id(owner.workspace), owner.heap_manager.epoch, owner._closed,
+                       binding.pool.closed if binding is not None else None)
+        return (
+            tuple((tuple(weight.shape), weight.dtype, weight.device, weight._version) for weight in weights),
+            generations,
+        )
 
     @contextmanager
     def save_supplied_route(self, ids: torch.Tensor, counts: torch.Tensor) -> Iterator[None]:
@@ -69,6 +82,7 @@ class _CheckpointScope:
     cursor: int = 0
     defer_forward_copies: bool = False
     guest_snapshot_bytes: int = 0
+    route_only: bool = False
 
 
 _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_checkpoint", default=None)
@@ -79,7 +93,7 @@ class ReplayCheckpoint:
 
     def __init__(
         self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False,
-        defer_forward_copies: bool = False, guest_snapshot_bytes: int = 0,
+        defer_forward_copies: bool = False, guest_snapshot_bytes: int = 0, route_only: bool = False,
     ) -> None:
         """Register the caller's version lookup and optional checkpoint policies.
 
@@ -91,10 +105,13 @@ class ReplayCheckpoint:
         """
         if type(guest_snapshot_bytes) is not int or guest_snapshot_bytes < 0:
             raise ValueError("guest_snapshot_bytes must be a nonnegative integer")
+        if route_only and (prepare_replay or defer_forward_copies or guest_snapshot_bytes):
+            raise ValueError("Route-only checkpoint replay cannot restore or defer payloads")
         self.parameter_version = parameter_version
         self.prepare_replay = prepare_replay
         self.defer_forward_copies = defer_forward_copies
         self.guest_snapshot_bytes = guest_snapshot_bytes
+        self.route_only = route_only
         self.records: list[ReplayRecord] = []
         self.forward_version = None
 
@@ -113,6 +130,7 @@ class ReplayCheckpoint:
             self.records, replay, version is not None and version == self.forward_version,
             defer_forward_copies=self.defer_forward_copies,
             guest_snapshot_bytes=self.guest_snapshot_bytes,
+            route_only=self.route_only,
         )
         token = _ACTIVE.set(state)
         try:
@@ -143,6 +161,7 @@ def guest_weight_replay(record: ReplayRecord | None) -> tuple[ReplayRecord, bool
 
 def wrap_checkpoint(
     function: Callable[..., Any], parameter_version: Callable[[], Any], *, prepare_replay: bool = False,
+    route_only: bool = False,
 ) -> Callable[..., Any]:
     """Wrap one checkpoint call with state scoped to its original and replay forwards.
 
@@ -151,7 +170,7 @@ def wrap_checkpoint(
     When requested, restore the saved borrowed suffix before recompute reads
     any FSDP parameters. Route agreement still happens at the consumer.
     """
-    tape = ReplayCheckpoint(parameter_version, prepare_replay=prepare_replay)
+    tape = ReplayCheckpoint(parameter_version, prepare_replay=prepare_replay, route_only=route_only)
 
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -173,7 +192,8 @@ def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
     if scope is None:
         return None, False
     if not scope.replay:
-        record = ReplayRecord(owner, guest_snapshot_bytes=scope.guest_snapshot_bytes if scope.same_parameters else 0)
+        record = ReplayRecord(owner, guest_snapshot_bytes=scope.guest_snapshot_bytes if scope.same_parameters else 0,
+                              route_only=scope.route_only)
         scope.records.append(record)
         return record, False
     index = scope.cursor

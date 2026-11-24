@@ -118,6 +118,7 @@ def hot_replica_bf16_paths(identifier: str, backend: str) -> dict[str, str]:
         "soc": HOT_REPLICA_BF16_TARGETS[backend][0],
         "kernels": f"shmem/lib/{backend}/hot_replica/libhmc_hot_replica_kernels.so",
         "bridge": f"adapters/{identifier}/shmem/{backend}/hot_replica/_hot_replica_shared_bridge.so",
+        "planner": f"adapters/{identifier}/shmem/{backend}/hot_replica/_replica_host.so",
     }
 
 
@@ -138,6 +139,9 @@ def validate_adapter_paths(root: Path, variant: dict, backends: dict) -> None:
         if replica is None:
             continue
         expected = hot_replica_bf16_paths(variant["id"], backend)
+        # Older compatible adapters use the same selector through its Python path.
+        if isinstance(replica, dict) and "planner" not in replica:
+            expected.pop("planner")
         # Accept manifests from wheels that still package the A3 allocator.
         if backend == "arch22" and isinstance(replica, dict) and "allocator" in replica:
             expected["allocator"] = f"adapters/{variant['id']}/shmem/arch22/hot_replica/_a3_allocator.so"

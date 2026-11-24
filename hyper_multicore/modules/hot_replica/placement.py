@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from ..base_planner import ExpertPlacement
 from ..mega_moe.route import _upload_route_tensor
-from ._planner.planner import build_capacity_plan
+from ._planner.capacity import ExpertReplicaConfig
+from ._planner.receive import ReplicaCost, SourceQuota, select_replica_plan
 from ._planner.plan import ExpertExecutionPlan
 from .render import render_plan
 
@@ -32,28 +35,6 @@ _A3_FLOPS_PER_CUBE = 6e12
 _A3_STAGING_BYTES_PER_SECOND = 4e11
 _A3_PEER_BYTES_PER_SECOND = 2e11
 _A3_PLACEMENT_SECONDS = 8e-4
-_SHORT_ROUTE_PAYLOAD_BYTES = 512 * 1024**2
-
-
-def placement_receive_limit(
-    target_rows: int, ranks: int, local_experts: int, top_k: int, hidden_size: int, element_size: int
-) -> int:
-    """Rows a rank may receive without borrowing, using PR19's capacity policy.
-
-    Dynamic callers supply the actual average routed rows, rounded up. For a
-    short route, bounded fan-in may fit in the 512 MiB receive payload budget.
-    """
-    if target_rows < 0 or min(ranks, local_experts, top_k, hidden_size, element_size) <= 0:
-        raise ValueError("Invalid HotReplica receive geometry")
-    tile = 128
-    # ceil(1.3 * target_rows), without floating-point rounding at tile boundaries.
-    limit = min((13 * target_rows + 9) // 10, ranks * target_rows)
-    if 0 < target_rows < 16 * tile:
-        fan_in = (ranks * target_rows * min(local_experts, top_k) + top_k - 1) // top_k
-        worst = (fan_in + tile - 1) // tile * tile
-        if worst * hidden_size * element_size <= _SHORT_ROUTE_PAYLOAD_BYTES:
-            limit = max(limit, min(worst, ranks * target_rows))
-    return (limit + tile - 1) // tile * tile
 
 
 def _transfer_seconds(weight_bytes, gradient_bytes, ep_size, local_experts, replay_bytes, transfer_experts):
@@ -169,11 +150,13 @@ def build_placement(
     hidden: torch.Tensor,
     topk_ids: torch.Tensor,
     counts_by_source: torch.Tensor,
-    capacity: int,
+    capacity: int | None,
     rank: int,
     *,
     source_inverse: torch.Tensor | None = None,
     replica_slots_per_rank: int | None = None,
+    score: Callable[[int, int], float] | None = None,
+    receive_capacity_percent=None, nodes=(), cross_node_cost=None, resident=None,
 ) -> ExpertPlacement | None:
     """Borrow experts and render their virtual IDs without changing the router.
 
@@ -189,6 +172,7 @@ def build_placement(
         capacity: Positive target routed rows per rank for the allocator.
         rank: Rank within this ordered EP group.
         replica_slots_per_rank: Optional cap on guests, defaulting to the number of home experts.
+        score: Estimated saving for the actual receive peak and transfer degree.
 
     Returns:
         A per-invocation placement, or None when no expert needs to be borrowed.
@@ -200,12 +184,31 @@ def build_placement(
         raise ValueError("HotReplica counts must describe a valid ordered EP topology")
     if counts_by_source.dtype not in (torch.int32, torch.int64):
         raise TypeError("HotReplica counts must use INT32 or INT64")
-    plan = build_capacity_plan(
-        counts_by_source.cpu().numpy(), capacity, replica_slots_per_rank=replica_slots_per_rank,
-    )
+    wire = counts_by_source.cpu().numpy()
+    plan = search_ordered_plan(wire, capacity, replica_slots_per_rank, score, nodes=nodes,
+                               percent=receive_capacity_percent, cross_node_cost=cross_node_cost, resident=resident)
     if plan is None:
         return None
     return render_placement(hidden, topk_ids, plan, rank, source_inverse=source_inverse)
+
+
+def search_ordered_plan(wire, limit, budget, score, *, nodes=(), percent=None, cross_node_cost=None, resident=None):
+    """Search before constructing the source-ordered checkpoint dispatch table."""
+    ranks, experts = wire.shape
+    home = experts // ranks
+    config = ExpertReplicaConfig(experts, ranks, home if budget is None else min(home, budget))
+    if wire.min() < 0 or wire.max() > 2**31 - 1 or wire.sum(dtype="int64") > 2**31 - 1:
+        raise ValueError("HotReplica counts must be nonnegative and within the INT32 planner limit")
+    totals = wire.sum(axis=0, dtype="int64")
+    prices = ReplicaCost()
+    if score is not None:
+        maximum = int(totals.reshape(ranks, home).sum(axis=1).max())
+        mean = (int(totals.sum()) + ranks - 1) // ranks
+        prices = ReplicaCost.from_benefit(score, maximum, mean)
+    return select_replica_plan(wire, config, limit=limit if score is not None else None,
+                               soft_target=limit if score is None else None, receive_capacity_percent=percent,
+                               source_quota=SourceQuota.RANK_ORDER, prices=prices, nodes=nodes, cross_node_cost=cross_node_cost,
+                               totals=totals.tolist(), resident=resident)
 
 
 def render_placement(

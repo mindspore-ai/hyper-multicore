@@ -42,6 +42,7 @@ class PlacementRequest:
     ordinary_receive_capacity: int | None = None
     apply_probs_before_fc2: bool = True
     count_key: tuple[Any, ...] | None = None
+    rank_nodes: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

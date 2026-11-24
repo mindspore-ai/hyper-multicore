@@ -20,18 +20,16 @@ from unittest.mock import patch
 import torch
 
 from hyper_multicore.modules.hot_replica import placement
+from hyper_multicore.modules.hot_replica._planner.receive import receive_limit
 
 
 class TestHotReplicaPlacement(unittest.TestCase):
     """Reject invalid metadata before any optional device kernel is called."""
 
-    def test_receive_limit_matches_full_and_short_pr19_routes(self) -> None:
-        limit = placement.placement_receive_limit
-        self.assertEqual(limit(131072, 8, 64, 8, 2560, 2), 170496)
-        self.assertEqual(limit(32768, 8, 64, 8, 2560, 2), 42624)
-        self.assertEqual(limit(1024, 8, 64, 8, 2560, 2), 8192)
-        self.assertEqual(limit(1024, 8, 64, 8, 65536, 2), 1408)
-        self.assertEqual(limit(0, 8, 64, 8, 2560, 2), 0)
+    def test_receive_limit_is_exact_and_auto_has_no_limit(self) -> None:
+        self.assertIsNone(receive_limit("auto", 525, 4))
+        self.assertEqual(receive_limit(102, 525, 4), 134)
+        self.assertEqual(receive_limit(100, 525, 4), 132)
 
     def test_cost_charges_gradient_wire_bytes_and_peer_fanout(self) -> None:
         """Identical arithmetic must not ignore larger gradients or more peers."""
@@ -119,7 +117,7 @@ class TestHotReplicaPlacement(unittest.TestCase):
         ):
             with self.subTest(shape=counts.shape, rank=rank):
                 with (
-                    patch("hyper_multicore.modules.hot_replica.placement.build_capacity_plan") as allocate,
+                    patch("hyper_multicore.modules.hot_replica.placement.search_ordered_plan") as allocate,
                     self.assertRaises(ValueError),
                 ):
                     placement.build_placement(

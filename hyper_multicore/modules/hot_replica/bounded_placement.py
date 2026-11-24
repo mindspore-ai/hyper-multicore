@@ -16,8 +16,9 @@ from hyper_multicore.modules.mega_moe.route import (
 )
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
-from ._planner.planner import build_capacity_plan, build_expert_replica_plan
-from .placement import ExpertPlacement
+from ._planner.capacity import ExpertReplicaConfig
+from ._planner.receive import bf16_cost, select_replica_plan
+from .placement import ExpertPlacement, search_ordered_plan
 from .render import _render_slots, render_plan
 
 
@@ -210,11 +211,14 @@ class BoundedPlacement:
     """Reuse immutable geometry on the same complete count wire and stream."""
 
     def __init__(self, spec: MegaMoeSpec, *, replica_slots_per_rank: int | None = None,
-                 cross_node_cost: float | None = None) -> None:
+                 cross_node_cost: float | None = None, receive_capacity_percent=None) -> None:
         """Keep the most recent geometry for one EP execution owner."""
         self.spec = spec
         self.replica_slots_per_rank = min(spec.local_experts, replica_slots_per_rank or spec.local_experts)
+        if spec.dispatch_mode == "pull":
+            self.replica_slots_per_rank = min(self.replica_slots_per_rank, 6)
         self.cross_node_cost = cross_node_cost
+        self.receive_capacity_percent = receive_capacity_percent
         self.nodes = None
         self.snapshot = None
         self.key = None
@@ -225,6 +229,7 @@ class BoundedPlacement:
         inverse: torch.Tensor | None, projections: int, snapshot: PlacementWire | None = None,
         *, capacity_target: int | None = None,
         host_rows: list[list[int]] | None = None, indexed: bool = False,
+        score=None, receive_capacity_percent=None, resident=None,
     ) -> ExpertPlacement | _IndexedPlacement | None:
         """Map the current route through reusable quotas for the agreed receive budget."""
         spec = self.spec
@@ -237,8 +242,13 @@ class BoundedPlacement:
             wire = counts.cpu().numpy()
 
         transfers = None
-        if capacity_target is not None:
-            plan = build_capacity_plan(wire, capacity_target, replica_slots_per_rank=self.replica_slots_per_rank)
+        if score is not None:
+            if self.nodes is None and dist.is_initialized():
+                self.nodes = _rank_nodes(spec.ep_group, spec.ep_size)
+            plan = search_ordered_plan(
+                wire, capacity_target, self.replica_slots_per_rank, score, nodes=self.nodes or (),
+                percent=receive_capacity_percent, cross_node_cost=self.cross_node_cost, resident=resident,
+            )
             if plan is None or not plan.transfers:
                 return None
             if indexed:
@@ -248,11 +258,10 @@ class BoundedPlacement:
             geometry = _render_geometry(plan, spec, hidden.device, maximum, prepare_metadata=False)
             transfers = plan.maximum_transfer_degree
         else:
-            capacity = maximum * spec.ep_size * min(spec.local_experts, spec.top_k)
             stream = torch.npu.current_stream(hidden.device) if hidden.device.type == "npu" else None
-            key = (capacity, projections, hidden.device, stream, torch.is_inference_mode_enabled())
+            key = (projections, hidden.device, stream, torch.is_inference_mode_enabled(), resident)
             if self.key != key or not np.array_equal(self.snapshot, wire):
-                self._build(hidden.device, wire, capacity, projections, key, maximum)
+                self._build(hidden.device, wire, projections, key, maximum, resident)
             geometry = self.geometry
         if geometry is None:
             return None
@@ -276,19 +285,14 @@ class BoundedPlacement:
                                copies_by_rank=geometry.owners,
                                route_metadata=geometry.metadata, owner_rows=geometry.owner_rows)
 
-    def _build(self, device, wire, capacity, projections, key, maximum):
+    def _build(self, device, wire, projections, key, maximum, resident):
         spec = self.spec
         if self.nodes is None:
             self.nodes = _rank_nodes(spec.ep_group, spec.ep_size)
-        budget = self.replica_slots_per_rank
-        if spec.dispatch_mode == "pull":
-            budget = min(budget, 6)
-        plan = build_expert_replica_plan(
-            wire.tolist(), budget, minimum_replica_rows=1024,
-            minimum_load_reduction=0.25 if projections == 3 else 0.4,
-            capacity_limit=capacity, receive_capacity=capacity, rank_nodes=self.nodes,
-            transfer_row_credit=spec.intermediate_size * projections // 6,
-            cross_node_cost=self.cross_node_cost,
+        plan = select_replica_plan(
+            wire, ExpertReplicaConfig(spec.num_experts, spec.ep_size, self.replica_slots_per_rank),
+            nodes=self.nodes, prices=bf16_cost(spec, projections == 3), cross_node_cost=self.cross_node_cost,
+            receive_capacity_percent=self.receive_capacity_percent, resident=resident,
         )
-        geometry = _render_geometry(plan, spec, device, maximum) if plan.transfers else None
+        geometry = _render_geometry(plan, spec, device, maximum) if plan is not None else None
         self.key, self.snapshot, self.geometry = key, wire.copy(), geometry

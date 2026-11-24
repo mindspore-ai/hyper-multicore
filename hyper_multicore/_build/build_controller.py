@@ -142,6 +142,7 @@ def build_framework(python: Path, identity: dict, common: Path, sdks: dict[str, 
                      selected_env.get("LD_LIBRARY_PATH", "")])}
                 validate_elf(replica_output / "_hot_replica_shared_bridge.so", identity["host_arch"],
                              run.commands, link_env)
+                validate_elf(replica_output / "_replica_host.so", identity["host_arch"], run.commands, link_env)
                 paths[replica_target[1]] = MANIFEST.hot_replica_bf16_paths(identifier, backend)
         with run.commands.scope("Load"):
             load_backend(python, payload, common, sdk, backend, run, selected_env, identifier)

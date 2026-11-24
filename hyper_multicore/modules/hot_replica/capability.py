@@ -17,6 +17,7 @@
 import torch
 from hyper_multicore import _collective
 from hyper_multicore._loader import load_torch_npu, query_npu_arch, validate_native_compatibility
+from ._planner.native_host import load_replica_planner
 
 
 def _require_a3(tensor, *, dispatch_mode: str = "push") -> bool:
@@ -37,6 +38,8 @@ def _require_a3(tensor, *, dispatch_mode: str = "push") -> bool:
     for key in ("bridge", "kernels"):
         if not (selected["root"] / artifacts[key]).is_file():
             raise RuntimeError(f"Selected HotReplica artifact is missing: {key}")
+    if "planner" in artifacts:
+        load_replica_planner(selected["root"] / artifacts["planner"])
     build_info = selected["build_info"]
     if dispatch_mode == "pull" and not build_info.get("a3_bf16_pull_runtime_rows", False):
         raise RuntimeError("BF16 HotReplica Pull on Ascend910_93 requires an A3 wheel with runtime-row GET support")

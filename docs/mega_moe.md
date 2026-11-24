@@ -161,7 +161,9 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 - Push 的默认副本槽上限等于每 rank 的原属专家数 `num_experts / ep_size`。实际借用数量由路由、接收容量和放置代价决定。
 - `HotReplicaPlanner(cross_node_cost=1.0)` 将 A3 BF16 常规有界 Push 的跨节点与同节点副本按相同代价计入。
   EP 组内须使用相同值，省略时沿用原策略。
-- `HotReplicaPlanner(receive_capacity_percent=102)` 将 BF16 Push 的目标接收行数限制为实际 EP 均值的 102%，向上对齐 128 行。EP 组内须使用相同值，原成本准入仍生效。
+- BF16 Push 的 `receive_capacity_percent="auto"` 默认按预计净收益选点，已有接收区影响扩容代价。
+  显式 `receive_capacity_percent=102` 将各 rank 的实际接收行数限制在 EP 均值的 102%，向上取整到一行。
+  EP 组内使用相同设置。槽位不足或搜索无法找到合规计划时，调用报错。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   Pull 需要支持按实际行数切分 GET 的 A3 制品。默认放置策略沿用 Push 的配额计算，由执行 rank 从对称源区拉取 token。
   自定义 planner 给出的副本槽有实际路由行时，也可使用同一融合执行。
@@ -193,6 +195,10 @@ placement = MegaMoePlacementOptions(strategy="adaptive", planner=HotReplicaPlann
 `context_fn` 分别返回该对象的 `scope(False)` 和 `scope(True)`，并提供真实的参数代际回调。
 `defer_forward_copies=True` 在 A3 BF16 EOI Push 上将两份反向保存延后至重算，同时保持输出的概率加权位置。
 `guest_snapshot_bytes` 设置每 rank 每次调用的 guest 权重快照字节预算，EP 全员通过同次参数代际和完整路由检查后才复用。
+
+重入式 checkpoint 可以用 `wrap_checkpoint(function, parameter_version, route_only=True)` 包装一次 checkpoint 的函数。
+重算以本次输入、概率和权重执行。完整有序 Top-K、显式计数、参数版本、stream 和工作区代际经全 EP 校验后沿用前向路由描述。
+为每次 checkpoint 调用创建独立包装，并使用实际优化器更新代际。
 
 ### 从旧 HotReplica 配置迁移
 

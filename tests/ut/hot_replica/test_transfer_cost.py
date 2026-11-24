@@ -16,7 +16,8 @@
 
 import pytest
 
-from hyper_multicore.modules.hot_replica._planner.planner import build_expert_replica_plan
+from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
+from hyper_multicore.modules.hot_replica._planner.receive import ReplicaCost, select_replica_plan
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 from hyper_multicore.modules.hot_replica.placement import placement_is_profitable
 
@@ -74,9 +75,9 @@ def test_cross_node_cost_is_part_of_ep_planner_identity():
 def test_cross_node_cost_does_not_veto_mandatory_receive_capacity():
     """A required BF16 capacity plan still has to satisfy the actual row limit."""
     counts = [[1024, 1024, 0, 0]] * 4
-    plan = build_expert_replica_plan(counts, 1, minimum_load_reduction=0.25, minimum_replica_rows=256,
-                                     capacity_limit=2048, receive_capacity=2048, rank_nodes=(0, 0, 1, 1),
-                                     transfer_row_credit=1024, cross_node_cost=2.0)
+    plan = select_replica_plan(counts, ExpertReplicaConfig(4, 4, 1), receive_capacity_percent=100,
+                               nodes=(0, 0, 1, 1), prices=ReplicaCost(1e4, ((100., 100.),)),
+                               cross_node_cost=2.0)
     assert max(plan.destination_loads) <= 2048
     plan.validate()
 
@@ -91,10 +92,10 @@ def test_equal_replica_cost_prefers_fewer_cross_node_token_rows():
             expert = (position + 13 * rank) % 24 + 48 * (rank // 8)
             row[expert] += 1
         counts.append(row)
-    options = dict(minimum_replica_rows=1024, minimum_load_reduction=0.25, capacity_limit=393216,
-                   receive_capacity=393216, rank_nodes=(0,) * 8 + (1,) * 8, transfer_row_credit=896)
-    neutral = build_expert_replica_plan(counts, replicas, **options, cross_node_cost=1.0)
-    expensive = build_expert_replica_plan(counts, replicas, **options, cross_node_cost=2.0)
+    config = ExpertReplicaConfig(96, 16, replicas)
+    options = dict(nodes=(0,) * 8 + (1,) * 8, prices=ReplicaCost(phases=((896., 896.),)))
+    neutral = select_replica_plan(counts, config, **options, cross_node_cost=1.0)
+    expensive = select_replica_plan(counts, config, **options, cross_node_cost=2.0)
     assert neutral.transfers and neutral == expensive
     assert all(edge.owner_rank // 8 == edge.target_rank // 8 for edge in neutral.transfers)
     neutral.validate()
