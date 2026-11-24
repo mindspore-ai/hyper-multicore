@@ -28,16 +28,26 @@ static_assert(offsetof(MxQuantDescriptor, clamp_limit) == 40, "MX quant clamp of
 #ifdef __NPU_ARCH__
 __aicore__
 #endif
+inline bool IsMxQuantTaskShapeValid(const MxQuantDescriptor& r) {
+  switch (r.task_type) {
+    case MX_QUANT_TASK:
+      return r.columns % 64 == 0 && r.block_columns == 256 && r.clamp_limit == 0.0f;
+    case MX_SWIGLU_TASK:
+      return r.columns % 64 == 0 && r.block_columns == 256;
+    case MX_SWIGLU_GRAD_TASK:
+      return r.columns % 128 == 0 && r.block_columns == 128;
+    default:
+      return false;
+  }
+}
+
+#ifdef __NPU_ARCH__
+__aicore__
+#endif
 inline bool IsMxQuantDescriptorValid(const MxQuantDescriptor& r) {
-  const bool supported = r.task_type == MX_QUANT_TASK || r.task_type == MX_SWIGLU_TASK
-                        || r.task_type == MX_SWIGLU_GRAD_TASK;
-  const uint32_t block_columns = r.task_type == MX_SWIGLU_GRAD_TASK ? 128 : 256;
   return r.magic == MX_QUANT_MAGIC && r.version == 2 && r.size == sizeof(r) && r.input_bytes == 2
-    && r.columns > 0 && r.columns % 64 == 0 && r.worker_count > 0 && r.worker_index < r.worker_count
-    && supported && (r.task_type != MX_SWIGLU_GRAD_TASK || r.columns % 128 == 0)
-    && r.block_rows == 64 && r.block_columns == block_columns
-    && r.clamp_limit >= 0.0f && r.clamp_limit <= FLT_MAX
-    && (r.task_type != MX_QUANT_TASK || r.clamp_limit == 0.0f);
+    && r.columns > 0 && r.worker_index < r.worker_count && r.block_rows == 64
+    && r.clamp_limit >= 0.0f && r.clamp_limit <= FLT_MAX && IsMxQuantTaskShapeValid(r);
 }
 }  // namespace MulticoreMx
 #endif

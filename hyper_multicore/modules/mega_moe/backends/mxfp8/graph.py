@@ -38,6 +38,7 @@ class _MXTaskValues(TaskSplitValue):
 
     @property
     def all_event_num(self) -> int:
+        """Count the dispatch and per-expert compute events."""
         return 1 + self.all_expert_num + self.compute_stages * self.single_rank_expert_num
 
 
@@ -129,7 +130,7 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool) -> MXFP8Runtime:
     vectors = 2 * cubes
     glist, gtable, qtable = (6, 25, 26) if forward else (19, 31, 32)
 
-    def quant(name, kind, columns, inputs, outputs, first=False):
+    def _quant(name, kind, columns, inputs, outputs, first=False):
         if kind == MX_QUANT_TASK:
             fill = Mxfp8QuantFillConfig(kind, columns, vectors, first, quants)
         else:
@@ -138,24 +139,23 @@ def build_mxfp8_runtime(spec: MegaMoeSpec, *, forward: bool) -> MXFP8Runtime:
                      {MX_QUANT_TASK: OpType.QUANTIZE, MX_SWIGLU_TASK: OpType.SWIGLU_QUANT,
                       MX_SWIGLU_GRAD_TASK: OpType.SWIGLU_GRAD_QUANT}[kind])
 
-    def gmm(name, layout, dims, inputs, output, scales):
+    def _gmm(name, layout, dims, inputs, output, scales):
         _add_compute(graph, name, specs, inputs + [glist, gtable], [output],
                      Mxfp8GmmFillConfig(layout, *dims, *scales, cubes, gmms), cubes)
 
     if forward:
-        quant('quant_x', MX_QUANT_TASK, h, [0], [16, 17, 18, 19], first=True)
-        gmm('up', 'NN', (capacity, 2 * width, h), [16, 5], 7, (17, 23))
-        quant('swiglu_quant', MX_SWIGLU_TASK,
-              width, [7], [8, 20, 21, 22])
-        gmm('down', 'NN', (capacity, h, width), [8, 9], 11, (20, 24))
+        _quant('quant_x', MX_QUANT_TASK, h, [0], [16, 17, 18, 19], first=True)
+        _gmm('up', 'NN', (capacity, 2 * width, h), [16, 5], 7, (17, 23))
+        _quant('swiglu_quant', MX_SWIGLU_TASK, width, [7], [8, 20, 21, 22])
+        _gmm('down', 'NN', (capacity, h, width), [8, 9], 11, (20, 24))
         order = ['dispatch', 'quant_x', 'up', 'swiglu_quant', 'down', 'combine']
     else:
-        quant('quant_dy', MX_QUANT_TASK, h, [0], [20, 21, 22, 23], first=True)
-        gmm('dw2', 'TN', (width, h, capacity), [5, 22], 6, (24, 23))
-        gmm('da', 'NT', (capacity, width, h), [20, 7], 8, (21, 25))
-        quant('swiglu_grad_quant', MX_SWIGLU_GRAD_TASK, 2 * width, [9, 8], [10, 26, 27, 28])
-        gmm('dw1', 'TN', (h, 2 * width, capacity), [17, 27], 18, (30, 28))
-        gmm('dx', 'NT', (capacity, h, 2 * width), [10, 11], 12, (26, 29))
+        _quant('quant_dy', MX_QUANT_TASK, h, [0], [20, 21, 22, 23], first=True)
+        _gmm('dw2', 'TN', (width, h, capacity), [5, 22], 6, (24, 23))
+        _gmm('da', 'NT', (capacity, width, h), [20, 7], 8, (21, 25))
+        _quant('swiglu_grad_quant', MX_SWIGLU_GRAD_TASK, 2 * width, [9, 8], [10, 26, 27, 28])
+        _gmm('dw1', 'TN', (h, 2 * width, capacity), [17, 27], 18, (30, 28))
+        _gmm('dx', 'NT', (capacity, h, 2 * width), [10, 11], 12, (26, 29))
         order = ['dispatch', 'quant_dy', 'dw2', 'da', 'swiglu_grad_quant', 'dw1', 'dx', 'combine']
     for left, right in zip(order, order[1:]):
         graph.add_edge(left, right)

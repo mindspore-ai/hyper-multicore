@@ -431,6 +431,9 @@ function prepare_common() {
 
     CURRENT_REASON_CODE="MULTICORE_DEPENDENCY_PREPARATION_FAILED"
     DEPENDENCY_ARGS=(--dependency ops_nn --dependency ops_transformer)
+    while read -r device_arch _; do
+        DEPENDENCY_ARGS+=(--architecture "${device_arch}")
+    done <<< "${ARCH_GROUPS}"
     if [[ ",${SOC_LIST}," == *",ascend950,"* ]]; then
         DEPENDENCY_ARGS+=(--dependency ops_tensor)
     fi

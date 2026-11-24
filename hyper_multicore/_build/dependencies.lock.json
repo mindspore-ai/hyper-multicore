@@ -79,7 +79,10 @@
                 "purpose": "bind task-local vector worker indices for dynamic MX quantization and SwiGLU GroupQuant"
               }
             ],
-            "upgrade_policy": "compare row and column data and scales against the CANN operators before upgrading"
+            "upgrade_policy": "compare row and column data and scales against the CANN operators before upgrading",
+            "architectures": [
+              "arch35"
+            ]
           }
         }
       },
