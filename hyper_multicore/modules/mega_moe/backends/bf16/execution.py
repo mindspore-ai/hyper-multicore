@@ -20,7 +20,7 @@ from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionM
 
 from ...route import PreparedTopKRoute, restore_topk_output
 
-from .autograd import _CheckpointedPushFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
+from .autograd import _CheckpointedMegaMoeFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 
 if TYPE_CHECKING:
     from .resources import BF16Resources
@@ -59,7 +59,7 @@ def forward(
     record = route.checkpoint_record
     if not torch.is_grad_enabled():
         save = None
-        if record is not None and not pull and before_fc2 and hidden_flat.shape[0]:
+        if record is not None and before_fc2 and hidden_flat.shape[0]:
             save = _save_replay_activations(record, plan.spec, route, hidden_flat, topk_weights)
         output = _execute_mega_moe_without_autograd(
             topk_weights, *weights, route, plan, resources.workspace,
@@ -69,11 +69,11 @@ def forward(
             # original binding still selects its own replay protocol.
             record.weight_binding.snapshot = binding.snapshot
         return output.reshape_as(hidden_states)
-    if record is not None and not pull and record.allow_activation:
+    if record is not None and record.allow_activation:
         resources.placement.statistics["skipped_recomputes"] += 1
-        return _CheckpointedPushFunction.apply(
+        return _CheckpointedMegaMoeFunction.apply(
             hidden_flat, *weights, route.metadata, plan, resources.workspace,
-            record.activation, topk_weights, False, binding,
+            record.activation, topk_weights, binding,
         ).reshape_as(hidden_states)
     integrated_unpermute = pull or before_fc2
     output = execute_mega_moe_with_permutation(

@@ -765,17 +765,16 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             workspace.release(stream=workspace.lease_stream)
 
 
-class _CheckpointedPushFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
+class _CheckpointedMegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Bind a retained forward to the same BF16 backward used for ordinary calls."""
 
     @staticmethod
     def forward(
         ctx: Any, flat: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, metadata: RouteMetadata,
         plan: MegaMoePlan, workspace: MegaMoeWorkspace, activation: tuple[Any, ...], probs: torch.Tensor,
-        claimed: bool, weight_binding: Any,
+        weight_binding: Any,
     ) -> torch.Tensor:
         """Restore the saved output and capture the current owner weights."""
-        del claimed
         output, dispatch, up, act, mapping, reservation = activation
         ctx.source_rows = mapping.numel()
         ctx.token_rows = flat.shape[0]
@@ -937,8 +936,12 @@ def _execute_mega_moe_without_autograd(
             output = _restore_unweighted_output(execution.combine[:rows], route.unpermute_mapping, plan.spec.top_k)
             if save_activation is not None:
                 parts = execution.intermediates
-                parts.down_proj.copy_(execution.dispatch[:route.metadata.expert_capacity])
-                save_activation(output, parts.down_proj, parts.up_proj, parts.activation, route.unpermute_mapping)
+                dispatch = execution.dispatch
+                if plan.spec.dispatch_mode == "push":
+                    # Push's dispatch aliases the leased symmetric receive buffer.
+                    parts.down_proj.copy_(dispatch[:route.metadata.expert_capacity])
+                    dispatch = parts.down_proj
+                save_activation(output, dispatch, parts.up_proj, parts.activation, route.unpermute_mapping)
             return output
         return restore_topk_output(
             execution.combine[:rows], route.unpermute_mapping, topk_weights)

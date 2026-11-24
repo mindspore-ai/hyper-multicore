@@ -89,6 +89,7 @@ def test_placement_checkpoint_and_close():
             if replica:
                 owner = op._resource_group.resources.placement  # pylint: disable=protected-access
                 assert owner.statistics["route_replays"] == 1
+                assert owner.statistics["skipped_recomputes"] == 1
                 assert owner.pool is not None, "The hot route must admit a replica"
                 counts = owner.pool.statistics
                 assert counts["remote_prefetches"] + counts.get("fused_prefetches", 0) > 0, counts
@@ -100,6 +101,7 @@ def test_placement_checkpoint_and_close():
                 assert spec.compact_pull == (dispatch_mode == "pull")
                 placement_records.append({
                     "planner": type(planner).__name__, "route_replays": owner.statistics["route_replays"],
+                    "skipped_recomputes": owner.statistics["skipped_recomputes"],
                     "bank": dict(counts),
                 })
                 for a, b in zip(observed, reference):

@@ -73,18 +73,21 @@ def test_placement_requires_multiple_ranks():
         )
 
 
-def test_bf16_pull_accepts_adaptive_placement():
-    """Bind the existing BF16 placement configuration to Pull."""
+@pytest.mark.parametrize("mode", ["push", "pull"])
+def test_bf16_transports_accept_the_same_placement_limits(mode):
+    """Both transports bind explicit topology, receive and guest-slot settings."""
     from hyper_multicore.modules.mega_moe import module
 
     with patch.object(module, "_resolve_ep_size", return_value=2):
+        planner = HotReplicaPlanner(replica_slots_per_rank=7, receive_capacity_percent=102, cross_node_cost=1.5)
         expert = MegaMoeExperts(
-            hidden_size=128, intermediate_size=128, num_experts=4, top_k=2,
-            tuning_options=MegaMoeTuningOptions(dispatch_mode="pull", expert_placement=HotReplicaPlanner()),
+            hidden_size=128, intermediate_size=128, num_experts=16, top_k=2,
+            tuning_options=MegaMoeTuningOptions(dispatch_mode=mode, expert_placement=planner),
         )
     try:
-        assert expert._resource_group.specification["dispatch_mode"] == "pull"  # pylint: disable=protected-access
-        assert expert._resource_group.specification["hot_replica"]  # pylint: disable=protected-access
+        spec = expert._resource_group.specification  # pylint: disable=protected-access
+        assert spec["dispatch_mode"] == mode and spec["hot_replica"]
+        assert (spec["replica_slots_per_rank"], spec["receive_capacity_percent"], spec["cross_node_cost"]) == (7, 102, 1.5)
     finally:
         expert.close()
 
@@ -329,9 +332,9 @@ def test_configuration_mismatch_fails_before_optional_capability_collective():
 
 
 @pytest.mark.parametrize(("mode", "requested", "expected"), [
-    ("push", None, 12), ("push", 8, 8), ("push", 2, 2), ("pull", None, 6),
+    ("push", None, 12), ("push", 8, 8), ("push", 2, 2), ("pull", None, 12), ("pull", 8, 8),
 ])
-def test_a3_bounded_planning_uses_the_configured_push_slot_budget(mode, requested, expected):
+def test_a3_bounded_planning_uses_the_configured_slot_budget(mode, requested, expected):
     """Check the budget passed into the actual A3 bounded planner."""
     spec = MegaMoeSpec(512, 5120, 1792, 192, 8, 1.25, 8192, 16, None, 0, 24,
                        dispatch_mode=mode)

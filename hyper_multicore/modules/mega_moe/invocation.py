@@ -67,7 +67,7 @@ def prepare_expert_invocation(
                 placement.statistics["route_replays"] += 1
                 route = record.route
                 resources.workspace.wait_for_reuse()
-                if pull or not record.allow_activation:
+                if not record.allow_activation:
                     with torch.inference_mode(False), torch.no_grad():
                         if pull:
                             prepare_workspace(route.metadata.plan_tokens, route.maximum_received_slots)

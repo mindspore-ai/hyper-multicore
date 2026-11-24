@@ -35,6 +35,7 @@ from .spec import (
     MegaMoeSpec,
     _align_capacity,
     _grow_receive_capacity,
+    _grow_source_capacity,
     _resolve_receive_capacity,
 )
 from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
@@ -112,7 +113,7 @@ def _workspace_layout(
         physical["local_num_tokens"] = token_capacity
     if capacity is None:
         capacity = _resolve_receive_capacity(
-            specification["initial_capacity_factor"],
+            specification["initial_capacity_factor"] if specification.get("dispatch_mode", "push") == "push" else None,
             physical["local_num_tokens"] * specification["top_k"],
             specification["ep_size"],
         )
@@ -389,9 +390,9 @@ class _HeapManager:
         if not grow_source and not grow_receive:
             return None
         factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
-        token_limit = ((2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128) * 128
-        token_capacity = (_align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
-                          if grow_source else spec.local_num_tokens)
+        token_capacity = spec.local_num_tokens
+        if grow_source:
+            token_capacity = _grow_source_capacity(token_capacity, tokens, factor, spec.hidden_size, spec.top_k)
         receive_capacity = entry.layout.receive_capacity
         if grow_receive:
             receive_capacity = _align_capacity(max(preferred, math.ceil(min(2**31 - 1, receive_capacity * factor))))

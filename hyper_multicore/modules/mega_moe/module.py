@@ -37,6 +37,7 @@ from .resources import _MegaMoeExecutionResources
 from ..base_planner import BasePlanner
 from .spec import (
     _COMMUNICATION_SPLIT,
+    _grow_source_capacity,
     _resolve_capacity_factors,
 )
 from .transport import requested_transport
@@ -189,14 +190,10 @@ class MegaMoeExperts(MulticoreModule):
             if isinstance(planner, HotReplicaPlanner):
                 replica_slots_per_rank = planner.replica_slots_per_rank
                 if replica_slots_per_rank is not None and type(num_experts) is int and num_experts % ep_size == 0:
-                    replica_slot_budget(num_experts // ep_size, replica_slots_per_rank, tuning.dispatch_mode)
+                    replica_slot_budget(num_experts // ep_size, replica_slots_per_rank)
                 cross_node_cost = planner.cross_node_cost
                 if planner.receive_capacity_percent != "auto":
                     receive_capacity_percent = planner.receive_capacity_percent
-            if cross_node_cost is not None and tuning.dispatch_mode != "push":
-                raise ValueError("An explicit HotReplica cross_node_cost requires Push")
-            if receive_capacity_percent is not None and tuning.dispatch_mode != "push":
-                raise ValueError("An explicit HotReplica receive capacity percentage requires BF16 Push")
             settings = planner.configuration_key()
             if not isinstance(settings, str):
                 raise TypeError("Planner configuration_key() must return a string")
@@ -297,8 +294,15 @@ class MegaMoeExperts(MulticoreModule):
             combine_split=specification["combine_split"],
             auto_tokens=specification.get("auto_tokens", False),
         )
+        local_num_tokens = specification["local_num_tokens"]
+        if specification["dispatch_mode"] == "pull" and initial_capacity_factor > 1.0:
+            local_num_tokens = _grow_source_capacity(
+                local_num_tokens, local_num_tokens, initial_capacity_factor,
+                specification["hidden_size"], specification["top_k"],
+            )
         return {
             **specification,
+            "local_num_tokens": local_num_tokens,
             "initial_capacity_factor": initial_capacity_factor,
             "capacity_growth_factor": capacity_growth_factor,
         }

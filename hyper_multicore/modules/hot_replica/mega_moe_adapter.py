@@ -219,7 +219,7 @@ class PlacementResources:
                 spec = self.parent.spec
                 slots = spec.local_experts
                 if isinstance(planner, HotReplicaPlanner):
-                    slots = replica_slot_budget(slots, planner.replica_slots_per_rank, spec.dispatch_mode)
+                    slots = replica_slot_budget(slots, planner.replica_slots_per_rank)
                 plan = validate_quotas(result, request, slots=slots)
                 if plan is not None:
                     peak = max(plan.destination_loads)

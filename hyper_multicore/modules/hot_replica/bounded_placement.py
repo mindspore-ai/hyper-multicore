@@ -152,7 +152,7 @@ class BoundedPlacement:
     def __init__(self, spec: MegaMoeSpec, *, replica_slots_per_rank: int | None = None,
                  cross_node_cost: float | None = None, nodes: tuple[int, ...] = ()) -> None:
         self.spec = spec
-        slots = replica_slot_budget(spec.local_experts, replica_slots_per_rank, spec.dispatch_mode)
+        slots = replica_slot_budget(spec.local_experts, replica_slots_per_rank)
         self.config = ExpertReplicaConfig(spec.num_experts, spec.ep_size, slots)
         self.cross_node_cost = cross_node_cost
         self.nodes = nodes

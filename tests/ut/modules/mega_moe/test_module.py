@@ -440,7 +440,9 @@ class TestMegaMoeExperts(unittest.TestCase):
         default = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2)
         self.addCleanup(default.close)
         variants = (
-            ({"dispatch_mode": "pull"}, ("pull", None, None, 128, 128)),
+            ({"dispatch_mode": "pull"}, ("pull", 1.0, 1.25, 128, 128)),
+            ({"dispatch_mode": "pull", "initial_capacity_factor": 2.5, "capacity_growth_factor": 1.0},
+             ("pull", 2.5, 1.0, 128, 128)),
             ({"initial_capacity_factor": 1.5}, ("push", 1.5, 1.25, 128, 128)),
             ({"capacity_growth_factor": 2.0}, ("push", 1.25, 2.0, 128, 128)),
             ({"dispatch_split": 256}, ("push", 1.25, 1.25, 256, 128)),
@@ -455,6 +457,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.addCleanup(layer.close)
                 for key, value in zip(names, values):
                     self.assertEqual(layer._resource_group.specification[key], value)
+                self.assertEqual(layer._resource_group.specification["local_num_tokens"],
+                                 384 if options.get("initial_capacity_factor") == 2.5 else 128)
                 with self.assertRaises(ValueError):
                     MegaMoeExperts.share_execution_resources([default, layer])
 
@@ -643,7 +647,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             ({"initial_capacity_factor": float("nan")}, "initial_capacity_factor"),
             ({"capacity_growth_factor": float("inf")}, "capacity_growth_factor"),
             ({"initial_capacity_factor": True}, "initial_capacity_factor"),
-            ({"capacity_growth_factor": 1.5, "dispatch_mode": "pull"}, "push"),
+            ({"capacity_growth_factor": 0.999, "dispatch_mode": "pull"}, "capacity_growth_factor"),
             ({"dispatch_split": 129}, "dispatch_split"),
             ({"combine_split": 0}, "combine_split"),
             ({"dispatch_split": True}, "dispatch_split"),

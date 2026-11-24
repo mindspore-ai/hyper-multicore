@@ -32,6 +32,7 @@ def test_placement_checkpoint_and_close(monkeypatch, tmp_path, dispatch_mode, la
     monkeypatch.setenv("HOT_REPLICA_DISPATCH_MODE", dispatch_mode)
     monkeypatch.setenv("HOT_REPLICA_WEIGHT_LAYOUT", layout)
     monkeypatch.setenv("HOT_REPLICA_TEST_RESULTS", str(tmp_path))
+    monkeypatch.setenv("HYPER_MULTICORE_HOT_REPLICA_CHECKPOINT_BYTES", str(2 << 30))
     monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
         run_multicore_case(str(Path(__file__).with_name("_test_hot_replica.py")),

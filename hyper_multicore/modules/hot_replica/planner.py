@@ -94,7 +94,7 @@ class HotReplicaPlanner(BasePlanner):
             raise ValueError("HotReplica requires integer counts and a valid EP rank")
         if counts.min() < 0 or counts.max() > 2**31 - 1 or counts.sum(dtype=np.int64) > 2**31 - 1:
             raise ValueError("HotReplica counts must be nonnegative and within the INT32 planner limit")
-        budget = replica_slot_budget(experts // ranks, self.replica_slots_per_rank, request.dispatch_mode)
+        budget = replica_slot_budget(experts // ranks, self.replica_slots_per_rank)
         config = ExpertReplicaConfig(experts, ranks, budget)
         resident = request.ordinary_receive_capacity
         prices, limit, keep_home = self._policy(
@@ -112,12 +112,11 @@ class HotReplicaPlanner(BasePlanner):
 
 
 
-def replica_slot_budget(home: int, requested: int | None, dispatch_mode: str) -> int:
+def replica_slot_budget(home: int, requested: int | None) -> int:
     """Return the effective slot cap and reject out-of-range explicit requests."""
-    limit = min(home, 6) if dispatch_mode == "pull" else home
-    if requested is not None and requested > limit:
-        raise ValueError(f"Requested {requested} guest slots, but {dispatch_mode} supports at most {limit} per rank")
-    return limit if requested is None else requested
+    if requested is not None and requested > home:
+        raise ValueError(f"Requested {requested} guest slots, but at most {home} are supported per rank")
+    return home if requested is None else requested
 
 
 def as_placement(plan) -> ExpertPlacement:

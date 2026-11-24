@@ -155,9 +155,9 @@ from hyper_multicore.experimental import HotReplicaPlanner, MegaMoeTuningOptions
 tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 ```
 
-- 省略 `expert_placement` 时使用原属路由。Push 的默认槽上限是每 rank 的原属专家数 L，内置 Pull 默认为 `min(L, 6)`。显式请求超出相应范围时，构造执行器会报告所请求的宽度和适用上限。
-- `cross_node_cost` 表示跨节点副本矩阵搬运的相对代价。`None` 和 `1.0` 的倍率相同。显式设置适用于 Push，组内使用相同配置。
-- BF16 Push 的 `receive_capacity_percent="auto"` 默认按预计净收益选点，已有接收区影响扩容代价。
+- 省略 `expert_placement` 时使用原属路由。Push 和 Pull 的默认 guest 槽上限都是每 rank 的原属专家数 L。显式槽数须在 1 到 L 之间。
+- `cross_node_cost` 表示跨节点副本矩阵搬运的相对代价。`None` 和 `1.0` 的倍率相同。Push 和 Pull 都接受显式倍率，EP 组内使用相同配置。
+- `receive_capacity_percent="auto"` 默认按预计净收益选点。Push 评分同时考虑已经预留的接收区。
   显式 `receive_capacity_percent=102` 将各 rank 的实际接收行数限制在 EP 均值的 102%，向上取整到一行。
   两种设置共用评分和源端配额规则。EP 组内使用相同设置。槽位不足或搜索无法找到合规计划时，调用报错。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
@@ -168,6 +168,7 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
   执行器在申请副本 bank 前校验所有 source 的逻辑专家守恒、逐位置 Top-K 身份、物理槽直方图和全组配额一致性。
   Reentrant checkpoint 可使用同一实验命名空间的 `wrap_checkpoint`。每次原前向创建一个 wrapper。
   省略 `tokens_per_expert` 时，全 EP 验证 Top-K 顺序、参数代际和流后可复用原落位。
+  在 FC2 前乘路由概率且各 rank 激活预算和重放校验均满足时，Push 和 Pull 都可复用前向激活并跳过重算前向。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。固定字节预算优先容纳这次调用所需的对齐布局。
   副本布局超出固定预算时，可以在原属布局符合接收行数要求且放得下的情况下沿用原属布局。两种布局都超预算，或显式行数上限要求使用副本时，调用报错。
   `partial_weight_grad_dtype="float32"` 要求被拆专家的 partial 从 GEMM 产出起为 FP32。显式 FP32 配置预留 3L bank。
@@ -430,17 +431,16 @@ GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图�
 | 参数 | 默认值 | 作用与约束 |
 | --- | --- | --- |
 | `dispatch_mode` | `"push"` | `"push"` 用 PUT 分发，`"pull"` 用 GET 分发；两者的 combine 均使用 PUT。 |
-| `initial_capacity_factor` | `None`；push 实际为 `1.25` | push 初始接收行数相对预留 source 路由行数的倍率；须为有限数且不小于 `1.0`，pull 不接受显式值。 |
-| `capacity_growth_factor` | `None`；push 实际为 `1.25` | push 中 source token 和接收容量的扩容倍率；`1.0` 按当次需求对齐扩容。须为有限数且不小于 `1.0`，pull 不接受显式值。 |
+| `initial_capacity_factor` | `None`，Push 为 `1.25`，Pull 为 `1.0` | Push 的初始接收行数相对预留 source 路由行数的倍率，或 Pull 的初始 source token 预留倍率。 |
+| `capacity_growth_factor` | `None`，实际为 `1.25` | 两种模式的 source token 及 Push 对称接收区的扩容倍率。`1.0` 按当次需求对齐扩容。 |
 | `dispatch_split` | `128` | 正反向 dispatch 的通信分片行数，须为 `128` 的正整数倍。 |
 | `combine_split` | `128` | 正反向 combine 的通信分片行数，须为 `128` 的正整数倍。 |
 | `scheduler` | `None` | 可选 `MegaMoeSchedulerOptions`，保留硬件适用的默认调度。 |
 
-push 初始接收容量按 `ceil(min(initial_capacity_factor, EP) × 预留 source token 数 × top_k)`
-计算后向上对齐到 `128` 行，`EP` 为 `ep_group` 的成员数；首次绑定的预留 source token 数为 `128`。
-两个容量因子不接受布尔值。
-动态 token 调用中，pull 的 source 容量仍由内部按 `1.25` 增长；显式 heap 预算不足以支持几何扩容时，
-运行时会尝试只满足本次最小需求，仍不足则报错。不同策略的性能取决于实际负载，须分别测量。
+Push 首次预留 128 个 source token，初始接收行数按
+`ceil(min(initial_capacity_factor, EP) × 128 × top_k)` 向上对齐到 128 行。
+Pull 将 `128 × initial_capacity_factor` 向上对齐到 128 个 source token，接收区按实际局部路由行数分配。
+容量倍率须为有限数且至少为 `1.0`，不接受布尔值。显式 heap 预算放不下几何扩容时，运行时尝试当次最小需求。
 
 ```python
 import torch.distributed as dist
