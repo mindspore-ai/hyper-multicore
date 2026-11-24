@@ -909,10 +909,12 @@ def _execute_mega_moe_without_autograd(
         workspace.claim()
     acquired = False
     try:
-        weight1 = _native_weight_operand(weight1, plan)
-        weight2 = _native_weight_operand(weight2, plan)
+        # The fused descriptor still reads owner storage after acquire returns
+        # guest bank views. Retain any contiguous copies through the launch.
+        owner_weights = _native_weight_operand(weight1, plan), _native_weight_operand(weight2, plan)
+        weight1, weight2 = owner_weights
         if weight_binding is not None:
-            weight1, weight2 = weight_binding.acquire((weight1, weight2))
+            weight1, weight2 = weight_binding.acquire(owner_weights)
             acquired = True
             if route.checkpoint_record is not None and not weight_binding.fused:
                 weight_binding.save_snapshot((weight1, weight2))
