@@ -21,6 +21,8 @@ set(GATE_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate/op_host)
 set(GATE_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate_grad/op_host)
 set(MX_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8/op_host)
 set(MX_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe_mxfp8_grad/op_host)
+set(KDA_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_kda/op_host)
+set(KDA_GRAD_HOST ${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_kda_grad/op_host)
 set(CANN_PACKAGE_ARCH_ROOT ${ASCEND_CANN_PACKAGE_PATH})
 string(APPEND CANN_PACKAGE_ARCH_ROOT "/${CMAKE_SYSTEM_PROCESSOR}-linux")
 set(MHC_GRAD_TILING
@@ -55,6 +57,8 @@ set(OP_SCHEMA_SOURCES
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_infershape.cpp
     ${MX_HOST}/hyper_mega_moe_mxfp8_def.cpp
     ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_def.cpp
+    ${KDA_HOST}/hyper_mega_kda_def.cpp
+    ${KDA_GRAD_HOST}/hyper_mega_kda_grad_def.cpp
 )
 set(OP_TILING_SOURCES
     ${FWD_HOST}/hyper_mega_moe_tiling.cpp
@@ -68,6 +72,8 @@ set(OP_TILING_SOURCES
     ${GATE_GRAD_HOST}/hyper_mega_gate_route_grad_tiling.cpp
     ${MX_HOST}/hyper_mega_moe_mxfp8_tiling.cpp
     ${MX_GRAD_HOST}/hyper_mega_moe_mxfp8_grad_tiling.cpp
+    ${KDA_HOST}/hyper_mega_kda_tiling.cpp
+    ${KDA_GRAD_HOST}/hyper_mega_kda_grad_tiling.cpp
 )
 
 include_directories(${MX_HOST} ${MX_GRAD_HOST} ${HP_MULTICORE_SOURCE_ROOT})
@@ -126,9 +132,13 @@ set(ACLNN_SOURCES
     ${GATE_GRAD_HOST}/op_api/hyper_mega_gate_route_grad_post.cpp
     ${GATE_GRAD_HOST}/op_api/linear_index/linear_index.cpp
 )
+set_source_files_properties(${ASCEND_AUTOGEN_PATH}/aclnn_hyper_mega_kda.cpp PROPERTIES GENERATED TRUE COMPILE_OPTIONS "-fvisibility=default")
+set_source_files_properties(${ASCEND_AUTOGEN_PATH}/aclnn_hyper_mega_kda_grad.cpp PROPERTIES GENERATED TRUE COMPILE_OPTIONS "-fvisibility=default")
 list(APPEND ACLNN_SOURCES
     ${MX_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8.cpp
-    ${MX_GRAD_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp)
+    ${MX_GRAD_HOST}/op_api/aclnn_hyper_mega_moe_mxfp8_grad.cpp
+    ${ASCEND_AUTOGEN_PATH}/aclnn_hyper_mega_kda.cpp
+    ${ASCEND_AUTOGEN_PATH}/aclnn_hyper_mega_kda_grad.cpp)
 
 npu_op_library(cust_opapi ACLNN ${ACLNN_SOURCES})
 target_compile_options(cust_opapi PRIVATE -fvisibility=hidden)
@@ -139,6 +149,7 @@ target_include_directories(cust_opapi PRIVATE
     ${MHC_GRAD_HOST}/op_api
     ${GATE_HOST}/op_api
     ${GATE_GRAD_HOST}/op_api
+    ${ASCEND_AUTOGEN_PATH}
     ${CANN_OP_COMMON_INCLUDE}
     ${CANN_OP_HOST_INCLUDE}
     ${CANN_ACLNN_INCLUDE}
@@ -215,4 +226,6 @@ npu_op_package_add(${package_name}
         ${MHC_GRAD_HOST}/op_api/aclnn_hyper_mega_mhc_grad.h
         ${GATE_HOST}/op_api/aclnn_hyper_mega_gate_route.h
         ${GATE_GRAD_HOST}/op_api/aclnn_hyper_mega_gate_route_grad.h
+        ${ASCEND_AUTOGEN_PATH}/aclnn_hyper_mega_kda.h
+        ${ASCEND_AUTOGEN_PATH}/aclnn_hyper_mega_kda_grad.h
 )

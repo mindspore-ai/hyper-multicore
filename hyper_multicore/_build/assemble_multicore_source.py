@@ -65,6 +65,8 @@ _HYPER_OPERATORS = (
     "hyper_mega_gate_grad",
     "hyper_mega_moe_mxfp8",
     "hyper_mega_moe_mxfp8_grad",
+    "hyper_mega_kda",
+    "hyper_mega_kda_grad",
 )
 
 
@@ -302,6 +304,27 @@ def _compose_hyper_multicore_ops(
         if operator_name == "hyper_mega_gate":
             shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
             continue
+        if operator_name == "hyper_mega_kda":
+            shutil.copytree(_MULTICORE_OPS / "runtime", operator_root / "op_kernel" / "runtime")
+            shutil.copytree(
+                _MULTICORE_OPS / "hyper_mega_moe" / "op_kernel" / "put_mem_signal",
+                operator_root / "op_kernel" / "put_mem_signal",
+            )
+            shutil.copytree(
+                _MULTICORE_OPS / "common" / "mega_kda",
+                operator_root / "op_kernel" / "common" / "mega_kda",
+            )
+            continue
+        if operator_name == "hyper_mega_kda_grad":
+            shutil.copytree(
+                _MULTICORE_OPS / "common" / "mega_kda",
+                operator_root / "op_kernel" / "common" / "mega_kda",
+            )
+            shutil.copy2(
+                _MULTICORE_OPS / "hyper_mega_kda" / "op_kernel" / "kda_cube_raw.h",
+                operator_root / "op_kernel" / "kda_cube_raw.h",
+            )
+            continue
         if operator_name in ("hyper_mega_moe_mxfp8", "hyper_mega_moe_mxfp8_grad"):
             # Share host ABI; MX device code is registered only for arch35.
             continue
@@ -391,6 +414,10 @@ def _require_assembled_files(source_root: Path) -> None:
         source_root / "common" / "mega_moe" / "op_host" / "mxfp8_schema.h",
         source_root / "hyper_mega_moe_mxfp8" / "op_host" / "hyper_mega_moe_mxfp8_def.cpp",
         source_root / "hyper_mega_moe_mxfp8_grad" / "op_host" / "hyper_mega_moe_mxfp8_grad_def.cpp",
+        source_root / "hyper_mega_kda" / "op_host" / "hyper_mega_kda_def.cpp",
+        source_root / "hyper_mega_kda" / "op_kernel" / "hyper_mega_kda.cpp",
+        source_root / "hyper_mega_kda_grad" / "op_host" / "hyper_mega_kda_grad_def.cpp",
+        source_root / "hyper_mega_kda_grad" / "op_kernel" / "hyper_mega_kda_grad.cpp",
         source_root / "shmem" / "data_plane" / "rma.h",
         source_root / "shmem" / "data_plane" / "sync.h",
         source_root / "hyper_mega_mhc" / "op_host" / "hyper_mega_mhc_def.cpp",
