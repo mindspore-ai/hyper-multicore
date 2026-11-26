@@ -155,7 +155,7 @@ from hyper_multicore.experimental import HotReplicaPlanner, MegaMoeTuningOptions
 tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 ```
 
-- 省略 `expert_placement` 时使用原属路由。Push 和 Pull 的默认 guest 槽上限都是每 rank 的原属专家数 L。显式槽数须在 1 到 L 之间。
+- 省略 `expert_placement` 时使用原属路由。Push 和 Pull 的默认 guest 槽上限都是每 rank 的原属专家数 L。显式槽数须在 1 到 L 之间。自动模式在槽位预算内比较原属、单槽和多槽布局。
 - `cross_node_cost` 表示跨节点副本矩阵搬运的相对代价。`None` 和 `1.0` 的倍率相同。Push 和 Pull 都接受显式倍率，EP 组内使用相同配置。
 - `receive_capacity_percent="auto"` 默认按预计净收益选点。Push 评分同时考虑已经预留的接收区。
   显式 `receive_capacity_percent=102` 将各 rank 的实际接收行数限制在 EP 均值的 102%，向上取整到一行。

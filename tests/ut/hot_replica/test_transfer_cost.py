@@ -14,10 +14,16 @@
 # ============================================================================
 """Validate placement transfer cost accounting."""
 
+from dataclasses import replace
+
 import pytest
 
+from hyper_multicore.modules.hot_replica._planner.aligned import materialize_aligned_moves
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
-from hyper_multicore.modules.hot_replica._planner.receive import ReplicaCost, bf16_cost, select_replica_plan
+from hyper_multicore.modules.hot_replica._planner.receive import (
+    ReplicaCapacityError, ReplicaCost, SourceQuota, bf16_cost, select_replica_plan,
+)
+from hyper_multicore.modules.hot_replica.planner import as_placement
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 
 
@@ -71,3 +77,94 @@ def test_equal_replica_cost_prefers_fewer_cross_node_token_rows():
     assert neutral.transfers and neutral == expensive
     assert all(edge.owner_rank // 8 == edge.target_rank // 8 for edge in neutral.transfers)
     neutral.validate()
+
+
+@pytest.mark.parametrize(("arch", "precision", "engine", "charge_whole_copies", "minimum_rows"), [
+    (2201, "bf16", "mte", False, 1),
+])
+def test_training_auto_uses_the_backend_coefficients(arch, precision, engine, charge_whole_copies, minimum_rows):
+    """Select the backend coefficients in the common score and preserve the explicit limit."""
+    planner = HotReplicaPlanner()
+    prices, limit, _ = planner._policy(5120, 1792, 32 if arch == 3510 else 24, True, engine,
+                                       60000, 32768 * 16, 16, None, architecture=arch, precision=precision)
+    assert (prices.matrix_copy > 0) == charge_whole_copies
+    assert prices.minimum_replica_rows == minimum_rows
+    assert limit is None
+    hard = HotReplicaPlanner(receive_capacity_percent=102)
+    hard_prices, limit, _ = hard._policy(5120, 1792, 32 if arch == 3510 else 24, True, engine,
+                                       60000, 32768 * 16, 16, None, architecture=arch, precision=precision)
+    assert hard_prices.matrix_copy == 0
+    assert limit == 33424
+
+
+def test_matrix_copy_charge_can_reject_an_optional_plan_but_respects_a_hard_limit():
+    """Charge every additional matrix without discarding a required placement."""
+    counts = ((4096, 0, 0, 0),) * 4
+    config = ExpertReplicaConfig(4, 4, 1)
+    assert select_replica_plan(counts, config, prices=ReplicaCost()) is not None
+    prices = ReplicaCost(matrix_copy=7000.)
+    assert select_replica_plan(counts, config, prices=prices) is None
+    required = select_replica_plan(counts, config, prices=prices, limit=4096)
+    required.validate()
+    assert max(required.destination_loads) == 4096
+
+
+def test_full_budget_can_select_the_same_physical_layout_as_one_slot():
+    """Keep a one-slot layout that the full-budget greedy path cannot produce."""
+    counts = (
+        (0, 0, 0, 0, 0, 3, 0, 20, 1, 5, 20, 17),
+        (9, 0, 20, 1, 0, 0, 0, 20, 20, 0, 0, 9),
+        (0, 2, 0, 0, 0, 20, 0, 0, 17, 9, 9, 0),
+        (0, 0, 0, 9, 20, 3, 0, 0, 5, 0, 3, 0),
+    )
+    cap = ExpertReplicaConfig(12, 4, 3)
+    prices = ReplicaCost(setup=1., phases=((3., 3.),), matrix_copy=4.)
+    full = select_replica_plan(counts, cap, prices=prices)
+    one = select_replica_plan(counts, replace(cap, replica_slots_per_rank=1), prices=prices)
+    auto = select_replica_plan(counts, cap, prices=replace(prices, search_single_slot=True))
+    assert full.compact_borrowed_width == 2
+    assert auto.compact_borrowed_width == 1
+    assert as_placement(auto) == as_placement(one)
+    auto.validate()
+
+
+def test_multi_slot_search_preserves_a_required_wide_layout():
+    """Failure of the one-slot budget cannot veto a feasible wider placement."""
+    counts = ((10, 10, 10, 0, 0, 0),) * 2
+    prices = ReplicaCost(setup=1e4, matrix_copy=1e4, search_single_slot=True)
+    with pytest.raises(ReplicaCapacityError):
+        select_replica_plan(counts, ExpertReplicaConfig(6, 2, 1), prices=prices, limit=30)
+    plan = select_replica_plan(counts, ExpertReplicaConfig(6, 2, 3), prices=prices, limit=30)
+    assert plan.compact_borrowed_width == 2
+    assert plan.destination_loads == (30, 30)
+    plan.validate()
+
+
+def test_materialized_admission_keeps_hard_capacity_requests():
+    """Apply measured admission only after materializing an optional placement."""
+    counts = ((4096, 0, 0, 0),) * 4
+    config = ExpertReplicaConfig(4, 4, 1)
+    prices = ReplicaCost(admission=ReplicaCost(setup=14000.))
+    assert select_replica_plan(counts, config, prices=prices) is None
+    assert max(select_replica_plan(counts, config, prices=prices, limit=4096).destination_loads) == 4096
+
+
+def test_aligned_plan_intersects_original_source_rows_and_preserves_the_tail():
+    """Lower K64 cuts using global expert row order even across source ranks."""
+    plan = select_replica_plan(
+        ((150, 0), (43, 0)), ExpertReplicaConfig(2, 2, 1), quantum=64, limit=129,
+        source_quota=SourceQuota.RANK_ORDER, materialize=materialize_aligned_moves,
+    )
+    assert plan.intervals == ((0, 128), (0, 0), (0, 0), (128, 193))
+    assert plan.dispatch_counts == ((128, 0, 0, 22), (0, 0, 0, 43))
+    plan.validate()
+
+
+def test_search_and_capacity_repair_respect_peer_edges():
+    """An unreachable edge cannot satisfy an explicit receive limit."""
+    counts = ((64, 0), (64, 0))
+    config = ExpertReplicaConfig(2, 2, 1)
+    edges = ((True, False), (False, True))
+    assert select_replica_plan(counts, config, peer_edges=edges) is None
+    with pytest.raises(ReplicaCapacityError):
+        select_replica_plan(counts, config, peer_edges=edges, limit=64)

@@ -256,6 +256,7 @@ class PlacementResources:
             spec.intermediate_size, spec.num_cube_cores, training, checkpointing=checkpointing,
             apply_probs_before_fc2=spec.apply_probs_before_fc2, ordinary_receive_capacity=resident,
             rank_nodes=self.rank_nodes, dispatch_mode=spec.dispatch_mode, transport_engine=spec.transport_engine,
+            architecture=spec.architecture,
         )
 
     def bind(

@@ -150,7 +150,8 @@ def build_host_planner(output: Path) -> None:
         [
             *shlex.split(os.environ.get("CXX", "g++")),
             "-shared", "-fPIC", "-O3", "-std=c++17", "-Wl,-z,relro,-z,now,-z,noexecstack",
-            f"-I{sysconfig.get_path('include')}", str(source), "-o", str(output / "_replica_host.so"),
+            f"-I{sysconfig.get_path('include')}", str(source), str(source.with_name("aligned_dispatch.cpp")),
+            "-o", str(output / "_replica_host.so"),
         ],
         check=True,
     )

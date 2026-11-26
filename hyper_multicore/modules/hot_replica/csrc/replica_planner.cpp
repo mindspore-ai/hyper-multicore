@@ -13,6 +13,7 @@
 #include <vector>
 
 namespace ReplicaHost {
+PyObject *AlignedDispatch(PyObject *, PyObject *args);
 namespace {
 using Rows = std::vector<int64_t>;
 
@@ -69,25 +70,47 @@ bool ReadCountMatrix(PyObject *matrix, int ranks, int experts, std::vector<Rows>
   return true;
 }
 
+bool ReadPeerEdges(PyObject *matrix, int ranks, std::vector<std::vector<bool>> *peers) {
+  if (matrix == Py_None) return true;
+  if (!PyTuple_CheckExact(matrix) || PyTuple_GET_SIZE(matrix) != ranks) return false;
+  peers->resize(ranks);
+  for (int owner = 0; owner < ranks; ++owner) {
+    PyObject *row = PyTuple_GET_ITEM(matrix, owner);
+    if (!PyTuple_CheckExact(row) || PyTuple_GET_SIZE(row) != ranks) return false;
+    auto &allowed = (*peers)[owner];
+    allowed.reserve(ranks);
+    for (int guest = 0; guest < ranks; ++guest) {
+      PyObject *edge = PyTuple_GET_ITEM(row, guest);
+      if (!PyBool_Check(edge)) return false;
+      allowed.push_back(edge == Py_True);
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 PyObject *SelectPrefix(PyObject *, PyObject *args) {
-  PyObject *totals, *matrix, *levels, *topology, *phase_tuple;
-  int ranks, slots, quantum;
+  PyObject *totals, *matrix, *levels, *topology, *phase_tuple, *peer_matrix = Py_None;
+  int ranks, slots, quantum, minimum_rows = 1, search_single_slot = 0;
   long long capacity, resident;
-  double multiplier, compute, setup, resize;
-  if (!PyArg_ParseTuple(args, "OOiiiOOOddddLL", &totals, &matrix, &ranks, &slots, &quantum,
+  double multiplier, compute, setup, resize, matrix_copy = 0.;
+  if (!PyArg_ParseTuple(args, "OOiiiOOOddddLL|idOp", &totals, &matrix, &ranks, &slots, &quantum,
                         &levels, &topology, &phase_tuple, &multiplier, &compute, &setup,
-                        &resize, &capacity, &resident)) return nullptr;
+                        &resize, &capacity, &resident, &minimum_rows, &matrix_copy, &peer_matrix,
+                        &search_single_slot)) return nullptr;
   try {
     Rows weights, nodes, targets;
     std::vector<Rows> counts;
+    std::vector<std::vector<bool>> peers;
     PhasePrices phases;
-    if (quantum < 1 || !std::isfinite(multiplier) || !std::isfinite(compute) ||
-        !std::isfinite(setup) || !std::isfinite(resize) ||
+    if (quantum < 1 || minimum_rows < 1 || !std::isfinite(multiplier) || !std::isfinite(compute) ||
+        !std::isfinite(setup) || !std::isfinite(resize) || !std::isfinite(matrix_copy) || matrix_copy < 0. ||
         !ReadBoundedTuple(levels, 3, int64_t{3} << 30, &targets) ||
         !ReadSearch(totals, topology, ranks, slots, &weights, &nodes) ||
-        !ReadCountMatrix(matrix, ranks, weights.size(), &counts)) Py_RETURN_NONE;
+        !ReadCountMatrix(matrix, ranks, weights.size(), &counts) || !ReadPeerEdges(peer_matrix, ranks, &peers)) {
+      Py_RETURN_NONE;
+    }
     if (!ReadPhases(phase_tuple, &phases)) {
       if (PyErr_Occurred()) return nullptr;
       Py_RETURN_NONE;
@@ -99,30 +122,42 @@ PyObject *SelectPrefix(PyObject *, PyObject *args) {
     const auto peak = *std::max_element(loads.begin(), loads.end());
     auto best_seen = peak;
     bool has_best = capacity < 0;
-    auto best = std::make_tuple(0., 0., size_t{0}, peak);
+    auto best = std::make_tuple(0., 0, 0., size_t{0}, peak);
+    const bool compare_slots = search_single_slot && slots > 1;
     std::vector<PrefixMove> selected;
     for (const auto target : targets) {
-      auto moves = SearchPrefixes(weights, loads, nodes, counts, slots, quantum, target, multiplier, phases);
-      size_t accepted = 0;
-      double weighted_edges = 0.;
-      for (size_t i = 0; i < moves.size(); ++i) {
-        const auto &move = moves[i];
-        best_seen = std::min(best_seen, move.peak);
-        weighted_edges += move.charge;
-        if (capacity >= 0 && move.peak > capacity) continue;
-        double delta = (move.peak - peak) * compute + setup + TransferCost(move.sent, move.received, phases);
-        if (resize != 0. && move.peak <= resident) delta -= resize;
-        if (!std::isfinite(delta) || !std::isfinite(weighted_edges)) Py_RETURN_NONE;
-        const auto key = std::make_tuple(delta, weighted_edges, i + 1, move.peak);
-        if (!has_best || key < best) {
-          best = key;
-          has_best = true;
-          accepted = i + 1;
+      for (const int budget : {slots, 1}) {
+        auto moves = SearchPrefixes(weights, loads, nodes, counts, budget, quantum, target, multiplier, phases,
+                                    minimum_rows, matrix_copy, peers);
+        std::vector<int> occupied(compare_slots ? ranks : 0);
+        size_t accepted = 0;
+        double weighted_edges = 0.;
+        int width = 0;
+        for (size_t i = 0; i < moves.size(); ++i) {
+          const auto &move = moves[i];
+          best_seen = std::min(best_seen, move.peak);
+          weighted_edges += move.charge;
+          if (compare_slots && ++occupied[move.guest] > width) {
+            width = width == 0 ? 1 : std::min(slots, width * 2);
+          }
+          if (capacity >= 0 && move.peak > capacity) continue;
+          double delta = (move.peak - peak) * compute + setup + TransferCost(move.sent, move.received, phases) +
+                         matrix_copy * weighted_edges;
+          if (resize != 0. && move.peak <= resident) delta -= resize;
+          if (!std::isfinite(delta) || !std::isfinite(weighted_edges)) Py_RETURN_NONE;
+          const auto key = std::make_tuple(delta, width, weighted_edges, i + 1, move.peak);
+          if (!has_best || key < best) {
+            best = key;
+            has_best = true;
+            accepted = i + 1;
+          }
         }
-      }
-      if (accepted != 0) {
-        moves.resize(accepted);
-        selected = std::move(moves);
+        if (accepted != 0) {
+          moves.resize(accepted);
+          selected = std::move(moves);
+        }
+        // A wide trajectory that never used a second slot is also the narrow trajectory.
+        if (width <= 1) break;
       }
     }
     PyObject *result = PyList_New(selected.size());
@@ -148,6 +183,10 @@ PyObject *SelectPrefix(PyObject *, PyObject *args) {
 namespace {
 PyMethodDef methods[] = {
   {"select_prefix", ReplicaHost::SelectPrefix, METH_VARARGS, "Choose a capacity-legal prefix across target loads."},
+  {"select_prefix_with_minimum_rows", ReplicaHost::SelectPrefix, METH_VARARGS, "Set the minimum rows per optional move."},
+  {"select_prefix_with_matrix_cost", ReplicaHost::SelectPrefix, METH_VARARGS, "Price matrix copies on reachable edges."},
+  {"select_prefix_with_slot_search", ReplicaHost::SelectPrefix, METH_VARARGS, "Compare the full and single-slot searches."},
+  {"aligned_dispatch", ReplicaHost::AlignedDispatch, METH_VARARGS, "Materialize checked aligned quotas."},
   {nullptr, nullptr, 0, nullptr},
 };
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "_replica_host", nullptr, -1, methods, nullptr, nullptr, nullptr};

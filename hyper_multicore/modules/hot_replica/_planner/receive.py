@@ -15,10 +15,12 @@
 """Choose expert intervals directly from the receive, slot and link budgets."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from enum import Enum
 from heapq import heapify, heappop, heappush
 from itertools import chain
+import os
 
 import numpy as np
 
@@ -47,6 +49,10 @@ class ReplicaCost:
     setup: float = 0.
     phases: tuple[tuple[float, float], ...] = ()
     compute: float = 1.
+    minimum_replica_rows: int = 1
+    matrix_copy: float = 0.
+    admission: ReplicaCost | None = None
+    search_single_slot: bool = False
 
     def transfer(self, sent, received):
         return sum(max(owner * sent, guest * received) for owner, guest in self.phases)
@@ -61,21 +67,71 @@ class ReplicaCost:
         return (peak - mean) * self.compute <= self.setup
 
 
-def bf16_cost(hidden_size, intermediate_size, cube_cores, training, *, transport_engine="mte"):
-    """Translate exposed latency and expert bytes to rows at the given GEMM geometry.
+@dataclass(frozen=True)
+class _CostCoefficients:
+    """Coefficients for activation, busiest endpoints and all matrix copies."""
 
-    Effective rates come from the EP16 PanGu BF16 alternating-route calibration.
-    FP32 return accumulates at the owner; its guest only publishes the partial.
-    """
-    cube_flops, exposed_bandwidth, setup_seconds = 7.4e12, 5.9e11, .0035
-    if transport_engine == "mte":
-        # The exposed replica matrix rate is independent of token dispatch and topology.
-        exposed_bandwidth /= 8
-    area = hidden_size * intermediate_size
-    rows_per_second = cube_cores * cube_flops / (6 * area)
-    edge = rows_per_second * (6 * area / exposed_bandwidth)
-    phases = ((edge / 2, edge / 2), (edge / 2, edge / 4)) if training else ((edge, edge),)
-    return ReplicaCost(rows_per_second * setup_seconds, phases)
+    setup_seconds: float = 0.
+    setup_peak_fraction: float = 0.
+    endpoint_per_core: float = 0.
+    endpoint_per_half_inner: float = 0.
+    endpoint_seconds: float = 0.
+    endpoint_rows: float = 0.
+    phases: tuple[tuple[float, float], ...] = ((1., 1.),)
+    copy_rows: float = 0.
+    minimum_replica_rows: int = 1
+
+    def cost(self, hidden_size, intermediate_size, cube_cores, peak):
+        """Convert time and whole-matrix charges into equivalent GEMM rows."""
+        rows_per_second = cube_cores * 7.4e12 / (6 * hidden_size * intermediate_size)
+        endpoint = (self.endpoint_per_core * cube_cores + int(self.endpoint_per_half_inner * (intermediate_size // 2))
+                    + self.endpoint_seconds * rows_per_second + self.endpoint_rows)
+        return ReplicaCost(
+            setup=rows_per_second * self.setup_seconds + peak * self.setup_peak_fraction,
+            phases=tuple((owner * endpoint, guest * endpoint) for owner, guest in self.phases),
+            minimum_replica_rows=self.minimum_replica_rows,
+            matrix_copy=self.copy_rows,
+        )
+
+
+_A3_ENDPOINT_PER_CORE = 7.4e12 / 5.9e11
+_BF16_TRAINING_PHASES = ((.5, .5), (.5, .25))
+_A3_BF16 = {
+    (transport, training): _CostCoefficients(setup_seconds=.0035, endpoint_per_core=scale * _A3_ENDPOINT_PER_CORE,
+                                             phases=_BF16_TRAINING_PHASES if training else ((1., 1.),))
+    for transport, scale in (("mte", 8.), ("other", 1.)) for training in (False, True)
+}
+_BASE_PROFILES = {(2201, "bf16", transport, training): profile
+                  for (transport, training), profile in _A3_BF16.items()}
+_AUTO_TRAINING = {(2201, "bf16", "mte"): _A3_BF16["mte", True]}
+_AUTO_ADMISSION = {}
+
+
+def bf16_cost(hidden_size, intermediate_size, cube_cores, training, *, transport_engine="mte"):
+    """Convert the A3 PanGu BF16 calibration to equivalent rows."""
+    transport = "mte" if transport_engine == "mte" else "other"
+    return _A3_BF16[transport, training].cost(hidden_size, intermediate_size, cube_cores, 0)
+
+
+def replica_cost(architecture, precision, transport, training, automatic, hidden, inner, cores, peak,
+                 *, rank_nodes=()):
+    """Select coefficients for the executor and price its candidates in one unit."""
+    key = (architecture, precision, transport)
+    profile = _AUTO_TRAINING.get(key) if training and automatic else None
+    if profile is None:
+        profile = _BASE_PROFILES.get((*key, training))
+    if profile is None:
+        score = bf16_cost(hidden, inner, cores, training, transport_engine=transport)
+    else:
+        score = profile.cost(hidden, inner, cores, peak)
+    score = replace(score, search_single_slot=automatic)
+    validation = _AUTO_ADMISSION.get(key)
+    if training and automatic and validation is not None and rank_nodes:
+        expected_sizes, expected_qp, admission = validation
+        sizes = tuple(sorted(Counter(rank_nodes).values()))
+        if sizes == expected_sizes and os.environ.get("HYPER_MULTICORE_SHMEM_UDMA_QP_NUM") == expected_qp:
+            return replace(score, admission=admission.cost(hidden, inner, cores, peak))
+    return score
 
 
 def _lower(matrix, config, totals, moves, nodes, source_quota, limit):
@@ -102,7 +158,8 @@ def _tail(remaining, wanted, room, quantum):
     return min(remaining, low + quantum)
 
 
-def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices, source_counts):
+def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices, source_counts, peer_edges,
+              minimum_rows):
     """Drain the busiest owner first. Intermediate equal-peak moves can clear a plateau."""
     after = loads.copy()
     remaining = list(totals)
@@ -119,12 +176,13 @@ def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices,
         # A cheaper remote rank may beat a fuller local one.
         best_key = best_move = None
         for rank, load in enumerate(after):
-            if load >= target or len(guests[rank]) >= config.replica_slots_per_rank:
+            if (load >= target or len(guests[rank]) >= config.replica_slots_per_rank
+                    or peer_edges and not peer_edges[owner][rank]):
                 continue
             charge = multiplier if nodes and nodes[rank] != nodes[owner] else 1.
             next_sent = max(max_sent, sent[owner] + charge)
             next_received = max(max_received, received[rank] + charge)
-            transfer = prices.transfer(next_sent, next_received)
+            transfer = prices.transfer(next_sent, next_received) + prices.matrix_copy * charge
             room = target - load
             # No legal cut beats the maximum possible pairwise relief.
             if best_key is not None and min(room, (after[owner] - load) // 2) - transfer < best_key[0]:
@@ -135,7 +193,7 @@ def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices,
                     continue
                 cut = _tail(end, excess, room, quantum)
                 moved = end - cut
-                if moved <= 0:
+                if moved < minimum_rows:
                     continue
                 # Marginal reduction of the two endpoints, then source locality and whole experts.
                 relief = after[owner] - max(after[owner] - moved, load + moved)
@@ -161,39 +219,55 @@ def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices,
 
 
 def _select_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices, source_counts,
-                     capacity, resident, resize):
+                     capacity, resident, resize, peer_edges):
+    minimum_rows = prices.minimum_replica_rows if capacity is None else 1
     if type(prices) is ReplicaCost:
         native = select_prefix(totals, source_counts, config, quantum, levels, nodes, multiplier,
-                               prices, capacity, resident, resize)
+                               prices, capacity, resident, resize, minimum_rows, peer_edges)
         if native is not None:
             return native
     peak = max(loads)
     best_seen = peak
-    best = None if capacity is not None else (0., 0., 0, peak)
+    best = None if capacity is not None else (0., 0, 0., 0, peak)
     selected = ()
+    single_slot = (replace(config, replica_slots_per_rank=1)
+                   if prices.search_single_slot and config.replica_slots_per_rank > 1 else None)
+    budgets = (config,) if single_slot is None else (config, single_slot)
     for target in levels:
-        moves = []
-        weighted_edges = 0.
-        length = 0
-        for move, after, sent, received, edge in _prefixes(totals, loads, config, target, quantum, nodes,
-                                                        multiplier, prices, source_counts):
-            moves.append(move)
-            best_seen = min(best_seen, after)
-            weighted_edges += edge
-            if capacity is not None and after > capacity:
-                continue
-            delta = (after - peak) * prices.compute + prices.setup + prices.transfer(sent, received)
-            if resize and after <= resident:
-                delta -= resize
-            key = (delta, weighted_edges, len(moves), after)
-            if best is None or key < best:
-                best, length = key, len(moves)
-        if length:
-            selected = moves[:length]
+        for budget in budgets:
+            moves = []
+            weighted_edges = 0.
+            length = widest = 0
+            occupied = [0] * len(loads) if single_slot is not None else None
+            for move, after, sent, received, edge in _prefixes(totals, loads, budget, target, quantum, nodes,
+                                                            multiplier, prices, source_counts, peer_edges,
+                                                            minimum_rows):
+                moves.append(move)
+                best_seen = min(best_seen, after)
+                weighted_edges += edge
+                if occupied is not None:
+                    guest = move[1]
+                    occupied[guest] += 1
+                    widest = max(widest, occupied[guest])
+                if capacity is not None and after > capacity:
+                    continue
+                delta = ((after - peak) * prices.compute + prices.setup + prices.transfer(sent, received)
+                         + prices.matrix_copy * weighted_edges)
+                if resize and after <= resident:
+                    delta -= resize
+                width = min(config.replica_slots_per_rank, 1 << (widest - 1).bit_length()) if widest else 0
+                key = (delta, width, weighted_edges, len(moves), after)
+                if best is None or key < best:
+                    best, length = key, len(moves)
+            if length:
+                selected = moves[:length]
+            # With the same legal choices at every selected move the single-slot path is identical.
+            if widest <= 1:
+                break
     return selected, best_seen
 
 
-def _fill_capacity(totals, config, limit, quantum, nodes, multiplier):
+def _fill_capacity(totals, config, limit, quantum, nodes, multiplier, peer_edges):
     """Fill one receiver at a time from one owner; keep unaligned expert tails at home.
 
     Draining past a donor's own excess lets it become a receiver later. For row quotas
@@ -211,7 +285,9 @@ def _fill_capacity(totals, config, limit, quantum, nodes, multiplier):
         owner = max(range(ranks), key=lambda r: loads[r] - caps[r])
         if loads[owner] <= caps[owner]:
             return moves
-        peers = [r for r in range(ranks) if loads[r] < caps[r]]
+        peers = [r for r in range(ranks) if loads[r] < caps[r] and (not peer_edges or peer_edges[owner][r])]
+        if not peers:
+            return None
         rank = min(peers, key=lambda r: (multiplier if nodes and nodes[owner] != nodes[r] else 1.,
                                          caps[r] - loads[r], r))
         need = caps[rank] - loads[rank]
@@ -230,7 +306,7 @@ def _fill_capacity(totals, config, limit, quantum, nodes, multiplier):
             return None
 
 
-def _pack_capacity(totals, config, limit, quantum):
+def _pack_capacity(totals, config, limit, quantum, peer_edges):
     """Search small residual hard cases, including moving a short K64 tail off its owner."""
     ranks, home = config.ep_size, config.home_experts
     experts = sorted((e for e, n in enumerate(totals) if n), key=lambda e: -totals[e])
@@ -247,7 +323,8 @@ def _pack_capacity(totals, config, limit, quantum):
             return True
         expert = experts[index]
         owner, end = expert // home, totals[expert]
-        ranks_left = [r for r in range(ranks) if r not in used and space[r] and (r == owner or slots[r])]
+        ranks_left = [r for r in range(ranks) if r not in used and space[r] and
+                      (r == owner or slots[r] and (not peer_edges or peer_edges[owner][r]))]
         if sum(space[r] for r in ranks_left) < end - start:
             return False
         for rank in sorted(ranks_left, key=lambda r: (r != owner, -space[r], r)):
@@ -276,7 +353,7 @@ def _pack_capacity(totals, config, limit, quantum):
 
 def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="auto", limit=None,
                         nodes=(), cross_node_cost=None, prices=ReplicaCost(), source_quota=SourceQuota.LOCAL,
-                        totals=None, soft_target=None, resident=None):
+                        totals=None, soft_target=None, resident=None, materialize=None, peer_edges=()):
     """Minimize exposed rank work subject to physical slots, legal cuts and the receive limit.
 
     The optional absolute limit is for callers that already own a row budget. All built-in
@@ -303,9 +380,12 @@ def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="
     if not mandatory and (not config.replica_slots_per_rank or (peak - mean) * prices.compute <= prices.setup - resize):
         return None
     if mandatory:
-        available = (ranks - 1) * config.replica_slots_per_rank
-        lower = max(mean, max(load - sum(sorted(totals[r*home:(r+1)*home], reverse=True)[:available])
-                              for r, load in enumerate(loads)))
+        lower = mean
+        for rank, load in enumerate(loads):
+            available = (sum(peer_edges[rank]) if peer_edges else ranks) - 1
+            slots = available * config.replica_slots_per_rank
+            removable = sorted(totals[rank * home:(rank + 1) * home], reverse=True)[:slots]
+            lower = max(lower, load - sum(removable))
         if lower > limit:
             raise ReplicaCapacityError(f"Receive limit conflict: receive limit {limit} rows, "
                                        f"{config.replica_slots_per_rank} guest slots/rank, "
@@ -322,12 +402,12 @@ def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="
         levels += (resident,)
     selected, best_seen = _select_prefixes(
         totals, loads, config, tuple(dict.fromkeys(levels)), quantum, nodes, multiplier, prices, source_counts,
-        limit if mandatory else None, resident, resize,
+        limit if mandatory else None, resident, resize, peer_edges,
     )
     if mandatory and not selected:
-        selected = _fill_capacity(totals, config, limit, quantum, nodes, multiplier)
+        selected = _fill_capacity(totals, config, limit, quantum, nodes, multiplier, peer_edges)
         if selected is None:
-            selected = _pack_capacity(totals, config, limit, quantum)
+            selected = _pack_capacity(totals, config, limit, quantum, peer_edges)
         if selected is None:
             raise ReplicaCapacityError(f"No placement found within receive limit {limit} rows with "
                                        f"{config.replica_slots_per_rank} guest slots/rank, quantum {quantum}. "
@@ -335,7 +415,15 @@ def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="
     if not selected:
         return None
     counts = matrix if source_quota is SourceQuota.RANK_ORDER else source_counts
-    plan = _lower(counts, config, totals, selected, nodes, source_quota, limit)
+    plan = (_lower(counts, config, totals, selected, nodes, source_quota, limit) if materialize is None
+            else materialize(source_counts, config, totals, selected))
     if limit is not None and max(plan.destination_loads) > limit:
         raise ReplicaCapacityError(f"Placement exceeds receive limit {limit} rows")
+    acceptance = prices.admission
+    if limit is None and acceptance is not None:
+        degree = plan.maximum_transfer_degree
+        delta = ((max(plan.destination_loads) - peak) * acceptance.compute + acceptance.setup
+                 + acceptance.transfer(degree, degree))
+        if delta > 0:
+            return None
     return plan
