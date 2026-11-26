@@ -16,6 +16,18 @@
 cmake_minimum_required(VERSION 3.16)
 project(hyper_multicore_multicore_vendor LANGUAGES C CXX)
 
+if(NOT DEFINED CMAKE_C_COMPILER_LAUNCHER OR NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(HP_VENDOR_CCACHE NAMES ccache)
+    if(HP_VENDOR_CCACHE)
+        foreach(language IN ITEMS C CXX)
+            if(NOT DEFINED CMAKE_${language}_COMPILER_LAUNCHER)
+                set(CMAKE_${language}_COMPILER_LAUNCHER "${HP_VENDOR_CCACHE}")
+            endif()
+        endforeach()
+        message(STATUS "Vendor ccache found: ${HP_VENDOR_CCACHE}")
+    endif()
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(${CMAKE_CURRENT_LIST_DIR}/../hardening.cmake)

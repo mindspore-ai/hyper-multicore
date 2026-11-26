@@ -402,6 +402,10 @@ ops-transformer 的 GMM 和 MHC 共用仓库，按各自锁定提交导出片段
 新快照在制品提交成功并复核输入后原子发布。
 `build_info.json` 的 `vendor_sources` 区分原始 vendor 来源和本次组包身份；激活脚本与最终制品每次重新生成。
 
+需要编译 vendor 时，CMake 会自动查找 `ccache`，找到后在日志中打印 `Vendor ccache found` 和工具路径。
+已显式配置的 `CMAKE_C_COMPILER_LAUNCHER` 和 `CMAKE_CXX_COMPILER_LAUNCHER` 优先，空值可关闭对应语言的 launcher。
+`ccache` 缓存编译结果，vendor 快照命中时可以跳过整个 vendor 编译。
+
 ### 并行预算
 
 每架构只编译一次 vendor kernel，按 SoC 生成注册信息；每组框架编译一份 Torch 库及所选架构的 SHMEM binding。
