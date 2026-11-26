@@ -27,6 +27,7 @@ from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
 from ...probability import PROBABILITY_PLANES, probability_stride
+from .backward import BackwardOutputs
 from .plan import MegaMoePlan, record_plan_stream
 from ...route import PreparedTopKRoute, RouteMetadata, restore_topk_output
 from ...workspace import MegaMoeWorkspace
@@ -192,32 +193,27 @@ def _allocate_backward_intermediates(
     *, weight_grad_dtype: torch.dtype | None = None,
     group_list: torch.Tensor | None = None,
     all_experts_active: bool = False,
+    outputs: BackwardOutputs = BackwardOutputs(),
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
-    if group_list is None:
-        # Without count metadata, cold rows cannot be identified; initialize every expert.
-        grad_weight1 = torch.zeros_like(weight1, dtype=weight_grad_dtype)
-        grad_weight2 = torch.zeros_like(weight2, dtype=weight_grad_dtype)
-    else:
-        grad_weight1 = torch.empty_like(weight1, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
-        grad_weight2 = torch.empty_like(weight2, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
-        if not all_experts_active:
-            multicore_ops.zero_empty_expert_gradients(grad_weight1, grad_weight2, group_list)
-    act_grad = torch.empty(
-        (capacity, spec.intermediate_size),
-        dtype=grad_output.dtype,
-        device=grad_output.device,
-    )
-    swiglu_grad = torch.empty(
-        (capacity, spec.intermediate_size * 2),
-        dtype=grad_output.dtype,
-        device=grad_output.device,
-    )
-    gate_dx = reusable_dispatch if reusable_dispatch is not None else torch.empty(
-        (capacity, spec.hidden_size),
-        dtype=grad_output.dtype,
-        device=grad_output.device,
-    )
+    weight_grads = []
+    for weight, enabled in zip((weight1, weight2), outputs[1:]):
+        if not enabled:
+            # The native ABI still requires a tensor at this unused output port.
+            gradient = weight.new_empty((weight.shape[0], 1, 16), dtype=weight_grad_dtype)
+        elif group_list is None:
+            gradient = torch.zeros_like(weight, dtype=weight_grad_dtype)
+        else:
+            gradient = torch.empty_like(weight, dtype=weight_grad_dtype, memory_format=torch.contiguous_format)
+        weight_grads.append(gradient)
+    grad_weight1, grad_weight2 = weight_grads
+    if group_list is not None and not all_experts_active and any(outputs[1:]):
+        multicore_ops.zero_empty_expert_gradients(grad_weight1, grad_weight2, group_list)
+    need_activation_grad = outputs.combine or outputs.weight1
+    act_grad = grad_output.new_empty((capacity, spec.intermediate_size) if need_activation_grad else (1, 1))
+    swiglu_grad = grad_output.new_empty((capacity, spec.intermediate_size * 2) if need_activation_grad else (1, 1))
+    gate_dx = reusable_dispatch if reusable_dispatch is not None else grad_output.new_empty(
+        (capacity, spec.hidden_size) if outputs.combine else (1, 1))
     # Empty experts must retain exact zero gradients on the baseline kernel.
     return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
 
@@ -290,6 +286,7 @@ def _prepare_backward_execution(
                                else weights[0].dtype),
             group_list=groups,
             all_experts_active=all_experts_active,
+            outputs=plan.backward_outputs,
         ),
     )
 
@@ -368,7 +365,7 @@ def _save_forward_state(
     return output
 
 
-_CAPTURED_WEIGHT_GRADS: tuple[torch.Tensor, torch.Tensor] | None = None
+_CAPTURED_WEIGHT_GRADS: tuple[torch.Tensor | None, torch.Tensor | None] | None = None
 
 
 def _release_completed_graph(ctx: Any, workspace: MegaMoeWorkspace) -> None:
@@ -697,6 +694,14 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         owner_weights = saved.weight1, saved.weight2
         acquired = False
         try:
+            # Post-FC2 probability gradients are local to output unpermutation.
+            if (plan.spec.architecture == 2201 and plan.spec.dynamic_tokens and not plan.spec.apply_probs_before_fc2
+                    and not any(ctx.needs_input_grad[:3])):
+                _, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
+                _release_completed_graph(ctx, workspace)
+                if binding is not None:
+                    binding.release_graph(ctx)
+                return (None,) * 7 + (grad_topk_weights,) + (None,) * (len(ctx.needs_input_grad) - 8)
             if binding is not None:
                 operands = binding.acquire(owner_weights, backward=True)
                 acquired = True
@@ -713,15 +718,16 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 all_experts_active=ctx.all_experts_active,
                 owner_weights=fused_owner_weights,
             )
-            grad_weight1 = execution.intermediates.grad_weight1
-            grad_weight2 = execution.intermediates.grad_weight2
+            outputs = plan.backward_outputs
+            weight_grads = (execution.intermediates.grad_weight1 if outputs.weight1 else None,
+                            execution.intermediates.grad_weight2 if outputs.weight2 else None)
             _launch_backward_kernel(
                 plan,
                 saved,
                 source,
                 execution, stream=workspace.lease_stream,
                 runtime_override=(
-                    binding.runtime(plan.bwd_runtime_config, (grad_weight1, grad_weight2))
+                    binding.runtime(plan.bwd_runtime_config, weight_grads)
                     if acquired and binding.fused else None
                 ),
             )
@@ -733,13 +739,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                         saved_probabilities.shape, dtype=ctx.topk_dtype))
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
-            if binding is not None:
-                grad_weight1, grad_weight2 = binding.gradients(
-                    (grad_weight1, grad_weight2), owner_weights)
+            if binding is not None and any(gradient is not None for gradient in weight_grads):
+                weight_grads = binding.gradients(weight_grads, owner_weights)
             if os.environ.get("HP_MEGA_MOE_CAPTURE_DW") == "1":
                 global _CAPTURED_WEIGHT_GRADS  # pylint: disable=global-statement
-                _CAPTURED_WEIGHT_GRADS = (grad_weight1.detach().clone(),
-                                          grad_weight2.detach().clone())
+                _CAPTURED_WEIGHT_GRADS = tuple(
+                    gradient.detach().clone() if gradient is not None else None for gradient in weight_grads)
             grad_x = execution.grad_x
             del execution
             grad_input = _restore_input_gradient(ctx, grad_x, permutation_inputs)
@@ -748,8 +753,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 binding.release_graph(ctx)
             gradients = (
                 grad_input,
-                grad_weight1,
-                grad_weight2,
+                *weight_grads,
                 None,
                 None,
                 None,

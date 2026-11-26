@@ -102,6 +102,7 @@ def test_a3_bf16_pull_requires_runtime_row_get(tmp_path, runtime_rows):
     build_info = {"a3_replica_bf16_partials": True}
     if runtime_rows:
         build_info["a3_bf16_pull_runtime_rows"] = True
+        build_info["a3_replica_independent_dw"] = True
     selected = {"root": tmp_path, "variant": {"hot_replica": artifacts}, "build_info": build_info}
     with (
         patch.object(capability, "load_torch_npu"),
@@ -110,10 +111,10 @@ def test_a3_bf16_pull_requires_runtime_row_get(tmp_path, runtime_rows):
         patch.object(capability, "validate_native_compatibility", return_value=selected),
         patch.object(capability._collective, "exchange", side_effect=lambda value, **_: [value, value]),
     ):
-        assert capability.require_capability(tensor, None) == (True, (0, 0))
+        assert capability.require_capability(tensor, None) == (True, runtime_rows, (0, 0))
         expected = nullcontext() if runtime_rows else pytest.raises(RuntimeError, match="runtime-row GET support")
         with expected:
-            assert capability.require_capability(tensor, None, dispatch_mode="pull") == (True, (0, 0))
+            assert capability.require_capability(tensor, None, dispatch_mode="pull") == (True, True, (0, 0))
 
 
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])

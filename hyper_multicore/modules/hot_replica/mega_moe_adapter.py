@@ -120,7 +120,7 @@ class PlacementResources:
     """Select BF16 routes and own their lazy expert bank."""
 
     def __init__(self, parent: Any, specification: dict[str, Any], shared: bool, *,
-                 bf16_partials: bool = False, rank_nodes: tuple[int, ...] = ()) -> None:
+                 bf16_partials: bool = False, independent_dw: bool = False, rank_nodes: tuple[int, ...] = ()) -> None:
         """Attach lazy placement resources to one existing BF16 owner."""
         self.parent = parent
         self.shared = shared
@@ -129,6 +129,7 @@ class PlacementResources:
         self.cross_node_cost = specification.get("cross_node_cost")
         self.receive_capacity_percent = specification.get("receive_capacity_percent")
         self.rank_nodes = rank_nodes
+        self.independent_dw = independent_dw
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)

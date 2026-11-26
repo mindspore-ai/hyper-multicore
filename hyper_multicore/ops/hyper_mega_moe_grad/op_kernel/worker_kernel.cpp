@@ -79,7 +79,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     this->Process();
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
     const auto first = gradient_bands_[0];
-    const bool merge = first != nullptr && first->owned != 0 && worker_id_ % VECTOR_WORKER_STRIDE == 0;
+    const auto second = gradient_bands_[1];
+    const bool merge = first != nullptr && (first->owned != 0 || second->owned != 0) &&
+                       worker_id_ % VECTOR_WORKER_STRIDE == 0;
     if (merge) {
       const uint32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
       const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);

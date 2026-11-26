@@ -21,6 +21,7 @@ from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionM
 from ...route import PreparedTopKRoute, restore_topk_output
 
 from .autograd import _CheckpointedMegaMoeFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
+from .backward import BackwardOutputs
 
 if TYPE_CHECKING:
     from .resources import BF16Resources
@@ -35,8 +36,18 @@ def forward(
     """Launch BF16 experts over the route prepared by the frontend."""
     del module
     pull = resources.spec.dispatch_mode == "pull"
+    before_fc2 = resources.spec.apply_probs_before_fc2
     binding = route.weight_binding
     ordinary_options = {}
+    if resources.spec.architecture == 2201 and resources.spec.dynamic_tokens and torch.is_grad_enabled():
+        outputs = BackwardOutputs(hidden_flat.requires_grad or (before_fc2 and topk_weights.requires_grad),
+                                  weights[0].requires_grad, weights[1].requires_grad)
+        if (outputs.weight1 and not outputs.weight2 and binding is not None and binding.fused_gradients
+                and not resources.placement.independent_dw):
+            # Older workers start both owner reducers only when W2 has returns.
+            outputs = BackwardOutputs(outputs.combine, weight1=True, weight2=True)
+        if any(outputs) and outputs != BackwardOutputs():
+            ordinary_options["backward_outputs"] = outputs
     if binding is not None:
         route_experts = binding.placement.counts_by_source.shape[1]
         if route_experts != resources.spec.num_experts:
@@ -45,8 +56,10 @@ def forward(
         plan = resources.plan_for_tokens(
             route.metadata.plan_tokens, hidden_flat.device,
             weight_grad_dtype=torch.float32 if binding.mode is ReplicaExecutionMode.FP32_BAND else None,
-            route_experts=ordinary_options.get("route_experts"),
-            replica_pipeline=True, reserve_merge_workers=binding.owns_returns,
+            replica_pipeline=True,
+            reserve_merge_workers=binding.owns_returns and any(
+                ordinary_options.get("backward_outputs", BackwardOutputs())[1:]),
+            **ordinary_options,
         )
         if plan.fwd_diagnostics.is_tensor_dump_active:
             if binding.mode is ReplicaExecutionMode.FP32_BAND:
@@ -54,7 +67,6 @@ def forward(
             binding = binding.for_tensor_dump()
     if binding is None or not binding.fused:
         plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **ordinary_options)
-    before_fc2 = resources.spec.apply_probs_before_fc2
     options = {} if binding is None else {"weight_binding": binding}
     record = route.checkpoint_record
     if not torch.is_grad_enabled():

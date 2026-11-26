@@ -339,30 +339,32 @@ class SharedExpertPool:
 
     def return_generated_gradients(
         self,
-        gradients: tuple[torch.Tensor, ...],
+        gradients: tuple[torch.Tensor | None, ...],
         copies: torch.Tensor,
         active: bool = True,
         *,
         output_dtypes: tuple[torch.dtype, ...] | None = None,
         published_slots: int | None = None,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> tuple[torch.Tensor | None, ...]:
         """Sum borrowed gradients into the expert producer's home gradients."""
         if self.pipeline is not None:
             self.pipeline.invalidate()
         with _ordered_transfers(self):
-            home = reduce_banks(
-                gradients,
-                self._generic_banks(),
+            matrices = [index for index, gradient in enumerate(gradients) if gradient is not None]
+            banks = self._generic_banks()
+            home = iter(reduce_banks(
+                tuple(gradients[index] for index in matrices),
+                tuple(banks[index] for index in matrices),
                 copies,
                 self.rank,
                 self.blocks,
-                output_dtypes,
+                None if output_dtypes is None else tuple(output_dtypes[index] for index in matrices),
                 published_slots=published_slots,
-            )
+            ))
         self.generation += 1
         self.statistics["gradient_returns"] += 1
         self.statistics["remote_gradient_returns"] += int(active)
-        return tuple(home)
+        return tuple(next(home) if gradient is not None else None for gradient in gradients)
 
     def track_graph(self, ctx: Any) -> None:
         """Keep the bank's owner alive while its autograd graph can replay."""
@@ -502,8 +504,8 @@ class ExpertWeightBinding:
         self.generation = None
 
     def gradients(
-        self, gradients: tuple[torch.Tensor, ...], weights: tuple[torch.Tensor, ...]
-    ) -> tuple[torch.Tensor, ...]:
+        self, gradients: tuple[torch.Tensor | None, ...], weights: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor | None, ...]:
         """Return partial expert gradients to owners before casting parameter gradients."""
         if self.fused_gradients:
             stats = self.pool.statistics

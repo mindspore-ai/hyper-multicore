@@ -14,11 +14,12 @@
 # ============================================================================
 """Malformed task rejection and graph-declared probability effects."""
 from dataclasses import replace
+from itertools import product
 import unittest
 from unittest.mock import patch
 
 from hyper_multicore.modules.mega_moe.backends.bf16.activation import build_activation_node
-from hyper_multicore.modules.mega_moe.backends.bf16.backward import graph as backward_graph
+from hyper_multicore.modules.mega_moe.backends.bf16.backward import BackwardOutputs, graph as backward_graph
 from hyper_multicore.modules.mega_moe.backends.bf16.forward import graph as forward_graph
 from hyper_multicore.modules.mega_moe.backends.bf16.plan import (
     _build_runtime_artifacts, _build_task_values, build_mega_moe_plan,
@@ -66,6 +67,44 @@ class TestTaskContracts(unittest.TestCase):
             combine_effect, = bwd.get_op("combine").tensor_effects
             self.assertEqual(combine_effect.reads, activation_effect.writes)
             self.assertEqual(combine_effect.remote_writes, ("returned_dp",))
+
+    def test_frozen_gradients_prune_descriptors_without_losing_producer_credits(self):
+        """Check the queues and the W13-only activation dependency across A3 lowerings."""
+        schedules = [("push", "dense", False, False), ("pull", "dense", False, False),
+                     ("push", "compact", False, True), ("pull", "compact", False, True),
+                     ("push", "compact", True, False)]
+        for mode, lowering, batch, replica in schedules:
+            spec = replace(self.spec(mode), lowering=lowering, local_num_tokens=131072, batch_experts=batch,
+                           compact_pull=True, rank_id=2)
+            _, reference, _, _ = _build_runtime_artifacts(spec, replica_pipeline=replica)
+            reference = serialize_runtime_config(reference)
+            for outputs in map(BackwardOutputs._make, product((False, True), repeat=3)):
+                if not any(outputs):
+                    continue
+                with self.subTest(mode=mode, lowering=lowering, outputs=outputs, batch=batch):
+                    _, fwd, graph, bwd = _build_runtime_artifacts(spec, replica_pipeline=replica,
+                                                                 backward_outputs=outputs)
+                    self.assertEqual(serialize_runtime_config(fwd), reference)
+                    self.assertTrue(serialize_runtime_config(bwd))
+                    active = [bwd.all_tasks[task_id] for queue, count in zip(
+                        (bwd.cube_task_indices, bwd.vector_task_indices), bwd.task_index_num[:2])
+                              for task_id in queue[:count]]
+                    terminate, = (task for task in active if task.task_type == TaskType.TASK_TERMINATE)
+                    self.assertEqual(bwd.all_event_num_triggers[terminate.dependent_event],
+                                     sum(task.trigger_event == terminate.dependent_event for task in active))
+                    for name, expected in (("w1_grad", outputs.weight1), ("w2_grad", outputs.weight2),
+                                           ("gate_grad", outputs.combine), ("combine", outputs.combine),
+                                           ("act_grad", outputs.combine or outputs.weight1),
+                                           ("activation", outputs.combine or outputs.weight1)):
+                        self.assertEqual(bool(graph.get_op(name).task_num), expected, name)
+                    if outputs.weight1 and not outputs.combine:
+                        activation_events = {task.trigger_event for task in active
+                                             if task.task_type == TaskType.TASK_SWI_GLU_GRAD}
+                        weight1_dependencies = {task.dependent_event for task in active
+                                                if task.task_type == TaskType.TASK_GROUPED_MATMUL
+                                                and task.outputs[0].input_position == 18}
+                        self.assertTrue(weight1_dependencies)
+                        self.assertTrue(weight1_dependencies <= activation_events)
 
     def test_final_serializer_rejects_invalid_options(self):
         """Unknown bits and a communication-only bit cannot enter a SwiGLU task."""

@@ -603,6 +603,7 @@ def assemble_payload(
         "requested_target_ids": [v["id"] for v in records],
         "reference_cann": identities[0].get("reference_cann"),
         "a3_replica_bf16_partials": builds_a3,
+        "a3_replica_independent_dw": builds_a3,
         "a3_bf16_pull_runtime_rows": builds_a3,
         "framework_lock_sha256": (
             MANIFEST.file_sha256(ROOT / "hyper_multicore/_build/frameworks.lock.json") if args.all else None

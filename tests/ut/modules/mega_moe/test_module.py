@@ -740,7 +740,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
         resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False, dispatch_mode="push",
-                                                         apply_probs_before_fc2=False),
+                                                         apply_probs_before_fc2=False, architecture=2201),
                                     plan=object(), workspace=object(), ensure_capacity=Mock(), placement=None,
                                     plan_for_tokens=Mock())
         route = SimpleNamespace(execution_resources=None, weight_binding=None, checkpoint_record=None,
@@ -818,7 +818,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
         workspace = Mock()
         resources = SimpleNamespace(
-            spec=SimpleNamespace(auto_tokens=True, apply_probs_before_fc2=False,
+            spec=SimpleNamespace(auto_tokens=True, dynamic_tokens=True, architecture=2201, apply_probs_before_fc2=False,
                                  dispatch_mode=experts._resource_group.specification["dispatch_mode"]),
             workspace=workspace, prepare_auto_workspace=Mock(), plan_for_tokens=Mock(return_value=object()),
             placement=None,
@@ -864,7 +864,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             metadata=SimpleNamespace(plan_tokens=128), maximum_received_slots=4,
         )
         resources = SimpleNamespace(
-            spec=SimpleNamespace(auto_tokens=False, dispatch_mode="push", apply_probs_before_fc2=True),
+            spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False, architecture=2201,
+                                 dispatch_mode="push", apply_probs_before_fc2=True),
             workspace=object(), ensure_capacity=Mock(), placement=None, plan_for_tokens=Mock(return_value=object()),
         )
         with (

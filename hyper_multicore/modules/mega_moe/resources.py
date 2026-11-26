@@ -46,11 +46,11 @@ class _MegaMoeExecutionResources:
             self._validate_distributed_configuration(active_specifications)
         # Agree on optional stages before any HotReplica-only collective.
         placement = specification.get("hot_replica", False)
-        replica_bf16_partials = False
+        replica_bf16_partials = replica_independent_dw = False
         rank_nodes = ()
         if placement:
             from hyper_multicore.modules.hot_replica.capability import require_capability  # pylint: disable=import-outside-toplevel
-            replica_bf16_partials, rank_nodes = require_capability(
+            replica_bf16_partials, replica_independent_dw, rank_nodes = require_capability(
                 tensor, specification["ep_group"],
                 dispatch_mode=self.spec.dispatch_mode,
             )
@@ -106,7 +106,8 @@ class _MegaMoeExecutionResources:
         if placement:
             from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources  # pylint: disable=import-outside-toplevel
             self.placement = PlacementResources(
-                self, specification, shared, bf16_partials=replica_bf16_partials, rank_nodes=rank_nodes,
+                self, specification, shared, bf16_partials=replica_bf16_partials,
+                independent_dw=replica_independent_dw, rank_nodes=rank_nodes,
             )
 
     def _route_spec(self, experts: int | None) -> MegaMoeSpec:

@@ -232,7 +232,7 @@ class ReplicaPipeline:
     def runtime(self, base, binding, gradients=None, *, bf16_partials=False):
         """Encode the current projection addresses after the ordinary queue table."""
         gradients_address = 0
-        if gradients is not None:
+        if gradients is not None and any(gradient is not None for gradient in gradients):
             gradients_address = self._gradient_table(binding, gradients, bf16_partials=bf16_partials).data_ptr()
         words = (*binding.launch, gradients_address)
         extension = _words_tensor(words, self.pool.device, -base.numel() % 8)
@@ -253,8 +253,8 @@ class ReplicaPipeline:
         bank = pool.leased_banks
         rank_lines = pool.ranks * home * _LINE_WORDS
         bands_start = 3 * rank_lines + 2 * home * _LINE_WORDS
-        band_layouts = tuple(_band_layout(grad.shape[1:])
-                             for grad in gradients)
+        band_layouts = tuple(_band_layout(shape) for shape in projection_shapes(
+            pool.hidden, pool.intermediate, binding.layout))
         flags = tuple(home * bands * cubes * _LINE_WORDS for _, bands in band_layouts)
         offsets = (bands_start, bands_start + flags[0])
         done_words = cubes * _LINE_WORDS
@@ -267,6 +267,10 @@ class ReplicaPipeline:
         element_size = torch.bfloat16.itemsize if bf16_partials else torch.float32.itemsize
         for matrix in (1, 0):
             grad = gradients[matrix]
+            if grad is None:
+                # A zero-slot, zero-owner record keeps the two-projection ABI.
+                records.append((0,) * 16)
+                continue
             rows, columns = grad.shape[1:]
             per_band, bands = band_layouts[matrix]
             # The bank lease keeps the contiguous dW suffix alive for remote readers.

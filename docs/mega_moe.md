@@ -359,6 +359,17 @@ d_a = BF16(FP32(d_fc2_input) * p)
 
 ## 训练与资源管理
 
+### 部分梯度冻结
+
+A3 BF16 的动态 token 入口按每次前向的 `requires_grad` 选择反向计划。可以独立冻结
+`gate_up_weight`（W13）、`down_weight`（W2）或输入 `hidden_states`，直接使用 PyTorch 的
+`requires_grad_(False)`，外部参数也可以传入已 `detach()` 的张量。EP 组内各 rank 必须使用相同的冻结组合。
+
+冻结某组专家权重会跳过对应的权重梯度 GMM 和 HotReplica 梯度回传。冻结 `hidden_states`
+可跳过输入梯度 GMM 和 Combine。使用 FC2 前概率加权且 Router 概率仍需梯度时，Combine 负责回传概率梯度，
+因此仍执行该路径。使用 FC2 后加权且只训练 Router 时，概率梯度由输出还原计算，专家反向可以全部跳过。
+HotReplica 只训练 W13 时，跳过 W2 梯度回传需要包含独立投影回传能力的 A3 制品。旧制品沿用双投影回传。
+
 ### 动态 token 与通信容量
 
 执行器从实际 forward 输入维护容量，无需 token 上限或动态/静态模式开关。
