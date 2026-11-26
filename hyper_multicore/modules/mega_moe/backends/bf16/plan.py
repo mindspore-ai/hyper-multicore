@@ -55,7 +55,7 @@ from hyper_multicore.scheduler.config import (
 from hyper_multicore.scheduler.graph import ComputeGraph
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 
-from ...diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
+from ...diagnostics import REPLICA_TRACE_STAGES, _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
 from ...probability import (
     PROBABILITY_POSITION_FORWARD, PROBABILITY_POSITION_BACKWARD,
 )
@@ -284,6 +284,8 @@ def _prepare_diagnostics(
     backward_graph: ComputeGraph,
     backward_config: Any,
     device: Any,
+    *,
+    replica_pipeline: bool,
 ) -> tuple[MegaKernelDiagnostics, MegaKernelDiagnostics]:
     """Bind forward/backward plans to the public diagnostics integration API."""
     topology = _build_task_values(spec)
@@ -295,13 +297,20 @@ def _prepare_diagnostics(
         "rank": dist.get_rank() if dist.is_initialized() else spec.rank_id,
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
     }
+    backward_options = {}
+    if replica_pipeline:
+        options.update(profile_extra_stages=REPLICA_TRACE_STAGES, profile_extra_aic_records_per_task=1)
+        # Per projection: reduce, longest ready wait, drain, publish and at
+        # most one ACK wait per guest. The physical width bounds guest slots.
+        backward_options["profile_extra_aiv_records_per_worker"] = 2 * (4 + spec.local_experts)
     return (
         prepare_mega_kernel_diagnostics(
             forward_graph, forward_config,
             parameter_count=PROBABILITY_POSITION_FORWARD + 1 if spec.apply_probs_before_fc2 else 16, **options),
         prepare_mega_kernel_diagnostics(
             backward_graph, backward_config,
-            parameter_count=PROBABILITY_POSITION_BACKWARD + 1 if spec.apply_probs_before_fc2 else 20, **options),
+            parameter_count=PROBABILITY_POSITION_BACKWARD + 1 if spec.apply_probs_before_fc2 else 20,
+            **options, **backward_options),
     )
 
 
@@ -333,7 +342,7 @@ def build_mega_moe_plan(
         spec, weight_grad_dtype, replica_pipeline=replica_pipeline, reserve_merge_workers=reserve_merge_workers,
         backward_outputs=backward_outputs)
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
-        spec, forward_graph, forward_config, backward_graph, backward_config, device,
+        spec, forward_graph, forward_config, backward_graph, backward_config, device, replica_pipeline=replica_pipeline,
     )
     gmm_options = {
         "hidden_size": spec.hidden_size,

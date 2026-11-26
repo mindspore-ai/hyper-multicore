@@ -70,37 +70,46 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
   __aicore__ inline void RunBackward() {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    CycleTraceRecorder recorder;
     replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
     replica_bf16_partials_ = MulticoreMoE::UsesBf16ReplicaPartials(replica_launch_);
     gradient_bands_[0] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 0);
     gradient_bands_[1] = MulticoreMoE::GetReplicaGradientBands(replica_launch_, 1);
-#endif
+    if (replica_launch_ != nullptr && getDiagnosticMode(this->runtimeConfigPtr) == DiagnosticMode::PROFILE) {
+      replica_trace_ = &recorder;
+    }
     // Reserved merge lanes still participate in the ordinary entry handshake.
+    this->Process(recorder);
+#else
     this->Process();
+#endif
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
     const auto first = gradient_bands_[0];
     const auto second = gradient_bands_[1];
-    const bool merge = first != nullptr && (first->owned != 0 || second->owned != 0) &&
-                       worker_id_ % VECTOR_WORKER_STRIDE == 0;
-    if (merge) {
-      const uint32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
-      const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
-      // Keep a single scalar frame for the two projections.
+    if (first == nullptr || worker_id_ % VECTOR_WORKER_STRIDE != 0) return;
+    const uint32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
+    const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    const uint32_t local_experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
+    const uint32_t physical_base = first->rank * local_experts;
+    if (first->owned != 0 || second->owned != 0) {
+      // The gradient table stores W2 before W13. Keep a single scalar frame.
 #pragma unroll 1
       for (uint32_t projection = 0; projection < 2; ++projection) {
+        MulticoreMoE::ReplicaGradientTrace trace{replica_trace_, 1 - projection, physical_base};
         if (replica_bf16_partials_) {
           MulticoreMoE::ReturnBf16ReplicaGradientBands(
-              gradient_bands_[projection], input_list[19], worker, core_num, ep);
+              gradient_bands_[projection], input_list[19], worker, core_num, ep, trace);
         } else {
           MulticoreMoE::ReturnReplicaGradientBands(
-              gradient_bands_[projection], input_list[19], worker, core_num, ep);
+              gradient_bands_[projection], input_list[19], worker, core_num, ep, trace);
         }
       }
     }
-    if (first != nullptr && worker_id_ == 0) {
+    if (worker_id_ == 0) {
 #pragma unroll 1
       for (uint32_t projection = 0; projection < 2; ++projection) {
-        MulticoreMoE::WaitReplicaGradientAcks(gradient_bands_[projection]);
+        const MulticoreMoE::ReplicaGradientTrace trace{replica_trace_, 1 - projection, physical_base};
+        MulticoreMoE::WaitReplicaGradientAcks(gradient_bands_[projection], trace);
       }
     }
 #endif
@@ -143,6 +152,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
  private:
   const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
+  CycleTraceRecorder *replica_trace_ = nullptr;
   const __gm__ MulticoreMoE::ReplicaGradientBandRecord *gradient_bands_[2] = {nullptr, nullptr};
   bool replica_bf16_partials_ = false;
 
@@ -441,7 +451,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
           const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
               task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
           input_1 = MulticoreMoE::ReplicaWeight(input_1, matrix_bytes, data_index, weight == 11 ? 0 : 1,
-              replica_launch_, single_group);
+              replica_launch_, single_group, replica_trace_, task_desc.profile_owner_id);
         }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                        input_1, nullptr, nullptr, nullptr,

@@ -94,6 +94,29 @@ kernel、direction、rank、device、时间锚点及记录数。记录丢失或�
 采集会增加执行和显存开销。时间线适合解释内部行为，性能比较应另行关闭诊断，按
 [测试指南](../tests/README.md)使用相同输入与数值配置测量。
 
+### A3 BF16 HotReplica 流水线
+
+当一次调用实际启用融合副本时，前反向 trace 带有 `replica_mode`、`replica_ep_rank`、
+`replica_home_slots`、`replica_physical_slots` 和 `replica_guest_experts`。最后一个字段按本 rank
+的 guest 槽顺序记录逗号分隔的逻辑专家 ID，`-1` 表示空槽。用 `owner_id % replica_physical_slots`
+得到 rank 内物理槽，减去 `replica_home_slots` 后可索引 guest 表。跨 rank 的 token Dispatch
+使用目的端的落位表。
+
+| 事件 | 时间边界 |
+| --- | --- |
+| `ReplicaW13WeightWait`、`ReplicaW2WeightWait` | Guest AIC 读取权重前的 epoch 检查，嵌在相应 GMM 任务内。`stage_task_index` 是 guest 槽号。 |
+| `ReplicaDW13OwnerReduce`、`ReplicaDW2OwnerReduce` | Owner AIV 的分带阶段，包括 producer flag 等待、远端读取和归并写回。 |
+| `ReplicaDW13LongestBandReadyWait`、`ReplicaDW2LongestBandReadyWait` | 每个 AIV、每个投影最长一次 producer flag 等待，包含本地 owner 与相关 guest。`owner_id` 是该 owner 的物理专家 ID，`stage_task_index` 是 band。 |
+| `ReplicaDW13OwnerDrain`、`ReplicaDW2OwnerDrain` | Owner 的 ACK 发起 worker 等待本 rank 的归并 worker 全部完成。 |
+| `ReplicaDW13AckPublish`、`ReplicaDW2AckPublish` | Owner 发出该投影的 ACK 信号。 |
+| `ReplicaDW13GuestAckWait`、`ReplicaDW2GuestAckWait` | Guest 的 ACK worker 检查或等待单个槽的 ACK。`stage_task_index` 是 guest 槽号。 |
+
+同一 rank、同一次反向先找到最后的普通计算和 token 通信结束点，再看 `OwnerReduce`、
+`OwnerDrain` 或 `GuestAckWait` 是否越过该点，定位露在流水线末尾的阶段。最长 ready 等待
+嵌在归并区间里，不宜把两段时长相加。视同次 CANN trace 中的 owner SDMA 时间线可进一步
+判断权重搬运与 guest 消费的重叠。Staged 的 prefetch 和归并是独立 kernel，可在 CANN
+trace 查看。
+
 ### 采集配置
 
 `profiler.mega_kernel_profile()` 接受以下关键字参数：

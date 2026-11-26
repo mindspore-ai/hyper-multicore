@@ -398,6 +398,19 @@ def _diagnostic_runtime(runtime, ordinary, extended):
     return torch.cat((runtime, extended[ordinary.numel():]))
 
 
+def _replica_trace_tags(plan, binding):
+    if binding is None or not binding.fused:
+        return None
+    ep_rank = plan.spec.rank_id
+    return {
+        "replica_mode": binding.mode.value,
+        "replica_ep_rank": str(ep_rank),
+        "replica_home_slots": str(binding.pool.local_experts),
+        "replica_physical_slots": str(plan.spec.local_experts),
+        "replica_guest_experts": ",".join(map(str, binding.placement.copies_by_rank[ep_rank])),
+    }
+
+
 def _launch_forward_kernel(
     plan: MegaMoePlan,
     metadata: RouteMetadata,
@@ -405,7 +418,7 @@ def _launch_forward_kernel(
     weight1: Any,
     weight2: Any,
     execution: _ForwardExecution,
-    *, stream: Any = None, runtime_override: torch.Tensor | None = None,
+    *, stream: Any = None, weight_binding: Any = None,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -427,6 +440,7 @@ def _launch_forward_kernel(
         metadata.combine_src_off,
         metadata.combine_size,
     )
+    runtime_override = weight_binding.runtime(plan.fwd_runtime_config) if weight_binding is not None else None
     if not plan.fwd_diagnostics.is_active:
         runtime = plan.fwd_runtime_config if runtime_override is None else runtime_override
         record_plan_stream(plan, runtime, stream=stream)
@@ -450,6 +464,7 @@ def _launch_forward_kernel(
         _diagnostic_parameters(plan, kernel_parameters, execution.gmm_workspace),
         direction="forward",
         fallback_event_counters=execution.event_counters,
+        tags=_replica_trace_tags(plan, weight_binding),
     ) as diagnostic_call:
         runtime = _diagnostic_runtime(diagnostic_call.runtime_config, plan.fwd_runtime_config, runtime_override)
         record_plan_stream(plan, runtime, stream=stream)
@@ -475,7 +490,7 @@ def _launch_backward_kernel(
     saved: _SavedBackwardState,
     grad_output: Any,
     execution: _BackwardExecution,
-    *, stream: Any = None, runtime_override: torch.Tensor | None = None,
+    *, stream: Any = None, weight_binding: Any = None, runtime_override: torch.Tensor | None = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -530,6 +545,7 @@ def _launch_backward_kernel(
             plan.w2_grad_tiling, plan.swiglu_grad_tiling)),
         direction="backward",
         fallback_event_counters=execution.event_counters,
+        tags=_replica_trace_tags(plan, weight_binding),
     ) as diagnostic_call:
         runtime = _diagnostic_runtime(diagnostic_call.runtime_config, plan.bwd_runtime_config, runtime_override)
         record_plan_stream(plan, runtime, stream=stream)
@@ -659,7 +675,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 weight1,
                 weight2,
                 execution, stream=workspace.lease_stream,
-                runtime_override=weight_binding.runtime(plan.fwd_runtime_config) if acquired else None)
+                weight_binding=weight_binding)
             return _save_forward_state(
                 ctx, plan, workspace, execution, owner_weights, metadata, permutation_inputs, topk_weights,
             )
@@ -726,6 +742,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 saved,
                 source,
                 execution, stream=workspace.lease_stream,
+                weight_binding=binding,
                 runtime_override=(
                     binding.runtime(plan.bwd_runtime_config, weight_grads)
                     if acquired and binding.fused else None
@@ -928,7 +945,7 @@ def _execute_mega_moe_without_autograd(
         _launch_forward_kernel(
             plan, route.metadata.for_kernel(plan.spec.hidden_size), execution.source, weight1,
             weight2, execution, stream=workspace.lease_stream,
-            runtime_override=weight_binding.runtime(plan.fwd_runtime_config) if acquired else None)
+            weight_binding=weight_binding)
         if acquired and route.checkpoint_record is not None and weight_binding.fused:
             # This stream has consumed the guest operands, including both
             # projection-ready events, so their prefix can now be captured.

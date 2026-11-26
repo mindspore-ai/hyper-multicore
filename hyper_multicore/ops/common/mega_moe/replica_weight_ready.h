@@ -4,6 +4,7 @@
 #define HMC_MOE_REPLICA_WEIGHT_READY_H
 
 #include "kernel_operator.h"
+#include "common/mega_moe/replica_trace.h"
 #include "runtime/runtime_config.hpp"
 
 namespace MulticoreMoE {
@@ -55,14 +56,18 @@ __aicore__ inline const __gm__ ReplicaLaunch *GetReplicaLaunch(GM_ADDR runtime, 
 
 __aicore__ inline GM_ADDR ReplicaWeight(GM_ADDR ordinary, uint64_t matrix_bytes, uint32_t expert,
                                        uint32_t projection, const __gm__ ReplicaLaunch *launch,
-                                       bool single_group) {
+                                       bool single_group, MulticoreRuntime::CycleTraceRecorder *trace,
+                                       uint32_t profile_owner) {
   if (launch == nullptr) return ordinary;
   if (!single_group || launch->epoch == 0 || launch->epoch > 0x7fffffff) AscendC::Trap();
   if (expert < launch->home) {
     return reinterpret_cast<GM_ADDR>(launch->local[projection] + expert * matrix_bytes);
   }
   const uint32_t slot = expert - launch->home;
+  const auto start = ReplicaTraceCycle(trace);
   WaitReplicaEpoch(launch->ready[projection] + slot * MulticoreRuntime::DATA_CACHE_LINE_SIZE, launch->epoch);
+  RecordReplicaStage(trace, ReplicaTraceStage::WEIGHT_WAIT, projection, start, ReplicaTraceCycle(trace),
+                     slot, profile_owner);
   return reinterpret_cast<GM_ADDR>(launch->guest[projection] + slot * matrix_bytes);
 }
 

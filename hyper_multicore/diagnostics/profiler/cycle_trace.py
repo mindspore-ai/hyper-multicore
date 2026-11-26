@@ -51,6 +51,7 @@ MAX_RECORDS_PER_CORE = ((0xFFFFFFFF - CORE_HEADER.size) // PROFILE_RECORD.size
 MAX_CORE_STRIDE_BYTES = CORE_HEADER.size + MAX_RECORDS_PER_CORE * PROFILE_RECORD.size
 MAX_PROFILE_BUFFER_BYTES = CORE_SLOT_COUNT * MAX_CORE_STRIDE_BYTES
 INVALID_OWNER_ID = 0xFFFFFFFF
+NO_TASK_ID = 0xFFFFFFFF
 TASK_TYPE_DESC_BASE = 0x20000
 GRAPH_STAGE_DESC_BASE = 0x30000
 # GetSystemCycle uses the fixed system counter, not the variable AI Core clock.
@@ -122,6 +123,8 @@ class _ProfileMetadata:
     task_stage_names: Mapping[int, str]
     execution_mode: _TaskExecutionMode
     vector_worker_stride: int = 2
+    extra_aic_records_per_task: int = 0
+    extra_aiv_records_per_worker: int = 0
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,7 @@ def _max_worker_record_count(
     task_indices: Any,
     scheduled_task_count: int,
     active_worker_count: int,
+    extra_records_per_task: int = 0,
 ) -> int:
     """Return the largest record count assigned to one active worker."""
     if scheduled_task_count < 0 or scheduled_task_count > len(task_indices):
@@ -243,7 +247,7 @@ def _max_worker_record_count(
         if not 0 <= task_id < len(runtime_config.all_tasks):
             raise ValueError(f"scheduled task ID is outside RuntimeConfig capacity: {task_id}")
         worker_id = schedule_index % active_worker_count
-        worker_record_counts[worker_id] += _records_for_task(runtime_config.all_tasks[task_id])
+        worker_record_counts[worker_id] += _records_for_task(runtime_config.all_tasks[task_id]) + extra_records_per_task
     return max(worker_record_counts)
 
 
@@ -277,6 +281,7 @@ def _calculate_aiv_pipeline_profile_layout(
 
 def _calculate_event_driven_profile_layout(
     runtime_config: RuntimeConfigC, vector_worker_stride: int = 2,
+    extra_aic_records_per_task: int = 0, extra_aiv_records_per_worker: int = 0,
 ) -> _ProfileLayout:
     """Size AIC/AIV slots for event-driven task queues using the busiest worker."""
     num_workers = int(runtime_config.num_workers)
@@ -288,6 +293,7 @@ def _calculate_event_driven_profile_layout(
         runtime_config.cube_task_indices,
         int(runtime_config.task_index_num[0]),
         active_worker_count,
+        extra_aic_records_per_task,
     )
     aiv_required_records = _max_worker_record_count(
         runtime_config,
@@ -296,14 +302,15 @@ def _calculate_event_driven_profile_layout(
         num_workers // vector_worker_stride,
     )
     if runtime_config.queue_layout == 2:
-        def queue_records(record, indices):
+        def queue_records(record, indices, extra_records_per_task=0):
             # At most one idle episode is emitted between two completed tasks.
-            return sum(_records_for_task(runtime_config.all_tasks[indices[i]]) + 1
+            return sum(_records_for_task(runtime_config.all_tasks[indices[i]]) + 1 + extra_records_per_task
                        for i in range(record.begin, record.end, record.stride))
-        aic_required_records = max((queue_records(q, runtime_config.cube_task_indices)
+        aic_required_records = max((queue_records(q, runtime_config.cube_task_indices, extra_aic_records_per_task)
                                     for q in runtime_config.worker_queues[:active_worker_count]), default=0)
         aiv_required_records = max((queue_records(q, runtime_config.vector_task_indices)
                                     for q in runtime_config.worker_queues[active_worker_count:]), default=0)
+    aiv_required_records += extra_aiv_records_per_worker
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
@@ -323,7 +330,10 @@ def _calculate_profile_layout(
     if metadata.execution_mode is _TaskExecutionMode.AIV_PIPELINE:
         return _calculate_aiv_pipeline_profile_layout(runtime_config)
     if metadata.execution_mode is _TaskExecutionMode.EVENT_DRIVEN:
-        return _calculate_event_driven_profile_layout(runtime_config, metadata.vector_worker_stride)
+        return _calculate_event_driven_profile_layout(
+            runtime_config, metadata.vector_worker_stride,
+            metadata.extra_aic_records_per_task, metadata.extra_aiv_records_per_worker,
+        )
     raise ValueError(f"unsupported task execution mode: {metadata.execution_mode!r}")
 
 
@@ -380,9 +390,11 @@ class _PreparedProfileRuntime:
         runtime_config = runtime.copy_host_config()
         self._metadata = _configure_trace_metadata(runtime_config, runtime.metadata)
         self._metadata = _ProfileMetadata(
-            self._metadata.kernel_name, self._metadata.owner_label, self._metadata.stage_names,
+            self._metadata.kernel_name, self._metadata.owner_label,
+            self._metadata.stage_names | dict(runtime.spec.profile_extra_stages or {}),
             self._metadata.task_stage_names, _TaskExecutionMode(runtime.spec.execution_mode),
             1 if runtime_config.queue_layout == 2 else runtime.spec.vector_worker_stride,
+            runtime.spec.profile_extra_aic_records_per_task, runtime.spec.profile_extra_aiv_records_per_worker,
         )
         self._layout = _configure_profile_layout(runtime_config, self._metadata)
         self._rank = runtime.rank
@@ -579,6 +591,8 @@ def _event_name(
         stage_name = f"{task_stage_name}_{stage_name}"
     if not detailed_task_names:
         return stage_name
+    if task_id == NO_TASK_ID:
+        return stage_name if owner_id == INVALID_OWNER_ID else f"{owner_label}{owner_id}_{stage_name}"
     task_name = f"{stage_name}_task{stage_task_index + 1}"
     if owner_id == INVALID_OWNER_ID:
         return task_name
@@ -804,6 +818,8 @@ def _duration_trace_event(
     }
     if task_id in task_stage_names:
         args["task_stage"] = task_stage_names[task_id]
+    elif task_id == NO_TASK_ID and desc_id in stage_names:
+        args["task_stage"] = stage_names[desc_id]
     if TASK_TYPE_DESC_BASE <= desc_id < GRAPH_STAGE_DESC_BASE:
         args["task_type"] = desc_id - TASK_TYPE_DESC_BASE
     if record["owner_id"] != INVALID_OWNER_ID:

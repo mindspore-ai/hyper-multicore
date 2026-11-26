@@ -139,6 +139,11 @@ class KernelWorkerBase {
   }
 
   __aicore__ inline void Process() {
+    CycleTraceRecorder recorder;
+    Process(recorder);
+  }
+
+  __aicore__ inline void Process(CycleTraceRecorder &recorder) {
     ReadyHandshakeMeta meta;
     bool has_ready = LoadReadyHandshakeMeta(&meta);
     pull_protocol_ = meta.completion_event != 0;
@@ -146,7 +151,6 @@ class KernelWorkerBase {
       WaitForDeviceReady(meta);
     }
     const auto mode = getDiagnosticMode(this->runtimeConfigPtr);
-    CycleTraceRecorder recorder;
     if (mode == DiagnosticMode::PROFILE) {
       recorder.Init(this->worker_id_, this->input_list[Derived::DIAGNOSTIC_IDX],
                     getAicProfileRecordCapacity(this->runtimeConfigPtr),

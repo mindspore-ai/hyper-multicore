@@ -61,25 +61,31 @@ __aicore__ inline uint64_t GradientBandExpertFlags(const __gm__ ReplicaGradientB
 #if !defined(__DAV_CUBE__) && !defined(__DAV_C220_CUBE__)
 __aicore__ inline void FinishReplicaBandReads(const __gm__ ReplicaGradientBandRecord *record,
                                              const __gm__ ReplicaGradientBandEdge *edges,
-                                             uint32_t worker, uint32_t cubes) {
+                                             uint32_t worker, uint32_t cubes, const ReplicaGradientTrace &trace) {
   using namespace MulticoreRuntime;
   // Advertise reuse only after every local consumer has completed its stores.
   StoreReplicaCompletion(reinterpret_cast<GM_ADDR>(record->done + worker * DATA_CACHE_LINE_SIZE), record->epoch);
   if (worker != 0) return;
+  const auto drain_start = trace.Now();
   for (uint32_t lane = 0; lane < cubes; ++lane) {
     WaitReplicaEpoch(record->done + lane * DATA_CACHE_LINE_SIZE, record->epoch);
   }
+  const auto drained = trace.Now();
   for (uint32_t index = 0; index < record->owned; ++index) {
     const uint64_t line = record->rank * record->home + edges[index].slot;
     aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(record->ack + line * DATA_CACHE_LINE_SIZE),
                        record->epoch, ACLSHMEM_SIGNAL_SET, edges[index].peer);
   }
+  const auto published = trace.Now();
+  trace.Record(ReplicaTraceStage::OWNER_DRAIN, drain_start, drained);
+  trace.Record(ReplicaTraceStage::ACK_PUBLISH, drained, published);
 }
 #endif
 
 
 __aicore__ inline void ReturnReplicaGradientBands(const __gm__ ReplicaGradientBandRecord *record,
-                                                 GM_ADDR groups_address, uint32_t worker, uint32_t cubes, uint32_t ep) {
+                                                 GM_ADDR groups_address, uint32_t worker, uint32_t cubes, uint32_t ep,
+                                                 ReplicaGradientTrace &trace) {
 #if !defined(__DAV_CUBE__) && !defined(__DAV_C220_CUBE__)
   using namespace MulticoreRuntime;
   if (record == nullptr || record->owned == 0) return;
@@ -92,6 +98,7 @@ __aicore__ inline void ReturnReplicaGradientBands(const __gm__ ReplicaGradientBa
   const uint32_t group = worker % groups, lane = worker / groups;
   const uint32_t lanes = (cubes - 1 - group) / groups + 1;
   const uint64_t matrix_elements = record->rows * record->columns;
+  const auto reduce_start = trace.Now();
   for (uint32_t band = group; band < record->bands; band += groups) {
     const uint64_t offset = band * record->band_rows * record->columns;
     const uint64_t length = record->band_rows * record->columns;
@@ -106,11 +113,13 @@ __aicore__ inline void ReturnReplicaGradientBands(const __gm__ ReplicaGradientBa
       const auto guest = GradientBandExpertFlags(record, record->home + slot, cubes);
       auto mapped = hyper_multicore::shmem::data_plane::remote_ptr(reinterpret_cast<__gm__ void *>(guest), peer);
       if (mapped == nullptr) AscendC::Trap();
+      const auto wait_start = trace.Now();
       for (uint32_t cube = 0; cube < cubes; ++cube) {
         const uint64_t signal = (band * cubes + cube) * DATA_CACHE_LINE_SIZE;
         if (owner_produces) WaitReplicaEpoch<true>(local + signal, record->epoch);
         WaitReplicaEpoch<true>(reinterpret_cast<uint64_t>(mapped) + signal, record->epoch);
       }
+      trace.ObserveReadyWait(wait_start, band, owner);
       const uint64_t scratch = GradientBandOwnerScratch(record, owner);
       if (scratch == 0 || record->scratch == 0) AscendC::Trap();
       auto dst = reinterpret_cast<GM_ADDR>(
@@ -124,13 +133,15 @@ __aicore__ inline void ReturnReplicaGradientBands(const __gm__ ReplicaGradientBa
       }
     }
   }
-  FinishReplicaBandReads(record, edges, worker, cubes);
+  const auto reduce_end = trace.Now();
+  FinishReplicaBandReads(record, edges, worker, cubes, trace);
+  trace.RecordReduction(reduce_start, reduce_end);
 #endif
 }
 
 __aicore__ inline void ReturnBf16ReplicaGradientBands(const __gm__ ReplicaGradientBandRecord *record,
                                                      GM_ADDR groups_address, uint32_t worker,
-                                                     uint32_t cubes, uint32_t ep) {
+                                                     uint32_t cubes, uint32_t ep, ReplicaGradientTrace &trace) {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_CUBE__) && !defined(__DAV_C220_CUBE__)
   using namespace AscendC;
   using namespace MulticoreRuntime;
@@ -156,6 +167,7 @@ __aicore__ inline void ReturnBf16ReplicaGradientBands(const __gm__ ReplicaGradie
   const auto guest_base = reinterpret_cast<__gm__ bfloat16_t *>(record->guest);
   DataCopyPadExtParams<bfloat16_t> padding{false, 0, 0, 0};
 
+  const auto reduce_start = trace.Now();
   for (uint32_t band = group; band < record->bands; band += groups) {
     const uint64_t start = band * record->band_rows * record->columns;
     const uint64_t length = record->band_rows * record->columns;
@@ -168,6 +180,7 @@ __aicore__ inline void ReturnBf16ReplicaGradientBands(const __gm__ ReplicaGradie
       if (owner >= record->home) AscendC::Trap();
       const int64_t owner_start = owner == 0 ? 0 : expert_groups[owner - 1];
       const bool owner_produces = expert_groups[owner] > owner_start;
+      const auto wait_start = trace.Now();
       if (owner_produces) {
         const auto flags = GradientBandExpertFlags(record, owner, cubes);
         for (uint32_t cube = 0; cube < cubes; ++cube) {
@@ -187,6 +200,7 @@ __aicore__ inline void ReturnBf16ReplicaGradientBands(const __gm__ ReplicaGradie
                                  record->epoch);
         }
       } while (edges[last++].last == 0);
+      trace.ObserveReadyWait(wait_start, band, owner);
 
       for (uint64_t offset = start + lane * tile; offset < end; offset += lanes * tile) {
         const uint32_t count = end - offset < tile ? end - offset : tile;
@@ -221,18 +235,24 @@ __aicore__ inline void ReturnBf16ReplicaGradientBands(const __gm__ ReplicaGradie
     }
   }
   pipe.Destroy();
-  FinishReplicaBandReads(record, edges, worker, cubes);
+  const auto reduce_end = trace.Now();
+  FinishReplicaBandReads(record, edges, worker, cubes, trace);
+  trace.RecordReduction(reduce_start, reduce_end);
 #endif
 }
 
-__aicore__ inline void WaitReplicaGradientAcks(const __gm__ ReplicaGradientBandRecord *record) {
+__aicore__ inline void WaitReplicaGradientAcks(const __gm__ ReplicaGradientBandRecord *record,
+                                             const ReplicaGradientTrace &trace) {
 #if !defined(__DAV_CUBE__) && !defined(__DAV_C220_CUBE__)
   using namespace MulticoreRuntime;
   const auto owners = GradientBandGuestOwners(record);
   for (uint32_t slot = 0; slot < record->slots; ++slot) {
     if (owners[slot] != UINT64_MAX) {
       const uint64_t line = owners[slot] * record->home + slot;
+      const auto start = trace.Now();
       WaitReplicaEpoch(record->ack + line * DATA_CACHE_LINE_SIZE, record->epoch);
+      trace.Record(ReplicaTraceStage::GUEST_ACK_WAIT, start, trace.Now(), slot,
+                   trace.physical_base + record->home + slot);
     }
   }
 #endif

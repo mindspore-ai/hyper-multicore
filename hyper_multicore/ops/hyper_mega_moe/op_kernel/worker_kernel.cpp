@@ -58,9 +58,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
   __aicore__ inline void RunForward() {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    CycleTraceRecorder recorder;
     replica_launch_ = MulticoreMoE::GetReplicaLaunch(this->runtimeConfigPtr, input_list[TILING_IDX]);
-#endif
+    if (replica_launch_ != nullptr && getDiagnosticMode(this->runtimeConfigPtr) == DiagnosticMode::PROFILE) {
+      replica_trace_ = &recorder;
+    }
+    this->Process(recorder);
+#else
     this->Process();
+#endif
   }
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
@@ -100,6 +106,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
  private:
   const __gm__ MulticoreMoE::ReplicaLaunch *replica_launch_ = nullptr;
+  CycleTraceRecorder *replica_trace_ = nullptr;
 
   __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
     union {
@@ -305,7 +312,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         GM_ADDR weight_base = input_list[weight] + weight_offset;
         if (weight == 5 || weight == 9) {
           weight_base = MulticoreMoE::ReplicaWeight(weight_base, matrix_bytes, data_index, weight == 5 ? 0 : 1,
-              replica_launch_, single_group);
+              replica_launch_, single_group, replica_trace_, task_desc.profile_owner_id);
         }
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                        weight_base, nullptr, nullptr, nullptr,
