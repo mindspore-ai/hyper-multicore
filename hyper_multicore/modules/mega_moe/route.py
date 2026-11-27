@@ -973,6 +973,7 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
         snapshot = read_placement_wire(gathered, spec, workspace, stream)
         summary = snapshot.summary
         host_rows = None
+        metadata = None
         selected = select_placement(hidden, ids, gathered, summary, snapshot.source_rows,
                                     inverse, autograd_mask, snapshot=snapshot)
     else:

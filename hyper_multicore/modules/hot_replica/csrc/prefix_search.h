@@ -24,6 +24,12 @@ struct PrefixMove {
   double sent, received, charge;
 };
 
+inline int64_t RoundCut(int64_t end, int64_t excess, int64_t room, int quantum) {
+  const auto cut = std::max<int64_t>(0, end - std::min(excess, room));
+  const auto low = cut / quantum * quantum;
+  return (end - low <= room && cut - low <= quantum / 2) ? low : std::min(end, low + quantum);
+}
+
 // Record every legal move, including equal-peak prefixes. Selection and the hard-capacity
 // repair use the same score and materializer in receive.py for all execution paths.
 inline std::vector<PrefixMove> SearchPrefixes(
@@ -60,9 +66,7 @@ inline std::vector<PrefixMove> SearchPrefixes(
       for (int e = owner * home; e < (owner + 1) * home; ++e) {
         const auto end = remaining[e];
         if (end == 0 || guests[guest][e]) continue;
-        const auto cut = std::max<int64_t>(0, end - std::min(excess, room));
-        const auto low = cut / quantum * quantum;
-        const auto start = (end - low <= room && cut - low <= quantum / 2) ? low : std::min(end, low + quantum);
+        const auto start = RoundCut(end, excess, room, quantum);
         const auto moved = end - start;
         if (moved <= 0) continue;
         const auto relief = loads[owner] - std::max(loads[owner] - moved, load + moved);

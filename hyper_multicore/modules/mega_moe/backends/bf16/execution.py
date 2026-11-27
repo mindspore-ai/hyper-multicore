@@ -39,15 +39,7 @@ def forward(
     binding = route.weight_binding
     plan_options = {}
     if binding is not None:
-        route_experts = binding.placement.counts_by_source.shape[1]
-        if route_experts != resources.spec.num_experts:
-            plan_options["route_experts"] = route_experts
-        if binding.mode is ReplicaExecutionMode.FP32_BAND:
-            plan_options["weight_grad_dtype"] = torch.float32
-        if binding.fused and route.tensor_dump:
-            binding = binding.for_tensor_dump()
-        if binding.fused:
-            plan_options.update(replica_pipeline=True, reserve_merge_workers=binding.owns_returns)
+        binding, plan_options = _prepare_replica_binding(binding, route.tensor_dump, resources.spec.num_experts)
     plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **plan_options)
     options = {} if binding is None else {"weight_binding": binding}
     record = route.checkpoint_record
@@ -79,6 +71,21 @@ def forward(
     if binding is not None:
         resources.placement.record_submission(binding.mode)
     return output.reshape_as(hidden_states)
+
+
+def _prepare_replica_binding(binding, tensor_dump, num_experts):
+    """Match the plan to the execution slots, gradient precision and diagnostic mode."""
+    options = {}
+    route_experts = binding.placement.counts_by_source.shape[1]
+    if route_experts != num_experts:
+        options["route_experts"] = route_experts
+    if binding.mode is ReplicaExecutionMode.FP32_BAND:
+        options["weight_grad_dtype"] = torch.float32
+    if binding.fused and tensor_dump:
+        binding = binding.for_tensor_dump()
+    if binding.fused:
+        options.update(replica_pipeline=True, reserve_merge_workers=binding.owns_returns)
+    return binding, options
 
 
 def _save_replay_activations(record, spec, route, hidden: torch.Tensor, probs: torch.Tensor):

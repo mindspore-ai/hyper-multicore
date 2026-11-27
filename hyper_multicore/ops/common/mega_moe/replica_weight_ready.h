@@ -38,7 +38,12 @@ __aicore__ inline void WaitReplicaEpoch(uint64_t address, uint64_t epoch) {
 
 __aicore__ inline const __gm__ ReplicaLaunch *GetReplicaLaunch(GM_ADDR runtime, GM_ADDR tiling) {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-  using namespace MulticoreRuntime;
+  using MulticoreRuntime::ATOMIC_ADD_VALUE_LEN;
+  using MulticoreRuntime::RuntimeHeader;
+  using MulticoreRuntime::WorkerQueue;
+  using MulticoreRuntime::getAtomicAddValuesOffset;
+  using MulticoreRuntime::getExtraValueFromTiling;
+  using MulticoreRuntime::usesExplicitWorkerQueues;
   const auto header = reinterpret_cast<const __gm__ RuntimeHeader *>(runtime);
   uint64_t offset = getAtomicAddValuesOffset(runtime) + ATOMIC_ADD_VALUE_LEN * sizeof(int32_t);
   if (usesExplicitWorkerQueues(runtime)) {

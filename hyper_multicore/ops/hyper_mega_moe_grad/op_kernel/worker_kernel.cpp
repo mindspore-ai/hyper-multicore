@@ -331,6 +331,90 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     }
   }
 
+  __aicore__ inline GM_ADDR PrepareGroupedMatmulInputs(
+      GlobalTensor<int64_t> &groups, GM_ADDR tiling, int64_t experts, uint32_t index, int64_t rows,
+      bool batched, bool single_group, bool transpose) {
+    GM_ADDR scratch = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
+    GlobalTensor<int64_t> scratch_groups;
+    scratch_groups.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(scratch), experts);
+    PrepareGroupedMatmulList(groups, scratch_groups, scratch, experts, index, rows, batched, single_group);
+    auto *data = reinterpret_cast<__gm__ GMMTilingData *>(tiling);
+    if (transpose) {
+      data->mmTilingData.Ka = rows;
+      data->mmTilingData.Kb = rows;
+      data->mmTilingData.singleCoreK = rows;
+      cacheWriteThrough(tiling + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
+    } else {
+      data->gmmBaseParams.m = rows;
+      data->mmTilingData.M = rows;
+      data->mmTilingData.singleCoreM = rows;
+      cacheWriteThrough(tiling + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+      cacheWriteThrough(tiling + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
+    }
+    PipeBarrier<PIPE_ALL>();
+    return scratch;
+  }
+
+#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
+  struct GradientBandOutput {
+    const __gm__ MulticoreMoE::ReplicaGradientBandRecord *record;
+    GM_ADDR flags;
+    int32_t epoch;
+    uint32_t rows;
+  };
+
+  __aicore__ inline GradientBandOutput PrepareGradientBand(const TensorDesc &tensor, uint32_t index,
+                                                           bool single_group) {
+    const auto output = tensor.input_position;
+    const auto bands = (output == 6 || output == 18) ? gradient_bands_[output == 6 ? 0 : 1] : nullptr;
+    if (bands == nullptr) return {};
+    const auto element_size = replica_bf16_partials_ ? sizeof(bfloat16_t) : sizeof(float);
+    if (!single_group || tensor.data_type != element_size) AscendC::Trap();
+    return {bands, reinterpret_cast<GM_ADDR>(MulticoreMoE::GradientBandExpertFlags(bands, index, core_num)),
+            static_cast<int32_t>(bands->epoch), static_cast<uint32_t>(bands->band_rows)};
+  }
+
+  __aicore__ inline void BindGradientBandOutput(GradientBandOutput &band, uint32_t index, GM_ADDR &base,
+                                               int64_t &offset, bool &fp32) {
+    const auto bands = band.record;
+    if (bands == nullptr) return;
+    const uint64_t elements = bands->rows * bands->columns;
+    if (index >= bands->home) {
+      base = reinterpret_cast<GM_ADDR>(bands->guest);
+      offset = (index - bands->home) * elements * (replica_bf16_partials_ ? sizeof(bfloat16_t) : sizeof(float));
+    } else {
+      const uint64_t scratch = MulticoreMoE::GradientBandOwnerScratch(bands, index);
+      if (replica_bf16_partials_) {
+        offset = index * elements * sizeof(bfloat16_t);
+        if (scratch == 0) band.flags = nullptr;
+      } else if (scratch != 0) {
+        if (bands->scratch == 0) AscendC::Trap();
+        base = reinterpret_cast<GM_ADDR>(bands->scratch);
+        offset = (scratch - 1) * elements * sizeof(float);
+      } else {
+        fp32 = false;
+        offset = index * elements * sizeof(bfloat16_t);
+        band.flags = nullptr;
+      }
+    }
+  }
+#endif
+
+  __aicore__ inline GM_ADDR GroupedMatmulWeight(const TaskDesc &task, uint32_t index, int64_t start,
+                                               bool single_group) {
+    const auto &tensor = task.inputs[1];
+    const auto weight = tensor.input_position;
+    const int64_t matrix_bytes = static_cast<int64_t>(tensor.dim[1]) * tensor.dim[2] * tensor.data_type;
+    const int64_t offset = single_group && tensor.dynamic_shape != 1 ? index * matrix_bytes
+                                                                    : GmmRowOffset(tensor, start);
+    GM_ADDR base = input_list[weight] + offset;
+    if (weight == 7 || weight == 11) {
+      base = MulticoreMoE::ReplicaWeight(base, matrix_bytes, index, weight == 11 ? 0 : 1,
+                                        replica_launch_, single_group, replica_trace_, task.profile_owner_id);
+    }
+    return base;
+  }
+
   __aicore__ inline void ExecuteGroupedMatmul(const TaskDesc &task_desc) {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && defined(__DAV_CUBE__)
     if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
@@ -339,140 +423,80 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
       return;
     }
 #endif
-    if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.inputs[1].dynamic_shape == 1) {
-      DynamicData dynamic_data;
-      getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
-      if (dynamic_data.dynamic_type == DynamicType::DYNAMIC_DSV3_MOE) {
-        GM_ADDR grouped_list = input_list[task_desc.inputs[2].input_position] +
-                               task_desc.inputs[2].base_ptr_offset * task_desc.inputs[2].data_type;
-        GlobalTensor<int64_t> grouped_list_tensor;
-        int64_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
-        int64_t expert_num = getExtraValueFromTiling(input_list[TILING_IDX], 2);
-        int64_t expert_num_single_rank = expert_num / ep;
-        grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
+    if (task_desc.inputs[0].dynamic_shape != 1 && task_desc.inputs[1].dynamic_shape != 1) return;
+    DynamicData dynamic_data;
+    getDynamicData(this->runtimeConfigPtr, &dynamic_data);
+    if (dynamic_data.dynamic_type == DynamicType::DYNAMIC_DSV3_MOE) ExecuteDynamicGroupedMatmul(task_desc);
+  }
 
-        uint32_t data_index = task_desc.task_index / this->core_num;
-        const bool batched = IsBatchedGroupedMatmulTask(task_desc);
-        const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
-        if (batched && GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
-          for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
-            this->WaitForDependency(task_desc.dependent_event + expert, task_desc.dependency_poll_interval_us);
-          }
-        }
-        const int64_t start = data_index == 0 ? 0 : grouped_list_tensor.GetValue(data_index - 1);
-        const int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index) - start;
-        // The placement contains only positive guest quotas. An empty owner
-        // starts from zero scratch and the reducer does not wait for its flags.
-        if (value == 0) {
-          return;
-        }
-        const uint32_t output = task_desc.outputs[0].input_position;
-#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
-        GM_ADDR band_flags = nullptr;
-        int32_t band_epoch = 0;
-        uint32_t band_rows = 0;
-        const auto bands = (output == 6 || output == 18) ? gradient_bands_[output == 6 ? 0 : 1] : nullptr;
-        if (bands != nullptr) {
-          const auto element_size = replica_bf16_partials_ ? sizeof(bfloat16_t) : sizeof(float);
-          if (!single_group || task_desc.outputs[0].data_type != element_size) AscendC::Trap();
-          band_flags = reinterpret_cast<GM_ADDR>(MulticoreMoE::GradientBandExpertFlags(bands, data_index, core_num));
-          band_epoch = bands->epoch;
-          band_rows = bands->band_rows;
-        }
-#endif
-        const uint32_t weight = task_desc.inputs[1].input_position;
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-        const bool explicit_split = !batched && value > 0 && value <= INT32_MAX;
-#else
-        constexpr bool explicit_split = false;
-#endif
-        GM_ADDR grouped_list_real = nullptr;
-        GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
-        if (!explicit_split) {
-          grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
-          GlobalTensor<int64_t> grouped_list_tensor_real;
-          grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
-          PrepareGroupedMatmulList(grouped_list_tensor, grouped_list_tensor_real, grouped_list_real,
-                                   expert_num_single_rank, data_index, value, batched, single_group);
+  __aicore__ inline void ExecuteDynamicGroupedMatmul(const TaskDesc &task_desc) {
+    GM_ADDR grouped_list = input_list[task_desc.inputs[2].input_position] +
+                           task_desc.inputs[2].base_ptr_offset * task_desc.inputs[2].data_type;
+    GlobalTensor<int64_t> grouped_list_tensor;
+    int64_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
+    int64_t expert_num = getExtraValueFromTiling(input_list[TILING_IDX], 2);
+    int64_t expert_num_single_rank = expert_num / ep;
+    grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-          __gm__ GMMTilingData *tilingdata_data = reinterpret_cast<__gm__ GMMTilingData *>(tiling_data_addr);
-          if (getTransposeData(task_desc.inputs[0].transpose_flag)) {
-            tilingdata_data->mmTilingData.Ka = value;
-            tilingdata_data->mmTilingData.Kb = value;
-            tilingdata_data->mmTilingData.singleCoreK = value;
-            cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
-          } else {
-            tilingdata_data->gmmBaseParams.m = value;
-            tilingdata_data->mmTilingData.M = value;
-            tilingdata_data->mmTilingData.singleCoreM = value;
-            cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
-            cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
-          }
-          PipeBarrier<PIPE_ALL>();
-        }
-
-        int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
-        int64_t input_1_offset = GmmRowOffset(task_desc.inputs[1], start);
-        int64_t output_0_offset = GmmRowOffset(task_desc.outputs[0], start);
-
-        if (single_group && task_desc.inputs[1].dynamic_shape != 1) {
-          input_1_offset = static_cast<int64_t>(data_index) * task_desc.inputs[1].dim[1] *
-                           task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
-        }
-        if (single_group && task_desc.outputs[0].dynamic_shape != 1) {
-          output_0_offset = static_cast<int64_t>(data_index) * task_desc.inputs[0].dim[1] *
-                            task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
-        }
-        GM_ADDR output_base = input_list[output];
-        bool fp32_output = task_desc.outputs[0].data_type == sizeof(float);
-#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
-        if (bands != nullptr) {
-          const uint64_t elements = bands->rows * bands->columns;
-          if (data_index >= bands->home) {
-            output_base = reinterpret_cast<GM_ADDR>(bands->guest);
-            output_0_offset = (data_index - bands->home) * elements *
-                              (replica_bf16_partials_ ? sizeof(bfloat16_t) : sizeof(float));
-          } else {
-            const uint64_t scratch = MulticoreMoE::GradientBandOwnerScratch(bands, data_index);
-            if (replica_bf16_partials_) {
-              output_0_offset = data_index * elements * sizeof(bfloat16_t);
-              if (scratch == 0) band_flags = nullptr;
-            } else if (scratch != 0) {
-              if (bands->scratch == 0) AscendC::Trap();
-              output_base = reinterpret_cast<GM_ADDR>(bands->scratch);
-              output_0_offset = (scratch - 1) * elements * sizeof(float);
-            } else {
-              fp32_output = false;
-              output_0_offset = data_index * elements * sizeof(bfloat16_t);
-              band_flags = nullptr;
-            }
-          }
-        }
-#endif
-        GM_ADDR input_1 = input_list[weight] + input_1_offset;
-        if (weight == 7 || weight == 11) {
-          const int64_t matrix_bytes = static_cast<int64_t>(task_desc.inputs[1].dim[1]) *
-              task_desc.inputs[1].dim[2] * task_desc.inputs[1].data_type;
-          input_1 = MulticoreMoE::ReplicaWeight(input_1, matrix_bytes, data_index, weight == 11 ? 0 : 1,
-              replica_launch_, single_group, replica_trace_, task_desc.profile_owner_id);
-        }
-        grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_1, nullptr, nullptr, nullptr,
-                       nullptr, nullptr, grouped_list_real, nullptr,
-                       output_base + output_0_offset, input_list[WORKSPACE_IDX],
-                       tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
-                       getTransposeData(task_desc.inputs[1].transpose_flag),
-                       fp32_output
-#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
-                       , band_flags, band_epoch, band_rows
-#endif
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-                       , explicit_split ? static_cast<int32_t>(value) : 0, single_group, single_group ? 0 : data_index
-#endif
-        );
+    uint32_t data_index = task_desc.task_index / this->core_num;
+    const bool batched = IsBatchedGroupedMatmulTask(task_desc);
+    const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
+    if (GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::BATCHED) {
+      for (uint32_t expert = 1; expert < expert_num_single_rank; ++expert) {
+        this->WaitForDependency(task_desc.dependent_event + expert, task_desc.dependency_poll_interval_us);
       }
+    }
+    const int64_t start = data_index == 0 ? 0 : grouped_list_tensor.GetValue(data_index - 1);
+    const int64_t value = grouped_list_tensor.GetValue(batched ? expert_num_single_rank - 1 : data_index) - start;
+    // The placement contains only positive guest quotas. An empty owner
+    // starts from zero scratch and the reducer does not wait for its flags.
+    if (value == 0) {
       return;
     }
+    const uint32_t output = task_desc.outputs[0].input_position;
+#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
+    auto band = PrepareGradientBand(task_desc.outputs[0], data_index, single_group);
+#endif
+    GM_ADDR grouped_list_real = nullptr;
+    GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
+    const bool transpose_input = getTransposeData(task_desc.inputs[0].transpose_flag);
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    const int32_t split_rows = !batched && value > 0 && value <= INT32_MAX ? static_cast<int32_t>(value) : 0;
+    if (split_rows == 0) {
+#endif
+      grouped_list_real = PrepareGroupedMatmulInputs(grouped_list_tensor, tiling_data_addr, expert_num_single_rank,
+                                                     data_index, value, batched, single_group, transpose_input);
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    }
+#endif
+
+    int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
+    int64_t output_0_offset = GmmRowOffset(task_desc.outputs[0], start);
+
+    if (single_group && task_desc.outputs[0].dynamic_shape != 1) {
+      output_0_offset = static_cast<int64_t>(data_index) * task_desc.inputs[0].dim[1] *
+                        task_desc.inputs[1].dim[1] * task_desc.outputs[0].data_type;
+    }
+    GM_ADDR output_base = input_list[output];
+    bool fp32_output = task_desc.outputs[0].data_type == sizeof(float);
+#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
+    BindGradientBandOutput(band, data_index, output_base, output_0_offset, fp32_output);
+#endif
+    const auto input_1 = GroupedMatmulWeight(task_desc, data_index, start, single_group);
+    grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
+                   input_1, nullptr, nullptr, nullptr,
+                   nullptr, nullptr, grouped_list_real, nullptr,
+                   output_base + output_0_offset, input_list[WORKSPACE_IDX],
+                   tiling_data_addr, transpose_input,
+                   getTransposeData(task_desc.inputs[1].transpose_flag),
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+                   fp32_output, band.flags, band.epoch, band.rows, split_rows, single_group,
+                   single_group ? 0 : data_index);
+#elif !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
+                   fp32_output, band.flags, band.epoch, band.rows);
+#else
+                   fp32_output);
+#endif
   }
 
   __aicore__ inline void ExecuteShmemPutMem(const TaskDesc &task_desc) {

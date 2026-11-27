@@ -28,6 +28,7 @@ from tests.common.port_utils import allocate_port
 @pytest.mark.parametrize(("dispatch_mode", "layout"),
                          [("push", "EIO"), ("push", "EOI"), ("pull", "EIO"), ("pull", "EOI")])
 def test_placement_checkpoint_and_close(monkeypatch, tmp_path, dispatch_mode, layout):
+    """Run the checkpoint and bank cleanup regression for one transport and weight layout."""
     prepare_multicore_test_environment()
     monkeypatch.setenv("HOT_REPLICA_DISPATCH_MODE", dispatch_mode)
     monkeypatch.setenv("HOT_REPLICA_WEIGHT_LAYOUT", layout)

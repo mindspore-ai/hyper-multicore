@@ -54,6 +54,8 @@ def validate_quotas(result, request: PlacementRequest, *, slots: int) -> ExpertE
     width = len(copies[0])
     if width > slots or any(len(row) != width for row in copies):
         raise ValueError(f"Expert placement must use a uniform width within the {slots} available guest slots")
+    # Require Python ints for the wire format, excluding bool and objects with custom arithmetic.
+    # pylint: disable-next=unidiomatic-typecheck
     if any(type(expert) is not int for row in copies for expert in row):
         raise ValueError("Guest slots must identify integer logical experts")
 

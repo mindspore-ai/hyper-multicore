@@ -139,17 +139,8 @@ def agree_replay(
         and scope is not None and scope.same_parameters
     )
     with torch.no_grad():
-        if valid:
-            same_ids = (ids == record.ids).all()
-            flag = same_ids.to(torch.int32).reshape(1) * mask
-            if record.activation is not None and record.inputs is not None:
-                value, score = record.inputs
-                if (value.shape == hidden.shape and score.shape == probs.shape
-                        and record.input_versions == (value._version, score._version)):
-                    same_values = same_ids & (value == hidden).all() & (score == probs).all()
-                    flag += same_values.to(torch.int32).reshape(1) * _REPLAY_ACTIVATION_MASK
-        else:
-            flag = torch.zeros(1, dtype=torch.int32, device=hidden.device)
+        flag = (_replay_vote(record, hidden, ids, probs, mask) if valid else
+                torch.zeros(1, dtype=torch.int32, device=hidden.device))
         gathered = flag.new_empty(spec.ep_size)
         dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
         flags = gathered.tolist()
@@ -158,6 +149,22 @@ def agree_replay(
     if record is not None:
         record.allow_activation = reuse and all(value & _REPLAY_ACTIVATION_MASK for value in flags)
     return reuse
+
+
+def _replay_vote(record: ReplayRecord, hidden, ids, probs, mask):
+    """Vote on exact route identity and whether saved activations still match."""
+    same_ids = (ids == record.ids).all()
+    flag = same_ids.to(torch.int32).reshape(1) * mask
+    if record.activation is not None and record.inputs is not None:
+        value, score = record.inputs
+        if value.shape != hidden.shape or score.shape != probs.shape:
+            return flag
+        # The tensor version counters detect writes through aliases to the saved inputs.
+        versions = value._version, score._version  # pylint: disable=protected-access
+        if record.input_versions == versions:
+            same_values = same_ids & (value == hidden).all() & (score == probs).all()
+            flag += same_values.to(torch.int32).reshape(1) * _REPLAY_ACTIVATION_MASK
+    return flag
 
 
 class ActivationReservation:

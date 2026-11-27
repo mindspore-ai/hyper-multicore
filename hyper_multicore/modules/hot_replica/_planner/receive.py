@@ -23,13 +23,15 @@ from itertools import chain
 import numpy as np
 
 from ._dispatch import ReplicaCapacityError, _materialize
-from .capacity import ExpertReplicaConfig, _integer
+from .capacity import _integer
 from .native_host import select_prefix
 from .topology import _validate_rank_nodes
 
 
 def receive_limit(percent, total, ranks):
     """Return the exact limit in routed rows. Automatic capacity has no ceiling."""
+    # Only the built-in integer policy supplies a hard ceiling.
+    # pylint: disable-next=unidiomatic-typecheck
     return (total * percent + 100 * ranks - 1) // (100 * ranks) if type(percent) is int else None
 
 
@@ -104,6 +106,11 @@ def _tail(remaining, wanted, room, quantum):
     return min(remaining, low + quantum)
 
 
+def _transfer_charge(nodes, owner, guest, multiplier):
+    """Apply the inter-node rate only when the route has known distinct nodes."""
+    return multiplier if nodes and nodes[owner] != nodes[guest] else 1.
+
+
 def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices, source_counts):
     """Drain the busiest owner first. Intermediate equal-peak moves can clear a plateau."""
     after = loads.copy()
@@ -123,7 +130,7 @@ def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices,
         for rank, load in enumerate(after):
             if load >= target or len(guests[rank]) >= config.replica_slots_per_rank:
                 continue
-            charge = multiplier if nodes and nodes[rank] != nodes[owner] else 1.
+            charge = _transfer_charge(nodes, owner, rank, multiplier)
             next_sent = max(max_sent, sent[owner] + charge)
             next_received = max(max_received, received[rank] + charge)
             transfer = prices.transfer(next_sent, next_received)
@@ -164,11 +171,21 @@ def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices,
 
 def _select_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices, source_counts,
                      capacity, resident, resize):
+    """Use the native selector for the built-in score, or evaluate the Python score."""
+    # A subclass can override the cost calculation used by the Python selector.
+    # pylint: disable-next=unidiomatic-typecheck
     if type(prices) is ReplicaCost:
         native = select_prefix(totals, source_counts, config, quantum, levels, nodes, multiplier,
                                prices, capacity, resident, resize)
         if native is not None:
             return native
+    return _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices,
+                                   source_counts, capacity, resident, resize)
+
+
+def _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices, source_counts,
+                            capacity, resident, resize):
+    """Score prefixes from each target and legal slot budget in Python."""
     peak = max(loads)
     best_seen = peak
     best = None if capacity is not None else (0., 0, 0., 0, peak)
@@ -226,8 +243,7 @@ def _fill_capacity(totals, config, limit, quantum, nodes, multiplier):
         if loads[owner] <= caps[owner]:
             return moves
         peers = [r for r in range(ranks) if loads[r] < caps[r]]
-        rank = min(peers, key=lambda r: (multiplier if nodes and nodes[owner] != nodes[r] else 1.,
-                                         caps[r] - loads[r], r))
+        rank = min(peers, key=lambda r: (_transfer_charge(nodes, owner, r, multiplier), caps[r] - loads[r], r))
         need = caps[rank] - loads[rank]
         experts = sorted(range(owner * home, (owner + 1) * home), key=lambda e: -left[e])
         for expert in experts[:config.replica_slots_per_rank]:

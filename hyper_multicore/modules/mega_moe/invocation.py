@@ -75,21 +75,7 @@ def prepare_expert_invocation(
             if replay and agree_replay(
                     record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
                 placement.statistics["route_replays"] += 1
-                route = record.route
-                if tensor_dump:
-                    record.allow_activation = False
-                resources.workspace.wait_for_reuse()
-                if not record.allow_activation:
-                    with torch.inference_mode(False), torch.no_grad():
-                        if pull:
-                            prepare_workspace(route.metadata.plan_tokens, route.maximum_received_slots)
-                        binding = route.weight_binding
-                        virtual_ids = binding.placement.virtual_ids if binding is not None else ids
-                        rows, mapping = _materialize_route_permutation(
-                            hidden, virtual_ids, resources.spec, resources.workspace,
-                        )
-                    route = replace(route, routed_tokens=rows, unpermute_mapping=mapping)
-                yield replace(route, checkpoint_record=record, tensor_dump=tensor_dump)
+                yield _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump)
                 return
             if replay:
                 placement.statistics["route_replay_misses"] += 1
@@ -119,6 +105,23 @@ def prepare_expert_invocation(
     finally:
         if leased_workspace is not None:
             leased_workspace.release()
+
+
+def _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump):
+    """Reuse agreed descriptors, publishing a fresh permutation if recompute is required."""
+    route = record.route
+    if tensor_dump:
+        record.allow_activation = False
+    resources.workspace.wait_for_reuse()
+    if not record.allow_activation:
+        with torch.inference_mode(False), torch.no_grad():
+            if resources.spec.dispatch_mode == "pull":
+                prepare_workspace(route.metadata.plan_tokens, route.maximum_received_slots)
+            binding = route.weight_binding
+            virtual_ids = binding.placement.virtual_ids if binding is not None else ids
+            rows, mapping = _materialize_route_permutation(hidden, virtual_ids, resources.spec, resources.workspace)
+        route = replace(route, routed_tokens=rows, unpermute_mapping=mapping)
+    return replace(route, checkpoint_record=record, tensor_dump=tensor_dump)
 
 
 def _record_checkpoint_route(route, record, counts, ids):

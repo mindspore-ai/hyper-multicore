@@ -104,6 +104,41 @@ def _resolve_expert_options(precision, activation, numerics_options, tuning_opti
     return numerics, tuning, scheduler, activation_parameters
 
 
+def _placement_options(planner, replica_bank, precision, ep_size, num_experts):
+    """Resolve the placement contract used for resource compatibility and EP agreement."""
+    options = {
+        "hot_replica": planner is not None,
+        "planner_key": None,
+        "replica_bank": replica_bank,
+        "replica_slots_per_rank": None,
+        "cross_node_cost": None,
+        "receive_capacity_percent": None,
+    }
+    if planner is None:
+        return options
+    if precision != "bf16":
+        raise ValueError("HotReplica requires BF16 precision")
+    from ..hot_replica.planner import HotReplicaPlanner, replica_slot_budget  # pylint: disable=import-outside-toplevel
+
+    if ep_size <= 1:
+        raise ValueError("HotReplica requires an explicit EP group with more than one rank")
+    if isinstance(planner, HotReplicaPlanner):
+        slots = planner.replica_slots_per_rank
+        # Other topology types are handled by the common topology validator.
+        # pylint: disable-next=unidiomatic-typecheck
+        if slots is not None and type(num_experts) is int and num_experts % ep_size == 0:
+            replica_slot_budget(num_experts // ep_size, slots)
+        options["replica_slots_per_rank"] = slots
+        options["cross_node_cost"] = planner.cross_node_cost
+        if planner.receive_capacity_percent != "auto":
+            options["receive_capacity_percent"] = planner.receive_capacity_percent
+    settings = planner.configuration_key()
+    if not isinstance(settings, str):
+        raise TypeError("Planner configuration_key() must return a string")
+    options["planner_key"] = (type(planner).__module__, type(planner).__qualname__, settings)
+    return options
+
+
 class MegaMoeExperts(MulticoreModule):
     """Execute Router-selected local experts with the Torch MegaMoe kernel.
 
@@ -176,28 +211,7 @@ class MegaMoeExperts(MulticoreModule):
         if tuning.replica_bank == "dedicated" and planner is None:
             raise ValueError("A dedicated replica bank requires expert_placement")
         ep_size = _resolve_ep_size(ep_group)
-        planner_key = None
-        replica_slots_per_rank = None
-        cross_node_cost = None
-        receive_capacity_percent = None
-        if planner is not None:
-            if precision != "bf16":
-                raise ValueError("HotReplica requires BF16 precision")
-            from ..hot_replica.planner import HotReplicaPlanner, replica_slot_budget  # pylint: disable=import-outside-toplevel
-
-            if ep_size <= 1:
-                raise ValueError("HotReplica requires an explicit EP group with more than one rank")
-            if isinstance(planner, HotReplicaPlanner):
-                replica_slots_per_rank = planner.replica_slots_per_rank
-                if replica_slots_per_rank is not None and type(num_experts) is int and num_experts % ep_size == 0:
-                    replica_slot_budget(num_experts // ep_size, replica_slots_per_rank)
-                cross_node_cost = planner.cross_node_cost
-                if planner.receive_capacity_percent != "auto":
-                    receive_capacity_percent = planner.receive_capacity_percent
-            settings = planner.configuration_key()
-            if not isinstance(settings, str):
-                raise TypeError("Planner configuration_key() must return a string")
-            planner_key = (type(planner).__module__, type(planner).__qualname__, settings)
+        placement_options = _placement_options(planner, tuning.replica_bank, precision, ep_size, num_experts)
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
@@ -215,12 +229,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": tuning.dispatch_split,
             "combine_split": tuning.combine_split,
             "precision": precision,
-            "hot_replica": planner is not None,
-            "planner_key": planner_key,
-            "replica_bank": tuning.replica_bank,
-            "replica_slots_per_rank": replica_slots_per_rank,
-            "cross_node_cost": cross_node_cost,
-            "receive_capacity_percent": receive_capacity_percent,
+            **placement_options,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",

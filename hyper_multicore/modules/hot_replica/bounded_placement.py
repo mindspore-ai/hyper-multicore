@@ -107,6 +107,8 @@ def _placement_metadata(counts, spec, capacity, plan_tokens, tokens, device):
 
 @dataclass(frozen=True)
 class _Geometry:
+    """Cached routing tables and capacity shared by calls with equal source counts."""
+
     sorted_ids: torch.Tensor
     counts: torch.Tensor
     copies: torch.Tensor

@@ -14,7 +14,9 @@
 # ============================================================================
 """Regression coverage for single-backend placement and original-route fallback."""
 
-import struct
+# These integration tests inspect private route metadata and collective state.
+# pylint: disable=protected-access
+
 from typing import get_type_hints
 from types import SimpleNamespace
 from contextlib import nullcontext
@@ -25,18 +27,17 @@ import pytest
 import torch
 
 from hyper_multicore import MegaMoeExperts
-from hyper_multicore.experimental import BasePlanner, ExpertPlacement, HotReplicaPlanner, MegaMoeTuningOptions, PlacementRequest
-from hyper_multicore.modules.mega_moe import route, resources as resource_module
+from hyper_multicore.experimental import (
+    BasePlanner, ExpertPlacement, HotReplicaPlanner, MegaMoeTuningOptions, PlacementRequest,
+)
+from hyper_multicore.modules.mega_moe import invocation, module, route, resources as resource_module
 from hyper_multicore.modules.hot_replica import capability, checkpoint as replay, shmem_transfer
-from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.receive import ReplicaCost
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
 from hyper_multicore.modules.hot_replica import bounded_placement
 from hyper_multicore.modules.hot_replica.bounded_placement import _placement_metadata, read_placement_wire
 from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionMode, SharedExpertPool
-from hyper_multicore.modules.hot_replica.mega_moe_adapter import (
-    ExpertWeightBinding, PlacementResources, _get_mega_bank,
-)
+from hyper_multicore.modules.hot_replica.mega_moe_adapter import ExpertWeightBinding, PlacementResources
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.hot_replica.placement import validate_quotas
 
@@ -76,8 +77,6 @@ def test_placement_requires_multiple_ranks():
 @pytest.mark.parametrize("mode", ["push", "pull"])
 def test_bf16_transports_accept_the_same_placement_limits(mode):
     """Both transports bind explicit topology, receive and guest-slot settings."""
-    from hyper_multicore.modules.mega_moe import module
-
     with patch.object(module, "_resolve_ep_size", return_value=2):
         planner = HotReplicaPlanner(replica_slots_per_rank=7, receive_capacity_percent=102, cross_node_cost=1.5)
         expert = MegaMoeExperts(
@@ -87,7 +86,8 @@ def test_bf16_transports_accept_the_same_placement_limits(mode):
     try:
         spec = expert._resource_group.specification  # pylint: disable=protected-access
         assert spec["dispatch_mode"] == mode and spec["hot_replica"]
-        assert (spec["replica_slots_per_rank"], spec["receive_capacity_percent"], spec["cross_node_cost"]) == (7, 102, 1.5)
+        limits = spec["replica_slots_per_rank"], spec["receive_capacity_percent"], spec["cross_node_cost"]
+        assert limits == (7, 102, 1.5)
     finally:
         expert.close()
 
@@ -133,6 +133,7 @@ def test_a3_bounded_metadata_matches_the_ordinary_route(dispatch_mode, rank):
 
 
 def test_placement_wire_is_reused_only_for_equal_agreed_counts():
+    """Invalidate the cached wire only after a new count exchange passes validation."""
     ranks, experts = 32, 384
     spec = MegaMoeSpec(128, 64, 128, experts, 1, None, 128, ranks, None, 0, 24, auto_tokens=True)
     wire = torch.zeros((ranks, experts + 3), dtype=torch.int32)
@@ -398,51 +399,51 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     assert wrapped() == (False, False)
 
 
+@pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("supplied", [False, True])
 @pytest.mark.parametrize("bad_weight_rank", [None, 0, 1])
-def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, supplied, bad_weight_rank):
+def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, supplied, bad_weight_rank, rank):
     """An invalid rank votes against reuse, then both ranks reach route validation."""
-    from hyper_multicore.modules.mega_moe import invocation
-
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
     ids = torch.tensor([[0, 1]], dtype=torch.int32)
     counts = torch.ones(2, dtype=torch.int32)
     hidden, probs = torch.ones(1, 2), torch.ones(1, 2)
     weights = (torch.ones(1, 2), torch.ones(1, 2))
     route_counts = counts if supplied else None
-    for rank in (0, 1):
-        spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, top_k=2)
-        placement = SimpleNamespace(statistics={"route_replays": 0, "route_replay_misses": 0})
-        resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=placement, ensure_capacity=Mock())
-        votes = []
-        def gather(out, local, **_kwargs):
-            votes.append(int(local))
-            out[:] = 0 if supplied else 1
-            if bad_weight_rank is not None:
-                out[bad_weight_rank] = 0
-            assert int(out[rank]) == int(local)
-        def prepare(hidden, *_args, **options):
-            if votes and bad_weight_rank is not None:
-                rows = [[0, 1, 1, 2, 1, 1, 2] for _ in range(2)]
-                rows[bad_weight_rank][2] = route._INVALID_WEIGHT_MASK
-                assert options["autograd_mask"] == rows[rank][2]
-                route._validate_dynamic_rows(rows, spec)
-            return route.PreparedTopKRoute(hidden, ids, counts, counts, object())
+    spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, top_k=2)
+    placement = SimpleNamespace(statistics={"route_replays": 0, "route_replay_misses": 0})
+    resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=placement, ensure_capacity=Mock())
+    votes = []
+    def gather(out, local, **_kwargs):
+        votes.append(int(local))
+        out[:] = 0 if supplied else 1
+        if bad_weight_rank is not None:
+            out[bad_weight_rank] = 0
+        assert int(out[rank]) == int(local)
+    def prepare(hidden, *_args, **options):
+        if votes and bad_weight_rank is not None:
+            rows = [[0, 1, 1, 2, 1, 1, 2] for _ in range(2)]
+            rows[bad_weight_rank][2] = route._INVALID_WEIGHT_MASK
+            assert options["autograd_mask"] == rows[rank][2]
+            route._validate_dynamic_rows(rows, spec)
+        return route.PreparedTopKRoute(hidden, ids, counts, counts, object())
 
-        monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
-        monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
-        monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda *args: (hidden, ids))
-        tape = replay.ReplayCheckpoint(lambda: 1)
-        with tape.scope(False), invocation.prepare_expert_invocation(hidden, ids, probs, route_counts, weights, resources):
-            pass
-        local_error = rank == bad_weight_rank
-        current = (None, weights[1]) if local_error else weights
-        expected = pytest.raises((TypeError, ValueError), match="expert weights") if bad_weight_rank is not None else nullcontext()
-        with tape.scope(True), expected, invocation.prepare_expert_invocation(
-                hidden, ids, probs, route_counts, current, resources, weight_error=local_error):
-            pass
-        assert len(votes) == 1
-        assert placement.statistics["route_replays"] == (not supplied and bad_weight_rank is None)
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
+    monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda *args: (hidden, ids))
+    tape = replay.ReplayCheckpoint(lambda: 1)
+    with tape.scope(False), invocation.prepare_expert_invocation(
+            hidden, ids, probs, route_counts, weights, resources):
+        pass
+    local_error = rank == bad_weight_rank
+    current = (None, weights[1]) if local_error else weights
+    expected = (nullcontext() if bad_weight_rank is None else
+                pytest.raises((TypeError, ValueError), match="expert weights"))
+    with tape.scope(True), expected, invocation.prepare_expert_invocation(
+            hidden, ids, probs, route_counts, current, resources, weight_error=local_error):
+        pass
+    assert len(votes) == 1
+    assert placement.statistics["route_replays"] == (not supplied and bad_weight_rank is None)
 
 
 @pytest.mark.parametrize("guest_rows", [0, 1])
@@ -494,8 +495,6 @@ def test_staged_replay_does_not_change_a_shared_bank_before_route_agreement(monk
 
 def test_forward_uses_injected_planner_after_count_exchange():
     """Use the injected instance on the normal forward path."""
-    from hyper_multicore.modules.mega_moe import invocation, module
-
     class RecordingPlanner(BasePlanner):
         def plan(self, request):
             self.seen = request

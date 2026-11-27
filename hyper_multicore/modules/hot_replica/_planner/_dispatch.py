@@ -96,7 +96,7 @@ def _slot_quotas(copies: list[dict[int, int]], config: ExpertReplicaConfig, sour
         if source_locality:
             guests.sort()
         else:
-            guests.sort(key=lambda expert: (row[expert], expert), reverse=True)
+            guests.sort(key=lambda expert, quotas=row: (quotas[expert], expert), reverse=True)
         slot_map.append(physical_replica_slots(config, rank, guests))
         for slot, expert in enumerate(guests, start=home):
             by_expert.setdefault(expert, []).append([rank * width + slot, row[expert]])
@@ -183,7 +183,7 @@ def _materialize(
         slots, _ = _slot_quotas(copies, config, source_locality)
         table = _ordered_dispatch(counts, slots, copies)
         plan = ExpertExecutionPlan(config, counts.tolist(), slots, table.tolist())
-        object.__setattr__(plan, "_dispatch_counts_bytes", table.tobytes())
+        object.__setattr__(plan, "dispatch_counts_bytes", table.tobytes())
         return _capacity_checked_plan(plan, capacity_limit, copies=copies)
     home, width = config.home_experts, config.slots_per_rank
     has_guests = any(

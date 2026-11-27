@@ -67,7 +67,7 @@ def test_equal_replica_cost_prefers_fewer_cross_node_token_rows():
             row[expert] += 1
         counts.append(row)
     config = ExpertReplicaConfig(96, 16, replicas)
-    options = dict(nodes=(0,) * 8 + (1,) * 8, prices=ReplicaCost(phases=((896., 896.),)))
+    options = {"nodes": (0,) * 8 + (1,) * 8, "prices": ReplicaCost(phases=((896., 896.),))}
     neutral = select_replica_plan(counts, config, **options, cross_node_cost=1.0)
     expensive = select_replica_plan(counts, config, **options, cross_node_cost=2.0)
     assert neutral.transfers and neutral == expensive

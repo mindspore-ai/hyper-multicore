@@ -46,7 +46,10 @@ def _execute_graph(call, leaves, local_dy, mode):
     stream = torch.npu.Stream() if mode == "cross_stream" else torch.npu.current_stream()
     stream.wait_stream(torch.npu.current_stream())
     if mode == "reentrant":
-        call = wrap_checkpoint(call, lambda: tuple(weight._version for weight in leaves[2:]), prepare_replay=True)
+        call = wrap_checkpoint(
+            call, lambda: tuple(weight._version for weight in leaves[2:]),  # pylint: disable=protected-access
+            prepare_replay=True,
+        )
     if mode == "inference_first":
         with torch.inference_mode():
             initial = call(*leaves)
@@ -142,7 +145,7 @@ def _check_shared_bank(device, ranks):
 
         observed = tuple((output.detach(), *(leaf.grad for leaf in layer))
                          for output, layer in zip((first, second), layers))
-        owners = [expert._resource_group.resources.placement for expert in experts]
+        owners = [expert._resource_group.resources.placement for expert in experts]  # pylint: disable=protected-access
         first_pool, second_pool = (owner.pool for owner in owners)
         assert first_pool is not None and second_pool is not None
         assert first_pool is second_pool if policy == "shared" else first_pool is not second_pool

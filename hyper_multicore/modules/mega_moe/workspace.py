@@ -177,6 +177,7 @@ class MegaMoeWorkspace:
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
 
     def _allocation_specs(self, spec, dtype, capacity):
+        """Derive the symmetric allocations for this workspace layout."""
         precision = getattr(spec, "precision", "bf16")
         allocations = _workspace_allocation_specs(
             dispatch_mode=spec.dispatch_mode,
@@ -266,7 +267,8 @@ class MegaMoeWorkspace:
         self.expert_capacity = receive_capacity
         self.routed_slots = spec.routed_slots
         stages = 6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3
-        self.event_counter_bytes = mega_moe_event_capacity(self.event_experts or spec.num_experts, spec.ep_size, stages) * 4
+        self.event_counter_bytes = mega_moe_event_capacity(
+            self.event_experts or spec.num_experts, spec.ep_size, stages) * 4
         self.forward_ready_initialized = False
         self.backward_ready_initialized = False
 
@@ -349,7 +351,8 @@ class MegaMoeWorkspace:
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
         stages = 6 if getattr(spec, "precision", "bf16") == "mxfp8" else 3
-        self.event_counter_bytes = mega_moe_event_capacity(self.event_experts or spec.num_experts, spec.ep_size, stages) * 4
+        self.event_counter_bytes = mega_moe_event_capacity(
+            self.event_experts or spec.num_experts, spec.ep_size, stages) * 4
         created = []
         try:
             for field_name, allocation in allocations:

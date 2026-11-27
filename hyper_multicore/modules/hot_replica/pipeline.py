@@ -11,6 +11,7 @@ import torch
 
 from hyper_multicore import shmem
 from hyper_multicore.modules.mega_moe.route import _upload_route_tensor
+from hyper_multicore.shmem._api import _put_sdma
 
 from .bounded_placement import supports_bounded_placement
 
@@ -31,6 +32,18 @@ def projection_shapes(hidden, intermediate, layout):
 
 def _target_band_rows(columns):
     return max(1, _BAND_BYTES // (columns * 4))
+
+
+def _gradient_owner_scratch(grad, touched, owner_rows):
+    """Start empty owners at zero when no TN task will write their partial."""
+    scratch = grad.new_empty((len(touched), *grad.shape[1:]), dtype=torch.float32)
+    if owner_rows is None:
+        scratch.zero_()
+    else:
+        for expert, slot in touched.items():
+            if not owner_rows[expert]:
+                scratch[slot - 1].zero_()
+    return scratch
 
 
 def _band_layout(shape):
@@ -177,7 +190,7 @@ class ReplicaPipeline:
         _, received, owned = binding.edges
         credit = self.storage[:rank_lines].view(pool.ranks, pool.local_experts, _LINE_WORDS)
         for slot, owner in enumerate(received):
-            if owner != _NO_OWNER and owner != pool.rank:
+            if owner not in (_NO_OWNER, pool.rank):
                 shmem.signal(credit[pool.rank, slot, :1], self.epoch, owner)
         if not owned:
             return
@@ -208,8 +221,8 @@ class ReplicaPipeline:
                     for matrix in order:
                         source = weights[matrix][owner]
                         source.record_stream(copies[peer])
-                        shmem._api._put_sdma(bank[matrix][slot], source, peer)
-                        shmem._api._put_sdma(ready[matrix, slot, :1], value, peer)
+                        _put_sdma(bank[matrix][slot], source, peer)
+                        _put_sdma(ready[matrix, slot, :1], value, peer)
         finally:
             binding.transfers = tuple(copies.values())
         if backward:
@@ -238,6 +251,7 @@ class ReplicaPipeline:
         return torch.cat((base.view(torch.uint8), extension))
 
     def _gradient_table(self, binding, gradients, *, bf16_partials=False):
+        """Bind both projections to the current lease's gradient bands and flags."""
         pool = self.pool
         home, cubes = pool.local_experts, pool.blocks
         slots, received, owned = binding.edges
@@ -276,13 +290,7 @@ class ReplicaPipeline:
                 local_address = local_flags[matrix * flags[0]:].data_ptr()
                 done_address = local_flags[sum(flags) + matrix * done_words:].data_ptr()
                 if not bf16_partials:
-                    scratch = grad.new_empty((len(touched), rows, columns), dtype=torch.float32)
-                    if owner_rows is None:
-                        scratch.zero_()
-                    else:
-                        for expert, slot in touched.items():
-                            if not owner_rows[expert]:
-                                scratch[slot - 1].zero_()
+                    scratch = _gradient_owner_scratch(grad, touched, owner_rows)
                     scratch_address = scratch.data_ptr()
                     retained.append(scratch)
             ack = self.storage[(1 + matrix) * rank_lines:]

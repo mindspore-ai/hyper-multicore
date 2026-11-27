@@ -81,7 +81,8 @@ def test_arch22_compact_get_descriptors_require_bound_pull_support(compact_pull)
     _, forward, _, backward = _build_runtime_artifacts(spec)
     partition = ShmemTaskPartition.RUNTIME_ROWS if compact_pull else ShmemTaskPartition.FIXED_ROWS
     for config in (forward, backward):
-        transfers = [task for task in config.all_tasks[:config.task_num] if task.task_type == TaskType.TASK_SHMEM_GET_MEM]
+        transfers = [task for task in config.all_tasks[:config.task_num]
+                     if task.task_type == TaskType.TASK_SHMEM_GET_MEM]
         assert transfers
         assert all((task.extra_value_1 & ShmemTaskPartition.RUNTIME_ROWS) == partition for task in transfers)
 

@@ -230,7 +230,7 @@ class PlacementResources:
                     geometry = render_geometry(plan, spec, ids.device, 0, borrowed=width, prepare_metadata=False)
                     placement = geometry.lower(hidden, ids, inverse)
                     validate_lowered_ids(ids, placement.virtual_ids, plan, spec.rank_id)
-                    counts_digest = sha256(plan._dispatch_counts_bytes).digest()  # pylint: disable=protected-access
+                    counts_digest = sha256(plan.dispatch_counts_bytes).digest()
                     signature = (width, placement.copies_by_rank, counts_digest)
             if mandatory and placement is None:
                 raise ValueError(f"No expert placement found within receive limit {limit} rows")
@@ -277,7 +277,8 @@ class PlacementResources:
             if not mandatory:
                 return None
             if not self.bf16_partials and not self._uses_fp32_partials():
-                raise RuntimeError("A3 EIO HotReplica needs an A3 wheel with BF16 partial dW support for this placement")
+                raise RuntimeError(
+                    "A3 EIO HotReplica needs an A3 wheel with BF16 partial dW support for this placement")
             raise RuntimeError("No fused dW protocol fits the active A3 EIO HotReplica placement")
         if self.pool is None:
             source = max(_COMMUNICATION_SPLIT, _align_capacity(tokens))

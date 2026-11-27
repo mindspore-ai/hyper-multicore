@@ -134,24 +134,27 @@ def validate_adapter_paths(root: Path, variant: dict, backends: dict) -> None:
         if not path.is_file() or not path.stat().st_size:
             raise ValueError(f"Missing adapter resource: {expected}")
 
-    for backend, (soc, key) in HOT_REPLICA_BF16_TARGETS.items():
+    for backend, (_, key) in HOT_REPLICA_BF16_TARGETS.items():
         replica = variant.get(key)
-        if replica is None:
-            continue
-        expected = hot_replica_bf16_paths(variant["id"], backend)
-        # Older compatible adapters use the same selector through its Python path.
-        if isinstance(replica, dict) and "planner" not in replica:
+        if replica is not None:
+            _validate_replica_adapter(root, variant["id"], backend, backends.get(backend, {}), replica)
+
+
+def _validate_replica_adapter(root: Path, identifier: str, backend: str, architecture: dict, replica: dict) -> None:
+    """Check the replica payload, including the supported older manifest layouts."""
+    expected = hot_replica_bf16_paths(identifier, backend)
+    if isinstance(replica, dict):
+        # Older compatible adapters can use the Python selector and package the A3 allocator.
+        if "planner" not in replica:
             expected.pop("planner")
-        # Accept manifests from wheels that still package the A3 allocator.
-        if backend == "arch22" and isinstance(replica, dict) and "allocator" in replica:
-            expected["allocator"] = f"adapters/{variant['id']}/shmem/arch22/hot_replica/_a3_allocator.so"
-        accepted = [expected]
-        if replica not in accepted or soc not in backends.get(backend, {}).get("soc_list", []):
-            raise ValueError("Invalid HotReplica adapter capability or artifact paths")
-        for key in (key for key in expected if key != "soc"):
-            path = resource_path(root, replica[key])
-            if not path.is_file() or not path.stat().st_size:
-                raise ValueError(f"Missing HotReplica artifact: {key}")
+        if backend == "arch22" and "allocator" in replica:
+            expected["allocator"] = f"adapters/{identifier}/shmem/arch22/hot_replica/_a3_allocator.so"
+    if replica != expected or expected["soc"] not in architecture.get("soc_list", []):
+        raise ValueError("Invalid HotReplica adapter capability or artifact paths")
+    for key in (key for key in expected if key != "soc"):
+        path = resource_path(root, expected[key])
+        if not path.is_file() or not path.stat().st_size:
+            raise ValueError(f"Missing HotReplica artifact: {key}")
 
 
 def validate_architecture(root: Path, name: str, backend: dict) -> None:

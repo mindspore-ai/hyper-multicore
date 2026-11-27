@@ -3,8 +3,6 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include "prefix_search.h"
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -12,9 +10,13 @@
 #include <tuple>
 #include <vector>
 
+#include "csrc/prefix_search.h"
+
 namespace ReplicaHost {
 namespace {
 using Rows = std::vector<int64_t>;
+// The CPython L format requires the type returned by PyLong_AsLongLong.
+using PyLongValue = decltype(PyLong_AsLongLong(nullptr));
 
 bool ReadBoundedTuple(PyObject *value, Py_ssize_t max_size, int64_t limit, Rows *out) {
   if (!PyTuple_CheckExact(value) || PyTuple_GET_SIZE(value) == 0 || PyTuple_GET_SIZE(value) > max_size) {
@@ -48,6 +50,10 @@ Rows HomeLoads(const Rows &weights, int home, int ranks) {
   return loads;
 }
 
+bool InvalidPhase(const PhasePrices::value_type &phase) {
+  return !std::isfinite(phase.first) || !std::isfinite(phase.second);
+}
+
 bool ReadPhases(PyObject *tuple, PhasePrices *out) {
   if (!PyTuple_Check(tuple)) return false;
   out->reserve(PyTuple_GET_SIZE(tuple));
@@ -56,7 +62,7 @@ bool ReadPhases(PyObject *tuple, PhasePrices *out) {
     if (!PyArg_ParseTuple(PyTuple_GET_ITEM(tuple, i), "dd", &sent, &received)) return false;
     out->emplace_back(sent, received);
   }
-  return true;
+  return std::none_of(out->begin(), out->end(), InvalidPhase);
 }
 
 bool ReadCountMatrix(PyObject *matrix, int ranks, int experts, std::vector<Rows> *rows) {
@@ -69,22 +75,82 @@ bool ReadCountMatrix(PyObject *matrix, int ranks, int experts, std::vector<Rows>
   return true;
 }
 
+using PrefixKey = std::tuple<double, int, double, size_t, int64_t>;
+
+struct PrefixSelection {
+  int64_t peak;
+  int64_t best_seen;
+  bool has_best;
+  PrefixKey best;
+  std::vector<PrefixMove> moves;
+};
+
+struct PrefixScore {
+  PyLongValue capacity, resident;
+  double compute, setup, resize;
+};
+
+bool ConsiderPrefixes(std::vector<PrefixMove> moves, int ranks, int slots, const PrefixScore &score,
+                      const PhasePrices &phases, PrefixSelection *selection, int *width) {
+  std::vector<int> occupied(ranks);
+  size_t accepted = 0;
+  double weighted_edges = 0.;
+  for (size_t i = 0; i < moves.size(); ++i) {
+    const auto &move = moves[i];
+    selection->best_seen = std::min(selection->best_seen, move.peak);
+    weighted_edges += move.charge;
+    if (!occupied.empty() && ++occupied[move.guest] > *width) *width = std::min(slots, std::max(1, *width * 2));
+    if (score.capacity >= 0 && move.peak > score.capacity) continue;
+    double delta = (move.peak - selection->peak) * score.compute + score.setup +
+        TransferCost(move.sent, move.received, phases);
+    if (score.resize != 0. && move.peak <= score.resident) delta -= score.resize;
+    if (!std::isfinite(delta) || !std::isfinite(weighted_edges)) return false;
+    const auto key = std::make_tuple(delta, *width, weighted_edges, i + 1, move.peak);
+    if (!selection->has_best || key < selection->best) {
+      selection->best = key;
+      selection->has_best = true;
+      accepted = i + 1;
+    }
+  }
+  if (accepted != 0) {
+    moves.resize(accepted);
+    selection->moves = std::move(moves);
+  }
+  return true;
+}
+
+PyObject *BuildPrefixResult(const PrefixSelection &selection) {
+  PyObject *result = PyList_New(selection.moves.size());
+  if (result == nullptr) return nullptr;
+  for (size_t i = 0; i < selection.moves.size(); ++i) {
+    const auto &move = selection.moves[i];
+    PyObject *row = Py_BuildValue("(iiiLL)", move.owner, move.guest, move.expert,
+                                  static_cast<PyLongValue>(move.first), static_cast<PyLongValue>(move.last));
+    if (row == nullptr) {
+      Py_DECREF(result);
+      return nullptr;
+    }
+    PyList_SET_ITEM(result, i, row);
+  }
+  return Py_BuildValue("NL", result, static_cast<PyLongValue>(selection.best_seen));
+}
+
 }  // namespace
 
 PyObject *SelectPrefix(PyObject *, PyObject *args) {
   PyObject *totals, *matrix, *levels, *topology, *phase_tuple;
   int ranks, slots, quantum, search_single_slot;
-  long long capacity, resident;
-  double multiplier, compute, setup, resize;
+  PrefixScore score;
+  double multiplier;
   if (!PyArg_ParseTuple(args, "OOiiiOOOddddLLp", &totals, &matrix, &ranks, &slots, &quantum,
-                        &levels, &topology, &phase_tuple, &multiplier, &compute, &setup,
-                        &resize, &capacity, &resident, &search_single_slot)) return nullptr;
+                        &levels, &topology, &phase_tuple, &multiplier, &score.compute, &score.setup,
+                        &score.resize, &score.capacity, &score.resident, &search_single_slot)) return nullptr;
   try {
     Rows weights, nodes, targets;
     std::vector<Rows> counts;
     PhasePrices phases;
-    if (quantum < 1 || !std::isfinite(multiplier) || !std::isfinite(compute) ||
-        !std::isfinite(setup) || !std::isfinite(resize) ||
+    if (quantum < 1 || !std::isfinite(multiplier) || !std::isfinite(score.compute) ||
+        !std::isfinite(score.setup) || !std::isfinite(score.resize) ||
         !ReadBoundedTuple(levels, 3, int64_t{3} << 30, &targets) ||
         !ReadSearch(totals, topology, ranks, slots, &weights, &nodes) ||
         !ReadCountMatrix(matrix, ranks, weights.size(), &counts)) Py_RETURN_NONE;
@@ -92,59 +158,21 @@ PyObject *SelectPrefix(PyObject *, PyObject *args) {
       if (PyErr_Occurred()) return nullptr;
       Py_RETURN_NONE;
     }
-    if (std::any_of(phases.begin(), phases.end(), [](const auto &p) {
-          return !std::isfinite(p.first) || !std::isfinite(p.second);
-        })) Py_RETURN_NONE;
     const auto loads = HomeLoads(weights, weights.size() / ranks, ranks);
     const auto peak = *std::max_element(loads.begin(), loads.end());
-    auto best_seen = peak;
-    bool has_best = capacity < 0;
-    auto best = std::make_tuple(0., 0, 0., size_t{0}, peak);
-    const bool compare_slots = search_single_slot && slots > 1;
-    std::vector<PrefixMove> selected;
+    PrefixSelection selection{peak, peak, score.capacity < 0, {0., 0, 0., 0, peak}, {}};
+    const int compare_ranks = search_single_slot && slots > 1 ? ranks : 0;
     for (const auto target : targets) {
       for (const int budget : {slots, 1}) {
         auto moves = SearchPrefixes(weights, loads, nodes, counts, budget, quantum, target, multiplier, phases);
-        std::vector<int> occupied(compare_slots ? ranks : 0);
-        size_t accepted = 0;
-        double weighted_edges = 0.;
         int width = 0;
-        for (size_t i = 0; i < moves.size(); ++i) {
-          const auto &move = moves[i];
-          best_seen = std::min(best_seen, move.peak);
-          weighted_edges += move.charge;
-          if (compare_slots && ++occupied[move.guest] > width) width = std::min(slots, std::max(1, width * 2));
-          if (capacity >= 0 && move.peak > capacity) continue;
-          double delta = (move.peak - peak) * compute + setup + TransferCost(move.sent, move.received, phases);
-          if (resize != 0. && move.peak <= resident) delta -= resize;
-          if (!std::isfinite(delta) || !std::isfinite(weighted_edges)) Py_RETURN_NONE;
-          const auto key = std::make_tuple(delta, width, weighted_edges, i + 1, move.peak);
-          if (!has_best || key < best) {
-            best = key;
-            has_best = true;
-            accepted = i + 1;
-          }
-        }
-        if (accepted != 0) {
-          moves.resize(accepted);
-          selected = std::move(moves);
+        if (!ConsiderPrefixes(std::move(moves), compare_ranks, slots, score, phases, &selection, &width)) {
+          Py_RETURN_NONE;
         }
         if (width <= 1) break;
       }
     }
-    PyObject *result = PyList_New(selected.size());
-    if (result == nullptr) return nullptr;
-    for (size_t i = 0; i < selected.size(); ++i) {
-      const auto &m = selected[i];
-      PyObject *row = Py_BuildValue("(iiiLL)", m.owner, m.guest, m.expert,
-                                    static_cast<long long>(m.first), static_cast<long long>(m.last));
-      if (row == nullptr) {
-        Py_DECREF(result);
-        return nullptr;
-      }
-      PyList_SET_ITEM(result, i, row);
-    }
-    return Py_BuildValue("NL", result, static_cast<long long>(best_seen));
+    return BuildPrefixResult(selection);
   } catch (const std::bad_alloc &) {
     return PyErr_NoMemory();
   }

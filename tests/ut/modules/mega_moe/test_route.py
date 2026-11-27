@@ -20,7 +20,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -1013,7 +1013,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             count = wire[spec.rank_id, 3:]
             summary, raw, metadata = _read_cached_route(wire, spec, workspace, "cpu")
             permuted = torch.empty(0, 16), torch.empty(0, dtype=torch.int32)
-            return route_module._finalize_dynamic_route(
+            return route_module._finalize_dynamic_route(  # pylint: disable=protected-access
                 permuted, count, summary, raw, metadata, None, wire, spec, workspace, "cpu", int(wire[1, 1]),
             ).metadata
 

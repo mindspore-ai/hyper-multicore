@@ -36,6 +36,9 @@ from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
 from hyper_multicore.modules.hot_replica import shmem_transfer
 
+# These regressions drive the private placement agreement and allocation boundaries.
+# pylint: disable=protected-access
+
 
 def test_retry_free_skips_an_already_released_symmetric_allocation(monkeypatch):
     pool = SimpleNamespace(weights=("first", "second"), pipeline=None)
@@ -54,12 +57,14 @@ class _FixedPlanner(BasePlanner):
         self.result = result
 
     def plan(self, request):
+        del request
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
 
 
 def _exercise_quota_agreement(rank, rendezvous):
+    """Exercise quota and error consensus in both ranks of the Gloo group."""
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
     try:
         spec = SimpleNamespace(rank_id=rank, ep_size=2, ep_group=dist.group.WORLD, local_experts=1,

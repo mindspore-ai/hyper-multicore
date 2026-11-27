@@ -87,7 +87,7 @@ class ExpertExecutionPlan:
             object.__setattr__(self, name, tuple(tuple(row) for row in getattr(self, name)))
 
     @cached_property
-    def _dispatch_counts_bytes(self) -> bytes:
+    def dispatch_counts_bytes(self) -> bytes:
         """Encode the immutable count table once for device upload and host offsets."""
         size = self.config.ep_size * self.config.physical_experts
         return struct.pack(f"<{size}i", *chain.from_iterable(self.dispatch_counts))
@@ -147,7 +147,7 @@ class ExpertExecutionPlan:
         outgoing = [0] * self.config.ep_size
         for transfer in self.transfers:
             outgoing[transfer.owner_rank] += 1
-        return max(max(self.replica_slots_used), max(outgoing))
+        return max(chain(self.replica_slots_used, outgoing))
 
     def validate(self) -> None:
         """Check per-source conservation and physical ownership invariants."""

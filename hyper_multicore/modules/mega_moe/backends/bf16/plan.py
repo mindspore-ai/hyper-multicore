@@ -160,13 +160,8 @@ def _uses_explicit_queues(spec: MegaMoeSpec) -> bool:
     return explicit_queues
 
 
-def _build_runtime_artifacts(
-    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None, *,
-    replica_pipeline: bool = False, reserve_merge_workers: bool = False,
-) -> tuple[Any, Any, Any, Any]:
-    """Build forward/backward graphs and their serialized RuntimeConfig objects."""
-    explicit_queues = _uses_explicit_queues(spec)
-    task_values = _build_task_values(spec)
+def _communication_splits(spec: MegaMoeSpec, explicit_queues: bool) -> tuple[int, int]:
+    """Resolve the default communication splits for large arch35 Pull routes."""
     dispatch_split, combine_split = spec.dispatch_split, spec.combine_split
     if (explicit_queues and spec.auto_tokens and spec.lowering == "auto"
             and spec.dispatch_mode == "pull" and spec.transport_engine == "mte"):
@@ -179,6 +174,17 @@ def _build_runtime_artifacts(
             dispatch_split = split
         if combine_split == _COMMUNICATION_SPLIT:
             combine_split = split
+    return dispatch_split, combine_split
+
+
+def _build_runtime_artifacts(
+    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None, *,
+    replica_pipeline: bool = False, reserve_merge_workers: bool = False,
+) -> tuple[Any, Any, Any, Any]:
+    """Build forward/backward graphs and their serialized RuntimeConfig objects."""
+    explicit_queues = _uses_explicit_queues(spec)
+    task_values = _build_task_values(spec)
+    dispatch_split, combine_split = _communication_splits(spec, explicit_queues)
     forward_graph = build_forward_graph(
         task_values,
         dispatch_sv=dispatch_split,
@@ -235,7 +241,19 @@ def _build_runtime_artifacts(
             forward_data, forward_graph, spec, forward=True)
         backward_data = configure_expert_queues(
             backward_data, backward_graph, spec, forward=False)
-        return forward_graph, forward_data, backward_graph, backward_data
+    else:
+        _schedule_arch22(
+            spec, task_values, forward_graph, forward_data, backward_graph, backward_data,
+            compact=compact, replica_pipeline=replica_pipeline, reserve_merge_workers=reserve_merge_workers,
+        )
+    return forward_graph, forward_data, backward_graph, backward_data
+
+
+def _schedule_arch22(
+    spec, task_values, forward_graph, forward_data, backward_graph, backward_data, *,
+    compact, replica_pipeline, reserve_merge_workers,
+) -> None:
+    """Configure dependency lookahead, projection waves and replica consumers."""
     if not compact and spec.ready_depth not in (None, 0):
         raise ValueError("Ready lookahead on arch22 requires compact lowering")
     policy = MegaMoeSchedulePolicy(
@@ -260,7 +278,6 @@ def _build_runtime_artifacts(
         for worker, queue in enumerate(backward_data.worker_queues[spec.num_cube_cores:]):
             queue.begin = min(worker // 2, end) if worker % 2 else end
             queue.stride = spec.num_cube_cores
-    return forward_graph, forward_data, backward_graph, backward_data
 
 
 def _prepare_diagnostics(

@@ -25,6 +25,7 @@ from hyper_multicore.modules.hot_replica import mega_moe_adapter
 from hyper_multicore.modules.hot_replica._planner._dispatch import _materialize
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica.bounded_placement import render_geometry, supports_bounded_placement
+from hyper_multicore.modules.hot_replica.mega_moe_adapter import _get_mega_bank
 from hyper_multicore.modules.hot_replica.pipeline import (
     ReplicaPipeline, _band_layout, fused_replica_slots, supports_pipeline,
 )
@@ -64,7 +65,8 @@ def test_serial_replica_widths_use_the_same_workspace_and_bank(home):
     with patch.object(mega_moe_adapter, "_get_mega_bank") as bank:
         for width in (1, 2, home):
             table = torch.empty((spec.ep_size, spec.num_experts + spec.ep_size * width))
-            placement = SimpleNamespace(borrowed_capacity=width, receive_capacity=33792, counts_by_source=table, copies_by_rank=())
+            placement = SimpleNamespace(
+                borrowed_capacity=width, receive_capacity=33792, counts_by_source=table, copies_by_rank=())
             binding = owner.bind(hidden, placement, tokens=4096)
             assert binding.pool is bank.return_value and binding.placement is placement
     bank.assert_called_once_with(hidden, parent, owner, tokens=4096, received=33792,
@@ -79,7 +81,8 @@ def test_fixed_heap_declines_only_optional_placements(mandatory):
     parent = SimpleNamespace(spec=spec)
     owner = mega_moe_adapter.PlacementResources(parent, {}, True, bf16_partials=True)
     hidden = torch.empty(1, spec.hidden_size, dtype=torch.bfloat16)
-    placement = SimpleNamespace(borrowed_capacity=1, receive_capacity=16384, counts_by_source=torch.empty(2, 10), copies_by_rank=())
+    placement = SimpleNamespace(
+        borrowed_capacity=1, receive_capacity=16384, counts_by_source=torch.empty(2, 10), copies_by_rank=())
     with patch.object(mega_moe_adapter, "_get_mega_bank", side_effect=_HeapCapacityError("budget exceeded")) as reserve:
         if mandatory:
             with pytest.raises(_HeapCapacityError, match="budget exceeded"):
@@ -157,14 +160,16 @@ def test_fused_bank_reserves_room_for_later_routes_and_separate_flags(home, layo
           patch("torch.distributed.get_world_size", return_value=32),
           patch.object(manager, "reserve") as reserve, patch.object(manager, "bind"),
           patch.object(SharedExpertPool, "allocate")):
-        pool = mega_moe_adapter._get_mega_bank(hidden, parent, owner, tokens=4096, received=32768, pipeline=True)
+        pool = _get_mega_bank(hidden, parent, owner, tokens=4096, received=32768, pipeline=True)
     assert pool.bank_experts == extent
     assert reserve.call_args.kwargs['workspace_growth'] == (parent.workspace, 4096, 32768)
     ((_, bank_layout),), = reserve.call_args.args
     bank_bytes = 3 * extent * spec.hidden_size * spec.intermediate_size * hidden.element_size() + 1024
     assert bank_layout.required_bytes == bank_bytes + 4 * pool.pipeline.signal_words + 512
-    pool.leased_banks = tuple(torch.empty(shape, device="meta") for shape in pool._bank_shapes())
-    assert all(bank.shape[0] == 2 * home for bank in pool._generic_banks())
+    shapes = pool._bank_shapes()  # pylint: disable=protected-access
+    pool.leased_banks = tuple(torch.empty(shape, device="meta") for shape in shapes)
+    banks = pool._generic_banks()  # pylint: disable=protected-access
+    assert all(bank.shape[0] == 2 * home for bank in banks)
 
 
 def test_replica_banks_share_only_compatible_owners():
@@ -188,7 +193,7 @@ def test_replica_banks_share_only_compatible_owners():
                                          "partial_weight_grad_dtype": partial_dtype})
             parent = SimpleNamespace(spec=current, heap_manager=manager, workspace=object())
             owners.append(_builtin_placement(parent, bf16_partials=True, replica_bank=policy))
-            pools.append(mega_moe_adapter._get_mega_bank(hidden, parent, owners[-1], tokens=4096, received=32768, pipeline=True))
+            pools.append(_get_mega_bank(hidden, parent, owners[-1], tokens=4096, received=32768, pipeline=True))
     assert pools[0] is pools[1]
     assert [pool.bank_experts for pool in pools] == [12, 12, 18, 12]
     assert all(pools[3] is not pool for pool in pools[:3])
@@ -295,7 +300,8 @@ def test_fused_bank_rebuilds_flags_and_restores_a_retained_binding(home, layout)
         pool = SharedExpertPool(hidden, None, home, 16, 2, layout, root=manager,
                                 access=manager.access, pipeline=True)
     pool.bank_experts = 3 * home
-    pool.weights = tuple(torch.full(shape, 2, dtype=hidden.dtype) for shape in pool._bank_shapes())
+    shapes = pool._bank_shapes()  # pylint: disable=protected-access
+    pool.weights = tuple(torch.full(shape, 2, dtype=hidden.dtype) for shape in shapes)
     pool.pipeline.storage = torch.full((pool.pipeline.signal_words,), 5, dtype=torch.int32)
     placement = SimpleNamespace(
         borrowed_capacity=home, published_slots=home, copies_by_rank=((-1,) * home,) * 2,
@@ -304,7 +310,7 @@ def test_fused_bank_rebuilds_flags_and_restores_a_retained_binding(home, layout)
     with (patch("torch.npu.Event"), patch("torch.npu.current_stream"), patch.object(torch.Tensor, "record_stream"),
           patch("hyper_multicore.shmem.barrier") as barrier):
         binding.save_snapshot(pool.weights)
-        old, specifications = pool._allocations(hidden.dtype)
+        old, specifications = pool._allocations(hidden.dtype)  # pylint: disable=protected-access
         assert old[-1] is pool.pipeline.storage
         assert len(old) == len(specifications) == 3
         replacement = tuple(torch.empty(shape, dtype=dtype) for shape, dtype in specifications)
@@ -375,7 +381,8 @@ def test_weight_only_pipeline_drains_projection_copies_before_ordered_gradient_r
     pool = Mock()
     pool.pipeline.plan.return_value = (5, (), ((1, 0, 0),))
     placement = SimpleNamespace(copies=object(), published_slots=5)
-    binding = ExpertWeightBinding(pool, placement, "EOI", execution_mode=ReplicaExecutionMode.WEIGHT_PIPELINE, fused_slots=5)
+    binding = ExpertWeightBinding(
+        pool, placement, "EOI", execution_mode=ReplicaExecutionMode.WEIGHT_PIPELINE, fused_slots=5)
     weights = (torch.empty(1, dtype=torch.bfloat16), torch.empty(1, dtype=torch.bfloat16))
     gradients = (object(), object())
     ordinary = object()

@@ -63,7 +63,8 @@ void RecordUse(const at::Tensor &tensor, c10_npu::NPUStream stream) {
   }
 }
 
-at::Tensor RoutePayload(const at::Tensor &ids, int64_t experts, int64_t autograd_mask, const std::string &library_path) {
+at::Tensor RoutePayload(const at::Tensor &ids, int64_t experts, int64_t autograd_mask,
+                        const std::string &library_path) {
   TORCH_CHECK(ids.device().type() == c10::DeviceType::PrivateUse1 && ids.dim() == 2 &&
                   (ids.scalar_type() == at::kInt || ids.scalar_type() == at::kLong) &&
                   ids.size(1) >= 1 && ids.size(1) <= 8 && ids.numel() <= INT32_MAX &&

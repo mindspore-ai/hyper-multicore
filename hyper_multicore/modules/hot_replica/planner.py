@@ -34,6 +34,8 @@ class HotReplicaPlanner(BasePlanner):
         cross_node_cost: float | None = None,
     ) -> None:
         """Set optional guest and receive limits and a relative inter-node replica charge."""
+        # Placement settings use exact Python scalar types in their collective configuration key.
+        # pylint: disable=unidiomatic-typecheck
         if replica_slots_per_rank is not None and (
             type(replica_slots_per_rank) is not int or replica_slots_per_rank <= 0
         ):
@@ -46,6 +48,7 @@ class HotReplicaPlanner(BasePlanner):
             if type(cross_node_cost) not in (int, float) or not 0 < cross_node_cost <= float_info.max:
                 raise ValueError("cross_node_cost must be a finite positive multiplier")
             cross_node_cost = float(cross_node_cost)
+        # pylint: enable=unidiomatic-typecheck
         self._replica_slots_per_rank = replica_slots_per_rank
         self._receive_capacity_percent = "auto" if receive_capacity_percent is None else receive_capacity_percent
         self._cross_node_cost = cross_node_cost
