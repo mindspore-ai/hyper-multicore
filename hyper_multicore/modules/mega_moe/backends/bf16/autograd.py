@@ -53,6 +53,7 @@ class _SavedBackwardState:
     weight1: Any
     weight2: Any
     group_list: Any
+    all_experts_active: torch.Tensor
     dispatch_src_off: Any
     dispatch_target_off: Any
     dispatch_size: Any
@@ -233,9 +234,18 @@ def _native_weight_operand(weight: torch.Tensor, plan: MegaMoePlan) -> torch.Ten
     return weight.contiguous()
 
 
-def _saved_backward_state(saved_tensors: tuple[Any, ...]) -> _SavedBackwardState:
-    """Restore named kernel state from the flat autograd tensor tuple."""
-    return _SavedBackwardState(*saved_tensors[:12])
+def _saved_backward_state(saved_tensors: tuple[Any, ...]) -> tuple[_SavedBackwardState, tuple[Any, ...]]:
+    """Restore the common backward operands and the optional permutation operands."""
+    ordinary_tensors = 13
+    return _SavedBackwardState(*saved_tensors[:ordinary_tensors]), saved_tensors[ordinary_tensors:]
+
+
+def _backward_route_tensors(metadata: RouteMetadata) -> tuple[torch.Tensor, ...]:
+    """Save the activity proof with the group list that checkpoint replay supplies."""
+    # A CPU scalar carries the already computed flag without a device readback.
+    all_experts_active = torch.scalar_tensor(metadata.all_experts_active, dtype=torch.bool, device="cpu")
+    return (metadata.group_list, all_experts_active, metadata.dispatch_src_off, metadata.dispatch_target_off,
+            metadata.dispatch_size, metadata.combine_src_off, metadata.combine_target_off, metadata.combine_size)
 
 
 def _prepare_forward_execution(
@@ -267,7 +277,7 @@ def _prepare_backward_execution(
     plan: MegaMoePlan,
     saved: _SavedBackwardState,
     grad_output: Any,
-    *, all_experts_active: bool = False, owner_weights: tuple[torch.Tensor, ...] | None = None,
+    *, owner_weights: tuple[torch.Tensor, ...] | None = None,
 ) -> _BackwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for backward."""
     dispatch = (torch.empty_like(saved.dispatch) if plan.spec.dispatch_mode == "pull"
@@ -293,7 +303,7 @@ def _prepare_backward_execution(
             weight_grad_dtype=(plan.weight_grad_dtype if owner_weights is None
                                else weights[0].dtype),
             group_list=groups,
-            all_experts_active=all_experts_active,
+            all_experts_active=bool(saved.all_experts_active.item()),
         ),
     )
 
@@ -360,20 +370,13 @@ def _save_forward_state(
         else:
             output = output[:0]
     ctx.plan = plan
-    ctx.all_experts_active = metadata.all_experts_active
     ctx.workspace = workspace
     ctx.save_for_backward(
         saved_dispatch,
         intermediates.up_proj,
         intermediates.activation,
         *owner_weights,
-        metadata.group_list,
-        metadata.dispatch_src_off,
-        metadata.dispatch_target_off,
-        metadata.dispatch_size,
-        metadata.combine_src_off,
-        metadata.combine_target_off,
-        metadata.combine_size,
+        *_backward_route_tensors(metadata),
         *permutation_inputs,
     )
     workspace.track_graph(ctx)
@@ -736,8 +739,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         # Non-reentrant checkpoint hooks allow each saved tensor to be unpacked only once.
         saved_tensors = ctx.saved_tensors
         ctx.maybe_clear_saved_tensors()
-        saved = _saved_backward_state(saved_tensors)
-        permutation_inputs = saved_tensors[12:]
+        saved, permutation_inputs = _saved_backward_state(saved_tensors)
         if ctx.defer_forward_copies and (saved.dispatch.stride(-1) == 0 or permutation_inputs[1].stride(-1) == 0):
             raise RuntimeError("Deferred forward tensors reached backward without checkpoint replay")
         del saved_tensors
@@ -759,7 +761,6 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan,
                 saved,
                 grad_output,
-                all_experts_active=ctx.all_experts_active,
                 owner_weights=fused_owner_weights,
             )
             grad_weight1 = execution.intermediates.grad_weight1
@@ -838,14 +839,11 @@ class _CheckpointedMegaMoeFunction(torch.autograd.Function):  # pylint: disable=
         ctx.weight_binding = weight_binding
         ctx.plan = plan
         ctx.workspace = workspace
-        ctx.all_experts_active = metadata.all_experts_active
         metadata = metadata.for_kernel(plan.spec.hidden_size)
         w1 = _native_weight_operand(w1, plan)
         w2 = _native_weight_operand(w2, plan)
         ctx.save_for_backward(
-            dispatch, up, act, w1, w2, metadata.group_list, metadata.dispatch_src_off,
-            metadata.dispatch_target_off, metadata.dispatch_size, metadata.combine_src_off,
-            metadata.combine_target_off, metadata.combine_size, mapping, probs.float().contiguous(),
+            dispatch, up, act, w1, w2, *_backward_route_tensors(metadata), mapping, probs.float().contiguous(),
         )
         workspace.track_graph(ctx)
         if weight_binding is not None:
