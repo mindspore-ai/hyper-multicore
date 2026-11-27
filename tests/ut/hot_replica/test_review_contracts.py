@@ -191,7 +191,7 @@ def test_tensor_dump_preserves_the_original_replay_binding():
     assert diagnostic.mode is ReplicaExecutionMode.STAGED and not diagnostic.fused
     assert diagnostic.snapshot is snapshot and diagnostic.placement is placement
     assert diagnostic.token is not binding.token
-    assert binding.mode is ReplicaExecutionMode.FP32_BAND and binding.fused_gradients
+    assert binding.mode is ReplicaExecutionMode.FP32_BAND
 
 
 def test_submission_counts_the_executed_protocol_and_skips_activation_reuse():

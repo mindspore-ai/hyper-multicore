@@ -271,7 +271,7 @@ class PlacementResources:
             raise ValueError("Expert placement counts must match the EP group and borrowed capacity")
         self.statistics["placement_candidates"] += 1
         mode, slots = self._execution_mode(placement)
-        if self.requires_fused_return and mode not in (ReplicaExecutionMode.FP32_BAND, ReplicaExecutionMode.BF16_BAND):
+        if self.requires_fused_return and mode is ReplicaExecutionMode.STAGED:
             self.statistics["protocol_rejections"] += 1
             if not mandatory:
                 return None
@@ -324,7 +324,7 @@ class PlacementResources:
             slots = fused_replica_slots(spec, placement, bank_experts=extent, bf16_partials=True)
             if slots:
                 return ReplicaExecutionMode.BF16_BAND, slots
-        return ReplicaExecutionMode.WEIGHT_PIPELINE, placement.borrowed_capacity
+        return ReplicaExecutionMode.STAGED, None
 
     def _uses_fp32_partials(self):
         """Use the same partial-gradient dtype as the ordinary placed launch."""

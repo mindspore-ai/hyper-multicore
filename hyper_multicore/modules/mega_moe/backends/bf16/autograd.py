@@ -726,7 +726,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             source, grad_topk_weights = _stage_backward_source(ctx, grad_output, permutation_inputs)
             saved_probabilities = permutation_inputs[-1] if plan.spec.apply_probs_before_fc2 else None
             permutation_inputs = permutation_inputs[:1]
-            fused_owner_weights = owner_weights if acquired and binding.fused_gradients else None
+            fused_owner_weights = owner_weights if acquired and binding.fused else None
             execution = _prepare_backward_execution(
                 workspace,
                 plan,

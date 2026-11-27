@@ -368,7 +368,6 @@ class ReplicaExecutionMode(Enum):
     """The weight and dW protocol selected before an invocation launches."""
 
     STAGED = "staged"
-    WEIGHT_PIPELINE = "weight_pipeline"
     FP32_BAND = "fp32_band"
     BF16_BAND = "bf16_band"
 
@@ -402,10 +401,6 @@ class ExpertWeightBinding:
     def fused(self) -> bool:
         return self.mode is not ReplicaExecutionMode.STAGED
 
-    @property
-    def fused_gradients(self) -> bool:
-        return self.mode in (ReplicaExecutionMode.FP32_BAND, ReplicaExecutionMode.BF16_BAND)
-
     def for_tensor_dump(self) -> ExpertWeightBinding:
         """Use materialized bank operands without changing a saved binding."""
         return ExpertWeightBinding(self.pool, self.placement, self.layout,
@@ -413,7 +408,7 @@ class ExpertWeightBinding:
 
     @property
     def owns_returns(self):
-        return self.fused_gradients and bool(self.edges[2])
+        return self.fused and bool(self.edges[2])
 
     def acquire(
         self, weights: tuple[torch.Tensor, ...], *, backward: bool = False,
@@ -450,7 +445,7 @@ class ExpertWeightBinding:
         if not self.fused:
             return None
         return self.pool.pipeline.runtime(
-            ordinary, self, gradients if self.fused_gradients else None,
+            ordinary, self, gradients,
             bf16_partials=self.mode is ReplicaExecutionMode.BF16_BAND,
         )
 
@@ -469,15 +464,10 @@ class ExpertWeightBinding:
         self, gradients: tuple[torch.Tensor, ...], weights: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
         """Return partial expert gradients to owners before casting parameter gradients."""
-        if self.fused_gradients:
+        if self.fused:
             stats = self.pool.statistics
             stats["fused_gradient_returns"] = stats.get("fused_gradient_returns", 0) + 1
             return gradients
-        if self.fused:
-            # Both dX projections for every populated guest have waited for
-            # their incoming weights. Drain outgoing copies on the same
-            # stream before the ordered reducer reuses the bank for FP32 dW.
-            self.pool.pipeline.complete(self)
         return self.pool.return_generated_gradients(
             gradients, self.placement.copies, output_dtypes=tuple(w.dtype for w in weights),
             published_slots=self.placement.published_slots,

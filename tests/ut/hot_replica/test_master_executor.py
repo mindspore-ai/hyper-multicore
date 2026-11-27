@@ -228,7 +228,7 @@ def test_bf16_partial_return_only_replaces_wide_native_routes(home, layout):
                 continue
             binding = owner.bind(hidden, placement, tokens=4096)
             assert binding.fused
-            assert (binding.fused_gradients, binding.mode is ReplicaExecutionMode.BF16_BAND) == mode
+            assert (binding.fused, binding.mode is ReplicaExecutionMode.BF16_BAND) == mode
 
 
 @pytest.mark.parametrize(("hidden", "intermediate"), [(5120, 1800), (5120, 1793), (5112, 1792), (5112, 1793)])
@@ -374,23 +374,3 @@ def test_fused_checkpoint_restores_locally_only_after_the_binding_is_selected():
     pool.restore_snapshot.assert_called_once_with(binding.snapshot, 0)
     assert binding.weight_epoch == 1 and binding.gradient_epoch == 2
     assert pool.statistics["fused_snapshot_restores"] == 1
-
-
-def test_weight_only_pipeline_drains_projection_copies_before_ordered_gradient_return():
-    """Keep the native dW destinations for the wide split-weight path."""
-    pool = Mock()
-    pool.pipeline.plan.return_value = (5, (), ((1, 0, 0),))
-    placement = SimpleNamespace(copies=object(), published_slots=5)
-    binding = ExpertWeightBinding(
-        pool, placement, "EOI", execution_mode=ReplicaExecutionMode.WEIGHT_PIPELINE, fused_slots=5)
-    weights = (torch.empty(1, dtype=torch.bfloat16), torch.empty(1, dtype=torch.bfloat16))
-    gradients = (object(), object())
-    ordinary = object()
-    assert not binding.owns_returns
-    assert binding.runtime(ordinary, gradients) == pool.pipeline.runtime.return_value
-    pool.pipeline.runtime.assert_called_once_with(ordinary, binding, None, bf16_partials=False)
-    pool.reset_mock()
-    assert binding.gradients(gradients, weights) == pool.return_generated_gradients.return_value
-    assert [call[0] for call in pool.method_calls] == ["pipeline.complete", "return_generated_gradients"]
-    pool.return_generated_gradients.assert_called_once_with(
-        gradients, placement.copies, output_dtypes=(torch.bfloat16, torch.bfloat16), published_slots=5)
