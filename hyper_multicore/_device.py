@@ -15,41 +15,27 @@
 """Cached device capabilities shared by execution and placement kernels."""
 import ctypes
 from functools import lru_cache
-from typing import Any
 
 import torch
 
-# Public enum from CANN's acl/acl_platform.h; the capacity itself is queried.
-_ACL_PLATFORM_AICORE_UB_SIZE = 1
-
-
-@lru_cache(maxsize=1)
-def _platform_query() -> Any:
-    """Resolve the active CANN runtime without starting the Python compiler stack."""
-    library = ctypes.CDLL("libascendcl.so")
-    query = getattr(library, "aclplatformGetDeviceInfo", None)
-    if query is None:
-        raise RuntimeError("The selected CANN runtime must provide the platform-query API matching its native build")
-    query.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
-    query.restype = ctypes.c_int
-    return query
+from hyper_multicore._loader import query_npu_arch, validate_native_compatibility
 
 
 @lru_cache(maxsize=None)
-def device_ub_bytes(device_index: int) -> int:
-    """Read this device's UB size without mutating the caller's compiler SOC."""
-    value = ctypes.create_string_buffer(32)
+def device_ub_bytes(device_index: int) -> int | None:
+    """Look up this visible device's packaged UB size without initializing CANN tiling."""
+    capacities = validate_native_compatibility()["build_info"].get("device_ub_bytes")
+    if not capacities:
+        return None
+    by_soc = capacities.get(str(query_npu_arch(device_index)))
+    if not by_soc:
+        return None
+    name = ctypes.CDLL("libascendcl.so", mode=ctypes.RTLD_LOCAL).aclrtGetSocName
+    name.argtypes = []
+    name.restype = ctypes.c_char_p
     with torch.npu.device(device_index):
-        status = _platform_query()(_ACL_PLATFORM_AICORE_UB_SIZE, value, ctypes.sizeof(value))
-    if status:
-        raise RuntimeError(f"CANN UB query failed for device {device_index}: status={status}")
-    try:
-        size = int(value.value)
-    except ValueError as error:
-        raise RuntimeError(f"CANN returned an invalid UB size: {value.value!r}") from error
-    if size <= 0:
-        raise RuntimeError(f"CANN returned a nonpositive UB size for device {device_index}: {size}")
-    return size
+        soc = name()
+    return by_soc.get(soc.decode("ascii", errors="replace").lower()) if soc else None
 
 
 def device_core_limit(device: torch.device, name: str) -> int:

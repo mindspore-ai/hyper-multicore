@@ -15,6 +15,8 @@
 """Resolve build SoCs and their device architecture groups."""
 
 import argparse
+from configparser import ConfigParser, Error as ConfigError
+from pathlib import Path
 
 ARCHITECTURES = {
     "arch22": {"npu_arch": 2201, "compile_soc": "ascend910b", "sdk_soc_type": "Ascend910B",
@@ -39,6 +41,30 @@ def resolve_soc_selection(value: str) -> tuple[list[str], dict[str, list[str]]]:
     for soc in socs:
         groups.setdefault(SOC_ARCHITECTURES[soc], []).append(soc)
     return socs, groups
+
+
+def read_device_ub_bytes(cann_root: Path, host_arch: str) -> dict[str, dict[str, int]]:
+    """Read unambiguous UB capacities keyed by NpuArch and full SoC name."""
+    config_dir = cann_root / f"{host_arch}-linux/data/platform_config"
+    candidates: dict[tuple[int, str], set[int]] = {}
+    for path in config_dir.glob("*.ini"):
+        platform = ConfigParser(interpolation=None)
+        try:
+            platform.read(path, encoding="utf-8")
+            soc = platform.get("version", "SoC_version", fallback="").lower()
+            series = platform.get("version", "Short_SoC_version", fallback="").lower()
+            architecture = platform.getint("version", "NpuArch", fallback=0)
+            size = platform.getint("AICoreSpec", "ub_size", fallback=0)
+        except (ConfigError, ValueError):
+            continue
+        backend = SOC_ARCHITECTURES.get(series)
+        if soc and size > 0 and backend is not None and architecture == ARCHITECTURES[backend]["npu_arch"]:
+            candidates.setdefault((architecture, soc), set()).add(size)
+    capacities: dict[str, dict[str, int]] = {}
+    for (architecture, soc), sizes in candidates.items():
+        if len(sizes) == 1:
+            capacities.setdefault(str(architecture), {})[soc] = next(iter(sizes))
+    return capacities
 
 
 def main() -> None:

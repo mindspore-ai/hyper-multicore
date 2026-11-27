@@ -38,7 +38,7 @@ from .command_runner import message
 from .build_utils import atomic_json as write_json, measured, version_label
 from .build_state import BuildContext, BuildResult, PreparedFramework
 from .artifacts import _payload_hashes, _source_identity
-from .soc_selection import ARCHITECTURES, DEFAULT_SOC_LIST, resolve_soc_selection
+from .soc_selection import ARCHITECTURES, DEFAULT_SOC_LIST, read_device_ub_bytes, resolve_soc_selection
 from .build_publication import SourceGuard, publish_wheel, publish_payload, validate_elf, validate_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -595,6 +595,7 @@ def assemble_payload(
         **identities[0],
         "schema_version": 3,
         "architectures": architectures,
+        "device_ub_bytes": read_device_ub_bytes(Path(identities[0]["cann_root"]), identities[0]["host_arch"]),
         "build_mode": "all" if args.all else "current",
         "variants": records,
         "artifact_version": (

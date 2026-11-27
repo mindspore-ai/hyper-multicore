@@ -315,6 +315,7 @@ CANN 注册和查找索引按所选 SoC 保存，并指向对应架构的 kernel
 ### 查询构建记录与源码包
 
 `build_info.json` 记录构建环境、来源和资源摘要，`adapters/manifest.json` 记录运行选择信息。
+其中 `device_ub_bytes` 来自构建所用 CANN 的平台配置，按 NpuArch 和完整 SoC 名称提供 UB 容量。MegaMoE 遇到未收录的设备时使用通用路由 offsets。
 查询已安装制品的完整记录及文件列表：
 
 ```bash

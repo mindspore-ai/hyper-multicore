@@ -40,6 +40,7 @@ from hyper_multicore.modules.mega_moe.route import (
     _dynamic_summary,
     _expert_capacity,
     _host_route_metadata,
+    _packed_route_ub,
     _prepare_dynamic_route,
     _publish_staged_pull,
     _read_cached_route,
@@ -55,6 +56,17 @@ from tests.common.mark_utils import arg_mark
 
 class TestMegaMoeRoute(unittest.TestCase):
     """Validate trusted Router counts and bounded capacity without hardware."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_packed_route_requires_a_known_capacity_and_scratch_fit(self) -> None:
+        """Keep the generic route available for unknown devices and preserve the scratch limit."""
+        spec = replace(self._spec(ep_size=2), num_experts=16)
+        wire = SimpleNamespace(device=SimpleNamespace(type="npu", index=0),
+                               dtype=torch.int32, stride=(16, 1).__getitem__)
+        for capacity, expected in ((None, None), (764, None), (768, 768)):
+            with self.subTest(capacity=capacity), patch.object(route_module, "device_ub_bytes", return_value=capacity):
+                self.assertEqual(_packed_route_ub(wire, spec), expected)
 
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

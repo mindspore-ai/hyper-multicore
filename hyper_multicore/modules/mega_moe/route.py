@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 import torch.distributed as dist
 
+from hyper_multicore._device import device_ub_bytes
 from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
@@ -278,9 +279,9 @@ def _packed_route_ub(wire: torch.Tensor, spec: MegaMoeSpec, *, header: int = 0) 
     """Return the available UB when this count table fits the native descriptor kernel."""
     if wire.device.type != "npu" or wire.dtype != torch.int32 or wire.stride(1) != 1:
         return None
-    from hyper_multicore._device import device_ub_bytes  # pylint: disable=import-outside-toplevel
-
     ub = device_ub_bytes(wire.device.index)
+    if ub is None:
+        return None
     experts, peers, local = spec.num_experts, spec.ep_size, spec.local_experts
     stride = (experts + 31) // 32 * 32
     span = (peers - 1) * wire.stride(0) + experts + header

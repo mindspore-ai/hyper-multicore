@@ -52,6 +52,7 @@ VENDOR = BOOTSTRAP.load_module("vendor_cache")
 WORKSPACE = BOOTSTRAP.load_module("build_workspace")
 ARTIFACTS = BOOTSTRAP.load_module("artifacts")
 MERGE = BOOTSTRAP.load_module("merge_multicore_vendors")
+SOC_SELECTION = BOOTSTRAP.load_module("soc_selection")
 
 
 def write(path: Path, text: str = "fixture") -> Path:
@@ -125,6 +126,31 @@ class BuildChecks(unittest.TestCase):
             with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
                 BUILD.parse_arguments(["--soc-list", value])
             self.assertEqual(error.exception.code, 2)
+
+    def test_device_ub_table_uses_platform_identity(self):
+        """Use full INI identities and omit unsupported, incomplete and conflicting rows."""
+        directory = self.root / "aarch64-linux/data/platform_config"
+        rows = (
+            ("Ascend910B2", "Ascend910B", 2201, 196608),
+            ("Ascend910_9382", "Ascend910_93", 2201, 196608),
+            ("Ascend950PR_9599", "Ascend950", 3510, 253952),
+            ("Ascend950DT_9581", "Ascend950", 3510, 253952),
+            ("Ascend910B", "Ascend910", 1001, 262144),
+            ("Ascend310B1", "Ascend310B", 3002, 253952),
+            ("Ascend910_9391", "Ascend910_93", 3510, 253952),
+            ("Ascend910_9381", "Ascend910_93", 2201, 0),
+            ("Ascend910B3", "Ascend910B", 2201, 196608),
+            ("Ascend910B3", "Ascend910B", 2201, 262144),
+        )
+        for index, (name, series, arch, size) in enumerate(rows):
+            write(directory / f"{index}.ini", f"[version]\nSoC_version={name}\nShort_SoC_version={series}\n"
+                  f"NpuArch={arch}\n[AICoreSpec]\nub_size={size}\n")
+        write(directory / "invalid.ini", "missing section\n")
+        self.assertEqual(SOC_SELECTION.read_device_ub_bytes(self.root, "aarch64"), {
+            "2201": {"ascend910b2": 196608, "ascend910_9382": 196608},
+            "3510": {"ascend950pr_9599": 253952, "ascend950dt_9581": 253952},
+        })
+        self.assertEqual(SOC_SELECTION.read_device_ub_bytes(self.root, "x86_64"), {})
 
     def test_native_test_changes_update_identity_and_stop_publication(self):
         """Freeze the contents and membership of the compiled SHMEM test sources."""
