@@ -52,6 +52,7 @@ VENDOR = BOOTSTRAP.load_module("vendor_cache")
 WORKSPACE = BOOTSTRAP.load_module("build_workspace")
 ARTIFACTS = BOOTSTRAP.load_module("artifacts")
 MERGE = BOOTSTRAP.load_module("merge_multicore_vendors")
+DEPENDENCIES = BOOTSTRAP.load_module("prepare_dependencies")
 
 
 def write(path: Path, text: str = "fixture") -> Path:
@@ -105,6 +106,18 @@ class BuildChecks(unittest.TestCase):
         self.root = Path(self.resources.enter_context(
             tempfile.TemporaryDirectory(prefix="hyper-multicore-build-check-")))
         self.resources.enter_context(patch.dict(os.environ, HYPER_MULTICORE_VENV_PATH=str(self.root / "envs")))
+
+    def test_arch22_does_not_acquire_the_arch35_mxfp8_revision(self):
+        """Keep arch22 builds usable with only their locked common ops-nn checkout."""
+        ops_nn = DEPENDENCIES.load_dependency_locks()["ops_nn"]
+        for architectures, expected in (
+            ({"arch22"}, {"common"}),
+            ({"arch35"}, {"common", "mxfp8"}),
+            ({"arch22", "arch35"}, {"common", "mxfp8"}),
+        ):
+            with self.subTest(architectures=architectures):
+                self.assertEqual(set(DEPENDENCIES.dependency_revisions(ops_nn, architectures=frozenset(architectures))),
+                                 expected)
 
     def test_soc_arguments_group_all_supported_subsets(self):
         """Every nonempty subset selects only its required SHMEM backends."""

@@ -11,13 +11,58 @@
 #define TPL_SCALE_ALG_0 0
 #endif
 #include "dynamic_mx_quant_with_dual_axis/arch35/dynamic_mx_quant_with_dual_axis_base.h"
-#include "swiglu_mx_quant_with_dual_axis/arch35/swiglu_mx_quant_with_dual_axis_regbase.h"
-#include "swiglu_backward_mx_quant_with_dual_axis/arch35/swiglu_backward_mx_quant_with_dual_axis_regbase.h"
+#include "swiglu_group_quant_with_dual_axis/arch35/swiglu_group_quant_mx_kernel.h"
+#include "swiglu_backward_group_quant_with_dual_axis/arch35/swiglu_backward_group_quant_with_dual_axis_regbase.h"
 
 
 namespace MulticoreMx {
 __aicore__ inline int64_t MxQuantCeil(int64_t value, int64_t block) {
   return (value + block - 1) / block;
+}
+
+template <bool Clamp>
+__aicore__ inline void ExecuteMxSwiGLU(const MxQuantDescriptor& r, AscendC::TPipe& pipe, int64_t count,
+                                      GM_ADDR source, GM_ADDR row, GM_ADDR row_scale,
+                                      GM_ADDR column, GM_ADDR column_scale) {
+  const int64_t width = r.columns;
+  SwigluGroupQuantMxTilingData tiling{};
+  tiling.usedCoreNum = r.worker_count;
+  tiling.activateLeft = 1;
+  tiling.dimM = count;
+  tiling.dimN = width;
+  tiling.numGroups = 1;
+  tiling.dimNBlockNum = MxQuantCeil(width, SwigluGroupQuantMx::ONCE_ROW_LEN);
+  tiling.dimNTail = (width - 1) % SwigluGroupQuantMx::ONCE_ROW_LEN + 1;
+  SwigluGroupQuantMx::SwigluGroupQuantMxKernel<
+    bfloat16_t, fp8_e4m3fn_t, TPL_MODE_ROTATE, AscendC::RoundMode::CAST_RINT, 1,
+    TPL_NO_GROUP_INDEX, Clamp, Clamp>
+    op(&tiling, &pipe, r.clamp_limit, 1.0f, 0.0f, Clamp ? MX_HAS_CLAMP : 0U, 2U, r.worker_index);
+  op.Init(source, nullptr, nullptr, row, row_scale, column, column_scale, nullptr);
+  op.Process();
+}
+
+template <bool Clamp>
+__aicore__ inline void ExecuteMxSwiGLUGrad(const MxQuantDescriptor& r, AscendC::TPipe& pipe, int64_t count,
+                                          GM_ADDR source, GM_ADDR gradient, GM_ADDR row, GM_ADDR row_scale,
+                                          GM_ADDR column, GM_ADDR column_scale) {
+  SwigluBackwardGroupQuantWithDualAxisMxTilingData tiling{};
+  tiling.usedCoreNum = r.worker_count;
+  tiling.totalRows = count;
+  tiling.dimBatch = 1;
+  tiling.dimM = count;
+  tiling.dimN = r.columns / 2;
+  tiling.numGroups = 1;
+  tiling.quantMode = 1;
+  tiling.tileM = r.block_rows;
+  tiling.tileN = r.block_columns;
+  tiling.nTiles = MxQuantCeil(tiling.dimN, tiling.tileN);
+  tiling.alpha = 1.0f;
+  tiling.clampLimit = r.clamp_limit;
+  SwigluBackwardGroupQuantWithDualAxisMx::SwigluBackwardGroupQuantWithDualAxisMxBase<
+    bfloat16_t, fp8_e4m3fn_t, half, TPL_MODE_ROTATE, false, false, Clamp>
+    op(&tiling, &pipe, r.worker_index);
+  op.Init(source, gradient, nullptr, nullptr, nullptr, nullptr, nullptr, row, row_scale, column, column_scale);
+  op.Process();
 }
 
 __aicore__ inline void ExecuteMxQuantRange(const MxQuantDescriptor& r, GM_ADDR source, GM_ADDR gradient,
@@ -65,44 +110,18 @@ __aicore__ inline void ExecuteMxQuantRange(const MxQuantDescriptor& r, GM_ADDR s
     op.Init(source, row, row_scale, column, column_scale);
     op.Process();
   } else if (r.task_type == MX_SWIGLU_TASK) {
-    SwigluMxQuantWithDualAxisTilingData tiling{};
-    tiling.usedCoreNum = r.worker_count;
-    tiling.dstType = MX_FP8_E4M3FN_GE_TYPE;
-    tiling.activateLeft = 1;
-    tiling.dimM = count;
-    tiling.dimN = width;
-    tiling.numGroups = 1;
-    tiling.blockW = r.block_columns;
-    tiling.splitBlockH = r.block_rows;
-    tiling.dimNBlockNum = MxQuantCeil(width, r.block_columns);
-    tiling.dimNTail = (width - 1) % r.block_columns + 1;
-    SwigluMxQuantWithDualAxis::SwigluMxQuantWithDualAxisBase<
-      bfloat16_t, fp8_e4m3fn_t, 1, AscendC::RoundMode::CAST_RINT, 1, 0>
-      op(&tiling, &pipe, r.worker_index);
-    op.Init(source, nullptr, row, row_scale, column, column_scale);
-    op.Process();
+    if (r.clamp_limit > 0.0f) {
+      ExecuteMxSwiGLU<true>(r, pipe, count, source, row, row_scale, column, column_scale);
+    } else {
+      ExecuteMxSwiGLU<false>(r, pipe, count, source, row, row_scale, column, column_scale);
+    }
   } else {
-    const int64_t half_width = width / 2;
-    gradient += start * half_width * sizeof(bfloat16_t);
-    SwigluBackwardMxQuantWithDualAxisTilingData tiling{};
-    tiling.usedCoreNum = r.worker_count;
-    tiling.dstType = MX_FP8_E4M3FN_GE_TYPE;
-    tiling.activateLeft = 1;
-    tiling.dimM = count;
-    tiling.dimN = half_width;
-    tiling.numGroups = 1;
-    tiling.blockW = r.block_columns;
-    tiling.splitBlockH = r.block_rows;
-    tiling.dimNBlockNum = MxQuantCeil(half_width, r.block_columns);
-    tiling.dimNTail = (half_width - 1) % r.block_columns + 1;
-    tiling.yGradRowStride = half_width;
-    tiling.dimGradX = width;
-    tiling.dimBatch = 1;
-    SwigluBackwardMxQuantWithDualAxis::SwigluBackwardMxQuantWithDualAxisBase<
-      bfloat16_t, fp8_e4m3fn_t, 1, AscendC::RoundMode::CAST_RINT, 1, 0>
-      op(&tiling, &pipe, r.worker_index);
-    op.Init(source, gradient, nullptr, row, row_scale, column, column_scale);
-    op.Process();
+    gradient += start * (width / 2) * sizeof(bfloat16_t);
+    if (r.clamp_limit > 0.0f) {
+      ExecuteMxSwiGLUGrad<true>(r, pipe, count, source, gradient, row, row_scale, column, column_scale);
+    } else {
+      ExecuteMxSwiGLUGrad<false>(r, pipe, count, source, gradient, row, row_scale, column, column_scale);
+    }
   }
 #if (__NPU_ARCH__ == 3510)
   AscendC::SetCtrlSpr<60, 60>(overflow_mode);
@@ -130,6 +149,10 @@ __aicore__ inline void ExecuteMxQuantTask(const MulticoreRuntime::TaskDesc& task
   auto values = reinterpret_cast<uint64_t*>(&record);
   for (uint32_t index = 0; index < sizeof(record) / sizeof(uint64_t); ++index)
     values[index] = records.GetValue(task.extra_value_0 * (sizeof(record) / sizeof(uint64_t)) + index);
+  if (!IsMxQuantDescriptorValid(record) || record.task_type != static_cast<uint32_t>(task.task_type)) {
+    AscendC::Trap();
+    return;
+  }
   ExecuteMxQuant(record, input_list[task.inputs[0].input_position],
     backward ? input_list[task.inputs[1].input_position] : nullptr,
     input_list[task.inputs[group_slot].input_position], input_list[task.outputs[0].input_position],

@@ -76,6 +76,20 @@ class TestActivation(TestCase):
             with self.assertRaisesRegex(TypeError, 'activation'):
                 MegaMoeExperts(**_EXPERT_OPTIONS, activation=value)
 
+    def test_mxfp8_accepts_pre_silu_clamp(self):
+        """Expose the GroupQuant clamp through the normal executor constructor."""
+        options = {**_EXPERT_OPTIONS, "hidden_size": 128, "intermediate_size": 64, "precision": "mxfp8"}
+        activation = SwiGLUParameters(clamp_limit=0.5)
+        experts = MegaMoeExperts(**options, activation=activation)
+        self.addCleanup(experts.close)
+        self.assertEqual(experts.activation, activation)
+
+        with self.assertRaisesRegex(ValueError, "clamp only before SiLU"):
+            MegaMoeExperts(**options, activation=replace(activation, clamp_after_silu=True))
+        with self.assertRaisesRegex(ValueError, "before-FC2"):
+            MegaMoeExperts(**options, activation=activation,
+                           numerics_options=MegaMoeNumericsOptions(apply_probs_before_fc2=True))
+
     def test_unsupported_activation_fails_before_resource_registration(self):
         """Reject an unsupported activation before creating a resource group."""
         activation = SiTUGLUParameters(beta=3.0)

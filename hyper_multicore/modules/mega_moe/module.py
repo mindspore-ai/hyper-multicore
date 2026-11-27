@@ -26,7 +26,7 @@ import torch.distributed as dist
 
 from hyper_multicore import shmem
 from hyper_multicore.modules.mega_moe.numerics import (
-    MegaMoeNumericsOptions, SiTUGLUParameters, SwiGLUParameters,
+    MegaMoeNumericsOptions, SiTUGLUParameters, SwiGLUParameters, validate_mxfp8_activation,
 )
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
@@ -116,8 +116,10 @@ def _resolve_expert_options(precision, activation, numerics_options, tuning_opti
     scheduler = validate_schedule_options(tuning.scheduler)
     _validate_precision_schedule(precision, scheduler)
     activation_parameters = _resolve_activation_parameters(activation)
-    if precision == "mxfp8" and (activation_parameters.clamp_limit is not None or numerics.apply_probs_before_fc2):
-        raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
+    if precision == "mxfp8":
+        validate_mxfp8_activation(activation_parameters)
+        if numerics.apply_probs_before_fc2:
+            raise ValueError("MXFP8 does not support before-FC2 probability weighting")
     return numerics, tuning, scheduler, activation_parameters
 
 

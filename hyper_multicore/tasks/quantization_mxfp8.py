@@ -1,4 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Versioned side records for group-aware BF16 MX quantization tasks."""
 
 from dataclasses import dataclass
@@ -13,7 +26,7 @@ MX_QUANT_TASK = 143
 MX_SWIGLU_TASK = 145
 MX_SWIGLU_GRAD_TASK = 146
 MX_QUANT_MAGIC = 0x4D585154
-_RECORD = struct.Struct('<IHH8I3Q')
+_RECORD = struct.Struct('<IHH10I2Q')
 
 
 @dataclass(frozen=True)
@@ -24,6 +37,7 @@ class MxQuantDescriptor:
     I for SwiGLU forward, and 2I for SwiGLU backward. The cumulative group list
     supplies the actual token range at execution time. Scale storage retains the
     original packed64*2 grouped-column convention, including empty-group gaps.
+    Zero clamp bits select the unclamped activation specialization.
     """
 
     columns: int
@@ -31,9 +45,11 @@ class MxQuantDescriptor:
     worker_index: int = 0
     worker_count: int = 1
     task_type: int = MX_QUANT_TASK
+    clamp_limit_bits: int = 0
 
     def __post_init__(self) -> None:
-        fields = (self.columns, self.expert_index, self.worker_index, self.worker_count, self.task_type)
+        fields = (self.columns, self.expert_index, self.worker_index, self.worker_count,
+                  self.task_type, self.clamp_limit_bits)
         if any(not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0xFFFFFFFF
                for value in fields):
             raise ValueError('MX quant descriptor fields must be nonnegative uint32 integers')
@@ -45,6 +61,8 @@ class MxQuantDescriptor:
             raise ValueError('Unsupported MX quant task type')
         if self.task_type == MX_SWIGLU_GRAD_TASK and self.columns % 128:
             raise ValueError('SwiGLU backward output columns must be a multiple of 128')
+        if self.clamp_limit_bits >= 0x7F800000 or (self.task_type == MX_QUANT_TASK and self.clamp_limit_bits):
+            raise ValueError('MX clamp bits require an activation task and a finite nonnegative float32')
 
     @property
     def block_rows(self) -> int:
@@ -58,9 +76,9 @@ class MxQuantDescriptor:
 
     def serialize(self) -> bytes:
         """Return the 64-byte little-endian native record."""
-        return _RECORD.pack(MX_QUANT_MAGIC, 1, 2, self.columns, self.expert_index,
-                            self.worker_index, self.worker_count, self.block_rows,
-                            self.block_columns, self.task_type, _RECORD.size, 0, 0, 0)
+        return _RECORD.pack(MX_QUANT_MAGIC, 2, 2, self.columns, self.expert_index,
+                            self.worker_index, self.worker_count, self.block_rows, self.block_columns,
+                            self.task_type, _RECORD.size, self.clamp_limit_bits, 0, 0, 0)
 
 
 def serialize_mx_quant_descriptors(records: Iterable[MxQuantDescriptor]) -> bytes:
@@ -77,6 +95,7 @@ class Mxfp8QuantFillConfig:
     workers: int
     first: bool
     records: list
+    clamp_limit_bits: int = 0
 
     def fill(self, cfg: Any, op: OperatorNode, tsv: TaskSplitValue) -> None:
         """Populate the runtime task table and MX quantization records."""
@@ -86,6 +105,6 @@ class Mxfp8QuantFillConfig:
                 indices.append(len(self.records))
                 self.records.append(MxQuantDescriptor(
                     columns=self.columns, expert_index=expert, worker_index=worker,
-                    worker_count=self.workers, task_type=self.kind,
+                    worker_count=self.workers, task_type=self.kind, clamp_limit_bits=self.clamp_limit_bits,
                 ))
         fill_expert_compute_tasks(cfg, op, tsv, self.kind, self.workers, self.first, indices, cube=False)

@@ -57,6 +57,14 @@ class SwiGLUParameters:
             raise TypeError("clamp_after_silu must be a boolean")
 
 
+def validate_mxfp8_activation(activation: SwiGLUParameters) -> None:
+    """Reject activations outside the CANN GroupQuant contract."""
+    if not isinstance(activation, SwiGLUParameters):
+        raise ValueError("MXFP8 requires SwiGLU")
+    if activation.clamp_limit is not None and activation.clamp_after_silu:
+        raise ValueError("MXFP8 SwiGLU supports clamp only before SiLU")
+
+
 @dataclass(frozen=True, kw_only=True)  # pylint: disable=unexpected-keyword-arg
 class SiTUGLUParameters:
     """SiTUGLU parameters; nonpositive linear_beta disables up-branch tanh.

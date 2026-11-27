@@ -43,11 +43,15 @@ _OPS_NN_PATHS = (
     "index/linear_index/op_host/op_api",
 )
 _OPS_TRANSFORMER_PATHS = ("gmm/grouped_matmul/op_kernel",)
-_ARCH35_OPS_NN_PATHS = (
-    "common/inc/op_kernel",
-    "quant/dynamic_mx_quant_with_dual_axis/op_kernel/arch35",
-    "quant/swiglu_mx_quant_with_dual_axis/op_kernel/arch35",
-    "quant/swiglu_backward_mx_quant_with_dual_axis/op_kernel/arch35",
+_KERNEL_INCLUDES = "common/inc/op_kernel"
+_MX_QUANT = "dynamic_mx_quant_with_dual_axis"
+_MX_SWIGLU = "swiglu_group_quant_with_dual_axis"
+_MX_SWIGLU_GRAD = "swiglu_backward_group_quant_with_dual_axis"
+_MX_OPS_NN_PATHS = (
+    _KERNEL_INCLUDES,
+    f"quant/{_MX_QUANT}/op_kernel/arch35",
+    f"activation/{_MX_SWIGLU}/op_kernel/arch35",
+    f"activation/{_MX_SWIGLU_GRAD}/op_kernel/arch35",
 )
 _OPS_TRANSFORMER_MHC_PATHS = (
     "common/include",
@@ -85,6 +89,7 @@ def main() -> int:
     if (args.architecture == "arch35") != bool(args.ops_tensor_source):
         raise ValueError("--ops-tensor-source is required for arch35 and only used on that architecture")
     lock = load_dependency_locks(_LOCK_PATH)
+    nn_revisions = dependency_revisions(lock["ops_nn"])
     transformer_revisions = dependency_revisions(lock["ops_transformer"])
     ops_nn_source = Path(args.ops_nn_source).resolve()
     ops_transformer_source = Path(args.ops_transformer_source).resolve()
@@ -95,7 +100,8 @@ def main() -> int:
         (ops_nn_source, ops_transformer_source, *((ops_tensor_source,) if ops_tensor_source else ())),
     )
 
-    verify_git_dependency(lock["ops_nn"], ops_nn_source, dependency_name="ops_nn")
+    nn_common = nn_revisions["common"]
+    verify_git_dependency(nn_common, ops_nn_source, dependency_name="ops_nn.common")
     verify_git_dependency(
         transformer_revisions["gmm"],
         ops_transformer_source,
@@ -115,8 +121,8 @@ def main() -> int:
     _export_git_tree(
         ops_nn_source,
         ops_nn_copy,
-        lock["ops_nn"]["commit"],
-        _OPS_NN_PATHS + (_ARCH35_OPS_NN_PATHS if ops_tensor_source else ()),
+        nn_common["commit"],
+        _OPS_NN_PATHS + ((_KERNEL_INCLUDES,) if ops_tensor_source else ()),
     )
     _export_git_tree(
         ops_transformer_source,
@@ -130,7 +136,7 @@ def main() -> int:
         transformer_revisions["mhc"]["commit"],
         _OPS_TRANSFORMER_MHC_PATHS,
     )
-    _apply_locked_adapters(ops_nn_copy, lock["ops_nn"], architecture=args.architecture)
+    _apply_locked_adapters(ops_nn_copy, nn_common, architecture=args.architecture)
     _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"])
     _apply_locked_adapters(transformer_mhc_copy, transformer_revisions["mhc"])
 
@@ -145,13 +151,21 @@ def main() -> int:
         tensor_copy = work_dir / "adapter-inputs" / "ops-tensor"
         _export_git_tree(ops_tensor_source, tensor_copy, lock["ops_tensor"]["commit"], ("include/blaze",))
         _apply_locked_adapters(tensor_copy, lock["ops_tensor"], architecture="arch35")
-        _compose_arch35_sources(source_root, ops_nn_copy, tensor_copy, lock)
+        nn_mxfp8 = nn_revisions["mxfp8"]
+        verify_git_dependency(nn_mxfp8, ops_nn_source, dependency_name="ops_nn.mxfp8")
+        mxfp8_copy = work_dir / "adapter-inputs" / "ops-nn-mxfp8"
+        _export_git_tree(ops_nn_source, mxfp8_copy, nn_mxfp8["commit"], _MX_OPS_NN_PATHS)
+        _apply_locked_adapters(mxfp8_copy, nn_mxfp8, architecture="arch35")
+        _compose_arch35_sources(source_root, ops_nn_copy, mxfp8_copy, tensor_copy, {
+            "ops_nn": nn_common, "ops_nn_mxfp8": nn_mxfp8, "ops_tensor": lock["ops_tensor"],
+        })
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0
 
 
-def _compose_arch35_sources(source_root: Path, ops_nn: Path, ops_tensor: Path, lock: dict[str, Any]) -> None:
+def _compose_arch35_sources(source_root: Path, ops_nn: Path, mxfp8: Path, ops_tensor: Path,
+                            sources: dict[str, Any]) -> None:
     """Share upstream arch35 mathematics without vendoring a second implementation.
 
     The task adapters may change logical worker identity and entry boundaries;
@@ -161,19 +175,17 @@ def _compose_arch35_sources(source_root: Path, ops_nn: Path, ops_tensor: Path, l
     target = source_root / "arch35"
     shutil.copytree(ops_tensor / "include" / "blaze", target / "include" / "blaze")
     shutil.copytree(ops_nn / "activation/swi_glu_grad/op_kernel/arch35", target / "swi_glu_grad/arch35")
-    for operator in ("dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
-                     "swiglu_backward_mx_quant_with_dual_axis"):
-        destination = target / operator
-        shutil.copytree(ops_nn / "quant" / operator / "op_kernel/arch35", destination / "arch35")
-    # These are standard relative dependencies of the exported arch35 headers.
-    for operator in ("swi_glu_grad", "dynamic_mx_quant_with_dual_axis", "swiglu_mx_quant_with_dual_axis",
-                     "swiglu_backward_mx_quant_with_dual_axis"):
-        shutil.copytree(ops_nn / "common/inc/op_kernel", target / operator / "inc")
+    shutil.copytree(ops_nn / _KERNEL_INCLUDES, target / "swi_glu_grad" / "inc")
+    shutil.copytree(mxfp8 / "quant" / _MX_QUANT / "op_kernel/arch35", target / _MX_QUANT / "arch35")
+    shutil.copytree(mxfp8 / _KERNEL_INCLUDES, target / _MX_QUANT / "inc")
+    for operator in (_MX_SWIGLU, _MX_SWIGLU_GRAD):
+        shutil.copytree(mxfp8 / "activation" / operator / "op_kernel/arch35", target / operator / "arch35")
+    # GroupQuant uses ../../inc from its arch35 headers.
+    shutil.copytree(mxfp8 / _KERNEL_INCLUDES, target / "inc")
     files = {str(path.relative_to(target)): _sha256(path)
              for path in sorted(target.rglob("*")) if path.is_file()}
-    manifest = {"components": {name: {"commit": lock[name]["commit"],
-                                     "patches": lock[name].get("patches", [])}
-                               for name in ("ops_nn", "ops_tensor")},
+    manifest = {"components": {name: {"commit": source["commit"], "patches": source.get("patches", [])}
+                               for name, source in sources.items()},
                 "files": files}
     (target / "sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 

@@ -90,6 +90,8 @@ BF16 前向的任务图由组件生成。FC2 前概率加权的反向需要恢�
 MXFP8 在分发后的专家输入及中间激活上准备量化数据，GMM 使用相应数据与 scale 描述符。
 模型提供当前权重 root 的前向列布局和反向行布局；反向重新解析当前物理存储，不能依赖之前的临时权重 view。
 后端单独管理量化张量、计算中间结果、partial dW 与反向需要的状态。
+Ascend950 的动态双轴量化和 SwiGLU GroupQuant 前反向使用锁定的 CANN 9.2 源码。
+SwiGLU 任务从描述符读取 SiLU 前裁剪阈值，并按专家起点写入行向、列向数据及 scale。
 
 这一后端仍使用公共的路由、传输与结果恢复机制。量化步骤和 native 算子的 buffer-list 由
 [MXFP8 graph](../../hyper_multicore/modules/mega_moe/backends/mxfp8/graph.py)、

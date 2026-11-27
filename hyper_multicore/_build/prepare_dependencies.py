@@ -40,6 +40,8 @@ def _parse_args(dependencies: dict[str, Any]) -> argparse.Namespace:
         choices=tuple(dependencies),
         help="Dependency to prepare. Repeat the option to prepare several dependencies.",
     )
+    parser.add_argument("--architecture", action="append", choices=("arch22", "arch35"),
+                        help="Limit architecture-specific revisions to the requested architectures.")
     parser.add_argument("--cache-dir", default=str(_DEFAULT_CACHE))
     parser.add_argument("--source-dir")
     parser.add_argument("--verify-only", action="store_true")
@@ -55,13 +57,14 @@ def main() -> int:
         cache_dir = _REPO_ROOT / cache_dir
     if args.source_dir and len(args.dependency) != 1:
         raise ValueError("--source-dir can only be used with one --dependency value.")
+    architectures = frozenset(args.architecture or ())
     prepared: dict[str, Any] = {}
     for dependency in dict.fromkeys(args.dependency):
         source_dir = Path(args.source_dir) if args.source_dir else cache_dir / dependency / "src"
         if not source_dir.is_absolute():
             source_dir = _REPO_ROOT / source_dir
         dependency_lock = dependencies[dependency]
-        revisions = dependency_revisions(dependency_lock)
+        revisions = dependency_revisions(dependency_lock, architectures=architectures)
         external_source = bool(args.source_dir and source_dir.exists())
         if not source_dir.exists():
             if args.verify_only:
@@ -159,8 +162,10 @@ def load_dependency_locks(lock_path: Path | None = None) -> dict[str, Any]:
     return dependencies
 
 
-def dependency_revisions(dependency_lock: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Resolve single-version or named revisions into complete verification entries."""
+def dependency_revisions(
+    dependency_lock: dict[str, Any], *, architectures: frozenset[str] = frozenset(),
+) -> dict[str, dict[str, Any]]:
+    """Select locked revisions and resolve their complete verification entries."""
     if "revisions" not in dependency_lock:
         return {"default": dependency_lock}
     revisions = dependency_lock["revisions"]
@@ -168,8 +173,15 @@ def dependency_revisions(dependency_lock: dict[str, Any]) -> dict[str, dict[str,
         raise ValueError("Dependency revisions must be a nonempty mapping")
     if any(not isinstance(revision, dict) or "repository" in revision for revision in revisions.values()):
         raise ValueError("Each revision must be an object; repository belongs to the parent entry")
-    return {name: {**revision, "repository": dependency_lock["repository"]}
-            for name, revision in revisions.items()}
+    matching = {
+        name: {**revision, "repository": dependency_lock["repository"]}
+        for name, revision in revisions.items()
+        if (not architectures or not revision.get("architectures")
+            or architectures.intersection(revision["architectures"]))
+    }
+    if not matching:
+        raise ValueError(f"No locked revisions of {dependency_lock['repository']} for {sorted(architectures)}")
+    return matching
 
 
 def _clone_dependency(dependency_lock: dict[str, Any], source_dir: Path) -> None:
@@ -222,7 +234,9 @@ def _git_output(source_dir: Path, *args: str) -> str:
 def _git_archive_sha256(source_dir: Path, commit: str, archive_prefix: str) -> str:
     """Hash a deterministic uncompressed Git archive without creating a tarball."""
     with subprocess.Popen(
-        ["git", "archive", "--format=tar", f"--prefix={archive_prefix}", commit],
+        # Hash committed LFS pointers regardless of local LFS caches or filter settings.
+        ["git", "-c", "filter.lfs.process=", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.required=false",
+         "archive", "--format=tar", f"--prefix={archive_prefix}", commit],
         cwd=source_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

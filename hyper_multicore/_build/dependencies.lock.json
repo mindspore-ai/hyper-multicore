@@ -21,55 +21,70 @@
   "components": {
     "multicore": {
       "ops_nn": {
-        "version": "v9.1.0.pre",
         "repository": "https://gitcode.com/cann/ops-nn.git",
-        "tag_object": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
-        "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
-        "tree": "52694bc828b50c83f37781b9d4a378466410f671",
-        "git_archive_tar_sha256": "20e717c1004de51bc2de594509ffde1a2cf84911a20fc8ab610bb4ec508fe14d",
-        "git_archive_tar_sha256_compat": [
-          "6797add7ec5380727a4d2dd9c86874864a093fdc5d1f6e3aaaacbf729991258d"
-        ],
-        "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
-        "patches": [
-          {
-            "path": "hyper_multicore/ops/patches/swi_glu_fusion.patch",
-            "sha256": "ca4cacfad1299b3b37fffeec43d8047fb6325eb4f0fdccdf475f855f45173bef",
-            "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
+        "revisions": {
+          "common": {
+            "version": "v9.1.0.pre",
+            "tag_object": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+            "commit": "39e54ece7ee5ff64c8015d3ba418f891e640f242",
+            "tree": "52694bc828b50c83f37781b9d4a378466410f671",
+            "git_archive_tar_sha256": "20e717c1004de51bc2de594509ffde1a2cf84911a20fc8ab610bb4ec508fe14d",
+            "git_archive_tar_sha256_compat": [
+              "6797add7ec5380727a4d2dd9c86874864a093fdc5d1f6e3aaaacbf729991258d"
+            ],
+            "resolution": "exact upstream source tag; the fusion adapter is applied only to an isolated source copy",
+            "patches": [
+              {
+                "path": "hyper_multicore/ops/patches/swi_glu_fusion.patch",
+                "sha256": "ca4cacfad1299b3b37fffeec43d8047fb6325eb4f0fdccdf475f855f45173bef",
+                "purpose": "expose the selected SwiGLU and SwiGLUGrad kernels as inline HyperMegaMoe building blocks"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/swi_glu_clamp.patch",
+                "sha256": "b8c29dfa3b3f819a21441aaa62de466a6c159c1d09f14dd4085ca89c07cd2a7f",
+                "purpose": "add optional pre/post-SiLU clipping and dynamic tail bounds"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
+                "sha256": "d1751299e120709f3a625af9b6d606c1696059fbb55c99ed01788765f1840004",
+                "purpose": "add a logical token-block RMSNorm entry point and non-atomic Ascend950 backward-cache writes"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/rms_norm_grad_worker_fusion.patch",
+                "sha256": "0d6eacd29418c897cd3ac42bd4b62eb331912a62a36fa506a4df80f6fffd1ce2",
+                "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/swiglu_grad_logical_worker.patch",
+                "sha256": "113578566e9f254061f746bd25e0df03d8440c75f46d6b16fdad445ab4120a50",
+                "purpose": "supply a task-local logical vector index without changing SwiGLUGrad mathematics",
+                "architectures": [
+                  "arch35"
+                ]
+              }
+            ],
+            "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
           },
-          {
-            "path": "hyper_multicore/ops/patches/swi_glu_clamp.patch",
-            "sha256": "b8c29dfa3b3f819a21441aaa62de466a6c159c1d09f14dd4085ca89c07cd2a7f",
-            "purpose": "add optional pre/post-SiLU clipping and dynamic tail bounds"
-          },
-          {
-            "path": "hyper_multicore/ops/patches/rms_norm_worker_fusion.patch",
-            "sha256": "d1751299e120709f3a625af9b6d606c1696059fbb55c99ed01788765f1840004",
-            "purpose": "add a logical token-block RMSNorm entry point and non-atomic Ascend950 backward-cache writes"
-          },
-          {
-            "path": "hyper_multicore/ops/patches/rms_norm_grad_worker_fusion.patch",
-            "sha256": "0d6eacd29418c897cd3ac42bd4b62eb331912a62a36fa506a4df80f6fffd1ce2",
-            "purpose": "add task-local RMSNormGrad execution without shared-workspace initialization, explicit pipe cleanup and Ascend950 BF16 output packing"
-          },
-          {
-            "path": "hyper_multicore/ops/patches/swiglu_grad_logical_worker.patch",
-            "sha256": "113578566e9f254061f746bd25e0df03d8440c75f46d6b16fdad445ab4120a50",
-            "purpose": "supply a task-local logical vector index without changing SwiGLUGrad mathematics",
-            "architectures": [
-              "arch35"
-            ]
-          },
-          {
-            "path": "hyper_multicore/ops/patches/mx_quant_logical_workers.patch",
-            "sha256": "e29002ac109e79cf1ef6171101f4a6ddabc1a7cc0edbf9a9dfbba66bdd2b86c3",
-            "purpose": "supply logical vector indices for standard MX quant and activation kernels",
+          "mxfp8": {
+            "version": "v9.2.0",
+            "tag_object": "814ce56c09d6bac1a99364a71a421ef7c1abf519",
+            "commit": "814ce56c09d6bac1a99364a71a421ef7c1abf519",
+            "tree": "ce1d3d3a05e58e7d5f5ae1a60d6815c708a5a621",
+            "git_archive_tar_sha256": "c60a1b0926704fb7f6a2c34b4ae9b4d192f8f6ceced02e66ad96cf7a94721ec4",
+            "resolution": "CANN 9.2.0 source for the Ascend950 MXFP8 dynamic dual-axis quantization and SwiGLU GroupQuant tasks",
+            "patches": [
+              {
+                "path": "hyper_multicore/ops/patches/mx_quant_logical_workers.patch",
+                "sha256": "bfdcbabe9e296a01d4d577e143414ee10dd1cdc00034aa45944327937a7afc96",
+                "purpose": "bind task-local vector worker indices for dynamic MX quantization and SwiGLU GroupQuant"
+              }
+            ],
+            "upgrade_policy": "compare row and column data and scales against the CANN operators before upgrading",
             "architectures": [
               "arch35"
             ]
           }
-        ],
-        "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"
+        }
       },
       "ops_transformer": {
         "repository": "https://gitcode.com/cann/ops-transformer.git",

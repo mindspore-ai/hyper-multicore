@@ -15,17 +15,20 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 """Shared error convergence, source leases and dynamic MX plan bounds."""
 from collections import OrderedDict
+import struct
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from hyper_multicore import SwiGLUParameters
 from hyper_multicore.modules.mega_moe import invocation
 from hyper_multicore.modules.mega_moe.route import _INVALID_WEIGHT_MASK
 from hyper_multicore.modules.mega_moe.backends.mxfp8 import backend
 from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_multicore.tasks.quantization_mxfp8 import MX_QUANT_TASK, MX_SWIGLU_TASK, MX_SWIGLU_GRAD_TASK
 
 
 @pytest.mark.parametrize('mode', ['push', 'pull'])
@@ -62,6 +65,23 @@ def test_mx_tail_plans_keep_complete_communication_coverage(mode):
             assert op.task_num == spec.num_experts * 2
             assert op.split_value == 512
         assert program.config.queue_layout == 2
+
+
+@pytest.mark.parametrize("forward,activation_task", [(True, MX_SWIGLU_TASK), (False, MX_SWIGLU_GRAD_TASK)])
+@pytest.mark.parametrize("clamp_limit", [None, 0.5])
+def test_mx_clamp_descriptor(forward, activation_task, clamp_limit):
+    """Send the same clamp to every activation worker without clipping inputs or upstream gradients."""
+    spec = MegaMoeSpec(128, 512, 128, 24, 8, 1.25, 1024, 4, None, 0, 32,
+                       architecture=3510, precision="mxfp8",
+                       activation_parameters=SwiGLUParameters(clamp_limit=clamp_limit))
+    data = build_mxfp8_runtime(spec, forward=forward).quant_descriptors
+    records = list(struct.iter_unpack("<IHH8IfI2Q", data))
+    expected_tasks = {activation_task, MX_QUANT_TASK}
+    assert {record[9] for record in records} == expected_tasks
+    for record in records:
+        assert record[1] == 2
+        expected = (clamp_limit or 0.0) if record[9] == activation_task else 0.0
+        assert record[11] == expected
 
 
 def test_mx_plan_cache_distinguishes_committed_token_coverage():
