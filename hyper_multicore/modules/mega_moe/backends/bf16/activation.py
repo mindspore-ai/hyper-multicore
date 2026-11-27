@@ -36,7 +36,7 @@ def build_activation_node(
     return OperatorNode(
         name="swiglu_grad" if backward else "swiglu",
         op_type=OpType.SWIGLU_GRAD if backward else OpType.SWIGLU,
-        diagnostic_name="SwiGLUGrad" if backward else "SwiGLU",
+        diagnostic_stage_name="SwiGLUGrad" if backward else "SwiGLU",
         inputs=inputs, outputs=outputs, param_positions=param_positions,
         split_value=split_value,
         split_spec=SplitSpec(

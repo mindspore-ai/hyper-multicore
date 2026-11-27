@@ -14,7 +14,7 @@
 # ============================================================================
 """Standalone MegaKernel profiling tool."""
 
-from hyper_multicore.diagnostics.profiler.api import TorchMegaKernelProfiler, mega_kernel_profile
+from hyper_multicore.diagnostics.profiler.api import ProfilerSession, profile
 from hyper_multicore.diagnostics.profiler.trace_merger import merge_chrome_traces
 
-__all__ = ["TorchMegaKernelProfiler", "mega_kernel_profile", "merge_chrome_traces"]
+__all__ = ["ProfilerSession", "profile", "merge_chrome_traces"]

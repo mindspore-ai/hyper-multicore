@@ -27,17 +27,19 @@ from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import (
     _execute_mega_moe_without_autograd, _kernel_workspace, _stage_backward_source, _stage_probabilities,
 )
-from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts, _prepare_diagnostics
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.modules.mega_moe.workspace import MegaMoeWorkspace, _workspace_allocation_specs
 
 
 from hyper_multicore.diagnostics.common.graph import validate_mega_kernel_diagnostic_contract
-from hyper_multicore.diagnostics.dump.l1 import L1TensorViewContext, L1TensorView
+from hyper_multicore.diagnostics.dumper import DumpConfig, TaskDumpTensorView, TaskDumpTensorViewContext
+from hyper_multicore.diagnostics.dumper._task import _prepare_task_dump
 from hyper_multicore.modules.mega_moe.diagnostics import _adapt_mega_moe_diagnostic_graph
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _diagnostic_parameters
-from hyper_multicore.modules.mega_moe.tensor_dump import resolve_mega_moe_l1_tensor_view
-from hyper_multicore.scheduler.config import TaskType
+from hyper_multicore.modules.mega_moe.task_dump import resolve_mega_moe_task_dump_tensor_view
+from hyper_multicore.scheduler.config import RuntimeConfigC, TaskType
+from hyper_multicore.scheduler.runtime import allocate_runtime_config
 from hyper_multicore.scheduler.graph import TensorSpec
 
 
@@ -224,6 +226,37 @@ class TestProbabilityWeighting(unittest.TestCase):
                                 [bytes(copied.all_tasks[i]) for i in after[:length]],
                             )
 
+    def test_batched_task_dump_uploads_the_selected_task(self) -> None:
+        """A remapped forward or backward record must address the task in the actual launch queue."""
+        spec = MegaMoeSpec(256, 1024, 512, 12, 2, 1.25, 640, 4, None, 0, 20, batch_experts=True)
+        artifacts = _build_runtime_artifacts(spec)
+        forward, backward = _prepare_diagnostics(spec, *artifacts, "cpu")
+        _, forward_config, _, backward_config = artifacts
+        for handle, original, stage in ((forward, forward_config, "GMM2"), (backward, backward_config, "GateGrad")):
+            with self.subTest(stage=stage):
+                runtime = handle._runtime
+                task_id = next(i for i, name in handle.metadata.task_stage_names.items() if name == stage)
+                operator = next(op for op in runtime.graph.topological_sort() if op.diagnostic_stage_name == stage)
+                weight = operator.inputs[1]
+                operands = [None] * runtime.parameter_count
+                operands[weight.param_position] = torch.ones(weight.shape, dtype=torch.bfloat16)
+                selection = DumpConfig("dump", level="task", task_ids=task_id, tensor_names=weight.name,
+                                       max_bytes_per_tensor=16)
+                prepared = _prepare_task_dump(runtime, operands, selection)
+                record, = prepared.records
+                raw = prepared.runtime_config_tensor.numpy().tobytes()
+                header = RuntimeConfigC.from_buffer_copy(raw)
+                layout = allocate_runtime_config(header.task_capacity, header.event_capacity,
+                                                 spec.local_experts, header.num_workers)
+                uploaded = type(layout).from_buffer_copy(raw)
+                config = runtime.diagnostic_runtime_config
+                position = list(config.cube_task_indices[:config.task_index_num[0]]).index(task_id)
+                original_id = original.cube_task_indices[position]
+                self.assertNotEqual(task_id, original_id)
+                self.assertEqual(uploaded.cube_task_indices[position], record.task_id)
+                self.assertEqual(bytes(uploaded.all_tasks[record.task_id]), bytes(original.all_tasks[original_id]))
+                self.assertEqual(uploaded.completion_event, original.completion_event)
+
     def test_scratch_bindings_preserve_logical_plan_strides(self) -> None:
         """Retained plans expose logical scratch bounds after physical heap growth."""
         spec = SimpleNamespace(apply_probs_before_fc2=True, ep_size=4, plan_tokens=128, top_k=2)
@@ -240,7 +273,7 @@ class TestProbabilityWeighting(unittest.TestCase):
         self.assertIs(_diagnostic_parameters(plan, parameters, buffer), parameters)
 
     def test_probability_snapshots_use_local_scalar_slices(self) -> None:
-        """L1 dumps snapshot initialized local rows, never unused remote scratch."""
+        """Task dumps snapshot initialized local rows, never unused remote scratch."""
         cases = (
             (TaskType.TASK_SWI_GLU, 4, 1), (TaskType.TASK_SWI_GLU_GRAD, 4, 2),
             (TaskType.TASK_SHMEM_PUT_MEM_SIGNAL, 4, 0),
@@ -267,16 +300,23 @@ class TestProbabilityWeighting(unittest.TestCase):
                 task_type=kind, task_split_num=4, task_split_value=128, task_index=3, extra_value_1=flag,
             )
             config = SimpleNamespace(dynamic_data=SimpleNamespace(dynamic_group_size=2, dynamic_input_position=6))
-            context = L1TensorViewContext(
+            context = TaskDumpTensorViewContext(
                 operator, 0, 1, task, SimpleNamespace(data_type=4),
                 TensorSpec("probability_workspace", [4, 512], 16, dtype_size=4),
-                "output", 1, parameters, config, 0, "scalar", L1TensorView(0, (4, 512)), {},
+                "output", 1, parameters, config, 0, "scalar", TaskDumpTensorView(0, (4, 512)), {},
                 owner_context=SimpleNamespace(topology=SimpleNamespace(rank_id=0)),
             )
-            view = resolve_mega_moe_l1_tensor_view(context)
-            self.assertEqual(view.shape, (3,))
-            self.assertEqual(view.source_offset_bytes, (plane * 512 + 257) * 4)
-            self.assertLessEqual(view.source_offset_bytes + 3 * 4, parameters[16].numel() * 4)
+            is_swiglu = kind in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD)
+            compact_coverage = "first_tile" if is_swiglu else "range_unknown"
+            for coverage in ("task_view", compact_coverage):
+                with self.subTest(kind=kind, flag=flag, coverage=coverage):
+                    if coverage != "task_view":
+                        operator.compact_lanes = 2
+                    view = resolve_mega_moe_task_dump_tensor_view(context)
+                    self.assertEqual(view.coverage, coverage)
+                    self.assertEqual(view.shape, (3,))
+                    self.assertEqual(view.source_offset_bytes, (plane * 512 + 257) * 4)
+                    self.assertLessEqual(view.source_offset_bytes + 3 * 4, parameters[16].numel() * 4)
 
 
     def test_local_scalar_prefixes_reuse_aliases_across_dynamic_rows_and_growth(self) -> None:

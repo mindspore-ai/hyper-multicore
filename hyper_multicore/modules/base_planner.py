@@ -16,9 +16,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 
 
@@ -50,6 +51,7 @@ class ExpertPlacement:
         virtual_ids: Selected virtual expert IDs, retaining original token and Top-K order.
         counts_by_source: Counts from every source for all home and borrowed expert slots.
         copies: Device plan whose rows identify the global experts borrowed by each rank.
+        host_copies: Optional Host snapshot of the borrowed slots, stable for the lifetime of this placement.
     """
 
     virtual_ids: torch.Tensor
@@ -60,6 +62,7 @@ class ExpertPlacement:
     local_receive_capacity: int | None = None
     transfer_experts: int | None = None
     published_slots: int | None = None
+    host_copies: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Validate the shared layout without reading any device tensor values."""
@@ -82,6 +85,21 @@ class ExpertPlacement:
         ):
             raise ValueError("Expert placement capacities must be nonnegative integers")
 
+    def expert_ids(self, rank: int | None = None) -> tuple[int | None, ...]:
+        """Return owners in schedule-slot order, for one EP rank or the whole placement."""
+        ranks, experts = self.counts_by_source.shape
+        home = experts // ranks - self.borrowed_capacity
+        start, stop = (0, ranks) if rank is None else (rank, rank + 1)
+        if self.host_copies is None:
+            borrowed = self.copies[start:stop].detach().cpu().tolist()
+        else:
+            borrowed = self.host_copies[start:stop].tolist()
+        owners = []
+        for ep_rank, row in enumerate(borrowed, start):
+            owners.extend(range(ep_rank * home, (ep_rank + 1) * home))
+            owners.extend(expert if expert >= 0 else None for expert in row)
+        return tuple(owners)
+
     def received_rows(self, rank: int) -> int:
         """Return the rows destined for this rank across all source ranks."""
         if self.local_receive_capacity is not None:
@@ -102,6 +120,9 @@ class ExpertPlacement:
         local = self.counts_by_source.shape[1] // ranks - self.borrowed_capacity
         if local < 1 or self.borrowed_capacity > local:
             raise ValueError("Expert borrowed capacity exceeds its home expert bank")
+        if self.host_copies is not None and (self.host_copies.shape != self.copies.shape
+                                             or self.host_copies.dtype != np.int32):
+            raise ValueError("Host expert copy table must match the device copy table shape and INT32 dtype")
         if tuple(self.copies.shape) != (ranks, self.borrowed_capacity):
             raise ValueError("Expert copy tables must match the logical borrowed capacity")
 

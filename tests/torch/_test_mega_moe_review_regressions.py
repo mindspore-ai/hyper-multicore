@@ -48,7 +48,7 @@ def _layer(layout: str, **options: Any) -> OwnedMegaMoeExperts:
 
 def _header(plan: MegaMoePlan) -> RuntimeConfigC:
     """Read the runtime header uploaded by the selected plan."""
-    raw = plan.fwd_runtime_config.detach().cpu().numpy().tobytes()
+    raw = plan.fwd_runtime_config_tensor.detach().cpu().numpy().tobytes()
     return RuntimeConfigC.from_buffer_copy(raw[:ctypes.sizeof(RuntimeConfigC)])
 
 

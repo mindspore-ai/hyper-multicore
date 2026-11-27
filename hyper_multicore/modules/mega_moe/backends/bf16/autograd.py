@@ -19,11 +19,14 @@ from __future__ import annotations
 import os
 
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import Any
 
 import torch
 
 from hyper_multicore._loader import load_torch_npu
+from hyper_multicore.diagnostics.common.call import KernelDumpRowGroups
+from hyper_multicore.modules.base_planner import ExpertPlacement
 from hyper_multicore.torch import ops as multicore_ops
 
 from ...probability import PROBABILITY_PLANES, probability_stride
@@ -395,6 +398,28 @@ def _diagnostic_parameters(
     return (*parameters, *tilings, planes)
 
 
+def _expert_rows(
+    group_list: torch.Tensor, ep_rank: int, slots_per_rank: int, placement: ExpertPlacement | None,
+) -> list[tuple[int, int, int]]:
+    """Label consecutive local activation ranges with their global expert IDs."""
+    base = ep_rank * slots_per_rank
+    expert_ids = range(base, base + slots_per_rank) if placement is None else placement.expert_ids(ep_rank)
+    home_experts = slots_per_rank if placement is None else slots_per_rank - placement.borrowed_capacity
+    ends = group_list.detach().cpu().tolist()
+    if len(ends) < home_experts:
+        raise ValueError(f"expected row offsets for {home_experts} home experts, got {len(ends)}")
+    rows = []
+    start = 0
+    for slot, end in enumerate(ends):
+        expert = expert_ids[slot] if slot < len(expert_ids) else None
+        if end < start or (expert is None and end != start):
+            raise ValueError(f"invalid expert rows for slot {slot}: expert={expert}, range=[{start}, {end})")
+        if expert is not None:
+            rows.append((expert, start, end))
+        start = end
+    return rows
+
+
 def _launch_forward_kernel(
     plan: MegaMoePlan,
     metadata: RouteMetadata,
@@ -402,7 +427,7 @@ def _launch_forward_kernel(
     weight1: Any,
     weight2: Any,
     execution: _ForwardExecution,
-    *, stream: Any = None,
+    *, stream: Any = None, weight_binding: Any = None,
 ) -> None:
     """Launch the internal forward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -424,15 +449,15 @@ def _launch_forward_kernel(
         metadata.combine_src_off,
         metadata.combine_size,
     )
-    if not plan.fwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.fwd_runtime_config, stream=stream)
+    if not plan.fwd_diagnostics.requires_diagnostic_launch:
+        record_plan_stream(plan, plan.fwd_runtime_config_tensor, stream=stream)
         multicore_ops.mega_moe(
             *kernel_parameters,
             execution.gmm_workspace,
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            plan.fwd_runtime_config,
+            plan.fwd_runtime_config_tensor,
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -442,19 +467,26 @@ def _launch_forward_kernel(
         )
         return
 
+    placement = None if weight_binding is None else weight_binding.placement
     with plan.fwd_diagnostics.launch(
         _diagnostic_parameters(plan, kernel_parameters, execution.gmm_workspace),
         direction="forward",
-        fallback_event_counters=execution.event_counters,
+        event_counters=execution.event_counters,
+        resolve_owner_ids=placement.expert_ids if placement is not None else None,
+        # Dispatch, GMM1, activation and GMM2 use the same expert-major rows.
+        dump_row_groups=KernelDumpRowGroups(
+            parameter_positions=(0, 7, 8, 11),
+            resolve_rows=partial(_expert_rows, metadata.group_list, spec.rank_id, spec.local_experts, placement),
+        ),
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
+        record_plan_stream(plan, diagnostic_call.runtime_config_tensor, stream=stream)
         multicore_ops.mega_moe_with_diagnostic_buffer(
             *kernel_parameters,
             execution.gmm_workspace,
             plan.up_proj_tiling,
             plan.swiglu_tiling,
             plan.down_proj_tiling,
-            diagnostic_call.runtime_config,
+            diagnostic_call.runtime_config_tensor,
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,
@@ -470,7 +502,7 @@ def _launch_backward_kernel(
     saved: _SavedBackwardState,
     grad_output: Any,
     execution: _BackwardExecution,
-    *, stream: Any = None,
+    *, stream: Any = None, weight_binding: Any = None,
 ) -> None:
     """Launch the internal backward ABI with prepared buffers and metadata."""
     spec = plan.spec
@@ -497,8 +529,8 @@ def _launch_backward_kernel(
         gradients.grad_weight1,
         saved.group_list,
     )
-    if not plan.bwd_diagnostics.is_active:
-        record_plan_stream(plan, plan.bwd_runtime_config, stream=stream)
+    if not plan.bwd_diagnostics.requires_diagnostic_launch:
+        record_plan_stream(plan, plan.bwd_runtime_config_tensor, stream=stream)
         multicore_ops.mega_moe_grad(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -508,7 +540,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            plan.bwd_runtime_config,
+            plan.bwd_runtime_config_tensor,
             execution.event_counters,
             spec.rank_id,
             spec.ep_size,
@@ -523,9 +555,10 @@ def _launch_backward_kernel(
             plan.act_grad_tiling, plan.gate_grad_tiling, plan.w1_grad_tiling,
             plan.w2_grad_tiling, plan.swiglu_grad_tiling)),
         direction="backward",
-        fallback_event_counters=execution.event_counters,
+        event_counters=execution.event_counters,
+        resolve_owner_ids=weight_binding.placement.expert_ids if weight_binding is not None else None,
     ) as diagnostic_call:
-        record_plan_stream(plan, diagnostic_call.runtime_config, stream=stream)
+        record_plan_stream(plan, diagnostic_call.runtime_config_tensor, stream=stream)
         multicore_ops.mega_moe_grad_with_diagnostic_buffer(
             *kernel_parameters,
             plan.act_grad_tiling,
@@ -535,7 +568,7 @@ def _launch_backward_kernel(
             plan.swiglu_grad_tiling,
             execution.gmm_workspace,
             execution.swiglu_workspace,
-            diagnostic_call.runtime_config,
+            diagnostic_call.runtime_config_tensor,
             diagnostic_call.event_counters,
             diagnostic_call.diagnostic_buffer,
             spec.rank_id,
@@ -651,7 +684,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 execution.source,
                 weight1,
                 weight2,
-                execution, stream=workspace.lease_stream)
+                execution, stream=workspace.lease_stream, weight_binding=weight_binding)
             output = execution.combine[:ctx.source_rows]
             if not spec.apply_probs_before_fc2:
                 output = output.clone()
@@ -721,7 +754,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 plan,
                 saved,
                 source,
-                execution, stream=workspace.lease_stream)
+                execution, stream=workspace.lease_stream, weight_binding=binding)
             if plan.spec.apply_probs_before_fc2 and ctx.needs_input_grad[7]:
                 grad_topk_weights = (
                     workspace.probabilities(plan.spec).slice(ctx.source_rows, gradient=True).index_select(
@@ -917,7 +950,8 @@ def _execute_mega_moe_without_autograd(
         _launch_forward_kernel(
             plan, route.metadata.for_kernel(plan.spec.hidden_size), execution.source,
             _native_weight_operand(weight1, plan),
-            _native_weight_operand(weight2, plan), execution, stream=workspace.lease_stream)
+            _native_weight_operand(weight2, plan), execution,
+            stream=workspace.lease_stream, weight_binding=weight_binding)
         rows = route.routed_tokens.shape[0]
         if not rows:
             return route.routed_tokens.new_empty((0, plan.spec.hidden_size))

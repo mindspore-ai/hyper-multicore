@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-__all__ = ["TorchMegaKernelProfiler", "mega_kernel_profile"]
+__all__ = ["ProfilerSession", "profile"]
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -31,7 +31,7 @@ from hyper_multicore.diagnostics.common.session import (
     _deactivate_session,
 )
 from hyper_multicore.diagnostics.profiler.cycle_trace import _PreparedProfileRuntime
-from hyper_multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments, LaunchContext
+from hyper_multicore.diagnostics.common.call import DiagnosticCall, LaunchArguments, LaunchContext, OwnerIds
 from hyper_multicore.diagnostics.common.schedule import DiagnosticAction
 
 
@@ -45,6 +45,7 @@ class _RawInvocation:
     step: int
     invocation_id: int
     tags: dict[str, str] = field(default_factory=dict)
+    owner_ids: OwnerIds | None = None
 
 
 @dataclass
@@ -119,11 +120,11 @@ class _ProfileCall(DiagnosticCall):
     def __init__(
         self,
         *,
-        runtime_config: Any,
+        runtime_config_tensor: Any,
         event_counters: Any,
         diagnostic_buffer: Any,
         clear_event_counters: Any | None = None,
-        profiler: TorchMegaKernelProfiler | None = None,
+        profiler: ProfilerSession | None = None,
         runtime: _PreparedProfileRuntime | None = None,
         profile_buffer_key: tuple[int, int] | None = None,
         direction: str = "",
@@ -132,7 +133,7 @@ class _ProfileCall(DiagnosticCall):
     ) -> None:
         """Store launch arguments and optional active-session bookkeeping."""
         super().__init__(LaunchArguments(
-            runtime_config, event_counters, diagnostic_buffer,
+            runtime_config_tensor, event_counters, diagnostic_buffer,
             event_counters if clear_event_counters is None else clear_event_counters,
         ))
         self._profiler = profiler
@@ -143,6 +144,7 @@ class _ProfileCall(DiagnosticCall):
         self.invocation_id = invocation_id
         self.finished = False
         self.tags: dict[str, str] = {}
+        self.owner_ids: OwnerIds | None = None
 
     def complete(self) -> None:
         """Mark the direct-write profile buffer as complete after a successful launch."""
@@ -161,7 +163,7 @@ class _ProfileCall(DiagnosticCall):
         self.finished = True
 
 
-class TorchMegaKernelProfiler:
+class ProfilerSession:
     """Standalone schedule-driven MegaKernel internal profiler for Torch."""
 
     def __init__(
@@ -207,7 +209,7 @@ class TorchMegaKernelProfiler:
         """Return the current schedule action."""
         return self._action
 
-    def __enter__(self) -> TorchMegaKernelProfiler:
+    def __enter__(self) -> ProfilerSession:
         """Activate this profiler as the process-local MegaKernel session."""
         _activate_session("profiler", self)
         self._entered = True
@@ -276,8 +278,8 @@ class TorchMegaKernelProfiler:
             raise TypeError("MegaKernel schedule must return DiagnosticAction, " f"got {type(action).__name__}")
         return action
 
-    def is_capture_enabled(self) -> bool:
-        """Return whether the current schedule action records Device cycles."""
+    def should_prepare_call(self) -> bool:
+        """Return whether this step prepares profiling, including discarded warmup."""
         return self._action is not DiagnosticAction.NONE
 
     def prepare_call(self, context: LaunchContext) -> DiagnosticCall:
@@ -286,13 +288,16 @@ class TorchMegaKernelProfiler:
         Args:
             context: Selected invocation or operand context supplied by the diagnostic framework.
         """
-        if not self.is_capture_enabled():
+        if not self.should_prepare_call():
             return DiagnosticCall(context.ordinary_arguments())
         runtime = self._profile_runtimes.get(context.runtime)
         if runtime is None:
             runtime = _PreparedProfileRuntime(context.runtime)
             self._profile_runtimes[context.runtime] = runtime
-        call = self.acquire_call(runtime, context.fallback_event_counters, context.direction)
+        owner_ids = (context.resolve_owner_ids()
+                     if context.resolve_owner_ids is not None and self._action is not DiagnosticAction.WARMUP else None)
+        call = self.acquire_call(runtime, context.event_counters, context.direction)
+        call.owner_ids = owner_ids
         tags = getattr(context, "tags", None)
         if tags is not None:
             if not all(isinstance(k, str) and isinstance(v, str) for k, v in tags.items()):
@@ -320,7 +325,7 @@ class TorchMegaKernelProfiler:
         profile_buffer, profile_buffer_key = self._take_profile_buffer(runtime)
         self._next_invocation_id += 1
         call = _ProfileCall(
-            runtime_config=runtime.profile_tensor,
+            runtime_config_tensor=runtime.profile_runtime_config_tensor,
             event_counters=event_counters,
             clear_event_counters=event_counters,
             profiler=self,
@@ -423,6 +428,7 @@ class TorchMegaKernelProfiler:
                         step=call.step,
                         invocation_id=call.invocation_id,
                         tags=dict(call.tags),
+                        owner_ids=call.owner_ids,
                     )
                 )
             self._release_profile_buffer(call, cache=True)
@@ -471,6 +477,7 @@ class TorchMegaKernelProfiler:
                 invocation.runtime.parse(
                     invocation.data,
                     detailed_task_names=self._detailed_task_names,
+                    owner_ids=invocation.owner_ids,
                 ),
             )
             for invocation in invocations
@@ -506,13 +513,13 @@ class TorchMegaKernelProfiler:
 
 
 # The argument name intentionally mirrors torch.profiler.profile.
-def mega_kernel_profile(
+def profile(
     *,
     schedule: Callable[[int], DiagnosticAction] | None = None,
     on_trace_ready: Callable[[Any], None] | None = None,
     detailed_task_names: bool = False,
     max_pending_calls: int = 16,
-) -> TorchMegaKernelProfiler:
+) -> ProfilerSession:
     # pylint: disable=redefined-outer-name
     """Create the standalone MegaKernel profiler.
 
@@ -530,7 +537,7 @@ def mega_kernel_profile(
     Returns:
         Standalone MegaKernel profiler context manager.
     """
-    return TorchMegaKernelProfiler(
+    return ProfilerSession(
         schedule=schedule,
         on_trace_ready=on_trace_ready,
         detailed_task_names=detailed_task_names,

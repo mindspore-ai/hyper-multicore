@@ -33,9 +33,11 @@ from hyper_multicore.scheduler.config import (
     TaskDescC,
     TaskType,
 )
+from hyper_multicore.diagnostics.common.call import OwnerIds
 from hyper_multicore.diagnostics.common.graph import _scheduled_task_ids
-from hyper_multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
+from hyper_multicore.diagnostics.common.runtime import DeviceDiagnosticMode, PreparedDiagnosticRuntime
 from hyper_multicore.scheduler.runtime import runtime_cube_worker_capacity
+from hyper_multicore.scheduler.worker_queues import EXPLICIT_QUEUE_LAYOUT, split_worker_queues
 
 
 # Minimum AIC/AIV profile slots.
@@ -158,6 +160,7 @@ class _CycleTraceConfig:
     soc_name: str
     task_stage_names: Mapping[int, str] | None = None
     cube_slot_count: int = CUBE_SLOT_COUNT
+    owner_ids: OwnerIds | None = None
 
 
 def _get_soc_name(device_id: int | None) -> str:
@@ -295,15 +298,18 @@ def _calculate_event_driven_profile_layout(
         int(runtime_config.task_index_num[1]),
         num_workers // vector_worker_stride,
     )
-    if runtime_config.queue_layout == 2:
-        def queue_records(record, indices):
+    if runtime_config.queue_layout == EXPLICIT_QUEUE_LAYOUT:
+        def _queue_record_count(queue, indices):
             # At most one idle episode is emitted between two completed tasks.
             return sum(_records_for_task(runtime_config.all_tasks[indices[i]]) + 1
-                       for i in range(record.begin, record.end, record.stride))
-        aic_required_records = max((queue_records(q, runtime_config.cube_task_indices)
-                                    for q in runtime_config.worker_queues[:active_worker_count]), default=0)
-        aiv_required_records = max((queue_records(q, runtime_config.vector_task_indices)
-                                    for q in runtime_config.worker_queues[active_worker_count:]), default=0)
+                       for i in queue.positions())
+        cube_queues, vector_queues = split_worker_queues(runtime_config)
+        aic_required_records = max(
+            (_queue_record_count(queue, runtime_config.cube_task_indices) for queue in cube_queues), default=0,
+        )
+        aiv_required_records = max(
+            (_queue_record_count(queue, runtime_config.vector_task_indices) for queue in vector_queues), default=0,
+        )
     return _ProfileLayout(
         aic_required_records=aic_required_records,
         aiv_required_records=aiv_required_records,
@@ -377,31 +383,31 @@ class _PreparedProfileRuntime:
 
     def __init__(self, runtime: PreparedDiagnosticRuntime) -> None:
         """Build only profiling-owned metadata, layout and Device configuration."""
-        runtime_config = runtime.copy_host_config()
-        self._metadata = _configure_trace_metadata(runtime_config, runtime.metadata)
+        profile_runtime_config = runtime.copy_diagnostic_runtime_config()
+        self._metadata = _configure_trace_metadata(profile_runtime_config, runtime.metadata)
         self._metadata = _ProfileMetadata(
             self._metadata.kernel_name, self._metadata.owner_label, self._metadata.stage_names,
             self._metadata.task_stage_names, _TaskExecutionMode(runtime.spec.execution_mode),
-            1 if runtime_config.queue_layout == 2 else runtime.spec.vector_worker_stride,
+            1 if profile_runtime_config.queue_layout == EXPLICIT_QUEUE_LAYOUT else runtime.spec.vector_worker_stride,
         )
-        self._layout = _configure_profile_layout(runtime_config, self._metadata)
+        self._layout = _configure_profile_layout(profile_runtime_config, self._metadata)
         self._rank = runtime.rank
         self._device_id = runtime.device_id
-        self._host_config = runtime_config
-        self._normal_tensor = runtime.normal_tensor
-        self._device = getattr(runtime.normal_tensor, "device", None)
-        runtime_config.diagnostic_mode = DiagnosticMode.PROFILE
-        self._profile_tensor = runtime.tensor_from_config(runtime_config)
+        self._profile_runtime_config = profile_runtime_config
+        self._runtime_config_tensor = runtime.runtime_config_tensor
+        self._device = getattr(runtime.runtime_config_tensor, "device", None)
+        profile_runtime_config.diagnostic_mode = DeviceDiagnosticMode.CYCLE_PROFILE
+        self._profile_runtime_config_tensor = runtime.tensor_from_config(profile_runtime_config)
 
     @property
-    def normal_tensor(self) -> Any:
-        """Return the original normal image without modifying it."""
-        return self._normal_tensor
+    def runtime_config_tensor(self) -> Any:
+        """Return the original standard execution configuration Tensor."""
+        return self._runtime_config_tensor
 
     @property
-    def profile_tensor(self) -> Any:
-        """Return the independent profiling configuration."""
-        return self._profile_tensor
+    def profile_runtime_config_tensor(self) -> Any:
+        """Return the independent profiling configuration Tensor."""
+        return self._profile_runtime_config_tensor
 
     @property
     def buffer_size(self) -> int:
@@ -429,9 +435,9 @@ class _PreparedProfileRuntime:
         return self._metadata.kernel_name
 
     @property
-    def host_config(self) -> RuntimeConfigC:
-        """Return an immutable Host copy retaining the graph-sized runtime arrays."""
-        return self._host_config
+    def profile_runtime_config(self) -> RuntimeConfigC:
+        """Return the structured profiling configuration with graph-sized arrays."""
+        return self._profile_runtime_config
 
     @property
     def task_stage_names(self) -> Mapping[int, str]:
@@ -443,12 +449,13 @@ class _PreparedProfileRuntime:
         """Return the concrete kernel's task-owner label."""
         return self._metadata.owner_label
 
-    def parse(self, buffer: Any, *, detailed_task_names: bool) -> dict[str, Any]:
+    def parse(self, buffer: Any, *, detailed_task_names: bool, owner_ids: OwnerIds | None = None) -> dict[str, Any]:
         """Decode one completed invocation buffer.
 
         Args:
             buffer: Host-visible bytes copied from the profiling buffer.
             detailed_task_names: Whether event names include owner and task details.
+            owner_ids: Invocation-specific business owners indexed by the device owner ID.
         """
         soc_name = _get_soc_name(self._device_id)
         trace = _parse_cycle_buffer(
@@ -462,13 +469,14 @@ class _PreparedProfileRuntime:
                 owner_label=self._metadata.owner_label,
                 stage_names=self._metadata.stage_names,
                 soc_name=soc_name,
+                owner_ids=owner_ids,
                 task_stage_names=self._metadata.task_stage_names,
                 cube_slot_count=self._layout.cube_slot_count,
             ),
             aic_record_capacity=self._layout.aic_record_capacity,
             aiv_record_capacity=self._layout.aiv_record_capacity,
         )
-        workers = int(self._host_config.num_workers)
+        workers = int(self._profile_runtime_config.num_workers)
         pipeline = self._metadata.execution_mode is _TaskExecutionMode.AIV_PIPELINE
         trace["megaKernelCycleTrace"]["workerCapacities"] = {
             "cubeSlots": self._layout.cube_slot_count,
@@ -870,6 +878,9 @@ def _parse_cycle_buffer(
         raw_records,
         key=lambda item: (item["start_cycle"], item["core_type"], item["block_id"]),
     ):
+        if config.owner_ids is not None and record["owner_id"] != INVALID_OWNER_ID:
+            owner = config.owner_ids[record["owner_id"]]
+            record["owner_id"] = INVALID_OWNER_ID if owner is None else owner
         trace_events.append(_duration_trace_event(
             record,
             rank=config.rank,

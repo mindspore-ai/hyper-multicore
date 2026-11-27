@@ -164,5 +164,7 @@ class TestTaskContracts(unittest.TestCase):
                     new_graph = getattr(candidate, direction + "_graph")
                     self.assertIs(old_graph.get_op("activation"), old_graph.get_op(name))
                     self.assertEqual(new_graph.get_op("activation").name, "renamed_" + name)
-                for field in ("fwd_runtime_config", "bwd_runtime_config", "swiglu_tiling", "swiglu_grad_tiling"):
+                for field in (
+                    "fwd_runtime_config_tensor", "bwd_runtime_config_tensor", "swiglu_tiling", "swiglu_grad_tiling",
+                ):
                     self.assertTrue(getattr(baseline, field).equal(getattr(candidate, field)), field)

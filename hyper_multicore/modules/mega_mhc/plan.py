@@ -38,13 +38,13 @@ class MegaMhcPlan:
     hidden_size: int
     num_cube_cores: int
     token_tile: int
-    runtime: MegaKernelDiagnostics
+    diagnostics: MegaKernelDiagnostics
     event_capacity: int
 
     @property
-    def runtime_config(self) -> torch.Tensor:
-        """Return the profiling-disabled RuntimeConfig tensor."""
-        return self.runtime.runtime_config
+    def runtime_config_tensor(self) -> torch.Tensor:
+        """Return the standard Task-pipeline configuration Tensor."""
+        return self.diagnostics.runtime_config_tensor
 
 
 def build_mega_mhc_plan(
@@ -77,7 +77,7 @@ def build_mega_mhc_plan(
         num_cube_cores=num_cube_cores,
     )
     _validate_runtime_task_queues(runtime_config, runtime_config.event_capacity)
-    runtime = prepare_mega_kernel_diagnostics(
+    diagnostics = prepare_mega_kernel_diagnostics(
         graph, runtime_config, kernel_name="HyperMegaMhc",
         parameter_count=23, device=device, owner_label="TokenPartition",
         rank=dist.get_rank() if dist.is_initialized() else 0,
@@ -88,6 +88,6 @@ def build_mega_mhc_plan(
         hidden_size=hidden_size,
         num_cube_cores=num_cube_cores,
         token_tile=token_tile,
-        runtime=runtime,
+        diagnostics=diagnostics,
         event_capacity=runtime_config.event_capacity,
     )

@@ -111,8 +111,8 @@ MXFP8 在分发后的专家输入及中间激活上准备量化数据，GMM 使�
 [MoE utilities](../../hyper_multicore/ops/common/mega_moe/utilities.asc)。依赖 revision、补丁与目标架构由
 [构建指南](../build.md)及依赖锁维护。
 
-BF16 与 MXFP8 均接入任务 profiler，MXFP8 当前拒绝 tensor dump 捕获；
-BF16 dump 的支持范围由其端口与视图适配决定。具体采集方法和限制见[诊断指南](../diagnostics.md)。
+BF16 与 MXFP8 均接入任务 profiler。MXFP8 发射向 Dumper 提供 kernel 名、方向与作业全局 rank，供会话判断是否提示采集跳过，
+随后走普通发射。BF16 dump 的支持范围由其端口与视图适配决定。具体采集方法和限制见[诊断指南](../diagnostics.md)。
 测试存在或源码完成接入不等于所有模式已验证，检查范围与运行方式见[测试指南](../../tests/README.md)。
 
 MXFP8 训练集成层通过内部标签接口 `mx_profile_scope(layer=..., phase=...)` 标记层及
@@ -150,7 +150,7 @@ BF16 的图传播根据 `SplitSpec` 和上游张量的分块信息决定任务�
 ### 队列与通信进展
 
 worker 的队列选择、依赖等待和完成发布见[运行时模型](../architecture.md#运行时模型)。
-normal、profile 和支持 L1 dump 的路径复用队列执行逻辑；采集开销仍可能改变运行中实际观察到的就绪顺序。
+normal、profile 和支持 Task dump 的路径复用队列执行逻辑；采集开销仍可能改变运行中实际观察到的就绪顺序。
 
 arch22 BF16 支持 compact、nominal 和专家批处理；compact 的粒度变化先于队列编排。
 arch35 BF16 与 MXFP8 将各自数学阶段映射到共享专家调度策略，通信采用固定 owner 和 FIFO 队列，

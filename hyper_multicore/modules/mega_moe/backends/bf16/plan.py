@@ -54,6 +54,7 @@ from hyper_multicore.scheduler.config import (
 )
 from hyper_multicore.scheduler.graph import ComputeGraph
 
+from ... import task_dump
 from ...diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
 from ...probability import (
     PROBABILITY_POSITION_FORWARD, PROBABILITY_POSITION_BACKWARD,
@@ -63,7 +64,6 @@ from ...schedule_policy import (
     MegaMoeSchedulePolicy, compact_graph,
 )
 from ...spec import MegaMoeSpec
-from ...tensor_dump import attach_mega_moe_l1_view_resolvers
 from .activation import prepare_activation_tiling
 
 
@@ -90,34 +90,35 @@ class MegaMoePlan:
     _recorded_streams: set = field(default_factory=set, repr=False, compare=False)
 
     @property
-    def fwd_runtime_config(self) -> Any:
-        """Return the original ordinary forward RuntimeConfig."""
-        return self.fwd_diagnostics.runtime_config
+    def fwd_runtime_config_tensor(self) -> Any:
+        """Return the standard forward configuration Tensor."""
+        return self.fwd_diagnostics.runtime_config_tensor
 
     @property
-    def bwd_runtime_config(self) -> Any:
-        """Return the original ordinary backward RuntimeConfig."""
-        return self.bwd_diagnostics.runtime_config
+    def bwd_runtime_config_tensor(self) -> Any:
+        """Return the standard backward configuration Tensor."""
+        return self.bwd_diagnostics.runtime_config_tensor
 
 
-    def record_stream(self, runtime_config: Any, *, stream: Any = None) -> None:
+    def record_stream(self, runtime_config_tensor: Any, *, stream: Any = None) -> None:
         """Register immutable plan storage once per stream, preserving allocator lifetime."""
-        if not isinstance(runtime_config, torch.Tensor) or runtime_config.device.type != "npu":
+        if not isinstance(runtime_config_tensor, torch.Tensor) or runtime_config_tensor.device.type != "npu":
             return
         if stream is None:
-            stream = torch.npu.current_stream(runtime_config.device)
+            stream = torch.npu.current_stream(runtime_config_tensor.device)
         # Reading npu_stream can drain the PTA queue while Python holds the GIL.
-        key = (runtime_config.device, stream.stream_id)
+        key = (runtime_config_tensor.device, stream.stream_id)
         if key not in self._recorded_streams:
             tensors = [value for value in vars(self).values() if isinstance(value, torch.Tensor)]
-            tensors.extend((self.fwd_runtime_config, self.bwd_runtime_config))
+            tensors.extend((self.fwd_runtime_config_tensor, self.bwd_runtime_config_tensor))
             for tensor in tensors:
                 if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu":
                     tensor.record_stream(stream)
             self._recorded_streams.add(key)
-        if runtime_config is not self.fwd_runtime_config and runtime_config is not self.bwd_runtime_config:
+        if (runtime_config_tensor is not self.fwd_runtime_config_tensor
+                and runtime_config_tensor is not self.bwd_runtime_config_tensor):
             # Diagnostic buffers are per invocation and cannot share the ordinary cache.
-            runtime_config.record_stream(stream)
+            runtime_config_tensor.record_stream(stream)
 
 
 # Keep the existing free-function call sites without another Python wrapper call.
@@ -183,7 +184,7 @@ def _build_runtime_artifacts(
     if not compact and (spec.lowering == "compact" or spec.nominal_schedule):
         raise ValueError("The requested compact lowering is unavailable for this MegaMoE configuration")
     forward_graph.propagate_splits(task_values)
-    attach_mega_moe_l1_view_resolvers(forward_graph)
+    task_dump.attach_view_resolver(forward_graph)
     forward_data = build_forward_config(
         forward_graph,
         task_values,
@@ -208,7 +209,7 @@ def _build_runtime_artifacts(
     if compact:
         compact_graph(backward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
     backward_graph.propagate_splits(task_values)
-    attach_mega_moe_l1_view_resolvers(backward_graph)
+    task_dump.attach_view_resolver(backward_graph)
     backward_data = build_backward_config(
         backward_graph,
         task_values,

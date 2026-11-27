@@ -15,6 +15,7 @@
 """CPU contracts for planner count formats and optional execution dependencies."""
 
 import sys
+from dataclasses import replace
 from types import ModuleType
 import unittest
 from unittest.mock import patch
@@ -101,6 +102,24 @@ class TestHotReplicaPlacement(unittest.TestCase):
                 self.assertEqual(actual_capacity, 256)
                 self.assertEqual(actual_counts.dtype, torch.int32)
                 torch.testing.assert_close(actual_counts, counts.to(torch.int32))
+
+    def test_expert_ids_reuse_the_planners_host_copy(self) -> None:
+        """Both rank-local and full diagnostic maps use the placement's original Host snapshot."""
+        counts = torch.tensor([[4, 0], [0, 0]], dtype=torch.int32)
+        copies = torch.tensor([[-1], [0]], dtype=torch.int32)
+        ids = torch.tensor([[0], [0], [0], [0]], dtype=torch.int32)
+        allocation = (torch.tensor([[2, 4], [0, 0]]), None, None, copies)
+        routes = (ids.flatten(), torch.zeros(2, 4, dtype=torch.int32))
+        with (
+            patch.object(placement, "allocate_experts", return_value=allocation),
+            patch.object(placement, "render_expert_major", return_value=routes),
+        ):
+            result = placement.build_placement(torch.empty(4, 2), ids, counts, 2, 1, source_inverse=torch.arange(4))
+        self.assertEqual(replace(result, host_copies=None).expert_ids(), (0, None, 1, 0))
+        copies.fill_(-1)
+        with patch.object(torch.Tensor, "cpu", side_effect=AssertionError("unexpected placement readback")):
+            self.assertEqual(result.expert_ids(), (0, None, 1, 0))
+            self.assertEqual(result.expert_ids(1), (1, 0))
 
     def test_wide_counts_reject_overflow_before_allocator(self) -> None:
         """A large INT64 wire count must never wrap to a negative planner value."""

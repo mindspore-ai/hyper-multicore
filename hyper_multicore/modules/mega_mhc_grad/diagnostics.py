@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Native backward operand bindings; reduction outputs are L0-only."""
+"""Native backward operand bindings; reduction outputs are Kernel-only."""
 
 from math import prod
 from typing import Any
 
 from hyper_multicore.diagnostics.common.graph import bind_graph_tensor_ports
-from hyper_multicore.diagnostics.dump.l1 import L1TensorView, L1TensorViewContext
+from hyper_multicore.diagnostics.dumper import TaskDumpTensorView, TaskDumpTensorViewContext, UnsupportedTaskDumpPort
 from hyper_multicore.scheduler.graph import TensorSpec
 
 
-def resolve_backward_view(context: L1TensorViewContext) -> L1TensorView:
+def resolve_backward_view(context: TaskDumpTensorViewContext) -> TaskDumpTensorView:
     """Capture local token ranges, never a concurrently accumulated parameter.
 
     Args:
@@ -31,7 +31,9 @@ def resolve_backward_view(context: L1TensorViewContext) -> L1TensorView:
     position = context.tensor_spec.param_position
     tensor = context.parameters[position]
     if context.io == "output" and position in (25, 26, 27, 32):
-        raise ValueError("mHC parameter gradients are multi-core reductions; use L0 or select token-local L1 outputs")
+        raise UnsupportedTaskDumpPort(
+            "mHC parameter gradients are multi-core reductions; use Kernel dump or select token-local Task dump outputs"
+        )
     shape = tuple(tensor.shape)
     token_count = int(context.parameters[3].shape[1])
     if position in (4, 5, 6, 10, 11, 15):

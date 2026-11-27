@@ -431,7 +431,7 @@ def build_mega_mhc_grad_graph(
         task_num: int,
         split_value: int,
         fill_config: FillConfig,
-        diagnostic_name: str,
+        diagnostic_stage_name: str,
     ) -> OperatorNode:
         """Construct one backward pipeline operator node.
 
@@ -440,7 +440,7 @@ def build_mega_mhc_grad_graph(
             task_num: Number of logical tasks.
             split_value: Tokens processed by each task.
             fill_config: Runtime task materializer.
-            diagnostic_name: Profiler-visible stage name.
+            diagnostic_stage_name: Profiler-visible stage name.
 
         Returns:
             Configured backward operator node.
@@ -455,7 +455,7 @@ def build_mega_mhc_grad_graph(
             split_spec=SplitSpec(None, lambda _tsv, count=task_num: count, []),
             tiling_position=34,
             fill_config=fill_config,
-            diagnostic_name=diagnostic_name,
+            diagnostic_stage_name=diagnostic_stage_name,
         )
 
     init = make_op(
