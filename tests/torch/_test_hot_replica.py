@@ -311,11 +311,11 @@ def _check_checkpoint_count_rejections(op, inputs, ids, counts, rank):
         leaves = tuple(value.detach().requires_grad_() for value in inputs)
         tape = ReplayCheckpoint(lambda: 1)
 
-        def _run(hidden, probs, w1, w2):
+        def _run(hidden, probs, w1, w2, *, replay_error=in_replay, malformed_counts=invalid_counts):
             nonlocal calls
             replaying = calls > 0
             calls += 1
-            local_counts = invalid_counts if rank == 1 and replaying == in_replay else counts
+            local_counts = malformed_counts if rank == 1 and replaying == replay_error else counts
             return op(hidden, ids, probs, expert_weights=(w1, w2), tokens_per_expert=local_counts)
 
         if in_replay:

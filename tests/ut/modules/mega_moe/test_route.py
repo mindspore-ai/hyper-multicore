@@ -26,6 +26,7 @@ import torch
 
 from hyper_multicore.modules.mega_moe import route as route_module
 from hyper_multicore.modules.mega_moe.route import (
+    _INVALID_COUNTS_MASK,
     _HOST_DESCRIPTOR_MAX_COUNTS,
     _HOST_ROUTE_CACHE_ENTRIES,
     _HostRouteCache,
@@ -1123,11 +1124,11 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         counts = torch.tensor([1, 1] + [0] * 22, dtype=torch.int32)
         good = torch.cat((counts.new_tensor([0, 1, 31]), counts))
         bad = counts.new_zeros(good.shape)
-        bad[:3] = counts.new_tensor([0, 1, 31 | route_module._INVALID_COUNTS_MASK])
+        bad[:3] = counts.new_tensor([0, 1, 31 | _INVALID_COUNTS_MASK])
         wire = torch.stack((good, bad, good, good))
         for rank, current in ((0, counts), (1, counts[:-1])):
-            def _gather(output, value, **_kwargs):
-                self.assertTrue(torch.equal(value, wire[rank]))
+            def _gather(output, value, *, local_rank=rank, **_kwargs):
+                self.assertTrue(torch.equal(value, wire[local_rank]))
                 output.copy_(wire.flatten())
                 return Mock()
 

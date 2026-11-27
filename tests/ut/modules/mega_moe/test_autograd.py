@@ -265,7 +265,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             result = original_empty_like(tensor, **kwargs)
             return result.fill_(float("nan")) if result.ndim == 3 else result
 
-        def forward_kernel(_plan, _metadata, source, _w1, _w2, execution, **_):
+        def forward_kernel(forward_plan, route_metadata, source, owner_weight1, owner_weight2, execution, **_):
+            del forward_plan, route_metadata, owner_weight1, owner_weight2
             execution.dispatch.copy_(source)
             execution.combine.copy_(source)
 
@@ -277,7 +278,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             w1[empty] = 0
             w2[empty] = 0
 
-        def backward_kernel(_plan, saved, _grad_output, execution, **_):
+        def backward_kernel(backward_plan, saved, grad_output, execution, **_):
+            del backward_plan, grad_output
             active = expert_rows(saved.group_list) > 0
             execution.intermediates.grad_weight1[active] = 1
             execution.intermediates.grad_weight2[active] = 1
@@ -286,8 +288,8 @@ class TestMegaMoeFunction(unittest.TestCase):
             with self.subTest(forward_active=forward_active, replay_active=replay_active):
                 visits = iter((forward_active, replay_active, replay_active))
 
-                def operation(source, first, second):
-                    active = next(visits)
+                def operation(source, first, second, *, activity=visits):
+                    active = next(activity)
                     groups = torch.tensor([1, 2] if active else [2, 2], dtype=torch.int64)
                     rows = expert_rows(groups)
                     offsets = groups - rows
