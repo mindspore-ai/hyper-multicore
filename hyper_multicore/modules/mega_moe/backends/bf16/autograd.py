@@ -831,6 +831,8 @@ class _CheckpointedMegaMoeFunction(torch.autograd.Function):  # pylint: disable=
         ctx.source_rows = mapping.numel()
         ctx.token_rows = flat.shape[0]
         ctx.has_permutation = ctx.has_unpermute = True
+        # The shared backward receives actual rows from the retained activation.
+        ctx.defer_forward_copies = False
         ctx.topk_dtype = probs.dtype
         ctx.activation_reservation = reservation
         ctx.weight_binding = weight_binding
