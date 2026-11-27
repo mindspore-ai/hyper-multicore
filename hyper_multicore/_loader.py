@@ -95,36 +95,31 @@ def load_torch_npu() -> ModuleType:
 
 
 def require_multicore_environment() -> Path:
-    """Require the packaged custom OPP environment prepared by ``set_env.bash``."""
+    """Require the selected payload's vendor to be visible to CANN and TorchNpu."""
     component_root = _component_root()
     vendor_root = component_root / "vendors" / _VENDOR_NAME
-    if not vendor_root.is_dir():
+    if not (vendor_root / "op_api/lib/libcust_opapi.so").is_file():
         raise NativeComponentUnavailableError(
             f"[HP-NATIVE-PAYLOAD-MISSING] component=multicore vendor={vendor_root}. "
             "Inspect the current build log; for source/PYTHONPATH development, run "
             "./build.sh."
         )
     vendor_root = vendor_root.resolve()
-    op_api_root = (vendor_root / "op_api" / "lib").resolve()
-    missing_variables = []
     if not _environment_contains_path("ASCEND_CUSTOM_OPP_PATH", vendor_root):
-        missing_variables.append("ASCEND_CUSTOM_OPP_PATH")
-    if not _environment_contains_path("LD_LIBRARY_PATH", op_api_root):
-        missing_variables.append("LD_LIBRARY_PATH")
-    if missing_variables:
         set_env_script = component_root / "set_env.bash"
-        missing_text = ",".join(missing_variables)
+        guidance = (
+            "Start a fresh Python process with the wheel installed in site-packages. "
+            "For source/PYTHONPATH payloads or with automatic OPP registration disabled, "
+            f"run source {set_env_script} before starting Python."
+        )
+        detail = f"component=multicore missing=ASCEND_CUSTOM_OPP_PATH vendor={vendor_root}. "
         if any(module in sys.modules for module in ("torch", "torch_npu")):
             raise NativeComponentUnavailableError(
-                "[HP-NATIVE-OPP-ACTIVATION-TOO-LATE] component=multicore "
-                f"missing={missing_text}. Torch/torch_npu has already been imported; "
-                f"exit the current Python process, run source {set_env_script}, and start a new process."
+                f"[HP-NATIVE-OPP-ACTIVATION-TOO-LATE] {detail}"
+                f"Torch/torch_npu has already been imported. {guidance}"
             )
-        raise NativeComponentUnavailableError(
-            "[HP-NATIVE-OPP-NOT-ACTIVATED] component=multicore "
-            f"missing={missing_text}. Run source {set_env_script} before starting Python with multicore."
-        )
-    return vendor_root.resolve()
+        raise NativeComponentUnavailableError(f"[HP-NATIVE-OPP-NOT-ACTIVATED] {detail}{guidance}")
+    return vendor_root
 
 
 def get_multicore_paths() -> tuple[Path, Path]:

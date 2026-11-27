@@ -34,6 +34,7 @@ from .build_utils import version_label
 from .soc_selection import DEFAULT_SOC_LIST, SOC_ARCHITECTURES, SUPPORTED_SOCS
 
 COMPONENT_VERSION = "0.1.0.dev0"
+WHEEL_STARTUP_FILES = ("_hyper_multicore_opp.py", "hyper_multicore_opp.pth", "hyper_multicore_opp.start")
 _MANIFEST = load_module("native_manifest")
 REQUIRED_LIBRARIES = (
     "lib/vendors/hyper_multicore_nn/op_api/lib/libcust_opapi.so",
@@ -98,7 +99,7 @@ def _source_identity(root: Path) -> dict:
                 path.name == "hyper_multicore_build_info"
                 or path.suffix
                 in {".py", ".asc", ".cpp", ".cc", ".h", ".hpp", ".sh", ".bash",
-                    ".patch", ".json", ".ini", ".cmake", ".txt"}
+                    ".patch", ".json", ".ini", ".cmake", ".txt", ".pth", ".start"}
             ):
                 if any(part in {"lib", "__pycache__"} for part in path.relative_to(root).parts):
                     continue

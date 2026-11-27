@@ -28,8 +28,8 @@ Or via the Python wrappers in this module:
     from hyper_multicore.torch.ops import mega_moe, mega_moe_grad
 
 Forward and backward ACLNN symbols are packaged in one component-owned
-``hyper_multicore_nn`` vendor. Source the packaged ``set_env.bash``
-before starting the application or framework Python process so CANN can discover that vendor.
+``hyper_multicore_nn`` vendor. An installed wheel registers its vendor path
+at Python startup so CANN and TorchNpu can discover it.
 """
 from __future__ import annotations
 

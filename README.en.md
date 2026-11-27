@@ -36,10 +36,10 @@ Run the following commands in Bash, replacing the placeholder paths. `--no-deps`
 ```bash
 source /path/to/cann/set_env.sh
 python -m pip install --no-deps "/path/to/hyper_multicore-<version>-<python>-<abi>-<platform>.whl"
-source "$(command -v hyper_multicore_set_env.bash)"
 ```
 
-Complete activation before starting a Python process that imports Torch/torch-npu. For compatibility,
+Use your existing `python` or `torchrun` command after installation. Python adds the packaged vendor to the
+operator search path at startup. For compatibility,
 import-origin and package-integrity checks, see [installation and verification](docs/build.md#安装与验证).
 
 ### Run the two-NPU MoE example

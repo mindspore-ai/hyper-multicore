@@ -443,4 +443,5 @@ SHMEM没有独立对外构建开关。根 `bash build.sh` 必须构建 Torch Mul
 私有库按设备架构保存于`hyper_multicore/shmem/lib/<arch>/`，使用专属SONAME，避免与框架通用SHMEM库冲突。
 首次使用SHMEM时查询可见逻辑设备0的架构，并按绝对路径加载对应SDK、ops和binding，不创建NPU上下文。
 进程可见设备须属于同一架构；Runtime初始化仍校验调用方当前设备。制品不携带RPATH或RUNPATH，
-`set_env.bash`激活vendor路径，SHMEM库不通过全局搜索路径选择。详见[构建与使用](build.md)。
+SHMEM 私有库通过包内绝对路径选择。安装 wheel 时由 Python 启动配置 vendor 路径，源码 payload 使用
+`set_env.bash`。详见[构建与使用](build.md)。

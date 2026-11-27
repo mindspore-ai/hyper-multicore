@@ -369,6 +369,47 @@ while not Path(sys.argv[1]).exists():
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("HP-NATIVE-PAYLOAD-MISSING", result.stderr)
 
+    def test_wheel_site_startup_only_configures_its_opp_vendor(self):
+        """Python site startup preserves existing vendors and leaves ELF loading to the adapter."""
+        site_packages = self.root / "site-packages"
+        shutil.copytree(ROOT / "hyper_multicore/_build/wheel", site_packages,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        vendor = site_packages / "hyper_multicore/lib/vendors/hyper_multicore_nn"
+        library = "op_api/lib/libcust_opapi.so"
+        write(vendor / library)
+        existing = os.pathsep.join(str(self.root / name) for name in ("first_vendor", "second_vendor"))
+        explicit_vendor = self.root / "checkout/vendors/hyper_multicore_nn"
+        write(explicit_vendor / library)
+        script = (
+            "import os, site, sys\n"
+            "before = os.environ.get('LD_LIBRARY_PATH')\n"
+            "site.addsitedir(sys.argv[1])\n"
+            "assert os.environ.get('LD_LIBRARY_PATH') == before\n"
+            "assert not {'hyper_multicore', 'torch', 'torch_npu'} & sys.modules.keys()\n"
+            "print(repr(os.environ.get('ASCEND_CUSTOM_OPP_PATH')))\n"
+        )
+        command = [sys.executable, "-S", "-c", script, str(site_packages)]
+        base_env = os.environ.copy()
+        base_env.pop("ASCEND_CUSTOM_OPP_PATH", None)
+        base_env.pop("HYPER_MULTICORE_DISABLE_AUTO_OPP", None)
+        for configured, disabled, expected in (
+            (None, False, str(vendor)),
+            (existing, False, os.pathsep.join((existing, str(vendor)))),
+            (str(vendor), False, str(vendor)),
+            (str(explicit_vendor), False, str(explicit_vendor)),
+            (None, True, None),
+            (existing, True, existing),
+        ):
+            with self.subTest(configured=configured, disabled=disabled):
+                environment = base_env.copy()
+                if configured is not None:
+                    environment["ASCEND_CUSTOM_OPP_PATH"] = configured
+                if disabled:
+                    environment["HYPER_MULTICORE_DISABLE_AUTO_OPP"] = "1"
+                result = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout.strip(), repr(expected))
+                self.assertEqual(result.stderr, "")
+
     def _sdk_fixture(self, directory):
         """Use real locked Git objects and recording tools in an isolated SDK project."""
         project, shmem, source = (directory / name for name in ("project", "shmem", "custom-json"))
