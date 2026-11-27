@@ -14,8 +14,14 @@
 # ============================================================================
 """CPU storage-lifetime tests for the MegaMoe autograd bridge."""
 
+import csv
+import json
+import struct
+import tempfile
 import unittest
+from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, PropertyMock, patch
@@ -23,10 +29,30 @@ from unittest.mock import Mock, PropertyMock, patch
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from hyper_multicore.diagnostics import MegaKernelDiagnostics
+from hyper_multicore.diagnostics import MegaKernelDiagnostics, dumper, profiler
+from hyper_multicore.diagnostics.dumper import _task as task_dump
+from hyper_multicore.diagnostics.profiler import cycle_trace
+from hyper_multicore.modules.base_planner import ExpertPlacement
+from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding
 from hyper_multicore.modules.mega_moe.backends.bf16 import autograd as function_module
 from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _MegaMoeFunction
+from hyper_multicore.modules.mega_moe.backends.bf16.plan import _build_runtime_artifacts, _prepare_diagnostics
+from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from tests.common.mark_utils import arg_mark
+
+
+def _capture_task_ports(buffer: torch.Tensor, parameters: Any) -> None:
+    """Emulate native copies using the source, length and destination in each record."""
+    raw = buffer.numpy()
+    magic, _, _, count = task_dump.TASK_DUMP_HEADER.unpack_from(raw)[:4]
+    if magic != task_dump.TASK_DUMP_MAGIC:
+        return
+    for i in range(count):
+        offset = task_dump.TASK_DUMP_RECORDS_OFFSET + i * task_dump.TASK_DUMP_RECORD.size
+        record = task_dump.TASK_DUMP_RECORD.unpack_from(raw, offset)
+        position, source, _, dest, size = record[2:7]
+        buffer[dest:dest + size].copy_(parameters[position].view(torch.uint8).flatten()[source:source + size])
+        struct.pack_into("<I", raw, offset + 7 * 4, task_dump.TASK_DUMP_STATUS_CAPTURED)
 
 
 # The private autograd bridge and saved execution buffers are the contracts under test.
@@ -34,6 +60,202 @@ class TestMegaMoeFunction(unittest.TestCase):
     """Exercise real autograd contexts with mocked communication and kernels."""
 
     # pylint: disable=protected-access
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dump_labels_activation_rows_with_global_experts(self) -> None:
+        """Follow real BF16 launch metadata into the same CSV and Tensor read by a developer."""
+        spec = MegaMoeSpec(256, 1024, 512, 8, 2, 1.25, 640, 2, None, 1, 20)
+        forward, _ = _prepare_diagnostics(spec, *_build_runtime_artifacts(spec), "cpu")
+        plan = SimpleNamespace(spec=spec, fwd_diagnostics=forward, up_proj_tiling=None,
+                               swiglu_tiling=None, down_proj_tiling=None)
+        placement = ExpertPlacement(
+            virtual_ids=torch.tensor([4, 6, 6]),
+            counts_by_source=torch.tensor([[0, 0, 0, 0, 1, 0, 2, 0], [0, 0, 0, 0, 1, 0, 1, 0]]),
+            copies=torch.tensor([[-1, -1], [0, -1]], dtype=torch.int32),
+            borrowed_capacity=2, receive_capacity=5,
+        )
+        binding = ExpertWeightBinding(SimpleNamespace(local_experts=2), placement, "EIO")
+        group_list = placement.counts_by_source[:, 4:].sum(0).cumsum(0)
+        offsets = torch.zeros(6, dtype=torch.int64)
+        route = function_module.RouteMetadata(*(offsets,) * 6, group_list=group_list, expert_capacity=6)
+        rows = torch.tensor([1., 3., 10., 20., 30., 1000.], dtype=torch.bfloat16)
+        activation = rows[:, None].repeat(1, spec.intermediate_size)
+        intermediates = function_module._ForwardIntermediates(activation, activation, activation)
+        execution = function_module._ForwardExecution(
+            activation, activation, activation, None, torch.empty(0), intermediates,
+        )
+
+        def launch(expert: int) -> None:
+            """Replay the same plan with new placement and distinguishable output rows."""
+            placement.copies[1, 0] = expert
+            binding.placement = replace(placement, host_copies=placement.copies.numpy().copy())
+            activation.copy_((rows + expert)[:, None])
+            function_module._launch_forward_kernel(
+                plan, route, activation, activation, activation, execution, weight_binding=binding,
+            )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(function_module, "record_plan_stream"):
+            root = Path(directory)
+            config = dumper.DumpConfig(root / "kernel", stages="SwiGLU", io="output", outputs=("tensor", "csv"))
+            with dumper.dump(config) as session, patch.object(function_module.multicore_ops,
+                                                             "mega_moe_with_diagnostic_buffer"):
+                launch(0)
+                launch(1)
+            manifest, = session.last_manifest_paths
+            with manifest.with_name("summary.csv").open(encoding="utf-8", newline="") as stream:
+                summaries = list(csv.DictReader(stream))
+            self.assertEqual(len(summaries), 2)
+            for expert, row in enumerate(summaries):
+                self.assertEqual(json.loads(row["expert_rows"]), [[2, 0, 2], [3, 2, 2], [expert, 2, 5]])
+                self.assertEqual(int(row["elements"]), 5 * spec.intermediate_size)
+                self.assertAlmostEqual(float(row["mean"]), 12.8 + expert)
+                port, = map(tuple, json.loads(row["ports"]))
+                payload = dumper.load_tensor(manifest, invocation_id=int(row["invocation"]), port=port)
+                expected_rows = (rows[2:5] + expert)[:, None].expand(3, spec.intermediate_size)
+                torch.testing.assert_close(payload[2:5], expected_rows)
+            self._check_placed_task(root, launch, rows[2:5, None].expand(3, spec.intermediate_size))
+            self._check_placed_trace(root, launch, forward, placement.copies)
+
+    def _check_placed_task(self, root, launch, borrowed_rows):
+        """Emulate device byte copies and verify the exact selected activation in the manifest."""
+        for selected in (0, 1):
+            config = dumper.DumpConfig(root / f"task{selected}", level="task", stages="SwiGLU", io="output",
+                                       owner_ids=selected)
+            with dumper.dump(config) as session, patch.object(
+                function_module.multicore_ops, "mega_moe_with_diagnostic_buffer",
+                side_effect=lambda *args: _capture_task_ports(args[-6], args),
+            ):
+                launch(0)
+                launch(1)
+            manifest, = session.last_manifest_paths
+            invocation, = json.loads(manifest.read_text())["invocations"]
+            tasks = invocation["tasks"]
+            self.assertEqual({task["owner"]["id"] for task in tasks}, {selected})
+            active, = (task for task in tasks if task["tensors"][0]["storedBytes"])
+            payload = dumper.load_tensor(manifest, invocation_id=invocation["invocationId"],
+                                         port=("SwiGLU", "output", 0), task_id=active["taskId"])
+            torch.testing.assert_close(payload, borrowed_rows + selected)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_gmm_weight_summary_uses_assigned_slots(self) -> None:
+        """An empty borrowed slot retains stale bytes; an assigned zero-token expert still has a weight."""
+        owners = (0, 1, None, None, 2, 3, None, 0)
+        for batched in (False, True):
+            with self.subTest(batched=batched), tempfile.TemporaryDirectory() as directory:
+                spec = MegaMoeSpec(256, 1024, 512, 8, 2, 1.25, 640, 2, None, 1, 20, batch_experts=batched)
+                forward, _ = _prepare_diagnostics(spec, *_build_runtime_artifacts(spec), "cpu")
+                runtime = forward._runtime
+                weight = runtime.graph.get_op("up_proj").inputs[1]
+                bank = torch.empty(weight.shape, dtype=torch.bfloat16)
+                for slot, value in enumerate((1, 2, 99, 4)):
+                    bank[slot].fill_(value)
+                operands = [None] * runtime.parameter_count
+                operands[weight.param_position] = bank
+                group_position = runtime.diagnostic_runtime_config.dynamic_data.dynamic_input_position
+                operands[group_position] = torch.tensor([2, 2, 2, 5])
+                tasks = {}
+                for task, stage in forward.metadata.task_stage_names.items():
+                    if stage == "GMM1":
+                        tasks.setdefault(forward.metadata.task_owner_ids.get(task), task)
+                stride = bank[0].numel()
+                config = dumper.DumpConfig(directory, level="task", task_ids=tuple(tasks.values()), io="input",
+                                           tensor_names=weight.name, outputs=("tensor", "csv"),
+                                           max_bytes_per_tensor=(3 * stride + 1) * bank.element_size())
+                with dumper.dump(config) as session, forward.launch(
+                    operands, direction="forward", event_counters=torch.zeros(16), resolve_owner_ids=lambda: owners,
+                ) as call:
+                    _capture_task_ports(call.diagnostic_buffer, operands)
+                manifest, = session.last_manifest_paths
+                with manifest.with_name("summary.csv").open(encoding="utf-8", newline="") as stream:
+                    rows = list(csv.DictReader(stream))
+                if not batched:
+                    self.assertEqual({(int(r["owner"]), float(r["mean"])) for r in rows}, {(2, 1), (3, 2), (0, 4)})
+                    continue
+                row, = rows
+                ranges = [[0, 2 * stride], [3 * stride, 3 * stride + 1]]
+                self.assertEqual(json.loads(row["valid_ranges"]), ranges)
+                self.assertEqual((row["range"], int(row["elements"]), float(row["max"])),
+                                 ("valid_elements", 2 * stride + 1, 4))
+                self.assertAlmostEqual(float(row["mean"]), (3 * stride + 4) / (2 * stride + 1))
+                task, = json.loads(manifest.read_text())["invocations"][0]["tasks"]
+                self.assertEqual(task["tensors"][0]["validRanges"], ranges)
+                payload = dumper.load_tensor(manifest, invocation_id=0, tensor_name=weight.name)
+                self.assertEqual(payload[2 * stride].item(), 99)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_batched_gmm_activation_requires_ready_rows(self) -> None:
+        """Capture a complete activation only when every selected row is ready at task entry."""
+        for experts, stage, name in ((8, "GMM2", "swiglu_out"), (2, "GMM2", "swiglu_out"),
+                                    (8, "W1Grad", "swiglu_out"), (8, "W2Grad", "w2_grad_x1")):
+            with self.subTest(experts=experts, stage=stage), tempfile.TemporaryDirectory() as directory:
+                spec = MegaMoeSpec(256, 1024, 512, experts, 2, 1.25, 640, 2, None, 1, 20, batch_experts=True)
+                forward, backward = _prepare_diagnostics(spec, *_build_runtime_artifacts(spec), "cpu")
+                direction = "forward" if stage == "GMM2" else "backward"
+                handle = forward if direction == "forward" else backward
+                runtime = handle._runtime
+                task = next(i for i, label in handle.metadata.task_stage_names.items() if label == stage)
+                op = next(op for op in runtime.graph.topological_sort() if op.diagnostic_stage_name == stage)
+                activation = next(t for t in op.inputs if t.name == name)
+                rows = torch.arange(2 * activation.shape[1]).reshape(2, -1).to(torch.bfloat16)
+                operands = [None] * runtime.parameter_count
+                operands[activation.param_position] = rows
+                pos = runtime.diagnostic_runtime_config.dynamic_data.dynamic_input_position
+                operands[pos] = torch.full((spec.local_experts,), 2)
+                config = dumper.DumpConfig(directory, level="task", task_ids=task, io="input", tensor_names=name,
+                                           directions=direction)
+                if stage == "GMM2" and spec.local_experts > 1:
+                    with self.assertLogs("hyper_multicore.diagnostics.dumper.api", "WARNING") as logs:
+                        with dumper.dump(config) as session, handle.launch(
+                            operands, direction=direction, event_counters=torch.zeros(16),
+                        ) as call:
+                            self.assertIs(call.runtime_config_tensor, handle.runtime_config_tensor)
+                    self.assertIn("unsupported_port", logs.output[0])
+                    self.assertIn("SwiGLU.output[0]", logs.output[0])
+                    self.assertFalse(session.last_manifest_paths)
+                    continue
+                with dumper.dump(config) as session, handle.launch(
+                    operands, direction=direction, event_counters=torch.zeros(16),
+                ) as call:
+                    _capture_task_ports(call.diagnostic_buffer, operands)
+                manifest, = session.last_manifest_paths
+                payload = dumper.load_tensor(manifest, invocation_id=0, task_id=task, tensor_name=name)
+                torch.testing.assert_close(payload, rows)
+
+    def _check_placed_trace(self, root, launch, forward, copies):
+        """Decode the same virtual owner twice after the second launch changed the placement."""
+        def copy_to_host(tensor: torch.Tensor) -> torch.Tensor:
+            """Emulate independent D2H storage and reject another placement readback."""
+            self.assertNotEqual(tensor.data_ptr(), copies.data_ptr(), "profiler reread the placement")
+            return tensor.clone()
+
+        metadata = forward.metadata
+        task_id = next(i for i, owner in metadata.task_owner_ids.items()
+                       if owner == 6 and metadata.task_stage_names[i] == "SwiGLU")
+        task_index = forward._runtime.diagnostic_runtime_config.all_tasks[task_id].task_index
+        record = {
+            "desc_id": cycle_trace.GRAPH_STAGE_DESC_BASE + metadata.task_stage_ids[task_id],
+            "task_id": task_id, "owner_id": 6, "stage_task_index": task_index, "core_type": 2,
+            "block_id": 1, "entry_cycle": 1, "start_cycle": 2, "end_cycle": 3,
+        }
+        with (
+            patch.object(function_module.multicore_ops, "mega_moe_with_diagnostic_buffer"),
+            patch.object(torch, "npu", create=True),
+            patch.object(torch.Tensor, "cpu", copy_to_host),
+            patch.object(cycle_trace, "_get_soc_name", return_value="ascend910b"),
+            patch.object(cycle_trace, "_decode_cycle_records", side_effect=lambda *_: ([record.copy()], [1], 0)),
+            profiler.profile(detailed_task_names=True) as session,
+        ):
+            launch(0)
+            launch(1)
+        trace = session.export_chrome_trace(root / "trace.json")
+        events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+        self.assertEqual([(e["args"]["invocation_id"], e["args"]["owner_id"]) for e in events], [(0, 0), (1, 1)])
+        for expert, event in enumerate(events):
+            self.assertEqual(event["args"]["task_stage"], "SwiGLU")
+            self.assertEqual(event["name"], f"Expert{expert}_SwiGLU_task{task_index + 1}")
 
     def test_plan_stream_identity_preserves_registration(self) -> None:
         """Register plan storage without requesting a queue-draining stream handle."""
@@ -43,9 +265,9 @@ class TestMegaMoeFunction(unittest.TestCase):
             tensor.device = device
         plan = function_module.MegaMoePlan(
             spec=None, forward_graph=None,
-            fwd_diagnostics=SimpleNamespace(runtime_config=forward),
+            fwd_diagnostics=SimpleNamespace(runtime_config_tensor=forward),
             up_proj_tiling=tiling, swiglu_tiling=None, down_proj_tiling=None,
-            backward_graph=None, bwd_diagnostics=SimpleNamespace(runtime_config=backward),
+            backward_graph=None, bwd_diagnostics=SimpleNamespace(runtime_config_tensor=backward),
             act_grad_tiling=None, gate_grad_tiling=None, w1_grad_tiling=None,
             w2_grad_tiling=None, swiglu_grad_tiling=None,
         )
@@ -267,10 +489,10 @@ class TestMegaMoeFunction(unittest.TestCase):
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
-        runtime = SimpleNamespace(normal_tensor=None, kernel_name="mega_moe", rank=0)
+        runtime = SimpleNamespace(runtime_config_tensor=None, kernel_name="mega_moe", rank=0)
         plan.fwd_diagnostics = MegaKernelDiagnostics(runtime)
         plan.bwd_diagnostics = MegaKernelDiagnostics(runtime)
-        plan.fwd_runtime_config = plan.bwd_runtime_config = None
+        plan.fwd_runtime_config_tensor = plan.bwd_runtime_config_tensor = None
         workspace = Mock(
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),

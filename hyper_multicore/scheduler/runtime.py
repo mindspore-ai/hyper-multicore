@@ -30,7 +30,7 @@ from hyper_multicore.scheduler.config import (
     TaskDescC,
 )
 
-from hyper_multicore.scheduler.worker_queues import serialize_worker_queues
+from hyper_multicore.scheduler.worker_queues import EXPLICIT_QUEUE_LAYOUT, serialize_worker_queues
 
 RUNTIME_HEADER_BYTES = ctypes.sizeof(RuntimeConfigC)
 TASK_DESC_SIZE = ctypes.sizeof(TaskDescC)
@@ -219,7 +219,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
         cfg.completion_event,
         cfg.protocol_version,
         cfg.queue_layout,
-        expected if cfg.queue_layout == 2 else 0,
+        expected if cfg.queue_layout == EXPLICIT_QUEUE_LAYOUT else 0,
     )
     sections = [
         (layout.all_event_num_triggers.offset, event_capacity * 4),
@@ -236,7 +236,7 @@ def serialize_runtime_config(cfg: RuntimeConfigC) -> bytes:
     data = prefix + b"".join(ctypes.string_at(address + offset, size) for offset, size in sections)
     if len(data) != expected:
         raise RuntimeError(f"runtime serialization produced {len(data)} bytes, expected {expected}")
-    if cfg.queue_layout == 2:
+    if cfg.queue_layout == EXPLICIT_QUEUE_LAYOUT:
         data += serialize_worker_queues(cfg)
     elif cfg.queue_layout != 0:
         raise ValueError(f"Unknown worker queue layout: {cfg.queue_layout}")

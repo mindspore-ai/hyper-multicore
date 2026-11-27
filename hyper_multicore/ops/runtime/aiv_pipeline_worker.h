@@ -10,7 +10,7 @@
 #include "cycle_trace_recorder.h"
 #include "kernel_operator.h"
 #include "runtime_config.hpp"
-#include "l1_tensor_dump.h"
+#include "task_tensor_dump.h"
 
 namespace MulticoreRuntime {
 
@@ -35,12 +35,12 @@ class AivPipelineWorkerBase {
   }
 
   __aicore__ inline void Process() {
-    if (getDiagnosticMode(runtime_config_) == DiagnosticMode::NORMAL) {
+    if (getDiagnosticMode(runtime_config_) == DeviceDiagnosticMode::DISABLED) {
       ProcessFast();
       return;
     }
-    if (getDiagnosticMode(runtime_config_) == DiagnosticMode::TENSOR_DUMP_L1) {
-      ProcessL1Dump();
+    if (getDiagnosticMode(runtime_config_) == DeviceDiagnosticMode::TASK_TENSOR_DUMP) {
+      ProcessTaskTensorDump();
       return;
     }
     if (isCycleProfileEnabled(runtime_config_)) {
@@ -51,15 +51,15 @@ class AivPipelineWorkerBase {
   }
 
  protected:
-  __aicore__ inline void ProcessL1Dump() {
+  __aicore__ inline void ProcessTaskTensorDump() {
     GM_ADDR parameters[Derived::DIAGNOSTIC_PARAMETER_COUNT] = {};
     static_cast<Derived *>(this)->PopulateDiagnosticInputList(parameters);
     for (uint32_t stage = 0; stage < stage_count_; ++stage) {
       const uint32_t task_id = LoadTaskId(stage);
-      CaptureL1TaskTensors(diagnostic_buffer_, parameters, task_id, L1_DUMP_PHASE_BEFORE, worker_id_);
+      CaptureTaskTensors(diagnostic_buffer_, parameters, task_id, TASK_DUMP_PHASE_BEFORE, worker_id_);
       ExecuteTask(task_id);
       AscendC::PipeBarrier<PIPE_ALL>();
-      CaptureL1TaskTensors(diagnostic_buffer_, parameters, task_id, L1_DUMP_PHASE_AFTER, worker_id_);
+      CaptureTaskTensors(diagnostic_buffer_, parameters, task_id, TASK_DUMP_PHASE_AFTER, worker_id_);
     }
   }
 

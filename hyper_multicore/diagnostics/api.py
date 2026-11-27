@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 
-from hyper_multicore.diagnostics.common.call import DiagnosticCall, LaunchContext
+from hyper_multicore.diagnostics.common.call import DiagnosticCall, KernelDumpRowGroups, LaunchContext, OwnerIdResolver
 from hyper_multicore.diagnostics.common.graph import DiagnosticSpec, GraphDiagnosticMetadata
 from hyper_multicore.diagnostics.common.runtime import PreparedDiagnosticRuntime
 from hyper_multicore.diagnostics.common.session import _get_active_session
@@ -37,15 +37,19 @@ class MegaKernelDiagnostics:
         self._runtime = runtime
 
     @property
-    def runtime_config(self) -> torch.Tensor:
-        """Return the original normal execution configuration."""
-        return self._runtime.normal_tensor
+    def runtime_config_tensor(self) -> torch.Tensor:
+        """Return the standard execution configuration Tensor."""
+        return self._runtime.runtime_config_tensor
 
     @property
-    def is_active(self) -> bool:
-        """Return whether an explicit diagnostic session is active."""
+    def requires_diagnostic_launch(self) -> bool:
+        """Return whether this step needs diagnostic launch preparation.
+
+        The session applies invocation filters later in prepare_call(). Kernel
+        dump needs this path too, despite using no Device diagnostic mode.
+        """
         session = _get_active_session()
-        return session is not None and session.is_capture_enabled()
+        return session is not None and session.should_prepare_call()
 
     @property
     def metadata(self) -> GraphDiagnosticMetadata:
@@ -54,22 +58,28 @@ class MegaKernelDiagnostics:
 
     def launch(
         self, parameters: Sequence[torch.Tensor | None], *, direction: str,
-        fallback_event_counters: torch.Tensor | None = None,
+        event_counters: torch.Tensor | None = None,
         tags: dict[str, str] | None = None,
+        dump_row_groups: KernelDumpRowGroups | None = None,
+        resolve_owner_ids: OwnerIdResolver | None = None,
     ) -> DiagnosticCall:
         """Select exactly one tool, or return an ordinary no-op context.
 
-        Kernel adapters should bypass this method when is_active is false so
+        Kernel adapters should bypass this method when requires_diagnostic_launch is false so
         ordinary execution need not create even a Host-side diagnostic call.
 
         Args:
             parameters: Complete native ABI bindings for this invocation.
             direction: Forward or backward invocation direction.
-            fallback_event_counters: Existing execution-owned event counters, if any.
+            event_counters: Existing execution-owned event counters, if any.
+            tags: Optional identifiers for this invocation.
+            dump_row_groups: Optional business-owned row ranges for Kernel summaries.
+            resolve_owner_ids: Optional per-call mapping from schedule owners to exported owners.
         """
-        context = LaunchContext(self._runtime, parameters, direction, fallback_event_counters, tags)
+        context = LaunchContext(self._runtime, parameters, direction, event_counters, tags,
+                                dump_row_groups=dump_row_groups, resolve_owner_ids=resolve_owner_ids)
         session = _get_active_session()
-        if session is None or not session.is_capture_enabled():
+        if session is None or not session.should_prepare_call():
             return DiagnosticCall(context.ordinary_arguments())
         if len(parameters) != self._runtime.parameter_count:
             raise ValueError(f"launch expects {self._runtime.parameter_count} ABI parameters, got {len(parameters)}")
@@ -91,12 +101,12 @@ def prepare_mega_kernel_diagnostics(
     Args:
         graph: Completed scheduling graph; may be None if graph_adapter builds
             the graph of a native broadcast pipeline on first capture.
-        runtime_config: Filled graph-sized Host configuration.
+        runtime_config: Filled graph-sized structured configuration.
         kernel_name: Stable name shared by both tools.
         parameter_count: Number of launch binding entries. Device task positions
             must match input_list exactly; zero-task Host boundary nodes may
             describe results produced outside the MegaKernel.
-        device: Device receiving the ordinary runtime configuration.
+        device: Device receiving the standard configuration Tensor.
         rank: Distributed rank recorded by diagnostics.
         owner_label: Business display label, such as Expert, Head or Block.
         owner_resolver: Optional task-owner callback, never called on the normal path.

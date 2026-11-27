@@ -56,7 +56,7 @@ def _resolve_expert_owner(
     task_desc: TaskDescC,
     raw_context: Any,
 ) -> int | None:
-    """Resolve the global expert ID from a graph operator and its concrete task."""
+    """Resolve the owner in the scheduled topology, including HotReplica virtual slots."""
     context = _require_diagnostic_context(raw_context)
     topology = context.topology
     rank_owner_base = topology.rank_id * topology.single_rank_expert_num

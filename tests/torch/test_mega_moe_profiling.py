@@ -70,7 +70,7 @@ def test_mega_moe_standalone_profiler(monkeypatch, tmp_path: Path) -> None:
         trace = json.loads(trace_path.read_text(encoding="utf-8"))
         metadata = trace["megaKernelCycleTrace"]
         assert metadata["invocationCount"] == 1
-        cube_slots = metadata["invocations"][0]["workerCapacities"]["cubeSlots"]
-        expected_records = cube_slots * _LOCAL_EXPERTS * 2 * 3 + _EXPECTED_AIV_RECORD_COUNT
+        active_cube_workers = metadata["invocations"][0]["workerCapacities"]["activeCubeWorkers"]
+        expected_records = active_cube_workers * _LOCAL_EXPERTS * 2 * 3 + _EXPECTED_AIV_RECORD_COUNT
         assert metadata["recordCount"] == expected_records
         assert metadata["droppedRecordCount"] == 0

@@ -16,19 +16,32 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+
+# Indexed by the schedule's owner ID. Empty execution slots have no business owner.
+OwnerIds = tuple[int | None, ...]
+OwnerIdResolver = Callable[[], OwnerIds]
 
 
 @dataclass
 class LaunchArguments:
     """Complete native arguments selected by exactly one diagnostic tool."""
 
-    runtime_config: Any
+    runtime_config_tensor: Any
     event_counters: Any
     diagnostic_buffer: Any
     clear_event_counters: Any
+
+
+@dataclass(frozen=True)
+class KernelDumpRowGroups:
+    """ABI parameters sharing (owner ID, start row, end row) ranges covering consecutive rows starting at zero."""
+
+    parameter_positions: tuple[int, ...]
+    resolve_rows: Callable[[], list[tuple[int, int, int]]]
 
 
 @dataclass(frozen=True)
@@ -38,15 +51,17 @@ class LaunchContext:
     runtime: Any
     parameters: Sequence[Any]
     direction: str
-    fallback_event_counters: Any
+    event_counters: Any
     tags: dict[str, str] | None = None
+    dump_row_groups: KernelDumpRowGroups | None = None
+    resolve_owner_ids: OwnerIdResolver | None = None
 
     def ordinary_arguments(self) -> LaunchArguments:
         """Reuse the original runtime and counters without allocating device storage."""
         return LaunchArguments(
-            self.runtime.normal_tensor, self.fallback_event_counters,
-            self.runtime.normal_tensor if self.fallback_event_counters is None else self.fallback_event_counters,
-            self.fallback_event_counters,
+            self.runtime.runtime_config_tensor, self.event_counters,
+            self.runtime.runtime_config_tensor if self.event_counters is None else self.event_counters,
+            self.event_counters,
         )
 
 
@@ -59,9 +74,9 @@ class DiagnosticCall:
         self.finished = False
 
     @property
-    def runtime_config(self) -> Any:
-        """Return this call's complete runtime configuration."""
-        return self.arguments.runtime_config
+    def runtime_config_tensor(self) -> Any:
+        """Return the configuration Tensor selected for this call."""
+        return self.arguments.runtime_config_tensor
 
     @property
     def event_counters(self) -> Any:

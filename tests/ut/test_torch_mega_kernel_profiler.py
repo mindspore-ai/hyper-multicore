@@ -36,14 +36,14 @@ from hyper_multicore.torch import ops as multicore_adapter
 from tests.common.mark_utils import arg_mark
 
 
-def _prepare_profile_call(runtime, *, direction, fallback_event_counters):
+def _prepare_profile_call(runtime, *, direction, event_counters):
     """Test private profiler lifecycle with a synthetic prepared trace runtime."""
     session = _get_active_session("profiler")
     if session is None:
         return DiagnosticCall(LaunchArguments(
-            runtime.normal_tensor, fallback_event_counters, fallback_event_counters, fallback_event_counters,
+            runtime.runtime_config_tensor, event_counters, event_counters, event_counters,
         ))
-    return session.acquire_call(runtime, fallback_event_counters, direction)
+    return session.acquire_call(runtime, event_counters, direction)
 
 
 class _FakeStorage:
@@ -119,8 +119,8 @@ class _FakeRuntime:
     """Prepared-runtime stand-in that returns deterministic parsed traces."""
 
     rank = 2
-    normal_tensor = "disabled-config"
-    profile_tensor = "enabled-config"
+    runtime_config_tensor = "disabled-config"
+    profile_runtime_config_tensor = "enabled-config"
     device = "runtime-device"
     device_id = 0
     kernel_name = "FakeMegaKernel"
@@ -130,8 +130,11 @@ class _FakeRuntime:
         """Initialize isolated fake lifecycle state."""
         self.parse_calls = []
 
-    def parse(self, data: bytes, *, detailed_task_names: bool) -> dict[str, Any]:
+    def parse(
+        self, data: bytes, *, detailed_task_names: bool, owner_ids: tuple[int | None, ...] | None = None
+    ) -> dict[str, Any]:
         """Return a deterministic trace for one fake invocation payload."""
+        assert owner_ids is None
         self.parse_calls.append((data, detailed_task_names))
         anchor = int(data.decode("ascii"))
         return {
@@ -257,10 +260,10 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             call = _prepare_profile_call(
                 runtime,
                 direction="forward",
-                fallback_event_counters=event_counters,
+                event_counters=event_counters,
             )
 
-        self.assertEqual(call.runtime_config, runtime.normal_tensor)
+        self.assertEqual(call.runtime_config_tensor, runtime.runtime_config_tensor)
         self.assertEqual(call.event_counters, event_counters)
         self.assertIs(call.diagnostic_buffer, event_counters)
         self.assertEqual(call.clear_event_counters, event_counters)
@@ -277,9 +280,9 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         runtime = _FakeRuntime()
 
         with patch.object(torch_profiler.torch, "empty") as mock_empty:
-            call = _prepare_profile_call(runtime, direction="forward", fallback_event_counters=None)
+            call = _prepare_profile_call(runtime, direction="forward", event_counters=None)
 
-        self.assertEqual(call.runtime_config, runtime.normal_tensor)
+        self.assertEqual(call.runtime_config_tensor, runtime.runtime_config_tensor)
         self.assertIsNone(call.event_counters)
         mock_empty.assert_not_called()
 
@@ -292,7 +295,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         """
         runtime = _FakeRuntime()
         profile_buffer = _FakeProfileBuffer(b"1000")
-        profiler = torch_profiler.TorchMegaKernelProfiler(
+        profiler = torch_profiler.ProfilerSession(
             schedule=None,
             on_trace_ready=None,
             detailed_task_names=False,
@@ -301,8 +304,8 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
 
         with patch.object(torch_profiler.torch, "empty", return_value=profile_buffer) as mock_empty:
             with profiler:
-                call = _prepare_profile_call(runtime, direction="forward", fallback_event_counters=None)
-                self.assertEqual(call.runtime_config, runtime.profile_tensor)
+                call = _prepare_profile_call(runtime, direction="forward", event_counters=None)
+                self.assertEqual(call.runtime_config_tensor, runtime.profile_runtime_config_tensor)
                 self.assertIsNone(call.event_counters)
                 self.assertIsNone(call.clear_event_counters)
                 self.assertIs(call.diagnostic_buffer, profile_buffer)
@@ -330,7 +333,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             active=1,
             repeat=1,
         )
-        profiler = torch_profiler.TorchMegaKernelProfiler(
+        profiler = torch_profiler.ProfilerSession(
             schedule=capture_schedule,
             on_trace_ready=ready.append,
             detailed_task_names=True,
@@ -345,9 +348,9 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
                 call = _prepare_profile_call(
                     runtime,
                     direction="forward",
-                    fallback_event_counters=event_counters,
+                    event_counters=event_counters,
                 )
-                self.assertEqual(call.runtime_config, runtime.profile_tensor)
+                self.assertEqual(call.runtime_config_tensor, runtime.profile_runtime_config_tensor)
                 self.assertEqual(
                     call.clear_event_counters,
                     event_counters,
@@ -415,7 +418,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         """
         runtime = _FakeRuntime()
         profile_buffer = _FakeProfileBuffer(b"1000")
-        profiler = torch_profiler.mega_kernel_profile(max_pending_calls=1)
+        profiler = torch_profiler.profile(max_pending_calls=1)
         parse_error = ValueError("invalid profile header")
 
         with (
@@ -460,7 +463,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         runtime = _FakeRuntime()
         profile_buffer = _FakeProfileBuffer(b"1000")
         ready = []
-        profiler = torch_profiler.mega_kernel_profile(
+        profiler = torch_profiler.profile(
             schedule=schedule(wait=0, warmup=0, active=1, repeat=1),
             on_trace_ready=ready.append,
         )
@@ -498,7 +501,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         """
         runtime = _FakeRuntime()
         profile_buffer = _FakeProfileBuffer(b"1000")
-        profiler = torch_profiler.mega_kernel_profile(max_pending_calls=1)
+        profiler = torch_profiler.profile(max_pending_calls=1)
 
         with (
             patch.object(torch_profiler.torch, "npu", _FakeNpu(), create=True),
@@ -543,7 +546,7 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             _FakeProfileBuffer(b"1000"),
             _FakeProfileBuffer(b"1100"),
         ]
-        profiler = torch_profiler.TorchMegaKernelProfiler(
+        profiler = torch_profiler.ProfilerSession(
             schedule=None,
             on_trace_ready=None,
             detailed_task_names=False,
@@ -560,10 +563,10 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
         ):
             with profiler:
                 first = _prepare_profile_call(
-                    runtime, direction="forward", fallback_event_counters=event_counters
+                    runtime, direction="forward", event_counters=event_counters
                 )
                 second = _prepare_profile_call(
-                    runtime, direction="forward", fallback_event_counters=event_counters
+                    runtime, direction="forward", event_counters=event_counters
                 )
                 self.assertIsNot(first.diagnostic_buffer, second.diagnostic_buffer)
                 first.complete()
@@ -574,13 +577,13 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
 
     def test_nested_contexts_are_rejected(self):
         """Reject nested profiler contexts in the same process."""
-        first = torch_profiler.TorchMegaKernelProfiler(
+        first = torch_profiler.ProfilerSession(
             schedule=None,
             on_trace_ready=None,
             detailed_task_names=False,
             max_pending_calls=1,
         )
-        second = torch_profiler.TorchMegaKernelProfiler(
+        second = torch_profiler.ProfilerSession(
             schedule=None,
             on_trace_ready=None,
             detailed_task_names=False,

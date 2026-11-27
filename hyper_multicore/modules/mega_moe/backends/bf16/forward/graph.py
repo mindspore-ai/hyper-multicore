@@ -107,7 +107,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
      combine_out, target_offset_c, src_offset_c, size_c) = specs
     dispatch = OperatorNode(
         name="dispatch", op_type=OpType.ALLTOALL,
-        diagnostic_name="Dispatch",
+        diagnostic_stage_name="Dispatch",
         inputs=[target_offset, src, src_offset, size_d],
         outputs=[target],
         param_positions=[1, 2, 3, 4, 0],
@@ -123,7 +123,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     )
     up_proj = OperatorNode(
         name="up_proj", op_type=OpType.GMM,
-        diagnostic_name="GMM1",
+        diagnostic_stage_name="GMM1",
         inputs=[target, up_proj_weight, up_proj_glist], outputs=[up_proj_y],
         param_positions=[0, 5, 6, 7], split_value=up_proj_sv,
         split_spec=SplitSpec(
@@ -142,7 +142,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     )
     down_proj = OperatorNode(
         name="down_proj", op_type=OpType.GMM,
-        diagnostic_name="GMM2",
+        diagnostic_stage_name="GMM2",
         inputs=[swiglu_out, down_proj_weight, down_proj_glist], outputs=[down_proj_y],
         param_positions=[8, 9, 10, 11], split_value=down_proj_sv,
         split_spec=SplitSpec(
@@ -155,7 +155,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
     )
     combine = OperatorNode(
         name="combine", op_type=OpType.ALLTOALL,
-        diagnostic_name="Combine",
+        diagnostic_stage_name="Combine",
         inputs=[target_offset_c, down_proj_y, src_offset_c, size_c], outputs=[combine_out],
         param_positions=[13, 11, 14, 15, 12], split_value=combine_sv,
         split_spec=SplitSpec(

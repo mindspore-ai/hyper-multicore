@@ -408,7 +408,7 @@ def _make_post_and_norm_cast(
         split_spec=SplitSpec(None, task_num_fn, [0]),
         tiling_position=18,
         fill_config=_PostFillConfig(),
-        diagnostic_name="MhcPost",
+        diagnostic_stage_name="MhcPost",
     )
     norm_cast = OperatorNode(
         name="mhc_norm_cast",
@@ -420,7 +420,7 @@ def _make_post_and_norm_cast(
         split_spec=SplitSpec(None, task_num_fn, [0]),
         tiling_position=18,
         fill_config=_NormCastFillConfig(ring_slots),
-        diagnostic_name="MhcNormCast",
+        diagnostic_stage_name="MhcNormCast",
     )
     return post, norm_cast
 
@@ -486,7 +486,7 @@ def build_mega_mhc_graph(
         split_spec=SplitSpec(None, task_num_fn, [0]),
         tiling_position=18,
         fill_config=_ProjectionFillConfig(),
-        diagnostic_name="MhcProjection",
+        diagnostic_stage_name="MhcProjection",
     )
     input_mix = OperatorNode(
         name="mhc_input_mix",
@@ -498,7 +498,7 @@ def build_mega_mhc_graph(
         split_spec=SplitSpec(None, task_num_fn, [0]),
         tiling_position=18,
         fill_config=_InputMixFillConfig(),
-        diagnostic_name="MhcInputMix",
+        diagnostic_stage_name="MhcInputMix",
     )
     rms_norm = OperatorNode(
         name="mhc_rms_norm",
@@ -510,7 +510,7 @@ def build_mega_mhc_graph(
         split_spec=SplitSpec(None, task_num_fn, [0]),
         tiling_position=18,
         fill_config=_RmsNormFillConfig(2 * num_cube_cores),
-        diagnostic_name="ShiftedRmsNorm",
+        diagnostic_stage_name="ShiftedRmsNorm",
     )
     mapping = OperatorNode(
         name="mhc_mapping",
@@ -522,7 +522,7 @@ def build_mega_mhc_graph(
         split_spec=SplitSpec(None, task_num_fn, [0]),
         tiling_position=18,
         fill_config=_MappingFillConfig(),
-        diagnostic_name="MhcMapping/Sinkhorn",
+        diagnostic_stage_name="MhcMapping/Sinkhorn",
     )
     graph = _assemble_forward_graph(
         topology, post, norm_cast, projection_op, input_mix, rms_norm, mapping

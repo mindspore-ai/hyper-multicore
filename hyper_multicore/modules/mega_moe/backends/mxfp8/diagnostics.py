@@ -7,8 +7,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
+import torch.distributed as dist
+
 from hyper_multicore.diagnostics.api import prepare_mega_kernel_diagnostics
 from hyper_multicore.diagnostics.common.session import _get_active_session
+from hyper_multicore.diagnostics.dumper import DumperSession
+from hyper_multicore.diagnostics.profiler import ProfilerSession
 
 _SCOPE = ContextVar('mx_profile_scope', default=None)
 
@@ -67,14 +71,14 @@ def mx_profile_bindings(buffers: Sequence[Any], runtime: Any, events: Any) -> li
     return list(buffers) + [None] * (64 - len(buffers)) + [runtime, events, None, None]
 
 
-def mx_profile_capture_enabled() -> bool:
-    """Select profiling and reject unsupported diagnostic modes."""
+def select_mx_profile_launch(*, kernel_name: str, direction: str, ep_rank: int) -> bool:
+    """Select profiling or report an unsupported call selected by the dumper."""
     session = _get_active_session()
-    if session is None or not session.is_capture_enabled():
+    if isinstance(session, DumperSession):
+        global_rank = dist.get_rank() if dist.is_initialized() else ep_rank
+        session._report_unsupported_kernel(kernel_name=kernel_name, direction=direction, rank=global_rank)
         return False
-    if _get_active_session('profiler') is not session:
-        raise RuntimeError('MX tensor dumps are unsupported; only the task profiler has a physical ABI contract.')
-    return True
+    return isinstance(session, ProfilerSession) and session.should_prepare_call()
 
 
 def prepare_mx_diagnostics(host: Any, spec: Any, device: Any) -> Any:
@@ -92,7 +96,7 @@ def profile_mx_launch(buffers: Sequence[Any], runtime: Any, events: Any, spec: A
     """Submit the graph through the shared diagnostic lifecycle."""
     parameters = mx_profile_bindings(buffers, runtime.runtime, events)
     with runtime.diagnostics.launch(
-            parameters, direction=direction, fallback_event_counters=events, tags=scope) as call:
+            parameters, direction=direction, event_counters=events, tags=scope) as call:
         # Use master's diagnostic lifecycle; normal launches bypass it entirely.
-        descriptor = prepare(buffers, call.runtime_config, call.event_counters, spec)
-        launch(buffers, call.runtime_config, call.event_counters, call.diagnostic_buffer, descriptor)
+        descriptor = prepare(buffers, call.runtime_config_tensor, call.event_counters, spec)
+        launch(buffers, call.runtime_config_tensor, call.event_counters, call.diagnostic_buffer, descriptor)

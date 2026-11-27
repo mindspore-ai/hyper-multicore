@@ -50,12 +50,13 @@ def _launch_route(
     routed_scaling_factor: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch the eventless Route pipeline on FP32 logits."""
-    runtime = plan.route_runtime
+    diagnostics = plan.route_diagnostics
     options = {}
-    if runtime.is_active:
-        options["diagnostics"] = runtime
+    if diagnostics.requires_diagnostic_launch:
+        options["diagnostics"] = diagnostics
     return _native_ops()._mega_gate_route(  # pylint: disable=protected-access
-        logits, text_bias, vision_bias, image_mask, runtime.runtime_config, runtime.runtime_config,
+        logits, text_bias, vision_bias, image_mask,
+        diagnostics.runtime_config_tensor, diagnostics.runtime_config_tensor,
         top_k=top_k, routed_scaling_factor=routed_scaling_factor, use_vision_bias=use_vision_bias, **options,
     )
 
@@ -73,20 +74,20 @@ def _launch_route_grad(
     routed_scaling_factor: float,
 ) -> torch.Tensor:
     """Launch RouteGrad without combining the direct logits gradient."""
-    runtime = plan.route_grad_k1_runtime if top_k == 1 else plan.route_grad_runtime
+    diagnostics = plan.route_grad_k1_diagnostics if top_k == 1 else plan.route_grad_diagnostics
     inputs = (logits, route_scores, selected_scores, normalization_denominator, expert_indices, grad_routing_weights)
-    if not runtime.is_active:
+    if not diagnostics.requires_diagnostic_launch:
         return _native_ops()._mega_gate_route_grad(  # pylint: disable=protected-access
-            *inputs, runtime.runtime_config, runtime.runtime_config,
+            *inputs, diagnostics.runtime_config_tensor, diagnostics.runtime_config_tensor,
             top_k=top_k, routed_scaling_factor=routed_scaling_factor,
         )
     # Positions 0..6 mirror the internal RouteGrad MegaKernel ABI. The zero-task
     # ACLNN tail node only uses Host positions 9/10, never Device workspace pointers.
     parameters = [selected_scores, normalization_denominator, grad_routing_weights, route_scores, expert_indices,
-                  runtime.runtime_config, runtime.runtime_config, None, None, None, logits]
-    with runtime.launch(parameters, direction="backward") as call:
+                  diagnostics.runtime_config_tensor, diagnostics.runtime_config_tensor, None, None, None, logits]
+    with diagnostics.launch(parameters, direction="backward") as call:
         result = _native_ops()._mega_gate_route_grad(  # pylint: disable=protected-access
-            *inputs, call.runtime_config, call.diagnostic_buffer,
+            *inputs, call.runtime_config_tensor, call.diagnostic_buffer,
             top_k=top_k, routed_scaling_factor=routed_scaling_factor,
         )
         parameters[9] = result

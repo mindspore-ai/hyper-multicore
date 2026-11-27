@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -31,6 +32,7 @@ import torch_npu  # noqa: F401  pylint: disable=unused-import
 from torch.nn import functional
 from torch.utils.checkpoint import checkpoint
 
+from hyper_multicore.diagnostics import dumper
 from hyper_multicore.diagnostics import profiler as multicore_profiler
 from hyper_multicore.modules.mega_gate import MegaGate
 from hyper_multicore.modules.mega_gate.diagnostics import MEGA_GATE_ROUTE_GRAD_STAGE_NAMES
@@ -461,7 +463,7 @@ def _check_mega_gate_pipeline_profile() -> None:
         for _ in range(5):
             gate(hidden)
         torch.npu.synchronize()
-        with multicore_profiler.mega_kernel_profile(detailed_task_names=True) as profiler:
+        with multicore_profiler.profile(detailed_task_names=True) as profiler:
             gate(hidden)
             profiler.step()
     with tempfile.TemporaryDirectory() as output_dir:
@@ -482,6 +484,47 @@ def _check_mega_gate_pipeline_profile() -> None:
         assert [event["args"]["task_id"] for event in worker_events] == list(range(10))
 
 
+def _check_mega_gate_shared_bias_dump() -> None:
+    """Compare a two-token dump with its trace and read the shared bias from each active worker."""
+    gate = _make_gate()
+    hidden, weight, bias = _make_inputs(1, 2, seed=42)
+    _set_parameters(gate, weight, bias)
+    with torch.no_grad(), tempfile.TemporaryDirectory() as directory:
+        with multicore_profiler.profile(detailed_task_names=True) as profiler:
+            expected = gate(hidden)
+        trace = profiler.export_chrome_trace(Path(directory) / "trace.json")
+        workers = [event["args"] for event in trace["traceEvents"]
+                   if event.get("ph") == "X" and event["args"].get("task_stage") == "AddBias"]
+        assert sorted(worker["block_id"] for worker in workers) == [0, 1]
+        selected = next(worker for worker in workers if worker["block_id"] == 1)
+        selections = (
+            ("all_workers", {}, workers),
+            ("by_stage_task_index", {"stage_task_indices": selected["stage_task_index"]}, [selected]),
+            ("by_owner", {"owner_ids": selected["owner_id"]}, [selected]),
+        )
+        for name, filters, expected_workers in selections:
+            selection = dumper.DumpConfig(
+                Path(directory) / name, level="task", stages="AddBias", tensor_names="text_bias", io="input",
+                **filters,
+            )
+            with dumper.dump(selection) as session:
+                actual = gate(hidden)
+            _assert_outputs_match(actual, expected)
+            manifest, = session.last_manifest_paths
+            invocation, = json.loads(manifest.read_text(encoding="utf-8"))["invocations"]
+            actual_workers = {(task["coreId"], task["stageTaskIndex"], task["owner"]["id"])
+                              for task in invocation["tasks"]}
+            assert len(invocation["tasks"]) == len(expected_workers)
+            assert actual_workers == {(worker["block_id"], worker["stage_task_index"], worker["owner_id"])
+                                      for worker in expected_workers}
+            for worker in expected_workers:
+                captured = dumper.load_tensor(
+                    manifest, invocation_id=invocation["invocationId"], port=("AddBias", "input", 1),
+                    task_id=worker["task_id"], worker=(worker["core_type"], worker["block_id"]),
+                )
+                torch.testing.assert_close(captured, bias.cpu(), rtol=0, atol=0)
+
+
 def _check_mega_gate_grad_pipeline_profile() -> None:
     """Require RouteGrad to expose its ordered token-row stages."""
     gate = _make_gate()
@@ -491,7 +534,7 @@ def _check_mega_gate_grad_pipeline_profile() -> None:
     logits_gradient = torch.randn_like(logits)
     routing_gradient = torch.randn_like(routing_weights)
     torch.npu.synchronize()
-    with multicore_profiler.mega_kernel_profile(detailed_task_names=True) as profiler:
+    with multicore_profiler.profile(detailed_task_names=True) as profiler:
         torch.autograd.grad(
             (logits, routing_weights),
             (hidden, gate.weight),
@@ -737,8 +780,8 @@ def _check_mega_gate_route_score_operation_order(tokens: int, experts: int) -> N
         correction_bias,
         correction_bias,
         plan.vision_mask_placeholder,
-        plan.route_runtime.runtime_config,
-        plan.route_runtime.runtime_config,
+        plan.route_diagnostics.runtime_config_tensor,
+        plan.route_diagnostics.runtime_config_tensor,
         top_k=6,
         routed_scaling_factor=_SCALING,
         use_vision_bias=False,
@@ -765,10 +808,10 @@ def _check_mega_gate_route_grad_operation_order(top_k: int) -> None:
 
     gate = _make_gate()
     plan = gate._plan(logits)  # pylint: disable=protected-access
-    runtime = plan.route_grad_k1_runtime if top_k == 1 else plan.route_grad_runtime
+    diagnostics = plan.route_grad_k1_diagnostics if top_k == 1 else plan.route_grad_diagnostics
     actual = ops._mega_gate_route_grad(  # pylint: disable=protected-access
         logits.detach(), scores.detach(), selected.detach(), denominator.detach(),
-        indices, upstream, runtime.runtime_config, runtime.runtime_config,
+        indices, upstream, diagnostics.runtime_config_tensor, diagnostics.runtime_config_tensor,
         top_k=top_k, routed_scaling_factor=_SCALING,
     )
     torch.npu.synchronize()
@@ -795,11 +838,11 @@ def _check_mega_gate_route_grad_batch_parity(tokens: int, top_k: int) -> None:
 
     gate = _make_gate()
     plan = gate._plan(logits)  # pylint: disable=protected-access
-    runtime = plan.route_grad_k1_runtime if top_k == 1 else plan.route_grad_runtime
+    diagnostics = plan.route_grad_k1_diagnostics if top_k == 1 else plan.route_grad_diagnostics
     with torch.no_grad():
         actual = ops._mega_gate_route_grad(  # pylint: disable=protected-access
             logits.detach(), scores.detach(), selected.detach(), denominator.detach(),
-            indices, gradient, runtime.runtime_config, runtime.runtime_config,
+            indices, gradient, diagnostics.runtime_config_tensor, diagnostics.runtime_config_tensor,
             top_k=top_k, routed_scaling_factor=_SCALING,
         )
     torch.npu.synchronize()
@@ -851,8 +894,8 @@ def _check_mega_gate_route_grad_extremes() -> None:
                 denominator.detach(),
                 expert_indices.detach(),
                 routing_gradient,
-                plan.route_grad_runtime.runtime_config,
-                plan.route_grad_runtime.runtime_config,
+                plan.route_grad_diagnostics.runtime_config_tensor,
+                plan.route_grad_diagnostics.runtime_config_tensor,
                 top_k=top_k,
                 routed_scaling_factor=_SCALING,
             )
@@ -912,6 +955,7 @@ def test_mega_gate_pipeline_profile() -> None:
     """Validate forward and backward stage traces in one NPU worker."""
     _check_mega_gate_pipeline_profile()
     _check_mega_gate_grad_pipeline_profile()
+    _check_mega_gate_shared_bias_dump()
 
 
 def test_mega_gate_symbol_resolution_concurrency() -> None:

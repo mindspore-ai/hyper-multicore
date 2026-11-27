@@ -10,8 +10,8 @@ PyTorch 接口；各特性的原理、用法和限制由对应文档说明。
 | 计算 token 的专家路由 | `MegaGate` | [MegaGate](../docs/mega_gate.md) |
 | 执行四路残差流混合与归一化 | `MegaMhc` | [MegaMHC](../docs/mega_mhc.md) |
 | 根据路由结果执行专家计算 | `MegaMoeExperts` | [MegaMoE](../docs/mega_moe.md) |
-| 采集任务时间线 | `profiler.mega_kernel_profile()` | [诊断指南](../docs/diagnostics.md#采集任务时间线) |
-| 采集调用或任务边界的张量 | `dump.tensor_dump()` | [诊断指南](../docs/diagnostics.md#采集张量快照) |
+| 采集任务时间线 | `profiler.profile()` | [诊断指南](../docs/diagnostics.md#采集任务时间线) |
+| 采集调用或任务边界的张量 | `dumper.dump()` | [诊断指南](../docs/diagnostics.md#采集张量快照) |
 
 MegaMoE 的激活配置使用 `SwiGLUParameters` / `SiTUGLUParameters`，通用数值配置使用 `MegaMoeNumericsOptions`，字段与用法见[数值配置](../docs/mega_moe.md#模型数学与数值语义)。
 各接口的精度支持和诊断能力见对应特性文档。
@@ -20,7 +20,7 @@ MegaMoE 的激活配置使用 `SwiGLUParameters` / `SiTUGLUParameters`，通用�
 
 ```python
 from hyper_multicore import MegaGate, MegaMhc, MegaMoeExperts, MegaMoeNumericsOptions
-from hyper_multicore.diagnostics import dump, profiler
+from hyper_multicore.diagnostics import dumper, profiler
 ```
 
 使用 native 路径前需准备 CANN 并安装或构建、激活匹配的 payload，具体步骤见[构建与安装](../docs/build.md)。

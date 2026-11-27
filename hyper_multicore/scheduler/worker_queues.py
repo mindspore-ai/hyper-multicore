@@ -1,4 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Component-independent contiguous/strided worker queues and ready contracts."""
 from collections import Counter
 import ctypes
@@ -8,6 +21,7 @@ from .config import RuntimeConfigC
 WAIT_HEAD = 0
 RESCAN_WINDOW = 1
 MAX_READY_LOOKAHEAD = 256
+EXPLICIT_QUEUE_LAYOUT = 2
 
 
 class WorkerQueueC(ctypes.Structure):
@@ -15,13 +29,24 @@ class WorkerQueueC(ctypes.Structure):
     _fields_ = [(name, ctypes.c_uint32) for name in (
         "begin", "end", "ready_depth", "stride", "wait_mode", "poll_interval_us")]
 
+    def positions(self) -> range:
+        """Return positions in this worker's task-index array."""
+        return range(self.begin, self.end, self.stride)
+
+
+def split_worker_queues(cfg: RuntimeConfigC) -> tuple[list[WorkerQueueC], list[WorkerQueueC]]:
+    """Return the explicit AIC and AIV queue tables in device worker order."""
+    records = cfg.worker_queues
+    cube_workers = cfg.num_workers // 2
+    return records[:cube_workers], records[cube_workers:]
+
 
 def _attach(cfg, records):
     cfg.worker_queues = (WorkerQueueC * len(records))(*records)
-    cfg.queue_layout = 2
+    cfg.queue_layout = EXPLICIT_QUEUE_LAYOUT
     if cfg.completion_event:
         cfg.all_event_num_triggers[cfg.completion_event] = len(records)
-    serialize_worker_queues(cfg)
+    validate_worker_queues(cfg)
     return cfg
 
 
@@ -72,13 +97,13 @@ def install_worker_queues(cfg: RuntimeConfigC, cubes: list[list[int]], vectors: 
     return _attach(result, records)
 
 
-def serialize_worker_queues(cfg: RuntimeConfigC) -> bytes:
-    """Validate complete unique index coverage before serializing the queue table."""
-    records = cfg.worker_queues
-    cubes = cfg.num_workers // 2
-    if cfg.num_workers % 2 or len(records) != cubes + cfg.num_workers:
+def validate_worker_queues(cfg: RuntimeConfigC) -> None:
+    """Validate the explicit queue table and its complete, unique index coverage."""
+    records = getattr(cfg, "worker_queues", None)
+    num_workers = cfg.num_workers
+    if records is None or num_workers % 2 or len(records) != num_workers // 2 + num_workers:
         raise ValueError("Worker queue count does not match runtime resources")
-    for kind, group in ((0, records[:cubes]), (1, records[cubes:])):
+    for kind, group in enumerate(split_worker_queues(cfg)):
         count = cfg.task_index_num[kind]
         positions = []
         for record in group:
@@ -86,7 +111,12 @@ def serialize_worker_queues(cfg: RuntimeConfigC) -> bytes:
                     or record.ready_depth > MAX_READY_LOOKAHEAD or record.wait_mode not in (WAIT_HEAD, RESCAN_WINDOW)
                     or (record.wait_mode == RESCAN_WINDOW and not record.poll_interval_us)):
                 raise ValueError("Invalid worker queue view or ready/wait policy")
-            positions.extend(range(record.begin, record.end, record.stride))
+            positions.extend(record.positions())
         if len(positions) != count or set(positions) != set(range(count)):
             raise ValueError("Worker queues must cover every original index exactly once")
-    return bytes(records)
+
+
+def serialize_worker_queues(cfg: RuntimeConfigC) -> bytes:
+    """Validate and serialize the explicit queue table."""
+    validate_worker_queues(cfg)
+    return bytes(cfg.worker_queues)

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Any
 
 import torch
 
-from hyper_multicore.diagnostics.dump.layout import _SAFE_FILE_NAME, _stage_names
+from hyper_multicore.diagnostics.dumper._layout import _SAFE_FILE_NAME, _save_tensor, _stage_names
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,7 @@ class _TensorPort:
 
 @dataclass(frozen=True)
 class _GraphTensor:
-    """One logical graph Tensor and its L0 capture relationship."""
+    """One logical graph Tensor and its Kernel capture relationship."""
 
     name: str
     param_position: int
@@ -51,14 +52,11 @@ class _GraphTensor:
 
 
 @dataclass
-class _TensorSnapshot:
+class _KernelDumpTensorSnapshot:
     """One Host-owned Tensor value plus export metadata."""
 
     graph_tensor: _GraphTensor
     phase: str
-    original_dtype: str
-    stored_dtype: str
-    shape: tuple[int, ...]
     data: torch.Tensor
 
 
@@ -68,46 +66,42 @@ def _operator_type_name(operator: Any) -> str:
     return str(value)
 
 
-def _describe_graph_tensors(graph: Any) -> tuple[_GraphTensor, ...]:
-    """Deduplicate ABI-bound graph tensors and classify their producers and consumers."""
+def _describe_graph_tensors(
+    graph: Any, *, stages: Collection[str] | None = None, io: Collection[str] | None = None,
+) -> tuple[_GraphTensor, ...]:
+    """Select stage ports while deriving each Tensor's capture phase from the full graph."""
     relationships: dict[tuple[str, int], dict[str, Any]] = {}
     operators = graph.topological_sort()
     stage_names = _stage_names(operators)
     for operator in operators:
         op_type = _operator_type_name(operator)
-        for index, tensor in enumerate(operator.inputs):
-            key = (tensor.name, int(tensor.param_position))
-            relationship = relationships.setdefault(
-                key,
-                {
-                    "shape": tuple(int(dim) for dim in tensor.shape),
-                    "producers": [],
-                    "consumers": [],
-                    "ports": [],
-                },
-            )
-            relationship["consumers"].append(operator.name)
-            relationship["ports"].append(
-                _TensorPort(operator.name, stage_names[operator.name], op_type, "input", index)
-            )
-        for index, tensor in enumerate(operator.outputs):
-            key = (tensor.name, int(tensor.param_position))
-            relationship = relationships.setdefault(
-                key,
-                {
-                    "shape": tuple(int(dim) for dim in tensor.shape),
-                    "producers": [],
-                    "consumers": [],
-                    "ports": [],
-                },
-            )
-            relationship["producers"].append(operator.name)
-            relationship["ports"].append(
-                _TensorPort(operator.name, stage_names[operator.name], op_type, "output", index)
-            )
+        stage = stage_names[operator.name]
+        for port_io, tensors, relation in (
+            ("input", operator.inputs, "consumers"),
+            ("output", operator.outputs, "producers"),
+        ):
+            for index, tensor in enumerate(tensors):
+                key = (tensor.name, int(tensor.param_position))
+                relationship = relationships.setdefault(
+                    key,
+                    {
+                        "shape": tuple(int(dim) for dim in tensor.shape),
+                        "producers": [],
+                        "consumers": [],
+                        "ports": [],
+                    },
+                )
+                relationship[relation].append(operator.name)
+                relationship["ports"].append(_TensorPort(operator.name, stage, op_type, port_io, index))
 
     descriptions = []
     for (name, param_position), relationship in relationships.items():
+        ports = tuple(
+            port for port in relationship["ports"]
+            if (stages is None or port.stage in stages) and (io is None or port.io in io)
+        )
+        if not ports:
+            continue
         producers = tuple(relationship["producers"])
         consumers = tuple(relationship["consumers"])
         if not producers:
@@ -124,41 +118,29 @@ def _describe_graph_tensors(graph: Any) -> tuple[_GraphTensor, ...]:
                 role=role,
                 producers=producers,
                 consumers=consumers,
-                ports=tuple(relationship["ports"]),
+                ports=ports,
             )
         )
     return tuple(sorted(descriptions, key=lambda tensor: (tensor.param_position, tensor.name)))
 
 
-def _dtype_name(dtype: Any) -> str:
-    return str(dtype).removeprefix("torch.")
-
-
-def _snapshot_tensor(tensor: Any, graph_tensor: _GraphTensor, phase: str) -> _TensorSnapshot:
+def _snapshot_tensor(tensor: Any, graph_tensor: _GraphTensor, phase: str) -> _KernelDumpTensorSnapshot:
     if not torch.is_tensor(tensor):
         raise TypeError(
             f"dump Tensor {graph_tensor.name!r} at param_position={graph_tensor.param_position} "
             f"must map to torch.Tensor, got {type(tensor).__name__}"
         )
     host_tensor = tensor.detach().contiguous().cpu().clone()
-    dtype_name = _dtype_name(host_tensor.dtype)
-    return _TensorSnapshot(
-        graph_tensor=graph_tensor,
-        phase=phase,
-        original_dtype=dtype_name,
-        stored_dtype=dtype_name,
-        shape=tuple(int(dim) for dim in tensor.shape),
-        data=host_tensor,
-    )
+    return _KernelDumpTensorSnapshot(graph_tensor, phase, host_tensor)
 
 
-def _write_l0_stage_files(
-    snapshot: _TensorSnapshot,
+def _write_kernel_stage_files(
+    snapshot: _KernelDumpTensorSnapshot,
     invocation_dir: Path,
     window_dir: Path,
     safe_name: str,
-) -> tuple[Path, list[dict[str, Any]]]:
-    """Save one L0 Tensor under stages and hard-link its remaining ports."""
+) -> list[dict[str, Any]]:
+    """Save one Kernel dump Tensor snapshot under stages and hard-link its remaining ports."""
     metadata = []
     primary_path = None
     for port in snapshot.graph_tensor.ports:
@@ -168,7 +150,7 @@ def _write_l0_stage_files(
         stage_file_name = f"{port.io}_{port.index:02d}_{safe_name}.pt"
         stage_path = stage_dir / stage_file_name
         if primary_path is None:
-            torch.save(snapshot.data, stage_path)
+            _save_tensor(snapshot.data, stage_path)
             primary_path = stage_path
         else:
             try:
@@ -187,11 +169,42 @@ def _write_l0_stage_files(
                 "file": stage_path.relative_to(window_dir).as_posix(),
             }
         )
-    if primary_path is None:
-        boundary_dir = invocation_dir / "stages" / "__kernel_boundary__"
-        boundary_dir.mkdir(parents=True, exist_ok=True)
-        boundary_io = "input" if snapshot.phase == "before" else "output"
-        file_name = f"{boundary_io}_{snapshot.graph_tensor.param_position:02d}_{safe_name}.pt"
-        primary_path = boundary_dir / file_name
-        torch.save(snapshot.data, primary_path)
-    return primary_path, metadata
+    return metadata
+
+
+def _write_kernel_snapshots(
+    snapshots: list[_KernelDumpTensorSnapshot],
+    invocation_dir: Path,
+    window_dir: Path,
+) -> dict[str, Any]:
+    """Write logical tensor snapshots and their stage-port metadata."""
+    tensor_metadata = []
+    for snapshot in snapshots:
+        safe_name = _SAFE_FILE_NAME.sub("_", snapshot.graph_tensor.name)
+        port_metadata = _write_kernel_stage_files(
+            snapshot,
+            invocation_dir,
+            window_dir,
+            safe_name,
+        )
+        dtype_name = str(snapshot.data.dtype).removeprefix("torch.")
+        tensor_metadata.append(
+            {
+                "name": snapshot.graph_tensor.name,
+                "paramPosition": snapshot.graph_tensor.param_position,
+                "role": snapshot.graph_tensor.role,
+                "capturePhase": snapshot.phase,
+                "producers": list(snapshot.graph_tensor.producers),
+                "consumers": list(snapshot.graph_tensor.consumers),
+                "ports": port_metadata,
+                "declaredShape": list(snapshot.graph_tensor.declared_shape),
+                "actualShape": list(snapshot.data.shape),
+                "originalDtype": dtype_name,
+                "storedDtype": dtype_name,
+                "file": port_metadata[0]["file"],
+            }
+        )
+    return {
+        "tensorCount": len(tensor_metadata),
+        "tensors": tensor_metadata,
+    }

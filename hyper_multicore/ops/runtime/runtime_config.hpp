@@ -46,10 +46,10 @@ constexpr uint32_t TASK_AICORE_INDEX_TYPE_COUNT = 3;
 
 using TaskId = uint32_t;
 
-enum class DiagnosticMode : uint32_t {
-  NORMAL = 0,
-  PROFILE = 1,
-  TENSOR_DUMP_L1 = 2,
+enum class DeviceDiagnosticMode : uint32_t {
+  DISABLED = 0,
+  CYCLE_PROFILE = 1,
+  TASK_TENSOR_DUMP = 2,
 };
 
 enum class TaskAiCoreType : uint32_t {
@@ -454,12 +454,12 @@ __aicore__ inline uint32_t getAtomicAddValuesOffset(__gm__ uint8_t *tiling) {
   return getGroupedMatmulGroupListOffset(tiling) + static_cast<uint32_t>(getGroupedMatmulGroupListBytes(tiling));
 }
 
-__aicore__ inline DiagnosticMode getDiagnosticMode(__gm__ uint8_t *tiling) {
-  return static_cast<DiagnosticMode>(*(__gm__ uint32_t *)(tiling + 5 * UINT32_T_SIZE));
+__aicore__ inline DeviceDiagnosticMode getDiagnosticMode(__gm__ uint8_t *tiling) {
+  return static_cast<DeviceDiagnosticMode>(*(__gm__ uint32_t *)(tiling + 5 * UINT32_T_SIZE));
 }
 
 __aicore__ inline bool isCycleProfileEnabled(__gm__ uint8_t *tiling) {
-  return getDiagnosticMode(tiling) == DiagnosticMode::PROFILE;
+  return getDiagnosticMode(tiling) == DeviceDiagnosticMode::CYCLE_PROFILE;
 }
 
 __aicore__ inline uint32_t getAicProfileRecordCapacity(__gm__ uint8_t *tiling) {

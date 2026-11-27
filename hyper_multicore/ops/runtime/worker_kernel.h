@@ -29,7 +29,7 @@
 #include "runtime_config.hpp"
 #include "runtime_storage_bounds.h"
 #include "cycle_trace_recorder.h"
-#include "l1_tensor_dump.h"
+#include "task_tensor_dump.h"
 #include "worker_ready_queue.h"
 
 
@@ -147,7 +147,7 @@ class KernelWorkerBase {
     }
     const auto mode = getDiagnosticMode(this->runtimeConfigPtr);
     CycleTraceRecorder recorder;
-    if (mode == DiagnosticMode::PROFILE) {
+    if (mode == DeviceDiagnosticMode::CYCLE_PROFILE) {
       recorder.Init(this->worker_id_, this->input_list[Derived::DIAGNOSTIC_IDX],
                     getAicProfileRecordCapacity(this->runtimeConfigPtr),
                     getAivProfileRecordCapacity(this->runtimeConfigPtr),
@@ -162,7 +162,7 @@ class KernelWorkerBase {
  protected:
   // Share the compute call site across diagnostics. Replicating the entire
   // inlined task dispatcher for each mode exceeds the AIV scalar stack limit.
-  __aicore__ inline void ProcessTasks(DiagnosticMode mode, CycleTraceRecorder &recorder) {
+  __aicore__ inline void ProcessTasks(DeviceDiagnosticMode mode, CycleTraceRecorder &recorder) {
     if (explicit_queues_) {
       ProcessWorkerQueue(mode, recorder);
       return;
@@ -198,14 +198,14 @@ class KernelWorkerBase {
 
   struct ReadyExecution {
     KernelWorkerBase &worker;
-    DiagnosticMode mode;
+    DeviceDiagnosticMode mode;
     CycleTraceRecorder &recorder;
     WorkerQueue view;
     uint64_t idle_start = 0;
     __aicore__ inline TaskId TaskAt(uint32_t index) { return worker.GetTaskIndex(index); }
     __aicore__ inline bool IsReady(TaskId task) { return worker.IsQueuedTaskReady(task); }
     __aicore__ inline void Execute(TaskId task) {
-      if (mode == DiagnosticMode::PROFILE && idle_start != 0) {
+      if (mode == DeviceDiagnosticMode::CYCLE_PROFILE && idle_start != 0) {
         TaskDesc desc;
         getTaskDesc(worker.runtimeConfigPtr, &desc, task);
         recorder.Record(0x10008, task, desc.task_index, getTaskProfileOwnerId(worker.runtimeConfigPtr, task),
@@ -220,7 +220,7 @@ class KernelWorkerBase {
           getAllTasksOffset(worker.runtimeConfigPtr) + task * sizeof(TaskDesc) + offsetof(TaskDesc, dependent_event));
         worker.WaitForDependency(dependent, view.poll_interval_us);
       } else {
-        if (mode == DiagnosticMode::PROFILE && idle_start == 0) idle_start = recorder.Now();
+        if (mode == DeviceDiagnosticMode::CYCLE_PROFILE && idle_start == 0) idle_start = recorder.Now();
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510
         constexpr auto cycles_per_us = SYSTEM_CYCLES_PER_US;
 #else
@@ -232,7 +232,7 @@ class KernelWorkerBase {
     }
   };
 
-  __aicore__ inline void ProcessWorkerQueue(DiagnosticMode mode, CycleTraceRecorder &recorder) {
+  __aicore__ inline void ProcessWorkerQueue(DeviceDiagnosticMode mode, CycleTraceRecorder &recorder) {
 #ifdef HMC_RUNTIME_CUBE
     const uint32_t index = this->worker_id_;
 #else
@@ -348,8 +348,8 @@ class KernelWorkerBase {
 #endif
   }
 
-  __aicore__ inline void CaptureL1TaskTensors(TaskId task_id, uint32_t phase) {
-    MulticoreRuntime::CaptureL1TaskTensors(input_list[Derived::DIAGNOSTIC_IDX], input_list, task_id, phase, worker_id_);
+  __aicore__ inline void CaptureTaskTensors(TaskId task_id, uint32_t phase) {
+    MulticoreRuntime::CaptureTaskTensors(input_list[Derived::DIAGNOSTIC_IDX], input_list, task_id, phase, worker_id_);
   }
 
   __aicore__ inline void LoadTaskDescriptor(TaskId task_id, TaskDesc &task_desc) {
@@ -363,11 +363,11 @@ class KernelWorkerBase {
     }
   }
 
-  __aicore__ inline void ExecuteTask(TaskId task_id, DiagnosticMode mode, CycleTraceRecorder &recorder) {
+  __aicore__ inline void ExecuteTask(TaskId task_id, DeviceDiagnosticMode mode, CycleTraceRecorder &recorder) {
     TaskDesc task_desc;
     LoadTaskDescriptor(task_id, task_desc);
-    const bool profile = mode == DiagnosticMode::PROFILE;
-    const bool dump = mode == DiagnosticMode::TENSOR_DUMP_L1;
+    const bool profile = mode == DeviceDiagnosticMode::CYCLE_PROFILE;
+    const bool dump = mode == DeviceDiagnosticMode::TASK_TENSOR_DUMP;
     const uint32_t owner_id = profile ? getTaskProfileOwnerId(this->runtimeConfigPtr, task_id) : 0;
     if (task_desc.dependent_event != EVENT_INVALID_ID) {
       const uint64_t start = profile ? recorder.Now() : 0;
@@ -377,7 +377,7 @@ class KernelWorkerBase {
                         start, recorder.Now());
       }
     }
-    if (dump) CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_BEFORE);
+    if (dump) CaptureTaskTensors(task_id, TASK_DUMP_PHASE_BEFORE);
     const uint64_t compute_start = profile ? recorder.Now() : 0;
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
     if (profile) {
@@ -390,7 +390,7 @@ class KernelWorkerBase {
     }
     if (dump) {
       PipeBarrier<PIPE_ALL>();
-      CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_AFTER);
+      CaptureTaskTensors(task_id, TASK_DUMP_PHASE_AFTER);
     }
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
       const uint64_t start = profile ? recorder.Now() : 0;

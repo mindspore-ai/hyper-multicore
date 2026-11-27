@@ -206,7 +206,7 @@ def test_mega_moe_local_capacity_lifetime() -> None:
                     for patterns in pairs:
                         expected = _deferred_pair(common, shape, patterns)
                         capture = factor is None and patterns == pairs[0]
-                        profile_context = multicore_profiler.mega_kernel_profile(
+                        profile_context = multicore_profiler.profile(
                             schedule=schedule(wait=0, warmup=0, active=1, repeat=1),
                         ) if capture else nullcontext()
                         with profile_context as profiler:

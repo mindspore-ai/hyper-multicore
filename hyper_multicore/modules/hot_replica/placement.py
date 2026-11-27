@@ -253,4 +253,7 @@ def build_placement(
     transfers = max(int(outgoing.max()), int(incoming.max()))
     published = np.flatnonzero(slots[rank] >= 0)
     last_slot = int(published[-1]) + 1 if published.size else 0
-    return ExpertPlacement(ids, table, copies, borrowed, bound, local_bound, transfers, last_slot)
+    host_copies = slots[:, :borrowed].astype(np.int32, copy=True)
+    host_copies.setflags(write=False)
+    return ExpertPlacement(ids, table, copies, borrowed, bound, local_bound, transfers, last_slot,
+                           host_copies=host_copies)

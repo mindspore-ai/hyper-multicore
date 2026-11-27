@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 import torch.distributed as dist
 
 from hyper_multicore.diagnostics import MegaKernelDiagnostics, prepare_mega_kernel_diagnostics
@@ -43,8 +44,13 @@ class MegaMhcGradPlan:
     num_cube_cores: int
     num_vector_cores: int
     token_tile: int
-    runtime: MegaKernelDiagnostics
+    diagnostics: MegaKernelDiagnostics
     event_capacity: int
+
+    @property
+    def runtime_config_tensor(self) -> torch.Tensor:
+        """Return the standard Task-pipeline configuration Tensor."""
+        return self.diagnostics.runtime_config_tensor
 
 
 def build_mega_mhc_grad_plan(
@@ -80,7 +86,7 @@ def build_mega_mhc_grad_plan(
     )
     order_vector_tasks_by_stage(runtime_config)
     _validate_runtime_task_queues(runtime_config, runtime_config.event_capacity)
-    runtime = prepare_mega_kernel_diagnostics(
+    diagnostics = prepare_mega_kernel_diagnostics(
         graph, runtime_config, kernel_name="HyperMegaMhcGrad",
         parameter_count=33, device=device, owner_label="NativeKernel",
         rank=dist.get_rank() if dist.is_initialized() else 0,
@@ -92,6 +98,6 @@ def build_mega_mhc_grad_plan(
         num_cube_cores,
         num_vector_cores,
         token_tile,
-        runtime,
+        diagnostics,
         runtime_config.event_capacity,
     )

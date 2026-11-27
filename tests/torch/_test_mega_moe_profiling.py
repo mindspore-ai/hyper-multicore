@@ -27,6 +27,7 @@ import torch_npu  # noqa: F401  # pylint: disable=unused-import
 from hyper_multicore.diagnostics import profiler as multicore_profiler, schedule as diagnostic_schedule
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore._core_spec import get_device_core_spec
+from hyper_multicore.scheduler.runtime import runtime_cube_worker_capacity
 from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts
 from tests.torch import _test_mega_moe as common
 
@@ -58,11 +59,13 @@ def _assert_complete_forward_trace(trace: dict) -> None:
     """Reject incomplete or ambiguously named device records."""
     metadata = trace["megaKernelCycleTrace"]
     # Two GMM stages per local expert, each recording wait, compute and trigger.
-    cube_slots = get_device_core_spec(common.DEVICE.index).num_cube_cores
-    cube_records = cube_slots * (_PROFILE_SHAPE.num_experts // _PROFILE_SHAPE.ep_size) * 2 * 3
+    active_cube_workers = get_device_core_spec(common.DEVICE.index).num_cube_cores
+    cube_records = active_cube_workers * (_PROFILE_SHAPE.num_experts // _PROFILE_SHAPE.ep_size) * 2 * 3
     expected_core_records = {"AIC": cube_records, "AIV": _EXPECTED_AIV_RECORD_COUNT}
     expected_record_count = sum(expected_core_records.values())
-    assert metadata["invocations"][0]["workerCapacities"]["cubeSlots"] == cube_slots
+    worker_capacities = metadata["invocations"][0]["workerCapacities"]
+    assert worker_capacities["activeCubeWorkers"] == active_cube_workers
+    assert worker_capacities["cubeSlots"] == runtime_cube_worker_capacity(active_cube_workers * 2)
     internal_events = [event for event in trace["traceEvents"] if event.get("cat") == "MegaKernelInternal"]
     core_record_counts = Counter(event["args"]["core_type"] for event in internal_events)
 
@@ -106,7 +109,7 @@ def test_mega_moe_forward_profiling() -> None:
             torch.npu.synchronize()
             dist.barrier()
 
-            with multicore_profiler.mega_kernel_profile(
+            with multicore_profiler.profile(
                 schedule=schedule,
                 detailed_task_names=True,
             ) as profiler:

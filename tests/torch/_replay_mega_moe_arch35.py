@@ -18,7 +18,7 @@ import torch.distributed as dist
 import torch_npu
 
 from hyper_multicore.diagnostics.common.schedule import DiagnosticAction
-from hyper_multicore.diagnostics.profiler.api import TorchMegaKernelProfiler
+from hyper_multicore.diagnostics.profiler.api import ProfilerSession
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.experimental import MegaMoeTuningOptions
 
@@ -82,7 +82,7 @@ def main():
         return {'shape': list(t.shape), 'sha256': hashlib.sha256(data).hexdigest()}
     prof = None
     if a.profile:
-        prof = TorchMegaKernelProfiler(
+        prof = ProfilerSession(
             schedule=lambda _: DiagnosticAction.RECORD_AND_SAVE, on_trace_ready=lambda _: None,
             detailed_task_names=True, max_pending_calls=3)
     with prof if prof is not None else nullcontext():

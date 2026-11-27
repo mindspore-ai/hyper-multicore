@@ -23,7 +23,7 @@ import unittest
 from unittest.mock import patch
 
 from hyper_multicore.diagnostics.common.graph import DiagnosticSpec, build_graph_metadata
-from hyper_multicore.diagnostics.common.runtime import PreparedDiagnosticRuntime
+from hyper_multicore.diagnostics.common.runtime import DeviceDiagnosticMode, PreparedDiagnosticRuntime
 from hyper_multicore.diagnostics.profiler.cycle_trace import (
     GRAPH_STAGE_DESC_BASE, MAX_PROFILE_BUFFER_BYTES, _PreparedProfileRuntime,
     _calculate_profile_layout, _configure_trace_metadata, _resolve_cycle_frequency_mhz,
@@ -31,6 +31,7 @@ from hyper_multicore.diagnostics.profiler.cycle_trace import (
 from hyper_multicore.scheduler.config import EVENT_INVALID_ID, RuntimeConfigC, TaskDescC, TaskType
 from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec
 from hyper_multicore.scheduler.runtime import allocate_runtime_config
+from hyper_multicore.scheduler.worker_queues import install_strided_worker_queues, install_worker_queues
 from hyper_multicore.diagnostics import prepare_mega_kernel_diagnostics
 from hyper_multicore.modules.mega_gate.diagnostics import (
     MEGA_GATE_ROUTE_STAGE_NAMES, MEGA_GATE_ROUTE_GRAD_STAGE_NAMES, MEGA_GATE_ROUTE_GRAD_K1_STAGE_NAMES,
@@ -96,7 +97,7 @@ class TestDiagnosticMetadata(unittest.TestCase):
         """
         graph = _graph()
         for operator in graph.topological_sort():
-            operator.diagnostic_name = "Repeated"
+            operator.diagnostic_stage_name = "Repeated"
         metadata = build_graph_metadata(graph, _runtime_config(), DiagnosticSpec("Custom"))
         self.assertEqual(metadata.stage_names, {0: "Repeated", 1: "Repeated"})
 
@@ -176,8 +177,13 @@ class TestDiagnosticMetadata(unittest.TestCase):
         profile = _PreparedProfileRuntime(runtime)
         self.assertEqual(len(created), 2)
         offset = RuntimeConfigC.diagnostic_mode.offset
-        self.assertEqual(struct.unpack_from("<I", runtime.normal_tensor, offset)[0], 0)
-        self.assertEqual(struct.unpack_from("<I", profile.profile_tensor, offset)[0], 1)
+        self.assertIsInstance(runtime.diagnostic_runtime_config, RuntimeConfigC)
+        self.assertIsInstance(profile.profile_runtime_config, RuntimeConfigC)
+        self.assertEqual(runtime.diagnostic_runtime_config.diagnostic_mode, DeviceDiagnosticMode.DISABLED)
+        self.assertEqual(profile.profile_runtime_config.diagnostic_mode, DeviceDiagnosticMode.CYCLE_PROFILE)
+        self.assertIs(profile.runtime_config_tensor, runtime.runtime_config_tensor)
+        self.assertEqual(struct.unpack_from("<I", runtime.runtime_config_tensor, offset)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", profile.profile_runtime_config_tensor, offset)[0], 1)
         self.assertEqual(bytes(config), original)
         self.assertEqual((profile.rank, profile.device_id), (3, 7))
 
@@ -217,6 +223,23 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
 
         self.assertEqual(layout.aic_required_records, 258)
         self.assertEqual(layout.aic_record_capacity, 272)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_layout_uses_explicit_worker_positions(self):
+        """Size explicit contiguous and strided queues from their busiest workers."""
+        config = allocate_runtime_config(8, num_workers=4)
+        config.task_index_num[:2] = (3, 5)
+        config.cube_task_indices[:3] = (0, 1, 2)
+        config.vector_task_indices[:5] = (3, 4, 5, 6, 7)
+        for task_id in range(8):
+            config.all_tasks[task_id] = _three_record_task()
+        contiguous = install_worker_queues(config, [[2, 0, 1], []], [[3, 4, 5, 6], [], [7], []])
+        strided = install_strided_worker_queues(config)
+        for runtime_config, expected in ((contiguous, (12, 16)), (strided, (8, 8))):
+            with self.subTest(required_records=expected):
+                layout = _calculate_profile_layout(runtime_config)
+                self.assertEqual((layout.aic_required_records, layout.aiv_required_records), expected)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
