@@ -23,10 +23,15 @@ from dataclasses import dataclass, replace
 from functools import wraps
 import os
 from threading import Lock
+from types import TracebackType
 from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
+
+from hyper_multicore.modules.mega_moe.route import (
+    _INVALID_COUNTS_MASK, _INVALID_ROUTE_INPUT_MASK, _reject_invalid_route_inputs, _validate_supplied_counts,
+)
 
 
 @dataclass
@@ -35,8 +40,10 @@ class ReplayRecord:
 
     owner: Any
     ids: torch.Tensor | None = None
+    supplied_counts: torch.Tensor | None = None
     route: Any = None
     stream: Any = None
+    autograd_mask: int = 0
     inputs: tuple[torch.Tensor, torch.Tensor] | None = None
     input_versions: tuple[int, int] | None = None
     activation: Any = None
@@ -51,6 +58,7 @@ class _CheckpointScope:
     records: list[ReplayRecord]
     replay: bool
     same_parameters: bool
+    non_reentrant: bool = False
     cursor: int = 0
     defer_forward_copies: bool = False
     guest_snapshot_bytes: int = 0
@@ -65,18 +73,23 @@ _REPLAY_SCOPES: ContextVar[tuple[AbstractContextManager, ...]] = ContextVar("hmc
 class _ReplayContext(AbstractContextManager):
     """Start a new replay cursor each time Torch re-enters its recompute context."""
 
-    def __init__(self, tape: ReplayCheckpoint):
+    def __init__(self, tape: ReplayCheckpoint) -> None:
+        """Keep the original invocation's tape alive for each recomputation."""
         self.tape = tape
 
-    def __enter__(self):
-        scope = self.tape.scope(True)
+    def __enter__(self) -> None:
+        """Enter a fresh replay scope when Torch starts recomputation."""
+        scope = self.tape.scope(True, non_reentrant=True)
         scope.__enter__()
         _REPLAY_SCOPES.set((*_REPLAY_SCOPES.get(), scope))
 
-    def __exit__(self, *exc):
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None,
+    ) -> bool | None:
+        """Restore the previous scope on completion or error."""
         scopes = _REPLAY_SCOPES.get()
         _REPLAY_SCOPES.set(scopes[:-1])
-        return scopes[-1].__exit__(*exc)
+        return scopes[-1].__exit__(exc_type, exc, traceback)
 
 
 class ReplayCheckpoint:
@@ -101,10 +114,10 @@ class ReplayCheckpoint:
 
     def contexts(self) -> tuple[AbstractContextManager, AbstractContextManager]:
         """Provide the context_fn for one non-reentrant torch checkpoint call."""
-        return self.scope(False), _ReplayContext(self)
+        return self.scope(False, non_reentrant=True), _ReplayContext(self)
 
     @contextmanager
-    def scope(self, replay: bool) -> Iterator[None]:
+    def scope(self, replay: bool, *, non_reentrant: bool = False) -> Iterator[None]:
         """Enter the tape before running any operator of the checkpointed block."""
         if (self.defer_forward_copies or self.guest_snapshot_bytes) and not torch.is_grad_enabled():
             raise RuntimeError("Checkpoint saves require a grad-enabled non-reentrant checkpoint")
@@ -116,6 +129,7 @@ class ReplayCheckpoint:
             self.forward_version = version
         state = _CheckpointScope(
             self.records, replay, version is not None and version == self.forward_version,
+            non_reentrant=non_reentrant,
             defer_forward_copies=self.defer_forward_copies, guest_snapshot_bytes=self.guest_snapshot_bytes,
         )
         token = _ACTIVE.set(state)
@@ -179,38 +193,64 @@ def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
 
 def agree_replay(
     record: ReplayRecord | None, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
-    counts: torch.Tensor | None, spec: Any, mask: int, *, weight_error: bool,
+    counts: torch.Tensor | None, spec: Any, mask: int,
 ) -> bool:
     """Agree across EP on exact routing, activation validity and guest snapshots."""
     scope = _ACTIVE.get()
-    valid = (
-        not weight_error and counts is None and record is not None
-        and record.route is not None and record.ids is not None
-        and record.ids.shape == ids.shape and record.ids.dtype == ids.dtype
-        and record.stream == torch.npu.current_stream(hidden.device)
-        and scope is not None and scope.same_parameters
-    )
+    assert scope is not None
+    if counts is not None:
+        try:
+            _validate_supplied_counts(counts, spec.num_experts, hidden.device)
+        except (TypeError, ValueError):
+            mask |= _INVALID_COUNTS_MASK
+    invalid = mask & _INVALID_ROUTE_INPUT_MASK
     with torch.no_grad():
-        flag = (_replay_vote(record, hidden, ids, probs, mask) if valid else
-                torch.zeros(1, dtype=torch.int32, device=hidden.device))
+        if not invalid and _can_replay(record, ids, counts, mask, scope):
+            flag = _replay_vote(record, hidden, ids, probs, counts, mask)
+        else:
+            flag = torch.full((1,), invalid, dtype=torch.int32, device=hidden.device)
         gathered = flag.new_empty(spec.ep_size)
         dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
         flags = gathered.tolist()
     route_mask = ~(_REPLAY_ACTIVATION_MASK | _REPLAY_GUEST_MASK)
     first = flags[0] & route_mask
-    reuse = first != 0 and all((value & route_mask) == first for value in flags)
+    reuse = first != 0 and not first & _INVALID_ROUTE_INPUT_MASK and all(
+        (value & route_mask) == first for value in flags)
+    if not reuse:
+        _reject_invalid_route_inputs(flags)
+        if scope.non_reentrant:
+            raise RuntimeError("Non-reentrant MegaMoe checkpoint could not replay its original expert layout "
+                               "on all EP ranks")
     if record is not None:
         record.allow_activation = reuse and all(value & _REPLAY_ACTIVATION_MASK for value in flags)
         record.allow_guest_restore = reuse and all(value & _REPLAY_GUEST_MASK for value in flags)
     return reuse
 
 
-def _replay_vote(record: ReplayRecord, hidden, ids, probs, mask):
+def _can_replay(
+    record: ReplayRecord | None, ids: torch.Tensor, counts: torch.Tensor | None,
+    mask: int, scope: _CheckpointScope,
+) -> bool:
+    """Check the saved metadata and execution mode before comparing tensors."""
+    if not scope.same_parameters or record is None:
+        return False
+    return (
+        record.route is not None and record.ids is not None
+        and record.ids.shape == ids.shape and record.ids.dtype == ids.dtype and record.ids.device == ids.device
+        and (counts is None) == (record.supplied_counts is None)
+        and record.stream == torch.npu.current_stream(ids.device)
+        and (not scope.non_reentrant or record.autograd_mask == mask)
+    )
+
+
+def _replay_vote(record: ReplayRecord, hidden, ids, probs, counts, mask):
     """Vote on exact route identity and whether saved activations still match."""
-    same_ids = (ids == record.ids).all()
+    same_route = (ids == record.ids).all()
+    if counts is not None:
+        same_route = same_route & (counts == record.supplied_counts).all()
     if record.guest_snapshot is not None:
         mask |= _REPLAY_GUEST_MASK
-    flag = same_ids.to(torch.int32).reshape(1) * mask
+    flag = same_route.to(torch.int32).reshape(1) * mask
     if record.activation is not None and record.inputs is not None:
         value, score = record.inputs
         if value.shape != hidden.shape or score.shape != probs.shape:
@@ -218,7 +258,7 @@ def _replay_vote(record: ReplayRecord, hidden, ids, probs, mask):
         # The tensor version counters detect writes through aliases to the saved inputs.
         versions = value._version, score._version  # pylint: disable=protected-access
         if record.input_versions == versions:
-            same_values = same_ids & (value == hidden).all() & (score == probs).all()
+            same_values = same_route & (value == hidden).all() & (score == probs).all()
             flag += same_values.to(torch.int32).reshape(1) * _REPLAY_ACTIVATION_MASK
     return flag
 

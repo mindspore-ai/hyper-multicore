@@ -1105,6 +1105,34 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         callback.assert_not_called()
         permute.assert_not_called()
 
+    def test_invalid_supplied_count_shape_is_rejected_by_the_existing_gather(self) -> None:
+        """Both ranks reject malformed counts before the placement callback."""
+        hidden, ids, probs = torch.ones(1, 16), torch.tensor([[0, 1]]), torch.ones(1, 2)
+        counts = torch.tensor([1, 1] + [0] * 22, dtype=torch.int32)
+        good = torch.cat((counts.new_tensor([0, 1, 31]), counts))
+        bad = counts.new_zeros(good.shape)
+        bad[:3] = counts.new_tensor([0, 1, 31 | route_module._INVALID_COUNTS_MASK])
+        wire = torch.stack((good, bad, good, good))
+        for rank, current in ((0, counts), (1, counts[:-1])):
+            def _gather(output, value, **_kwargs):
+                self.assertTrue(torch.equal(value, wire[rank]))
+                output.copy_(wire.flatten())
+                return Mock()
+
+            plan, allocate = Mock(), Mock()
+            with (self.subTest(rank=rank),
+                  patch.object(route_module.dist, "all_gather_into_tensor", side_effect=_gather) as exchange,
+                  patch.object(route_module, "_permute_topk_input", return_value=(hidden, ids)) as permute,
+                  self.assertRaisesRegex(ValueError, "tokens_per_expert")):
+                prepare_topk_route(hidden, ids, probs, self._spec(rank=rank), current, workspace=Mock(),
+                                   autograd_mask=31, prepare_workspace=allocate, select_placement=plan,
+                                   reuse_placement_geometry=True)
+            exchange.assert_called_once()
+            plan.assert_not_called()
+            allocate.assert_not_called()
+            if rank == 1:
+                permute.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

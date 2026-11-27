@@ -357,7 +357,7 @@ def test_a3_bounded_planning_uses_the_configured_slot_budget(mode, requested, ex
 def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     """Reject stale parameters across ranks, even if the token route matches."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
-    spec = SimpleNamespace(ep_size=2, ep_group=object())
+    spec = SimpleNamespace(ep_size=2, ep_group=object(), num_experts=2)
     hidden, probabilities = torch.ones((1, 4)), torch.ones((1, 2))
     ids = torch.tensor([[0, 1]])
     owner = object()
@@ -376,7 +376,7 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
         if recomputing:
             mask = 15 | (route._TENSOR_DUMP_MASK if tensor_dump else 0)
             route_matches = replay.agree_replay(
-                record, hidden, ids, probabilities, counts, spec, mask, weight_error=False,
+                record, hidden, ids, probabilities, counts, spec, mask,
             )
             return route_matches, record.allow_activation
         record.ids, record.stream, record.route = ids.clone(), "s", object()
@@ -416,7 +416,7 @@ def test_checkpoint_guest_snapshots_require_ep_agreement(monkeypatch, peer_snaps
         out.copy_(out.new_tensor([local.item(), peer_vote]))
 
     monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
-    spec = SimpleNamespace(ep_size=2, ep_group=object())
+    spec = SimpleNamespace(ep_size=2, ep_group=object(), num_experts=2)
     hidden, probs, ids = torch.ones((1, 4)), torch.ones((1, 2)), torch.tensor([[0, 1]])
     tape = replay.ReplayCheckpoint(lambda: 0, guest_snapshot_bytes=128)
     owner = object()
@@ -427,7 +427,7 @@ def test_checkpoint_guest_snapshots_require_ep_agreement(monkeypatch, peer_snaps
         original.guest_snapshot = snapshot
     with tape.scope(True):
         record, _ = replay.route_record(owner)
-        assert replay.agree_replay(record, hidden, ids, probs, None, spec, local_mask, weight_error=False) is route_hit
+        assert replay.agree_replay(record, hidden, ids, probs, None, spec, local_mask) is route_hit
         assert record.allow_guest_restore is (route_hit and peer_snapshot)
         assert not record.allow_activation
     assert record.guest_snapshot is snapshot and not original.allow_guest_restore
@@ -461,31 +461,24 @@ def test_nonreentrant_checkpoint_context_can_replay_a_retained_graph():
 @pytest.mark.parametrize("supplied", [False, True])
 @pytest.mark.parametrize("bad_weight_rank", [None, 0, 1])
 def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, supplied, bad_weight_rank, rank):
-    """An invalid rank votes against reuse, then both ranks reach route validation."""
+    """Reuse a valid route or reject a peer's weight error in the same replay vote."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
     ids = torch.tensor([[0, 1]], dtype=torch.int32)
     counts = torch.ones(2, dtype=torch.int32)
     hidden, probs = torch.ones(1, 2), torch.ones(1, 2)
     weights = (torch.ones(1, 2), torch.ones(1, 2))
     route_counts = counts if supplied else None
-    spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, top_k=2)
+    spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, num_experts=2)
     placement = SimpleNamespace(statistics={"route_replays": 0, "route_replay_misses": 0})
     resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=placement, ensure_capacity=Mock())
-    votes = []
-    def gather(out, local, **_kwargs):
-        votes.append(int(local))
-        out[:] = 0 if supplied else 1
+    def _gather(out, local, **_kwargs):
+        out[:] = 1
         if bad_weight_rank is not None:
-            out[bad_weight_rank] = 0
+            out[bad_weight_rank] = route._INVALID_WEIGHT_MASK
         assert int(out[rank]) == int(local)
-    def prepare(hidden, *_args, **options):
-        if votes and bad_weight_rank is not None:
-            rows = [[0, 1, 1, 2, 1, 1, 2] for _ in range(2)]
-            rows[bad_weight_rank][2] = route._INVALID_WEIGHT_MASK
-            assert options["autograd_mask"] == rows[rank][2]
-            route._validate_dynamic_rows(rows, spec)
-        return route.PreparedTopKRoute(hidden, ids, counts, counts, object())
 
+    gather = Mock(side_effect=_gather)
+    prepare = Mock(return_value=route.PreparedTopKRoute(hidden, ids, counts, counts, object()))
     monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
     monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
     monkeypatch.setattr(invocation, "_materialize_route_permutation", lambda *args: (hidden, ids))
@@ -493,15 +486,67 @@ def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, 
     with tape.scope(False), invocation.prepare_expert_invocation(
             hidden, ids, probs, route_counts, weights, resources):
         pass
+    current_counts = counts.to(torch.int64) if supplied else None
+    counts.add_(1)
     local_error = rank == bad_weight_rank
     current = (None, weights[1]) if local_error else weights
     expected = (nullcontext() if bad_weight_rank is None else
                 pytest.raises((TypeError, ValueError), match="expert weights"))
     with tape.scope(True), expected, invocation.prepare_expert_invocation(
-            hidden, ids, probs, route_counts, current, resources, weight_error=local_error):
+            hidden, ids, probs, current_counts, current, resources, weight_error=local_error) as restored:
+        if supplied:
+            torch.testing.assert_close(restored.tokens_per_expert, torch.ones_like(counts))
+    gather.assert_called_once()
+    prepare.assert_called_once()
+    assert placement.statistics["route_replays"] == (bad_weight_rank is None)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(("change_counts", "invalid", "non_reentrant"), [
+    (lambda counts: counts.add_(1), False, True),
+    (lambda counts: counts.add_(1), False, False),
+    (lambda counts: None, False, True),
+    (lambda counts: counts[:1], True, True),
+    (lambda counts: counts.float(), True, True),
+    (lambda counts: torch.empty_like(counts, device="meta"), True, True),
+], ids=["different", "reentrant-fallback", "omitted", "shape", "dtype", "device"])
+def test_checkpoint_replay_agrees_before_changing_layout(monkeypatch, rank, change_counts, invalid, non_reentrant):
+    """Keep non-reentrant replay on its original placement and converge invalid metadata."""
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
+    hidden, probs, ids = torch.ones(1, 2), torch.ones(1, 2), torch.tensor([[0, 1]])
+    counts = torch.ones(2, dtype=torch.int32)
+    spec = SimpleNamespace(ep_size=2, ep_group=object(), dispatch_mode="push", auto_tokens=True, num_experts=2)
+    stats = {"route_replays": 0, "route_replay_misses": 0}
+    resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=SimpleNamespace(statistics=stats))
+
+    def _gather(out, local, **_kwargs):
+        out[:] = out.new_tensor([1, route._INVALID_COUNTS_MASK if invalid else 0])
+        assert int(out[rank]) == int(local)
+
+    gather = Mock(side_effect=_gather)
+    physical_counts = torch.tensor([1, 0, 0, 1], dtype=torch.int32)
+    prepare = Mock(return_value=route.PreparedTopKRoute(hidden, ids, physical_counts, physical_counts, object()))
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(invocation, "prepare_topk_route", prepare)
+    tape = replay.ReplayCheckpoint(lambda: 1)
+    forward, recompute = tape.contexts() if non_reentrant else (tape.scope(False), tape.scope(True))
+    weights = hidden, hidden
+    with forward, invocation.prepare_expert_invocation(hidden, ids, probs, counts, weights, resources) as original:
+        record = original.checkpoint_record
+        assert record.route.tokens_per_expert is physical_counts
+    current_counts = change_counts(counts) if rank == 1 else counts
+    torch.testing.assert_close(record.supplied_counts, torch.ones_like(counts))
+    error = nullcontext()
+    if invalid:
+        error = pytest.raises(ValueError, match="tokens_per_expert")
+    elif non_reentrant:
+        error = pytest.raises(RuntimeError, match="original expert layout")
+    with recompute, error, invocation.prepare_expert_invocation(
+            hidden, ids, probs, current_counts, weights, resources):
         pass
-    assert len(votes) == 1
-    assert placement.statistics["route_replays"] == (not supplied and bad_weight_rank is None)
+    gather.assert_called_once()
+    assert prepare.call_count == (1 if non_reentrant else 2)
+    assert stats == {"route_replays": 0, "route_replay_misses": int(not non_reentrant)}
 
 
 @pytest.mark.parametrize("guest_rows", [0, 1])

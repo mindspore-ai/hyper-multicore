@@ -275,6 +275,10 @@ HotReplica 的放置计数以正向执行提交为准（`placements` 及各模�
 `placement_candidates` 记录物化后的候选，`heap_rejections` 和 `protocol_rejections` 记录相应的拒绝原因。
 checkpoint 跳过重算时单独计入 `skipped_recomputes`。
 
+重放记录保存每次前向的落位、有序 Top-K IDs，以及调用方提供的逻辑专家计数。
+重算在设备上检查路由输入，并沿用现有 EP 投票确认布局。非重入反向持有原前向的 plan 和权重绑定，
+因此非重入布局确认失败时全组报错。重入重算可在路由未命中时重新规划。
+
 非重入 checkpoint 可把 A3 BF16 MTE Push 的 dispatch 和 combine 保存移到重算阶段。
 原前向在工作区租约内完成反置换，向 Torch 保存对应形状、dtype 和设备的占位张量。
 重算在相同的保存位置写入独立持有的行张量，反向在取得工作区租约前校验这些行已被重算替换。

@@ -255,15 +255,17 @@ def test_nonreentrant_checkpoint_saves():
         tokens, hidden, intermediate = 1024, 512, 256
         x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) * .02
         ids = torch.arange(2, dtype=torch.int32, device=device).expand(tokens, 2).contiguous()
+        counts = torch.tensor([tokens, tokens] + [0] * 6, dtype=torch.int32, device=device)
         probs = torch.rand(tokens, 2, device=device).softmax(-1)
         weights = tuple(torch.randn(shape, dtype=torch.bfloat16, device=device) * .02
                         for shape in ((4, hidden, 2 * intermediate), (4, intermediate, hidden)))
         upstream = torch.randn_like(x)
         reference = None
         receipts = []
-        for name, defer, budget, restores in (
-            ("ordinary", False, 0, 0), ("deferred", True, 32 << 20, 1),
-            ("peer_miss", True, 1 if rank == 1 else 32 << 20, 0), ("snapshot_only", False, 32 << 20, 1),
+        for name, defer, budget, restores, supplied in (
+            ("ordinary", False, 0, 0, False), ("deferred", True, 32 << 20, 1, True),
+            ("peer_miss", True, 1 if rank == 1 else 32 << 20, 0, True),
+            ("snapshot_only", False, 32 << 20, 1, True),
         ):
             op = MegaMoeExperts(
                 hidden_size=hidden, intermediate_size=intermediate, num_experts=8, top_k=2,
@@ -271,7 +273,8 @@ def test_nonreentrant_checkpoint_saves():
             )
 
             def run(h, p, w1, w2, execute=op):
-                return execute(h, ids, p, expert_weights=(w1, w2))
+                return execute(h, ids, p, expert_weights=(w1, w2),
+                               tokens_per_expert=counts.clone() if supplied else None)
 
             leaves = tuple(t.detach().requires_grad_() for t in (x, probs, *weights))
             tape = ReplayCheckpoint(lambda: 1, defer_forward_copies=defer, guest_snapshot_bytes=budget)
@@ -287,13 +290,52 @@ def test_nonreentrant_checkpoint_saves():
             else:
                 for value, expected in zip(observed, reference, strict=True):
                     torch.testing.assert_close(value, expected, rtol=0, atol=0)
-            receipts.append({"mode": name, "route_replays": 1, "snapshot_restores": restores})
+            receipts.append({"mode": name, "route_replays": 1, "snapshot_restores": restores,
+                             "supplied_counts": supplied})
             del out, gradients, leaves, tape
+            if name == "snapshot_only":
+                inputs = x, probs, *weights
+                receipts.extend(_check_checkpoint_count_rejections(op, inputs, ids, counts, rank))
             op.close()
         output = Path(os.environ["HOT_REPLICA_TEST_RESULTS"])
         (output / f"rank{rank}.json").write_text(json.dumps({"rank": rank, "cases": receipts}))
     finally:
         dist.destroy_process_group()
+
+
+def _check_checkpoint_count_rejections(op, inputs, ids, counts, rank):
+    """Reject rank-local counts errors before planning a replacement route."""
+    placement = op._resource_group.resources.placement  # pylint: disable=protected-access
+    receipts = []
+    for name, in_replay, invalid_counts, error, message in (
+        ("forward_shape", False, counts[:-1], ValueError, "tokens_per_expert"),
+        ("replay_shape", True, counts[:-1], ValueError, "tokens_per_expert"),
+        ("replay_values", True, counts.roll(1), RuntimeError, "original expert layout"),
+    ):
+        calls = 0
+        before = placement.statistics["invocations"]
+        leaves = tuple(value.detach().requires_grad_() for value in inputs)
+        tape = ReplayCheckpoint(lambda: 1)
+
+        def _run(hidden, probs, w1, w2):
+            nonlocal calls
+            replaying = calls > 0
+            calls += 1
+            local_counts = invalid_counts if rank == 1 and replaying == in_replay else counts
+            return op(hidden, ids, probs, expert_weights=(w1, w2), tokens_per_expert=local_counts)
+
+        if in_replay:
+            output = checkpoint(_run, *leaves, use_reentrant=False, context_fn=tape.contexts)
+            with pytest.raises(error, match=message):
+                torch.autograd.grad(output, leaves, torch.ones_like(output))
+            del output
+        else:
+            with pytest.raises(error, match=message):
+                checkpoint(_run, *leaves, use_reentrant=False, context_fn=tape.contexts)
+        assert calls == 1 + int(in_replay)
+        assert placement.statistics["invocations"] == before + int(in_replay)
+        receipts.append({"mode": name, "error": error.__name__})
+    return receipts
 
 
 def test_wide_placement_and_hard_receive_limit():

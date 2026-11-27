@@ -143,28 +143,36 @@ def _validate_topk_inputs(
     return topk_ids.reshape(-1)
 
 
+def _validate_supplied_counts(
+    supplied_counts: torch.Tensor, num_experts: int, device: torch.device,
+) -> None:
+    """Check the logical count tensor without reading its contents."""
+    if not isinstance(supplied_counts, torch.Tensor):
+        raise TypeError("tokens_per_expert must be a Tensor.")
+    if tuple(supplied_counts.shape) != (num_experts,):
+        raise ValueError(
+            f"tokens_per_expert must have shape ({num_experts},), "
+            f"got {tuple(supplied_counts.shape)}."
+        )
+    if supplied_counts.device != device:
+        raise ValueError("tokens_per_expert must be on the route tensor device.")
+    if supplied_counts.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"tokens_per_expert must be int32 or int64, got {supplied_counts.dtype}."
+        )
+
+
 def _resolve_counts(
     flat_ids: torch.Tensor,
     supplied_counts: torch.Tensor | None,
     spec: MegaMoeSpec,
 ) -> torch.Tensor:
-    """Use trusted Router counts or compute them only when omitted."""
+    """Use validated Router counts or compute them only when omitted."""
     if supplied_counts is None:
         return (
             torch.bincount(flat_ids.to(torch.int64), minlength=spec.num_experts)
             .to(torch.int32)
             .contiguous()
-        )
-    if tuple(supplied_counts.shape) != (spec.num_experts,):
-        raise ValueError(
-            f"tokens_per_expert must have shape ({spec.num_experts},), "
-            f"got {tuple(supplied_counts.shape)}."
-        )
-    if supplied_counts.device != flat_ids.device:
-        raise ValueError("tokens_per_expert must be on the route tensor device.")
-    if supplied_counts.dtype not in (torch.int32, torch.int64):
-        raise TypeError(
-            f"tokens_per_expert must be int32 or int64, got {supplied_counts.dtype}."
         )
     if supplied_counts.dtype == torch.int32 and supplied_counts.is_contiguous():
         return supplied_counts
@@ -292,6 +300,7 @@ def _unpack_route_offsets(
     pull = spec.dispatch_mode == "pull"
 
     def describe(unit: int) -> RouteMetadata:
+        """Read one offset plane and its shared size fields."""
         offset_index, size_index = 9 * unit, 4 * unit
         src, target, length = offsets[offset_index + 4], offsets[offset_index + 6], sizes[size_index + 2]
         return RouteMetadata(
@@ -497,6 +506,13 @@ def prepare_topk_route(
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    if tokens_per_expert is not None:
+        try:
+            _validate_supplied_counts(tokens_per_expert, spec.num_experts, flat_ids.device)
+        except (TypeError, ValueError):
+            if not spec.dynamic_tokens or spec.ep_size == 1:
+                raise
+            autograd_mask |= _INVALID_COUNTS_MASK
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
                                       workspace, autograd_mask, prepare_workspace, select_placement,
@@ -552,14 +568,24 @@ def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 
 _INVALID_WEIGHT_MASK = 1 << 5
 _TENSOR_DUMP_MASK = 1 << 6
+_INVALID_COUNTS_MASK = 1 << 9
+_INVALID_ROUTE_INPUT_MASK = _INVALID_WEIGHT_MASK | _INVALID_COUNTS_MASK
+
+
+def _reject_invalid_route_inputs(flags: list[int]) -> None:
+    """Reject input errors reported by any participant in the route exchange."""
+    if any(flag & _INVALID_WEIGHT_MASK for flag in flags):
+        raise ValueError("expert weights do not match the bound layout on all EP ranks")
+    if any(flag & _INVALID_COUNTS_MASK for flag in flags):
+        raise ValueError("tokens_per_expert must be an int32 or int64 histogram of shape (num_experts,) "
+                         "on the route tensor device on all EP ranks")
 
 
 def _validate_route_flags(rows: list[list[int]]) -> None:
     """Check route participation before reusing geometry or selecting a protocol."""
     flags = rows[0][2]
-    if flags & _INVALID_WEIGHT_MASK or any(row[2] != flags for row in rows):
-        if any(row[2] & _INVALID_WEIGHT_MASK for row in rows):
-            raise ValueError("expert weights do not match the bound layout on all EP ranks")
+    if flags & _INVALID_ROUTE_INPUT_MASK or any(row[2] != flags for row in rows):
+        _reject_invalid_route_inputs([row[2] for row in rows])
         if any((row[2] ^ flags) & _TENSOR_DUMP_MASK for row in rows):
             raise RuntimeError("MegaMoe Tensor Dump mode differs across EP ranks")
         raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
@@ -845,14 +871,15 @@ def _dynamic_route_payload(
     """Pack one group-consistent wire format, including coordinated overflow flags."""
     tokens = hidden_states.shape[0]
     flexible = spec.auto_tokens
-    invalid = (tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 if flexible
-               else tokens > spec.max_local_num_tokens)
+    overflow = (tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 if flexible
+                else tokens > spec.max_local_num_tokens)
+    invalid = overflow or bool(autograd_mask & _INVALID_COUNTS_MASK)
     counts = (torch.zeros(spec.num_experts, dtype=torch.int32, device=hidden_states.device) if invalid
               else _resolve_counts(flat_ids, supplied_counts, spec))
     payload_dtype = torch.int32 if flexible else torch.int64
     # An invalid source must still join the same collective before all ranks reject it.
     header_tokens = min(tokens, 2**31 - 1) if flexible else tokens
-    header = _dynamic_header((int(invalid), header_tokens, autograd_mask), payload_dtype,
+    header = _dynamic_header((int(overflow), header_tokens, autograd_mask), payload_dtype,
                              hidden_states.device, workspace if flexible else None, stream=stream)
     payload = torch.cat((header, counts.to(payload_dtype)))
     return counts, payload, invalid

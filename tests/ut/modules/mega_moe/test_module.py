@@ -120,7 +120,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                     for rows in (0, 1, 127, 128, 129, 257, 4097):
                         result = layer._validate_forward_inputs(
                             torch.empty(1, rows, 16, dtype=torch.bfloat16),
-                            torch.zeros(rows, 2, dtype=torch.int32), torch.ones(rows, 2), None, parameters)
+                            torch.zeros(rows, 2, dtype=torch.int32), torch.ones(rows, 2), parameters)
                         self.assertEqual(tuple(result.shape), (rows, 16))
         for keyword in ("local_num_tokens", "max_local_num_tokens"):
             with self.subTest(keyword=keyword), self.assertRaisesRegex(TypeError, keyword):

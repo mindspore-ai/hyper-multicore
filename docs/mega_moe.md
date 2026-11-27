@@ -211,6 +211,9 @@ output = checkpoint(experts_forward, *inputs, use_reentrant=False, context_fn=ta
   重算从本地快照恢复。预算不足时全 EP 走原权重发布路径。多个在途调用各自持有快照。
 
 两个选项默认关闭。使用这两个选项时，原前向和重算均需启用梯度，并在同一 EP 组使用相同的保存策略。
+通过 `context_fn=tape.contexts` 重算时，整个 EP 组必须确认原始布局，否则全组报错。
+调用方应保持参数逻辑版本、有序 Top-K IDs、执行流和诊断模式一致。
+原前向和重算可以都省略 `tokens_per_expert`，或都传入内容相同的逻辑专家计数。
 
 ### 旧 HotReplica 接口退役
 

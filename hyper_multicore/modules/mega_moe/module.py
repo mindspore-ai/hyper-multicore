@@ -429,7 +429,6 @@ class MegaMoeExperts(MulticoreModule):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        tokens_per_expert: torch.Tensor | None,
         expert_weights: tuple,
     ) -> torch.Tensor:
         """Validate input shapes and return flattened local token states."""
@@ -449,13 +448,6 @@ class MegaMoeExperts(MulticoreModule):
                 f"topk_weights must have shape {route_shape}, "
                 f"got {tuple(topk_weights.shape)}."
             )
-        if tokens_per_expert is not None and tuple(tokens_per_expert.shape) != (
-            self.num_experts,
-        ):
-            raise ValueError(
-                f"tokens_per_expert must have shape ({self.num_experts},), "
-                f"got {tuple(tokens_per_expert.shape)}."
-            )
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
 
@@ -464,13 +456,12 @@ class MegaMoeExperts(MulticoreModule):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        tokens_per_expert: torch.Tensor | None,
         expert_weights: tuple,
     ) -> tuple[torch.Tensor, bool]:
         """Defer rank-local weight errors until the binding or route collective."""
         try:
             return self._validate_forward_inputs(
-                hidden_states, topk_ids, topk_weights, tokens_per_expert, expert_weights,
+                hidden_states, topk_ids, topk_weights, expert_weights,
             ), False
         except (_InvalidExpertWeights, _InvalidExpertWeightType):
             if self.ep_size == 1:
@@ -511,7 +502,7 @@ class MegaMoeExperts(MulticoreModule):
         """
         weights = expert_weights
         hidden_flat, weight_error = self._prepare_forward_inputs(
-            hidden_states, topk_ids, topk_weights, tokens_per_expert, weights,
+            hidden_states, topk_ids, topk_weights, weights,
         )
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")

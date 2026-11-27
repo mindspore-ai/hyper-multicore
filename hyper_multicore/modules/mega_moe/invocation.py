@@ -37,7 +37,7 @@ def prepare_expert_invocation(
     resources: "_MegaMoeExecutionResources", *, weight_error: bool = False,
     planner: "BasePlanner | None" = None,
 ) -> Iterator[PreparedTopKRoute]:
-    """Converge weight errors on the existing route collective before physical binding.
+    """Converge input errors on the existing route collective before physical binding.
 
     Pull source publication and consumption share one lease. Automatic capacity
     changes happen before claiming that lease. No precision implementation may
@@ -72,12 +72,11 @@ def prepare_expert_invocation(
             from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
 
             record, replay = route_record(resources)
-            if replay and agree_replay(
-                    record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
-                placement.statistics["route_replays"] += 1
-                yield _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump)
-                return
             if replay:
+                if agree_replay(record, hidden, ids, probs, counts, resources.spec, mask):
+                    placement.statistics["route_replays"] += 1
+                    yield _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump)
+                    return
                 placement.statistics["route_replay_misses"] += 1
                 record = None
 
@@ -93,15 +92,13 @@ def prepare_expert_invocation(
                 resources.workspace.ensure(resources.spec, hidden.dtype, hidden.device)
             resources.workspace.claim()
             leased_workspace = resources.workspace
-        if record is not None and counts is None and not weight_error:
-            record.stream = torch.npu.current_stream(hidden.device)
         with torch.inference_mode(False), torch.no_grad():
             route = prepare_topk_route(hidden, ids, probs, resources.spec, counts,
                                        workspace=resources.workspace, **options)
         if not pull and not resources.spec.auto_tokens:
             with torch.inference_mode(False):
                 resources.ensure_capacity(route.maximum_received_slots)
-        yield _record_checkpoint_route(route, record, counts, ids)
+        yield _record_checkpoint_route(route, record, counts, ids, mask)
     finally:
         if leased_workspace is not None:
             leased_workspace.release()
@@ -124,10 +121,14 @@ def _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace,
     return replace(route, checkpoint_record=record, tensor_dump=tensor_dump)
 
 
-def _record_checkpoint_route(route, record, counts, ids):
+def _record_checkpoint_route(route, record, counts, ids, mask):
     """Keep the route descriptors and placement with the checkpoint invocation."""
-    if record is None or counts is not None:
+    if record is None:
         return route
-    record.route = replace(route, routed_tokens=None, unpermute_mapping=None)
+    record.supplied_counts = counts.detach().clone() if counts is not None else None
+    saved_counts = record.supplied_counts if route.tokens_per_expert is counts else route.tokens_per_expert
+    record.route = replace(route, routed_tokens=None, unpermute_mapping=None, tokens_per_expert=saved_counts)
     record.ids = ids.detach().clone()
+    record.stream = torch.npu.current_stream(ids.device)
+    record.autograd_mask = mask
     return replace(route, checkpoint_record=record)
