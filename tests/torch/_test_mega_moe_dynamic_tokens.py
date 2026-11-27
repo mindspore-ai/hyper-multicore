@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -31,6 +32,7 @@ from torch.utils.checkpoint import checkpoint
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
 from hyper_multicore.experimental import MegaMoeTuningOptions
 from hyper_multicore.modules.mega_moe import route as route_module
+from hyper_multicore.modules.mega_moe import invocation as invocation_module
 from tests.common.multicore._evidence_helpers import EXTENDED_LEVEL1
 from tests.common.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
 from tests.common.multicore.moe_reference import grouped_matmul
@@ -545,50 +547,39 @@ def _run_token_matrix(mega: MegaMoeExperts, fixed: MegaMoeExperts, weights: tupl
     return results, fixed_reports
 
 
-def _latest_cached_route(workspace: object) -> object | None:
-    """Inspect the most recently used entry of the bounded descriptor cache."""
-    cache = workspace.route_cache
-    return next(reversed(cache.values()), None) if cache else None
+def _forward_with_metadata(mega, inputs, rank, device, *, supplied_counts=None):
+    """Observe this invocation's descriptors without assuming a cache policy."""
+    retained = []
+    prepare = invocation_module.prepare_topk_route
 
+    def record(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        retained.append(prepared.metadata)
+        return prepared
 
-def _check_route_cache_admission(cached: object, previous: object, phase: str) -> None:
-    """Check bounded descriptor admission, reuse and count-change invalidation."""
-    if cached is None or (phase == "flipped" and cached is not previous):
-        raise AssertionError(f"descriptor reuse failed: phase={phase}, old={id(previous)}, new={id(cached)}")
-    if phase == "shifted" and cached is previous:
-        raise AssertionError(f"changed counts reused descriptors: old={id(previous)}, new={id(cached)}")
-    if phase in ("confirm", "flipped") and getattr(cached, "metadata", None) is None:
-        raise AssertionError(f"repeated table did not retain descriptors: phase={phase}")
-
-
-def _warm_route_cache(mega: MegaMoeExperts, inputs: tuple, rank: int, device: torch.device,
-                      supplied_counts: torch.Tensor | None = None) -> None:
-    """Let bounded cache reprobing recover after the preceding changing-token matrix."""
-    if len(inputs[0]) * mega.num_experts > route_module._HOST_ROUTE_MAX_COUNTS:  # pylint: disable=protected-access
-        return
-    workspace = mega._resource_group.resources.workspace  # pylint: disable=protected-access
-    previous = None
-    limit = 2 * route_module._ROUTE_CACHE_REPROBE_STEPS + 4  # pylint: disable=protected-access
-    for _ in range(limit):
-        mega.zero_grad(set_to_none=True)
+    with patch.object(invocation_module, "prepare_topk_route", side_effect=record):
         invocation = _forward(mega, inputs, rank, device, supplied_counts=supplied_counts)
-        (invocation[2] * invocation[3]).sum().backward()
-        cached = _latest_cached_route(workspace)
-        eligible = cached is not None and cached.metadata is not None and workspace.route_cache_probe_after == 0
-        if eligible and cached is previous:
-            return
-        previous = cached if eligible else None
-    raise AssertionError(f"stable route did not recover its descriptor cache within {limit} calls")
+    assert len(retained) == 1, "one invocation must have one prepared route"
+    return invocation, retained[0]
+
+
+def _metadata_snapshot(metadata, width):
+    """Retain row and element values needed by saved backward graphs."""
+    return {(unit, name): value.cpu().clone()
+            for unit in (1, width) for name, value in vars(metadata.for_kernel(unit)).items()
+            if isinstance(value, torch.Tensor)}
+
+
+def _assert_metadata_unchanged(metadata, snapshot):
+    for (unit, name), expected in snapshot.items():
+        torch.testing.assert_close(getattr(metadata.for_kernel(unit), name).cpu(), expected, rtol=0, atol=0)
 
 
 def _same_histogram_routes(mega: MegaMoeExperts, weights: tuple, rank: int,
                            world: int, device: torch.device) -> None:
-    """Check real permutation changes, descriptor reuse and count invalidation on device."""
+    """Validate current counts, real permutation changes and retained descriptors."""
     inputs = _inputs([129 + index for index in range(world)], mega.num_experts, mega.top_k)
-    _warm_route_cache(mega, inputs, rank, device)
-    workspace = mega._resource_group.resources.workspace  # pylint: disable=protected-access
-    previous = None
-    host_policy = world * mega.num_experts <= route_module._HOST_ROUTE_MAX_COUNTS  # pylint: disable=protected-access
+    saved = []
     for phase in ("original", "confirm", "flipped", "shifted"):
         ids = inputs[1]
         if phase == "flipped":
@@ -597,40 +588,38 @@ def _same_histogram_routes(mega: MegaMoeExperts, weights: tuple, rank: int,
             ids = [(value + 1) % mega.num_experts for value in ids]
         batch = (inputs[0], ids, inputs[2], inputs[3])
         mega.zero_grad(set_to_none=True)
-        invocation = _forward(mega, batch, rank, device)
+        invocation, metadata = _forward_with_metadata(mega, batch, rank, device)
         _check_gradients(mega, invocation, _rounded_oracle(weights, batch),
                          [129 + index for index in range(world)], rank)
-        cached = _latest_cached_route(workspace)
-        if host_policy:
-            _check_route_cache_admission(cached, previous, phase)
-        previous = cached
+        counts = torch.stack([torch.bincount(value.long().reshape(-1), minlength=mega.num_experts)
+                              for value in ids]).int()
+        spec = mega._resource_group.resources.spec  # pylint: disable=protected-access
+        expected = route_module._compute_route_metadata(  # pylint: disable=protected-access
+            counts[rank], counts, None, spec, metadata.expert_capacity)
+        _assert_metadata_unchanged(metadata, _metadata_snapshot(expected, spec.hidden_size))
+        for old_metadata, snapshot in saved:
+            _assert_metadata_unchanged(old_metadata, snapshot)
+        saved.append((metadata, _metadata_snapshot(metadata, spec.hidden_size)))
 
 
-def _supplied_count_cache_ownership(mega: MegaMoeExperts, weights: tuple, rank: int,
-                                    world: int, device: torch.device) -> None:
-    """Keep confirmed cached descriptors independent of a reusable Router count tensor."""
+def _supplied_count_metadata_ownership(mega: MegaMoeExperts, weights: tuple, rank: int,
+                                       world: int, device: torch.device) -> None:
+    """Descriptor storage must not alias a reusable Router histogram."""
     lengths = [129 + index for index in range(world)]
     inputs = _inputs(lengths, mega.num_experts, mega.top_k)
     counts = torch.bincount(inputs[1][rank].reshape(-1).long(), minlength=mega.num_experts).int().to(device)
     replacement = counts.clone()
-    _warm_route_cache(mega, inputs, rank, device, supplied_counts=counts)
-    for _ in range(2):
-        mega.zero_grad(set_to_none=True)
-        invocation = _forward(mega, inputs, rank, device, supplied_counts=counts)
-        _check_gradients(mega, invocation, _rounded_oracle(weights, inputs), lengths, rank)
-    workspace = mega._resource_group.resources.workspace  # pylint: disable=protected-access
-    cached = _latest_cached_route(workspace)
-    assert cached is not None and cached.metadata is not None
-    metadata = cached.metadata
-    expected = {name: tensor.cpu().clone() for name, tensor in vars(metadata).items()
-                if isinstance(tensor, torch.Tensor)}
+    mega.zero_grad(set_to_none=True)
+    invocation, metadata = _forward_with_metadata(mega, inputs, rank, device, supplied_counts=counts)
+    _check_gradients(mega, invocation, _rounded_oracle(weights, inputs), lengths, rank)
+    expected = _metadata_snapshot(metadata, _HIDDEN)
     counts.zero_()
-    for name, tensor in expected.items():
-        torch.testing.assert_close(getattr(metadata, name).cpu(), tensor, rtol=0, atol=0)
+    _assert_metadata_unchanged(metadata, expected)
     current = ([tensor * 0.5 for tensor in inputs[0]], *inputs[1:])
     mega.zero_grad(set_to_none=True)
     invocation = _forward(mega, current, rank, device, supplied_counts=replacement)
     _check_gradients(mega, invocation, _rounded_oracle(weights, current), lengths, rank)
+    _assert_metadata_unchanged(metadata, expected)
 
 
 def test_probability_positions() -> None:
@@ -828,7 +817,7 @@ def test_dynamic_tokens() -> None:
     matrix_results, fixed_reports = _run_token_matrix(mega, fixed, weights, rank, world, device)
     results.extend(matrix_results)
     _same_histogram_routes(mega, weights, rank, world, device)
-    _supplied_count_cache_ownership(mega, weights, rank, world, device)
+    _supplied_count_metadata_ownership(mega, weights, rank, world, device)
     results.append(_verify(peer, [127] * world, weights, rank, device))
     if mega._resource_group.resources is not peer._resource_group.resources:  # pylint: disable=protected-access
         raise AssertionError("shared second layer acquired independent execution resources")
@@ -847,7 +836,7 @@ def test_dynamic_tokens() -> None:
               "source_growth_pending_backward": "passed", "mixed_transport_restart": "passed",
               "same_bucket_growth_pending_backward": "passed", "geometric_plan_reuse": bucket_reuse,
               "same_histogram_permutation_and_invalidation": "passed",
-              "supplied_count_cache_ownership": "passed",
+              "supplied_count_metadata_ownership": "passed",
               "final_capacity": final_state, "torch": torch.__version__, "torch_npu": torch_npu.__version__,
               "dispatch_mode": mode}
     if os.getenv("HP_MEGA_MOE_LEVEL1_RESULT"):

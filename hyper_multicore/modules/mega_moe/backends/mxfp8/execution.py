@@ -57,7 +57,8 @@ class MXFP8Execution:
             profile_mx_launch(buffers, runtime, events, plan.spec, direction,
                               prepare_mxfp8_launch, launch_graph, scope=scope)
             return
-        launch = prepare_mxfp8_launch(buffers, runtime.runtime, events, plan.spec)
+        launch = prepare_mxfp8_launch(buffers, runtime.runtime, events, plan.spec,
+                                     cache=self.resources.launch_cache)
         # Disabled diagnostics never read this binding, matching the BF16 adapter.
         launch_graph(buffers, runtime.runtime, events, events, launch)
 
@@ -68,6 +69,7 @@ class MXFP8Execution:
         resources, workspace = self.resources, self.resources.workspace
         spec, device = resources.spec, hidden.device
         metadata = route.metadata
+        kernel_metadata = metadata.for_kernel(spec.hidden_size)
         pull = spec.dispatch_mode == "pull"
         capacity = metadata.expert_capacity if pull else workspace.expert_capacity
         plan = resources.plan_for_capacity(capacity, device, tokens=metadata.plan_tokens)
@@ -86,11 +88,11 @@ class MXFP8Execution:
             workspace.claim()
         try:
             buffers = [
-                dispatch_buffer, metadata.dispatch_target_off * spec.hidden_size, source_buffer,
-                metadata.dispatch_src_off * spec.hidden_size, metadata.dispatch_size * spec.hidden_size,
+                dispatch_buffer, kernel_metadata.dispatch_target_off, source_buffer,
+                kernel_metadata.dispatch_src_off, kernel_metadata.dispatch_size,
                 weight1.col_data, metadata.group_list, up, a_row, weight2.col_data, metadata.group_list, down,
-                workspace.routed_buffer, metadata.combine_target_off * spec.hidden_size,
-                metadata.combine_src_off * spec.hidden_size, metadata.combine_size * spec.hidden_size,
+                workspace.routed_buffer, kernel_metadata.combine_target_off,
+                kernel_metadata.combine_src_off, kernel_metadata.combine_size,
                 x_row, x_scale, x_col, x_col_scale, a_scale, a_col, a_col_scale,
                 weight1.col_scale, weight2.col_scale, plan.forward.gmm, plan.forward.quant,
             ]
@@ -105,9 +107,9 @@ class MXFP8Execution:
                     and output.untyped_storage().data_ptr() == workspace.routed_buffer.untyped_storage().data_ptr()):
                 raise RuntimeError('No-grad MX unpermute output must not alias shared routed storage.')
             saved = ((x_col, x_col_scale, a_col, a_col_scale, up, expert_output, probabilities,
-                      route.unpermute_mapping, metadata.group_list, metadata.dispatch_target_off,
-                      metadata.dispatch_src_off, metadata.dispatch_size, metadata.combine_target_off,
-                      metadata.combine_src_off, metadata.combine_size) if retain_backward else ())
+                      route.unpermute_mapping, metadata.group_list, kernel_metadata.dispatch_target_off,
+                      kernel_metadata.dispatch_src_off, kernel_metadata.dispatch_size, kernel_metadata.combine_target_off,
+                      kernel_metadata.combine_src_off, kernel_metadata.combine_size) if retain_backward else ())
             return MXFP8ForwardState(
                 output.reshape_as(hidden), saved,
                 _ExecutionMetadata(plan, tuple(hidden.shape), route.routed_tokens.shape[0], probs.dtype), workspace,
@@ -145,11 +147,11 @@ class MXFP8Execution:
                 expert_output, gradient.reshape(-1, spec.hidden_size).contiguous(), mapping, probs, source, grad_probs,
             )
             buffers = [
-                dispatch, dispatch_target * spec.hidden_size, workspace.source_buffer if pull else source,
-                dispatch_source * spec.hidden_size, dispatch_size * spec.hidden_size,
+                dispatch, dispatch_target, workspace.source_buffer if pull else source,
+                dispatch_source, dispatch_size,
                 a_col, dw2, weight2.row_data, da, up, du_row, weight1.row_data, dx,
-                workspace.routed_buffer, combine_target * spec.hidden_size, combine_source * spec.hidden_size,
-                combine_size * spec.hidden_size, x_col, dw1, group_list, dy_row, dy_scale, dy_col, dy_col_scale,
+                workspace.routed_buffer, combine_target, combine_source,
+                combine_size, x_col, dw1, group_list, dy_row, dy_scale, dy_col, dy_col_scale,
                 a_col_scale, weight2.row_scale, du_scale, du_col, du_col_scale, weight1.row_scale, x_col_scale,
                 plan.backward.gmm, plan.backward.quant,
             ]

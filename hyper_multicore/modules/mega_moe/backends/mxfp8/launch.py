@@ -15,17 +15,8 @@ from .launch_contract import serialize_mx_launch_metadata
 @lru_cache(maxsize=1)
 def _load_mxfp8_native() -> None:
     _load_native()
-    if torch.ops.hyper_multicore.mega_moe_mxfp8_abi_version() != 3:
+    if torch.ops.hyper_multicore.mega_moe_mxfp8_abi_version() != 4:
         raise RuntimeError('MXFP8 MegaMoE adapter ABI mismatch; rebuild the local multicore component.')
-
-
-def _byte_aliases(buffers: Sequence[torch.Tensor]) -> list[torch.Tensor]:
-    aliases = []
-    for tensor in buffers:
-        if not tensor.is_contiguous():
-            raise ValueError('MXFP8 task buffers must be contiguous; implicit physical weight copies are forbidden.')
-        aliases.append(tensor.view(torch.uint8).reshape(-1))
-    return aliases
 
 
 def serialize_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
@@ -40,20 +31,38 @@ def serialize_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tenso
 
 
 def prepare_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
-                         events: torch.Tensor, spec: MegaMoeSpec) -> torch.Tensor:
-    """Upload the bounds of the current native operands."""
+                         events: torch.Tensor, spec: MegaMoeSpec, *, cache=None) -> torch.Tensor:
+    """Reuse exact immutable bounds while retaining cross-stream upload ordering."""
     metadata = serialize_mxfp8_launch(buffers, runtime, events, spec)
-    return torch.frombuffer(bytearray(metadata), dtype=torch.uint8).to(device=runtime.device)
+    cached = None if cache is None else cache.get(metadata)
+    stream = torch.npu.current_stream(runtime.device) if runtime.device.type == 'npu' else None
+    if cached is not None:
+        tensor, producer, ready = cached
+        if stream is not None:
+            if producer != stream:
+                stream.wait_event(ready)
+            tensor.record_stream(stream)
+        cache.move_to_end(metadata)
+        return tensor
+    tensor = torch.frombuffer(bytearray(metadata), dtype=torch.uint8).to(device=runtime.device)
+    if cache is not None:
+        ready = None
+        if stream is not None:
+            ready = torch.npu.Event()
+            ready.record(stream)
+        cache[metadata] = tensor, stream, ready
+        while len(cache) > 8:
+            cache.popitem(last=False)
+    return tensor
 
 
 def launch_mxfp8_experts(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
                            events: torch.Tensor, diagnostic: torch.Tensor, launch: torch.Tensor,
                            *, direction: str = 'forward') -> None:
     """Run the native fused MoE with alias-preserving physical arguments."""
-    aliases = _byte_aliases(buffers)
     _load_mxfp8_native()
     if direction not in ('forward', 'backward'):
         raise ValueError('MX native direction must be forward or backward')
     primary = (torch.ops.hyper_multicore.mega_moe_mxfp8_grad if direction == 'backward'
                else torch.ops.hyper_multicore.mega_moe_mxfp8)
-    primary(aliases, runtime, events, diagnostic, launch)
+    primary(buffers, runtime, events, diagnostic, launch)

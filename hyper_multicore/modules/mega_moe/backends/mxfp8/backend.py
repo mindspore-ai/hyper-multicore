@@ -56,6 +56,13 @@ class Resources(_MegaMoeExecutionResources):
             active_specifications=active_specifications,
         )
         self._plans = OrderedDict()
+        # Only immutable launch bounds are cached; route contents and pointers
+        # belong to each invocation and never participate in this cache.
+        self.launch_cache = OrderedDict()
+
+    def close(self):
+        super().close()
+        self.launch_cache.clear()
 
     def _initial_plan(self, tensor):
         # Capability rejection participates in the common construction collective.

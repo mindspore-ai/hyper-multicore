@@ -4,6 +4,15 @@
 #include "csrc/cached_op_api.h"
 
 namespace {
+std::vector<at::Tensor> ByteAliases(at::TensorList buffers) {
+  std::vector<at::Tensor> aliases;
+  aliases.reserve(buffers.size());
+  for (const auto& buffer : buffers) {
+    TORCH_CHECK(buffer.is_contiguous(), "MXFP8 task buffers must be contiguous; implicit copies are forbidden");
+    aliases.push_back(buffer.view(at::kByte).reshape({-1}));
+  }
+  return aliases;
+}
 void ValidateMoeBuffers(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
                        const at::Tensor& diagnostic, const at::Tensor& launch) {
   TORCH_CHECK(!buffers.empty() && buffers.size() <= 64, "MXFP8 MegaMoE requires 1..64 buffers");
@@ -21,15 +30,19 @@ void ValidateMoeBuffers(at::TensorList buffers, const at::Tensor& runtime, const
 }
 void MegaMoeMxfp8(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
                    const at::Tensor& diagnostic, const at::Tensor& launch) {
-  ValidateMoeBuffers(buffers, runtime, events, diagnostic, launch);
+  auto aliases = ByteAliases(buffers);
+  ValidateMoeBuffers(aliases, runtime, events, diagnostic, launch);
+  const at::TensorList byte_buffers(aliases);
   int64_t count = buffers.size();
-  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8, buffers, runtime, events, diagnostic, launch, buffers, count);
+  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8, byte_buffers, runtime, events, diagnostic, launch, byte_buffers, count);
 }
 void MegaMoeMxfp8Grad(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
                        const at::Tensor& diagnostic, const at::Tensor& launch) {
-  ValidateMoeBuffers(buffers, runtime, events, diagnostic, launch);
+  auto aliases = ByteAliases(buffers);
+  ValidateMoeBuffers(aliases, runtime, events, diagnostic, launch);
+  const at::TensorList byte_buffers(aliases);
   int64_t count = buffers.size();
-  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8Grad, buffers, runtime, events, diagnostic, launch, buffers, count);
+  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8Grad, byte_buffers, runtime, events, diagnostic, launch, byte_buffers, count);
 }
 }  // namespace
 
@@ -38,7 +51,7 @@ TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
         "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
   m.def("mega_moe_mxfp8_grad(Tensor(a!)[] buffers, Tensor(b!) runtime_config, Tensor(c!) events, "
         "Tensor(d!) diagnostic, Tensor launch_metadata) -> ()");
-  m.def("mega_moe_mxfp8_abi_version() -> int", []() -> int64_t { return 3; });
+  m.def("mega_moe_mxfp8_abi_version() -> int", []() -> int64_t { return 4; });
 }
 TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
   m.impl("mega_moe_mxfp8", &MegaMoeMxfp8);
