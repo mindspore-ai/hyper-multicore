@@ -127,14 +127,14 @@ def test_existing_bank_growth_respects_hard_receive_limit(mandatory):
                                   statistics={"heap_rejections": 0, "placements": 0}),
     )
 
-    def exchanged(*_args, **options):
+    def _exchanged(*_args, **options):
         return route._prepare_placed_route(
             hidden, ids, spec, None, None, None, None, None, None,
             options["prepare_workspace"], options["select_placement"],
         )
 
     with (
-        patch.object(invocation, "prepare_topk_route", side_effect=exchanged),
+        patch.object(invocation, "prepare_topk_route", side_effect=_exchanged),
         patch.object(route, "_read_cached_route", return_value=(original, None, None)),
         patch.object(route, "_materialize_route_permutation", return_value=(hidden, ids)),
         patch.object(route, "_finalize_dynamic_route", return_value="home") as finalize,
@@ -202,22 +202,22 @@ def test_submission_counts_the_executed_protocol_and_skips_activation_reuse():
     prepared = route.PreparedTopKRoute(hidden, ids, ids, ids, SimpleNamespace(plan_tokens=128),
                                       weight_binding=binding)
 
-    def forward(current):
+    def _forward(current):
         return execution.forward(None, hidden, hidden, ids, hidden, (hidden, hidden), resources, current)
 
     with (
         patch.object(execution, "execute_mega_moe_with_permutation", return_value=hidden) as launch,
         patch.object(execution, "_CheckpointedMegaMoeFunction") as retained,
     ):
-        forward(replace(prepared, tensor_dump=True))
+        _forward(replace(prepared, tensor_dump=True))
         assert launch.call_args.kwargs["weight_binding"].mode is ReplicaExecutionMode.STAGED
-        forward(prepared)
+        _forward(prepared)
         assert launch.call_args.kwargs["weight_binding"] is binding
-        forward(replace(prepared, checkpoint_record=SimpleNamespace(allow_activation=True, activation=())))
+        _forward(replace(prepared, checkpoint_record=SimpleNamespace(allow_activation=True, activation=())))
         retained.apply.assert_called_once()
         launch.side_effect = RuntimeError("launch failed")
         with pytest.raises(RuntimeError, match="launch failed"):
-            forward(prepared)
+            _forward(prepared)
     stats = resources.placement.statistics
     assert stats["placements"] == 2
     assert stats["staged_bindings"] == stats["fp32_band_bindings"] == stats["skipped_recomputes"] == 1

@@ -362,12 +362,12 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     version = [0]
     remote_dump = False
 
-    def gather(out, flag, **_kwargs):
+    def _gather(out, flag, **_kwargs):
         out.copy_(flag.expand_as(out))
         if remote_dump:
             out[1] |= route._TENSOR_DUMP_MASK
 
-    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", _gather)
 
     def _invocation(counts=None, *, tensor_dump=False):
         record, recomputing = replay.route_record(owner)
@@ -465,13 +465,13 @@ def test_staged_replay_does_not_change_a_shared_bank_before_route_agreement(monk
     saved.snapshot = tails, ready
     homes = tuple(torch.full_like(bank[:1], 3) for bank in pool.weights)
 
-    def layer():
+    def _layer():
         record, is_replay = replay.route_record(pool)
         if not is_replay:
             record.route = SimpleNamespace(weight_binding=saved)
         # A replay miss follows the ordinary B0 path with no replica lease.
 
-    wrapped = replay.wrap_checkpoint(layer, lambda: 1, prepare_replay=True)
+    wrapped = replay.wrap_checkpoint(_layer, lambda: 1, prepare_replay=True)
     with torch.no_grad():
         wrapped()
     with patch.object(shmem_transfer, "prefetch_banks") as prefetch:

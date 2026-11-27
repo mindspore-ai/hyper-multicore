@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Two-rank Ascend 910_93 HotReplica placement and checkpoint regression."""
+from collections import defaultdict
 from contextlib import nullcontext
 import gc
 import json
@@ -48,36 +49,46 @@ class SkewPlanner(BasePlanner):
         return self.last_placement
 
 
+def _check_guest_weight_waits(events, projection, gmm, home):
+    waits = events["forward", f"ReplicaW{projection}WeightWait"]
+    assert waits
+    tasks = defaultdict(list)
+    for task in events["forward", gmm]:
+        tasks[task["block_id"], task["owner_id"]].append(task)
+    for wait in waits:
+        assert wait["rank"] == 0
+        assert wait["owner_id"] == home + wait["stage_task_index"]
+        assert any(task["start_cycle"] <= wait["start_cycle"] <= wait["end_cycle"] <= task["end_cycle"]
+                   for task in tasks[wait["block_id"], wait["owner_id"]])
+
+
+def _gradient_tail_cycles(events):
+    task_end = max(args["end_cycle"] for (direction, name), group in events.items()
+                   if direction == "backward" and not name.startswith("Replica") for args in group)
+    replica_end = max(args["end_cycle"] for (direction, name), group in events.items()
+                      if direction == "backward" and name.startswith("ReplicaDW") for args in group)
+    return replica_end - task_end
+
+
 def _check_replica_trace(trace, rank, copies_by_rank, home):
     metadata = trace["megaKernelCycleTrace"]
     assert metadata["invocationCount"] == 2 and metadata["droppedRecordCount"] == 0
-    events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+    events = defaultdict(list)
+    for event in trace["traceEvents"]:
+        if event["ph"] == "X":
+            args = event["args"]
+            events[args["direction"], event["name"]].append(args)
     width = home + len(copies_by_rank[rank])
-    forward = [event for event in events if event["args"]["direction"] == "forward"]
-    backward = [event for event in events if event["args"]["direction"] == "backward"]
+    physical_owners = {rank * width + expert % home for expert in copies_by_rank[0] if expert >= 0}
     for projection, gmm in (("13", "GMM1"), ("2", "GMM2")):
         if rank == 0:
-            waiting = [event for event in forward if event["name"] == f"ReplicaW{projection}WeightWait"]
-            assert waiting
-            gmms = [event for event in forward if event["name"] == gmm]
-            for wait in waiting:
-                args = wait["args"]
-                assert args["rank"] == rank and args["owner_id"] == rank * width + home + args["stage_task_index"]
-                assert any(
-                    task["tid"] == wait["tid"] and task["args"]["owner_id"] == args["owner_id"]
-                    and task["args"]["start_cycle"] <= args["start_cycle"] <= args["end_cycle"] <= task["args"]["end_cycle"]
-                    for task in gmms
-                )
-            assert any(event["name"] == f"ReplicaDW{projection}GuestAckWait" for event in backward)
+            _check_guest_weight_waits(events, projection, gmm, home)
+            assert events["backward", f"ReplicaDW{projection}GuestAckWait"]
         else:
-            physical_owners = {rank * width + expert % home for expert in copies_by_rank[0] if expert >= 0}
-            waiting = [event["args"] for event in backward
-                       if event["name"] == f"ReplicaDW{projection}LongestBandReadyWait"]
+            waiting = events["backward", f"ReplicaDW{projection}LongestBandReadyWait"]
             assert waiting and all(args["rank"] == rank and args["owner_id"] in physical_owners for args in waiting)
-            assert any(event["name"] == f"ReplicaDW{projection}AckPublish" for event in backward)
-    task_end = max(event["args"]["end_cycle"] for event in backward if not event["name"].startswith("Replica"))
-    replica_end = max(event["args"]["end_cycle"] for event in backward if event["name"].startswith("ReplicaDW"))
-    return replica_end - task_end
+            assert events["backward", f"ReplicaDW{projection}AckPublish"]
+    return _gradient_tail_cycles(events)
 
 
 def test_placement_diagnostics():
@@ -94,6 +105,11 @@ def test_placement_diagnostics():
                    for shape in ((tokens, hidden), (home, hidden, 2 * intermediate), (home, intermediate, hidden)))
     probs = torch.full((tokens, home), .5, dtype=torch.float32, device=device)
     upstream = torch.randn_like(inputs[0])
+
+    def _train(op):
+        output = op(inputs[0], ids, probs, expert_weights=inputs[1:])
+        return (output, *torch.autograd.grad(output, inputs, upstream))
+
     records = []
     try:
         for mode in ("push", "pull"):
@@ -105,26 +121,22 @@ def test_placement_diagnostics():
                 numerics_options=MegaMoeNumericsOptions(partial_weight_grad_dtype="float32"),
             )
 
-            def train():
-                output = op(inputs[0], ids, probs, expert_weights=inputs[1:])
-                return (output, *torch.autograd.grad(output, inputs, upstream))
-
             try:
-                reference = train()
+                reference = _train(op)
                 owner = op._resource_group.resources.placement  # pylint: disable=protected-access
                 config = dump.TensorDumpConfig(result_dir / f"{mode}-dump", ranks=(0,), max_bytes_per_tensor=2048)
                 with (dump.tensor_dump(config) if rank == 0 else nullcontext()):
                     with pytest.raises(RuntimeError, match="Tensor Dump mode differs across EP ranks"):
-                        train()
+                        _train(op)
                 assert owner.statistics["placements"] == 1
                 with dump.tensor_dump(config) as dumper:
-                    observed = train()
+                    observed = _train(op)
                 assert bool(dumper.last_manifest_paths) == (rank == 0)
                 assert owner.statistics["staged_bindings"] == 1
                 for got, expected in zip(observed, reference, strict=True):
                     torch.testing.assert_close(got, expected, rtol=.02, atol=.002)
                 with profiler.mega_kernel_profile() as capture:
-                    observed = train()
+                    observed = _train(op)
                 for got, expected in zip(observed, reference, strict=True):
                     torch.testing.assert_close(got, expected, rtol=0, atol=0)
                 trace = capture.export_chrome_trace(result_dir / f"{mode}-rank{rank}-trace.json")
