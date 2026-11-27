@@ -271,6 +271,10 @@ source 容量、调度行数与实际 owner 接收量分别维护：source/返�
 借用所需通信存储并组织数学计算。Pull 的源发布与消费处于同一租约内，自动扩容发生在占用租约之前。
 各后端独立管理 plan 缓存；反向保留原调用需要的 plan 和状态，不使用模块后来一次调用的“最新结果”。
 
+HotReplica 的放置计数以正向执行提交为准（`placements` 及各模式的 `*_bindings`）。
+`placement_candidates` 记录物化后的候选，`heap_rejections` 和 `protocol_rejections` 记录相应的拒绝原因。
+checkpoint 跳过重算时单独计入 `skipped_recomputes`。
+
 Ascend950 BF16 Pull 先选择普通或虚拟专家路由，再取得相应工作区租约并置换到对称源区。
 事件容量兼容的两种布局共用工作区。重算复用保存的落位时，在所选租约内重新发布当前输入。
 

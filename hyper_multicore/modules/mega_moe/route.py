@@ -59,6 +59,7 @@ class PreparedTopKRoute:
     maximum_received_slots: int = 0
     weight_binding: Any = field(default=None, repr=False, compare=False)
     checkpoint_record: Any = field(default=None, repr=False, compare=False)
+    tensor_dump: bool = False
 
 
 _record_metadata_stream = RouteMetadata.record_stream
@@ -489,7 +490,7 @@ def prepare_topk_route(
         tokens_per_expert: Optional trusted Router histogram.
         workspace: Optional workspace ordered before the count exchange. Pull
             requires a lease acquired by the caller or the automatic-capacity callback.
-        autograd_mask: Group-consistent gradient participation flags in dynamic mode.
+        autograd_mask: Gradient participation and tensor dump flags in dynamic mode.
         prepare_workspace: Capacity and lease callback.
 
     Returns:
@@ -550,15 +551,24 @@ def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 
 
 _INVALID_WEIGHT_MASK = 1 << 5
+_TENSOR_DUMP_MASK = 1 << 6
+
+
+def _validate_route_flags(rows: list[list[int]]) -> None:
+    """Check route participation before reusing geometry or selecting a protocol."""
+    flags = rows[0][2]
+    if flags & _INVALID_WEIGHT_MASK or any(row[2] != flags for row in rows):
+        if any(row[2] & _INVALID_WEIGHT_MASK for row in rows):
+            raise ValueError("expert weights do not match the bound layout on all EP ranks")
+        if any((row[2] ^ flags) & _TENSOR_DUMP_MASK for row in rows):
+            raise RuntimeError("MegaMoe Tensor Dump mode differs across EP ranks")
+        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
 
 
 def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
     """Validate every rank before any automatic allocation or SHMEM write."""
     _validate_dynamic_sizes(rows, spec)
-    if rows[0][2] & _INVALID_WEIGHT_MASK or any(row[2] != rows[0][2] for row in rows):
-        if any(row[2] & _INVALID_WEIGHT_MASK for row in rows):
-            raise ValueError("expert weights do not match the bound layout on all EP ranks")
-        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    _validate_route_flags(rows)
     if any(not _valid_route_counts(row, spec.top_k) for row in rows):
         raise RuntimeError("MegaMoe counts must describe the actual distinct Top-K routes")
 
@@ -631,7 +641,7 @@ def _route_cache_signature(spec: MegaMoeSpec, device: Any) -> tuple[Any, ...]:
 
 
 def _route_descriptor_key(raw: list[list[int]]) -> tuple[tuple[int, ...], ...]:
-    """Gradient flags participate in validation, not immutable offset geometry."""
+    """Participation flags can change independently of immutable offset geometry."""
     return tuple(tuple(row[:2] + row[3:]) for row in raw)
 
 
@@ -651,11 +661,7 @@ def _reuse_cached_route(
 ) -> tuple[_RouteSummary, list[list[int]], RouteMetadata | None]:
     """Validate and reuse one exact cached descriptor."""
     _validate_dynamic_sizes(raw, spec)
-    expected_mask = raw[0][2] & ~_INVALID_WEIGHT_MASK
-    if any(row[2] != expected_mask for row in raw):
-        if any(row[2] & _INVALID_WEIGHT_MASK for row in raw):
-            raise ValueError("expert weights do not match the bound layout on all EP ranks")
-        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    _validate_route_flags(raw)
     if source_rows is not None:
         source_rows.extend(cached.source_totals)
     cached.wait(device, stream)
@@ -978,7 +984,7 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
         )
     if selected is not None:
         try:
-            prepare_workspace(summary.plan_tokens, selected.placement.receive_capacity)
+            prepare_workspace(summary.plan_tokens, selected.placement.receive_capacity, placed=True)
         except _HeapCapacityError:
             if selected.mandatory:
                 raise
@@ -1004,7 +1010,7 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     route = _finalize_dynamic_route(
         virtual_tokens, virtual_counts, virtual_summary, None, metadata, None, virtual_table,
         virtual_spec, workspace, hidden.device, hidden.shape[0])
-    return replace(route, weight_binding=binding)
+    return replace(route, weight_binding=binding, tensor_dump=bool(autograd_mask & _TENSOR_DUMP_MASK))
 
 
 class _EmptyTopKOutput(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ

@@ -120,7 +120,7 @@ class PlacementResources:
     """Select BF16 routes and own their lazy expert bank."""
 
     def __init__(self, parent: Any, specification: dict[str, Any], shared: bool, *,
-                 bf16_partials: bool = False, independent_dw: bool = False, rank_nodes: tuple[int, ...] = ()) -> None:
+                 bf16_partials: bool = False, rank_nodes: tuple[int, ...] = ()) -> None:
         """Attach lazy placement resources to one existing BF16 owner."""
         self.parent = parent
         self.shared = shared
@@ -129,7 +129,6 @@ class PlacementResources:
         self.cross_node_cost = specification.get("cross_node_cost")
         self.receive_capacity_percent = specification.get("receive_capacity_percent")
         self.rank_nodes = rank_nodes
-        self.independent_dw = independent_dw
         built_in = _uses_builtin_planner(specification)
         spec = parent.spec
         can_split_weights = supports_bounded_placement(spec)
@@ -154,7 +153,8 @@ class PlacementResources:
                 or not self.prefer_bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
             )
         self.statistics = {
-            "invocations": 0, "placements": 0,
+            "invocations": 0, "placement_candidates": 0, "placements": 0,
+            "heap_rejections": 0, "protocol_rejections": 0,
             "route_replays": 0, "route_replay_misses": 0, "skipped_recomputes": 0,
         }
 
@@ -257,7 +257,6 @@ class PlacementResources:
             spec.intermediate_size, spec.num_cube_cores, training, checkpointing=checkpointing,
             apply_probs_before_fc2=spec.apply_probs_before_fc2, ordinary_receive_capacity=resident,
             rank_nodes=self.rank_nodes, dispatch_mode=spec.dispatch_mode, transport_engine=spec.transport_engine,
-            architecture=spec.architecture,
         )
 
     def bind(
@@ -271,10 +270,11 @@ class PlacementResources:
         experts = spec.num_experts + spec.ep_size * placement.borrowed_capacity
         if tuple(placement.counts_by_source.shape) != (spec.ep_size, experts):
             raise ValueError("Expert placement counts must match the EP group and borrowed capacity")
+        self.statistics["placement_candidates"] += 1
         mode, slots = self._execution_mode(placement)
         if self.requires_fused_return and mode not in (ReplicaExecutionMode.FP32_BAND, ReplicaExecutionMode.BF16_BAND):
+            self.statistics["protocol_rejections"] += 1
             if not mandatory:
-                self.statistics["protocol_rejections"] = self.statistics.get("protocol_rejections", 0) + 1
                 return None
             if not self.bf16_partials and not self._uses_fp32_partials():
                 raise RuntimeError("A3 EIO HotReplica needs an A3 wheel with BF16 partial dW support for this placement")
@@ -292,19 +292,23 @@ class PlacementResources:
                     preferred_receive=preferred, pipeline=self.pipeline_enabled,
                 )
             except _HeapCapacityError:
+                self.statistics["heap_rejections"] += 1
                 if mandatory:
                     raise
                 return None
         if mode is not ReplicaExecutionMode.STAGED and (
                 self.pool.pipeline is None or self.pool.blocks != spec.num_cube_cores):
             raise RuntimeError("The selected HotReplica protocol does not match its bank")
-        self.statistics["placements"] += 1
-        mode_key = mode.value + "_bindings"
-        self.statistics[mode_key] = self.statistics.get(mode_key, 0) + 1
         return ExpertWeightBinding(
             self.pool, placement, spec.expert_weight_layout, mandatory=mandatory,
             execution_mode=mode, fused_slots=slots,
         )
+
+    def record_submission(self, mode: ReplicaExecutionMode) -> None:
+        """Count a submitted forward using the final execution protocol."""
+        self.statistics["placements"] += 1
+        mode_key = mode.value + "_bindings"
+        self.statistics[mode_key] = self.statistics.get(mode_key, 0) + 1
 
     def _execution_mode(self, placement):
         """Select the protocol from the bank extent, numerics and active guest slots."""

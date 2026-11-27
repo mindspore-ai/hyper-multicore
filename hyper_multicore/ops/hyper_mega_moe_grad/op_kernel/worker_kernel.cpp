@@ -85,13 +85,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #endif
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201 && !defined(__DAV_C220_CUBE__) && !defined(__DAV_CUBE__)
     const auto first = gradient_bands_[0];
-    const auto second = gradient_bands_[1];
     if (first == nullptr || worker_id_ % VECTOR_WORKER_STRIDE != 0) return;
     const uint32_t worker = worker_id_ / VECTOR_WORKER_STRIDE;
     const uint32_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
-    const uint32_t local_experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
-    const uint32_t physical_base = first->rank * local_experts;
-    if (first->owned != 0 || second->owned != 0) {
+    uint32_t physical_base = 0;
+    if (replica_trace_ != nullptr) {
+      const uint32_t rank = getExtraValueFromTiling(input_list[TILING_IDX], 0) % ep;
+      const uint32_t local_experts = getExtraValueFromTiling(input_list[TILING_IDX], 2) / ep;
+      physical_base = rank * local_experts;
+    }
+    if (first->owned != 0 || gradient_bands_[1]->owned != 0) {
       // The gradient table stores W2 before W13. Keep a single scalar frame.
 #pragma unroll 1
       for (uint32_t projection = 0; projection < 2; ++projection) {

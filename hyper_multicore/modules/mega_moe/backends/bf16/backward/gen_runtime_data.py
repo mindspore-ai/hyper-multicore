@@ -62,7 +62,7 @@ from hyper_multicore.scheduler.scheduler import (
     revise_gmm_task_queue_bwd,
     revise_task_queue,
 )
-from hyper_multicore.tasks.utils import add_dynamic_data, add_terminate, advance_tsv_cube
+from hyper_multicore.tasks.utils import add_dynamic_data, add_terminate
 
 
 @dataclass(frozen=True)
@@ -115,18 +115,9 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     init_task_split_value(tsv)
     tsv.rank_id = rank_id
 
-    gate_grad_op = graph.get_op("gate_grad")
-    w1_grad_op = graph.get_op("w1_grad")
+    # Fill tasks in topological order (dispatch, act_grad, w2_grad, swiglu_grad, gate_grad, combine, w1_grad)
     for op in graph.topological_sort():
-        if op is gate_grad_op and not op.task_num:
-            # Keep event IDs stable. W1 will depend directly on SwiGLU below.
-            advance_tsv_cube(tsv, 0, tsv.single_rank_expert_num)
-            continue
-        start = tsv.pre_task_num
         op.fill_config.fill(cfg, op, tsv)
-        if op is w1_grad_op and not gate_grad_op.task_num:
-            for task_id in range(start, tsv.pre_task_num):
-                cfg.all_tasks[task_id].dependent_event -= tsv.single_rank_expert_num
 
     # task_num_all = sum of all op tasks + 1 (terminate)
     task_num_all = sum(op.task_num for op in graph.topological_sort()) + 1
@@ -134,6 +125,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     dispatch_op    = graph.get_op("dispatch")
     activation_op = graph.get_op("activation")
     act_grad_op    = graph.get_op("act_grad")
+    w1_grad_op     = graph.get_op("w1_grad")
     w2_grad_op     = graph.get_op("w2_grad")
     combine_op     = graph.get_op("combine")
 
@@ -141,8 +133,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
                   w2_grad_op.task_num + w1_grad_op.task_num
                   + combine_op.task_num // tsv.ep * tsv.ep)
     revise_task_queue(cfg, tsv, dispatch_op.task_num, activation_op.task_num, combine_op.task_num)
-    if act_grad_op.task_num and w2_grad_op.task_num:
-        revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
+    revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
 
     cfg.task_num = task_num_all

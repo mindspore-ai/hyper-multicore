@@ -168,16 +168,19 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
   执行器在申请副本 bank 前校验所有 source 的逻辑专家守恒、逐位置 Top-K 身份、物理槽直方图和全组配额一致性。
   Reentrant checkpoint 可使用同一实验命名空间的 `wrap_checkpoint`。每次原前向创建一个 wrapper。
   省略 `tokens_per_expert` 时，全 EP 验证 Top-K 顺序、参数代际和流后可复用原落位。
+  保存的 guest 权重在重放路由达成一致后、取得 bank 租约时恢复。
   在 FC2 前乘路由概率且各 rank 激活预算和重放校验均满足时，Push 和 Pull 都可复用前向激活并跳过重算前向。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。固定字节预算优先容纳这次调用所需的对齐布局。
   副本布局超出固定预算时，可以在原属布局符合接收行数要求且放得下的情况下沿用原属布局。两种布局都超预算，或显式行数上限要求使用副本时，调用报错。
   `partial_weight_grad_dtype="float32"` 要求被拆专家的 partial 从 GEMM 产出起为 FP32。显式 FP32 配置预留 3L bank。
+  融合 FP32 band 中，未拆专家的 GEMM 直接写参数 dtype（BF16）的梯度。
   默认 `native` 预留 2L，可在窄槽选择 FP32 band，并在需要保留 BF16 舍入或处于真宽槽时选择 BF16 band。
   两种 band 协议都以 FP32 按固定顺序归并，最后转换为参数梯度 dtype。
   A3 EIO MTE 的活跃放置在发布权重前绑定核内 dW。中间梯度带长度取 32 字节的倍数，末带按实际元素数读写。
   单专家矩阵元素数无法按 16 元素对齐时，原独立回传使用的默认 BF16 partial 在窄槽也继续使用。
   显式 FP32 partial 在专家矩阵元素数和本地专家数均为奇数时补一个 BF16 bank 记录，以保持 FP32 尾区地址对齐。
-  若放置需要 BF16 partial 协议，应加载支持该协议的 A3 制品。捕获实际张量的 tensor dump 使用其专用捕获路径。
+  若放置需要 BF16 partial 协议，应加载支持该协议的 A3 制品。
+  Tensor Dump 的 EP 组使用相同的采集窗口设置，详见[分布式采集](diagnostics.md#分布式采集)。
   副本同步标志独立分配，并随 SHMEM 堆重建重新初始化。
 - 同一 EP/heap 上，尺寸、dtype、执行协议和标志布局兼容的层串行租用一份 bank。
   `MegaMoeTuningOptions(replica_bank="dedicated", expert_placement=...)` 为该执行资源组预留一份独占 bank。
@@ -358,17 +361,6 @@ d_a = BF16(FP32(d_fc2_input) * p)
 `dW2` 使用前向实际送入 FC2 的加权激活。checkpoint 重算执行相同的裁剪位置、概率位置和两处 BF16 舍入。
 
 ## 训练与资源管理
-
-### 部分梯度冻结
-
-A3 BF16 的动态 token 入口按每次前向的 `requires_grad` 选择反向计划。可以独立冻结
-`gate_up_weight`（W13）、`down_weight`（W2）或输入 `hidden_states`，直接使用 PyTorch 的
-`requires_grad_(False)`，外部参数也可以传入已 `detach()` 的张量。EP 组内各 rank 必须使用相同的冻结组合。
-
-冻结某组专家权重会跳过对应的权重梯度 GMM 和 HotReplica 梯度回传。冻结 `hidden_states`
-可跳过输入梯度 GMM 和 Combine。使用 FC2 前概率加权且 Router 概率仍需梯度时，Combine 负责回传概率梯度，
-因此仍执行该路径。使用 FC2 后加权且只训练 Router 时，概率梯度由输出还原计算，专家反向可以全部跳过。
-HotReplica 只训练 W13 时，跳过 W2 梯度回传需要包含独立投影回传能力的 A3 制品。旧制品沿用双投影回传。
 
 ### 动态 token 与通信容量
 

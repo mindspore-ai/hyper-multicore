@@ -41,7 +41,6 @@ class ReplayRecord:
     input_versions: tuple[int, int] | None = None
     activation: Any = None
     allow_activation: bool = False
-    weight_binding: Any = None
 
 
 @dataclass
@@ -53,15 +52,15 @@ class _CheckpointScope:
 
 
 _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_checkpoint", default=None)
+_REPLAY_ACTIVATION_MASK = 1 << 7
 
 
 class ReplayCheckpoint:
     """Hold one checkpoint invocation's tape across original and replay contexts."""
 
-    def __init__(self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False) -> None:
-        """Register the caller's version lookup and opt in to early restoration."""
+    def __init__(self, parameter_version: Callable[[], Any]) -> None:
+        """Register the caller's logical parameter version lookup."""
         self.parameter_version = parameter_version
-        self.prepare_replay = prepare_replay
         self.records: list[ReplayRecord] = []
         self.forward_version = None
         self.started = False
@@ -78,10 +77,6 @@ class ReplayCheckpoint:
         state = _CheckpointScope(self.records, replay, version is not None and version == self.forward_version)
         token = _ACTIVE.set(state)
         try:
-            if replay and state.same_parameters and self.prepare_replay and len(self.records) == 1:
-                binding = self.records[0].weight_binding
-                if binding is not None:
-                    binding.prepare_replay()
             yield
         finally:
             _ACTIVE.reset(token)
@@ -94,10 +89,11 @@ def wrap_checkpoint(
 
     The framework supplies a lightweight logical parameter version for its
     sharded module. A changed version disables weight and activation reuse.
-    When requested, restore the saved borrowed suffix before recompute reads
-    any FSDP parameters. Route agreement still happens at the consumer.
+    The consumer restores saved guest weights after route agreement.
+    The legacy ``prepare_replay`` argument is accepted for compatibility.
     """
-    tape = ReplayCheckpoint(parameter_version, prepare_replay=prepare_replay)
+    del prepare_replay
+    tape = ReplayCheckpoint(parameter_version)
 
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -151,16 +147,16 @@ def agree_replay(
                 if (value.shape == hidden.shape and score.shape == probs.shape
                         and record.input_versions == (value._version, score._version)):
                     same_values = same_ids & (value == hidden).all() & (score == probs).all()
-                    flag += same_values.to(torch.int32).reshape(1) * 32
+                    flag += same_values.to(torch.int32).reshape(1) * _REPLAY_ACTIVATION_MASK
         else:
             flag = torch.zeros(1, dtype=torch.int32, device=hidden.device)
         gathered = flag.new_empty(spec.ep_size)
         dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
         flags = gathered.tolist()
-    first = flags[0] % 32
-    reuse = first != 0 and all(value % 32 == first for value in flags)
+    first = flags[0] & ~_REPLAY_ACTIVATION_MASK
+    reuse = first != 0 and all((value & ~_REPLAY_ACTIVATION_MASK) == first for value in flags)
     if record is not None:
-        record.allow_activation = reuse and all(value >= 32 for value in flags)
+        record.allow_activation = reuse and all(value & _REPLAY_ACTIVATION_MASK for value in flags)
     return reuse
 
 

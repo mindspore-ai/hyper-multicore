@@ -51,6 +51,17 @@ def test_wide_placement_and_hard_receive_limit(monkeypatch, tmp_path):
 
 
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_placement_diagnostics(monkeypatch, tmp_path):
+    """Validate the EP dump protocol and real fused replica trace events."""
+    prepare_multicore_test_environment()
+    monkeypatch.setenv("HOT_REPLICA_TEST_RESULTS", str(tmp_path))
+    monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        run_multicore_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                           "test_placement_diagnostics", num_proc=2, timeout=360)
+
+
+@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 @pytest.mark.parametrize("ranks", [2, 4])
 def test_placement_edge_cases(monkeypatch, tmp_path, ranks):
     """Exercise both layouts, probability positions, splits and graph lifetimes."""
@@ -60,14 +71,3 @@ def test_placement_edge_cases(monkeypatch, tmp_path, ranks):
     with without_inherited_rank_environment():
         run_multicore_case(str(Path(__file__).with_name("_test_hot_replica_edge_cases.py")),
                            "test_placement_edge_cases", num_proc=ranks, timeout=600)
-
-
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_frozen_gradient_schedules(monkeypatch, tmp_path):
-    """Check frozen gradients in ordinary and HotReplica Push/Pull execution."""
-    prepare_multicore_test_environment()
-    monkeypatch.setenv("EDGE_OUT", str(tmp_path / "frozen-gradient-results"))
-    monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    with without_inherited_rank_environment():
-        run_multicore_case(str(Path(__file__).with_name("_test_hot_replica_edge_cases.py")),
-                           "test_frozen_gradient_schedules", num_proc=2, timeout=480)

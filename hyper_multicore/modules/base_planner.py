@@ -37,7 +37,6 @@ class PlacementRequest:
     rank_nodes: tuple[int, ...] = ()
     dispatch_mode: str = "push"
     transport_engine: str | None = "mte"
-    architecture: int = 2201
 
 
 @dataclass(frozen=True)

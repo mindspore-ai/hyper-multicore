@@ -22,7 +22,7 @@ import numpy as np
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
 from ._planner.capacity import ExpertReplicaConfig
-from ._planner.receive import receive_limit, replica_cost, select_replica_plan
+from ._planner.receive import bf16_cost, receive_limit, select_replica_plan
 
 
 class HotReplicaPlanner(BasePlanner):
@@ -77,13 +77,11 @@ class HotReplicaPlanner(BasePlanner):
         return ",".join(settings)
 
     def _policy(self, hidden_size, intermediate_size, cube_cores, training, transport_engine,
-                peak, total, ranks, resident, *, architecture=2201, precision="bf16", rank_nodes=()):
-        """Use one cost, capacity and home-admission rule for the executor."""
-        defaults = self.replica_slots_per_rank is None and self.cross_node_cost is None
-        prices = replica_cost(
-            architecture, precision, transport_engine, training, self.receive_capacity_percent == "auto",
-            hidden_size, intermediate_size, cube_cores, peak,
-            rank_nodes=rank_nodes if defaults else (),
+                peak, total, ranks, resident):
+        """Use one cost, capacity and home-admission rule for both planner callers."""
+        prices = bf16_cost(
+            hidden_size, intermediate_size, cube_cores, training, transport_engine=transport_engine,
+            search_single_slot=self.receive_capacity_percent == "auto",
         )
         limit = receive_limit(self.receive_capacity_percent, total, ranks)
         return prices, limit, prices.keep_home(peak, total, ranks, limit=limit, resident=resident)
@@ -104,7 +102,7 @@ class HotReplicaPlanner(BasePlanner):
         prices, limit, keep_home = self._policy(
             request.hidden_size, request.intermediate_size, request.cube_cores, request.training,
             request.transport_engine, request.maximum_received, request.total_rows,
-            ranks, resident, architecture=request.architecture, rank_nodes=request.rank_nodes,
+            ranks, resident,
         )
         if keep_home:
             return None

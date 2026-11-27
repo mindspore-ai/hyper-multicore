@@ -27,7 +27,7 @@ import torch
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.experimental import BasePlanner, ExpertPlacement, HotReplicaPlanner, MegaMoeTuningOptions, PlacementRequest
 from hyper_multicore.modules.mega_moe import route, resources as resource_module
-from hyper_multicore.modules.hot_replica import capability, checkpoint as replay
+from hyper_multicore.modules.hot_replica import capability, checkpoint as replay, shmem_transfer
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.receive import ReplicaCost
 from hyper_multicore.modules.hot_replica.bank_ops import reduce_banks
@@ -102,7 +102,6 @@ def test_a3_bf16_pull_requires_runtime_row_get(tmp_path, runtime_rows):
     build_info = {"a3_replica_bf16_partials": True}
     if runtime_rows:
         build_info["a3_bf16_pull_runtime_rows"] = True
-        build_info["a3_replica_independent_dw"] = True
     selected = {"root": tmp_path, "variant": {"hot_replica": artifacts}, "build_info": build_info}
     with (
         patch.object(capability, "load_torch_npu"),
@@ -111,10 +110,10 @@ def test_a3_bf16_pull_requires_runtime_row_get(tmp_path, runtime_rows):
         patch.object(capability, "validate_native_compatibility", return_value=selected),
         patch.object(capability._collective, "exchange", side_effect=lambda value, **_: [value, value]),
     ):
-        assert capability.require_capability(tensor, None) == (True, runtime_rows, (0, 0))
+        assert capability.require_capability(tensor, None) == (True, (0, 0))
         expected = nullcontext() if runtime_rows else pytest.raises(RuntimeError, match="runtime-row GET support")
         with expected:
-            assert capability.require_capability(tensor, None, dispatch_mode="pull") == (True, True, (0, 0))
+            assert capability.require_capability(tensor, None, dispatch_mode="pull") == (True, (0, 0))
 
 
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
@@ -356,23 +355,29 @@ def test_a3_bounded_planning_uses_the_configured_slot_budget(mode, requested, ex
 def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     """Reject stale parameters across ranks, even if the token route matches."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "s")
-    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", lambda out, x, **_: out.copy_(x.expand_as(out)))
     spec = SimpleNamespace(ep_size=2, ep_group=object())
     hidden, probabilities = torch.ones((1, 4)), torch.ones((1, 2))
     ids = torch.tensor([[0, 1]])
     owner = object()
     version = [0]
-    binding = Mock()
+    remote_dump = False
 
-    def _invocation(counts=None):
+    def gather(out, flag, **_kwargs):
+        out.copy_(flag.expand_as(out))
+        if remote_dump:
+            out[1] |= route._TENSOR_DUMP_MASK
+
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+
+    def _invocation(counts=None, *, tensor_dump=False):
         record, recomputing = replay.route_record(owner)
         if recomputing:
+            mask = 15 | (route._TENSOR_DUMP_MASK if tensor_dump else 0)
             route_matches = replay.agree_replay(
-                record, hidden, ids, probabilities, counts, spec, 15, weight_error=False,
+                record, hidden, ids, probabilities, counts, spec, mask, weight_error=False,
             )
             return route_matches, record.allow_activation
         record.ids, record.stream, record.route = ids.clone(), "s", object()
-        record.weight_binding = binding
         record.inputs = hidden.detach(), probabilities.detach()
         record.input_versions = (0, 0)
         record.activation = object()
@@ -381,17 +386,16 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     wrapped = replay.wrap_checkpoint(_invocation, lambda: version[0], prepare_replay=True)
     with torch.no_grad():
         wrapped()
-    binding.prepare_replay.assert_not_called()
     assert wrapped() == (True, True)
-    binding.prepare_replay.assert_called_once_with()
     with torch.no_grad(), pytest.raises(RuntimeError, match="separate wrap_checkpoint"):
         wrapped()
-    assert wrapped() == (True, True)
-    binding.prepare_replay.reset_mock()
+    remote_dump = True
+    assert wrapped() == (False, False)
+    assert wrapped(tensor_dump=True) == (True, True)
+    remote_dump = False
     assert wrapped(torch.tensor([1, 1])) == (False, False)
     version[0] += 1
     assert wrapped() == (False, False)
-    binding.prepare_replay.assert_called_once_with()
 
 
 @pytest.mark.parametrize("supplied", [False, True])
@@ -441,52 +445,51 @@ def test_checkpoint_converges_weight_errors_before_building_routes(monkeypatch, 
         assert placement.statistics["route_replays"] == (not supplied and bad_weight_rank is None)
 
 
-def test_early_weight_restore_uses_bank_generation(monkeypatch):
-    """A copy can be consumed after its stream event or recovered if the bank changed."""
+@pytest.mark.parametrize("guest_rows", [0, 1])
+def test_staged_replay_does_not_change_a_shared_bank_before_route_agreement(monkeypatch, guest_rows):
+    """A replay miss leaves a pending ordinary backward's bank lease valid."""
     monkeypatch.setattr(torch.distributed, "get_rank", lambda _: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda _: 2)
-    copy_stream = SimpleNamespace(device="npu:0", wait_event=Mock())
-    compute_stream = SimpleNamespace(device="npu:0", wait_event=Mock())
-    active = [copy_stream]
-    monkeypatch.setattr(torch.npu, "current_stream", lambda _: active[0])
-    monkeypatch.setattr(torch.npu, "Stream", lambda **_: copy_stream)
+    stream = SimpleNamespace(device="npu:0", wait_event=Mock())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _: stream)
     monkeypatch.setattr(torch.npu, "Event", Mock)
-    monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda *_: None)
     pool = SharedExpertPool(torch.empty((0, 4)), object(), 1, 2, 1, "EIO", root=Mock(), access=nullcontext)
     pool.weights = (torch.zeros(2, 4, 4), torch.zeros(2, 2, 4))
     pool.completion_event = Mock()
-    monkeypatch.setattr(torch.Tensor, "record_stream", lambda *_: None)
     placement = SimpleNamespace(copies=torch.empty((0,), dtype=torch.int32), borrowed_capacity=1)
-    binding = ExpertWeightBinding(pool, placement, "EIO")
-    tails = tuple(torch.full_like(bank[1:], 2) for bank in pool.weights)
+    saved = ExpertWeightBinding(pool, placement, "EIO")
+    ordinary = ExpertWeightBinding(pool, placement, "EIO")
+    tails = tuple(torch.full_like(bank[1:1 + guest_rows], 2) for bank in pool.weights)
     ready = object()
-    binding.snapshot = tails, ready
-    binding.prepare_replay()
-    copy_stream.wait_event.assert_called_once_with(ready)
-    pool.completion_event.record.assert_called_once_with(copy_stream)
-
-    active[0] = compute_stream
+    saved.snapshot = tails, ready
     homes = tuple(torch.full_like(bank[:1], 3) for bank in pool.weights)
-    weights = binding.acquire(homes)
-    compute_stream.wait_event.assert_called_once_with(pool.completion_event)
-    assert pool.statistics["early_restore_hits"] == 1
-    for weight, home, tail in zip(weights, homes, tails):
-        torch.testing.assert_close(weight, torch.cat((home, tail)))
-    binding.release()
 
-    active[0] = copy_stream
-    binding.prepare_replay()
-    # A later lease allowed another graph to overwrite the bank.
-    pool.generation += 1
-    for bank in pool.weights:
-        bank.zero_()
-    active[0] = compute_stream
-    weights = binding.acquire(homes)
+    def layer():
+        record, is_replay = replay.route_record(pool)
+        if not is_replay:
+            record.route = SimpleNamespace(weight_binding=saved)
+        # A replay miss follows the ordinary B0 path with no replica lease.
+
+    wrapped = replay.wrap_checkpoint(layer, lambda: 1, prepare_replay=True)
+    with torch.no_grad():
+        wrapped()
+    with patch.object(shmem_transfer, "prefetch_banks") as prefetch:
+        ordinary.acquire(homes)
+        ordinary.release()
+        generation = pool.generation
+        wrapped()
+        assert pool.generation == generation
+        stream.wait_event.assert_not_called()
+        ordinary.acquire(homes, backward=True)
+        ordinary.release()
+        prefetch.assert_called_once()
+    weights = saved.acquire(homes)
+    stream.wait_event.assert_called_once_with(ready)
     for weight, home, tail in zip(weights, homes, tails):
-        torch.testing.assert_close(weight, torch.cat((home, tail)))
-    assert pool.statistics["early_restores"] == 2
-    assert pool.statistics["early_restore_hits"] == 1
-    binding.release()
+        torch.testing.assert_close(weight[:1 + guest_rows], torch.cat((home, tail)))
+    assert pool.statistics["checkpoint_restores"] == 1
+    saved.release()
 
 
 def test_forward_uses_injected_planner_after_count_exchange():

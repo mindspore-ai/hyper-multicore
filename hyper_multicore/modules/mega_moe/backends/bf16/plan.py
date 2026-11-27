@@ -66,7 +66,6 @@ from ...schedule_policy import (
 from ...spec import MegaMoeSpec, _COMMUNICATION_SPLIT, _align_capacity
 from ...tensor_dump import attach_mega_moe_l1_view_resolvers
 from .activation import prepare_activation_tiling
-from .backward import BackwardOutputs
 
 
 @dataclass(frozen=True)
@@ -89,7 +88,6 @@ class MegaMoePlan:
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
     weight_grad_dtype: torch.dtype | None = None
-    backward_outputs: BackwardOutputs = BackwardOutputs()
     _recorded_streams: set = field(default_factory=set, repr=False, compare=False)
 
     @property
@@ -165,7 +163,6 @@ def _uses_explicit_queues(spec: MegaMoeSpec) -> bool:
 def _build_runtime_artifacts(
     spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None, *,
     replica_pipeline: bool = False, reserve_merge_workers: bool = False,
-    backward_outputs: BackwardOutputs = BackwardOutputs(),
 ) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     explicit_queues = _uses_explicit_queues(spec)
@@ -226,17 +223,6 @@ def _build_runtime_artifacts(
     if compact:
         compact_graph(backward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule)
     backward_graph.propagate_splits(task_values)
-    # Keep the ABI ports and tilings, but emit no descriptors for unused stages.
-    if not backward_outputs.weight1:
-        backward_graph.get_op("w1_grad").task_num = 0
-    if not backward_outputs.weight2:
-        backward_graph.get_op("w2_grad").task_num = 0
-    if not backward_outputs.combine:
-        backward_graph.get_op("gate_grad").task_num = 0
-        backward_graph.get_op("combine").task_num = 0
-        if not backward_outputs.weight1:
-            backward_graph.get_op("act_grad").task_num = 0
-            backward_graph.get_op("activation").task_num = 0
     attach_mega_moe_l1_view_resolvers(backward_graph)
     backward_data = build_backward_config(
         backward_graph,
@@ -317,7 +303,6 @@ def _prepare_diagnostics(
 def build_mega_moe_plan(
     spec: MegaMoeSpec, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
     replica_pipeline: bool = False, reserve_merge_workers: bool = False,
-    backward_outputs: BackwardOutputs = BackwardOutputs(),
 ) -> MegaMoePlan:
     """Build trimmed dense forward/backward runtime images without fusion slots.
 
@@ -327,7 +312,6 @@ def build_mega_moe_plan(
         weight_grad_dtype: Keep partial expert weight gradients in FP32.
         replica_pipeline: Use one GMM group per split weight destination.
         reserve_merge_workers: Give the even AIV lanes to owner gradient consumers.
-        backward_outputs: Expert gradients produced by the A3 backward schedule.
 
     Returns:
         Rank-local forward and backward runtime resources.
@@ -339,8 +323,7 @@ def build_mega_moe_plan(
     if reserve_merge_workers and not replica_pipeline:
         raise ValueError("A3 replica merge workers require a split-weight replica plan")
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(
-        spec, weight_grad_dtype, replica_pipeline=replica_pipeline, reserve_merge_workers=reserve_merge_workers,
-        backward_outputs=backward_outputs)
+        spec, weight_grad_dtype, replica_pipeline=replica_pipeline, reserve_merge_workers=reserve_merge_workers)
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
         spec, forward_graph, forward_config, backward_graph, backward_config, device, replica_pipeline=replica_pipeline,
     )
@@ -356,7 +339,6 @@ def build_mega_moe_plan(
         spec=spec,
         event_counter_bytes=forward_config.event_capacity * 4,
         weight_grad_dtype=weight_grad_dtype,
-        backward_outputs=backward_outputs,
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),

@@ -29,6 +29,12 @@ from hyper_multicore.scheduler.config import RuntimeConfigC, TaskDescC
 from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode
 
 
+def is_tensor_dump_active() -> bool:
+    """Report whether the current diagnostic window captures tensor operands."""
+    session = _get_active_session("tensor_dump")
+    return session is not None and session.is_capture_enabled()
+
+
 class MegaKernelDiagnostics:
     """A reusable normal runtime and optional tool-independent launch boundary."""
 
@@ -45,12 +51,6 @@ class MegaKernelDiagnostics:
     def is_active(self) -> bool:
         """Return whether an explicit diagnostic session is active."""
         session = _get_active_session()
-        return session is not None and session.is_capture_enabled()
-
-    @property
-    def is_tensor_dump_active(self) -> bool:
-        """Report whether the tool captures the actual tensor operand bindings."""
-        session = _get_active_session("tensor_dump")
         return session is not None and session.is_capture_enabled()
 
     @property

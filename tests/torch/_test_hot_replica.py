@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Two-rank Ascend 910_93 HotReplica placement and checkpoint regression."""
+from contextlib import nullcontext
 import gc
 import json
 import os
@@ -25,6 +26,7 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore.diagnostics import dump, profiler
 from hyper_multicore.experimental import BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions, wrap_checkpoint
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.receive import SourceQuota, select_replica_plan
@@ -44,6 +46,97 @@ class SkewPlanner(BasePlanner):
                                    soft_target=target, source_quota=SourceQuota.RANK_ORDER)
         self.last_placement = None if plan is None else as_placement(plan)
         return self.last_placement
+
+
+def _check_replica_trace(trace, rank, copies_by_rank, home):
+    metadata = trace["megaKernelCycleTrace"]
+    assert metadata["invocationCount"] == 2 and metadata["droppedRecordCount"] == 0
+    events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+    width = home + len(copies_by_rank[rank])
+    forward = [event for event in events if event["args"]["direction"] == "forward"]
+    backward = [event for event in events if event["args"]["direction"] == "backward"]
+    for projection, gmm in (("13", "GMM1"), ("2", "GMM2")):
+        if rank == 0:
+            waiting = [event for event in forward if event["name"] == f"ReplicaW{projection}WeightWait"]
+            assert waiting
+            gmms = [event for event in forward if event["name"] == gmm]
+            for wait in waiting:
+                args = wait["args"]
+                assert args["rank"] == rank and args["owner_id"] == rank * width + home + args["stage_task_index"]
+                assert any(
+                    task["tid"] == wait["tid"] and task["args"]["owner_id"] == args["owner_id"]
+                    and task["args"]["start_cycle"] <= args["start_cycle"] <= args["end_cycle"] <= task["args"]["end_cycle"]
+                    for task in gmms
+                )
+            assert any(event["name"] == f"ReplicaDW{projection}GuestAckWait" for event in backward)
+        else:
+            physical_owners = {rank * width + expert % home for expert in copies_by_rank[0] if expert >= 0}
+            waiting = [event["args"] for event in backward
+                       if event["name"] == f"ReplicaDW{projection}LongestBandReadyWait"]
+            assert waiting and all(args["rank"] == rank and args["owner_id"] in physical_owners for args in waiting)
+            assert any(event["name"] == f"ReplicaDW{projection}AckPublish" for event in backward)
+    task_end = max(event["args"]["end_cycle"] for event in backward if not event["name"].startswith("Replica"))
+    replica_end = max(event["args"]["end_cycle"] for event in backward if event["name"].startswith("ReplicaDW"))
+    return replica_end - task_end
+
+
+def test_placement_diagnostics():
+    """Check group agreement, staged snapshots, and both projections of the fused trace."""
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(rank)
+    dist.init_process_group("hccl")
+    device = torch.device("npu", rank)
+    result_dir = Path(os.environ["HOT_REPLICA_TEST_RESULTS"])
+    torch.manual_seed(519 + rank)
+    tokens, hidden, intermediate, home = 256, 512, 256, 2
+    ids = torch.arange(home, 2 * home, dtype=torch.int32, device=device).expand(tokens, -1).contiguous()
+    inputs = tuple((torch.randn(shape, dtype=torch.bfloat16, device=device) * .02).requires_grad_()
+                   for shape in ((tokens, hidden), (home, hidden, 2 * intermediate), (home, intermediate, hidden)))
+    probs = torch.full((tokens, home), .5, dtype=torch.float32, device=device)
+    upstream = torch.randn_like(inputs[0])
+    records = []
+    try:
+        for mode in ("push", "pull"):
+            planner = SkewPlanner()
+            op = MegaMoeExperts(
+                hidden_size=hidden, intermediate_size=intermediate, num_experts=2 * home, top_k=home,
+                ep_group=dist.group.WORLD,
+                tuning_options=MegaMoeTuningOptions(dispatch_mode=mode, expert_placement=planner),
+                numerics_options=MegaMoeNumericsOptions(partial_weight_grad_dtype="float32"),
+            )
+
+            def train():
+                output = op(inputs[0], ids, probs, expert_weights=inputs[1:])
+                return (output, *torch.autograd.grad(output, inputs, upstream))
+
+            try:
+                reference = train()
+                owner = op._resource_group.resources.placement  # pylint: disable=protected-access
+                config = dump.TensorDumpConfig(result_dir / f"{mode}-dump", ranks=(0,), max_bytes_per_tensor=2048)
+                with (dump.tensor_dump(config) if rank == 0 else nullcontext()):
+                    with pytest.raises(RuntimeError, match="Tensor Dump mode differs across EP ranks"):
+                        train()
+                assert owner.statistics["placements"] == 1
+                with dump.tensor_dump(config) as dumper:
+                    observed = train()
+                assert bool(dumper.last_manifest_paths) == (rank == 0)
+                assert owner.statistics["staged_bindings"] == 1
+                for got, expected in zip(observed, reference, strict=True):
+                    torch.testing.assert_close(got, expected, rtol=.02, atol=.002)
+                with profiler.mega_kernel_profile() as capture:
+                    observed = train()
+                for got, expected in zip(observed, reference, strict=True):
+                    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+                trace = capture.export_chrome_trace(result_dir / f"{mode}-rank{rank}-trace.json")
+                tail_cycles = _check_replica_trace(trace, rank, planner.last_placement.copies_by_rank, home)
+                assert owner.statistics["placements"] == 3
+                assert owner.statistics["fp32_band_bindings"] == 2
+                records.append({"mode": mode, "replica_tail_cycles": tail_cycles})
+            finally:
+                op.close()
+        (result_dir / f"rank{rank}-diagnostics.json").write_text(json.dumps(records))
+    finally:
+        dist.destroy_process_group()
 
 
 def test_placement_checkpoint_and_close():

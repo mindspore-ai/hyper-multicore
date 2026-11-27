@@ -89,6 +89,7 @@ def test_fixed_heap_declines_only_optional_placements(mandatory):
     reserve.assert_called_once_with(hidden, parent, owner, tokens=8192, received=16384,
                                     preferred_receive=20480, pipeline=True)
     assert owner.pool is None and owner.statistics["placements"] == 0
+    assert owner.statistics["placement_candidates"] == owner.statistics["heap_rejections"] == 1
 
 
 @pytest.mark.parametrize(("first", "second"), [("EIO", "EOI"), ("EOI", "EIO")])

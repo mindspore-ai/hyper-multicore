@@ -29,8 +29,7 @@ struct PrefixMove {
 inline std::vector<PrefixMove> SearchPrefixes(
     std::vector<int64_t> remaining, std::vector<int64_t> loads, const std::vector<int64_t>& nodes,
     const std::vector<std::vector<int64_t>>& counts, int slots, int quantum, int64_t target,
-    double multiplier, const PhasePrices& phases, int minimum_rows, double matrix_copy,
-    const std::vector<std::vector<bool>>& peers) {
+    double multiplier, const PhasePrices& phases) {
   const int ranks = loads.size();
   const int home = remaining.size() / ranks;
   std::vector<int> occupied(ranks);
@@ -52,11 +51,11 @@ inline std::vector<PrefixMove> SearchPrefixes(
     selected.guest = -1;
     for (int guest = 0; guest < ranks; ++guest) {
       const auto load = loads[guest], room = target - load;
-      if (room <= 0 || occupied[guest] >= slots || (!peers.empty() && !peers[owner][guest])) continue;
+      if (room <= 0 || occupied[guest] >= slots) continue;
       const double charge = nodes[owner] == nodes[guest] ? 1.0 : multiplier;
       const double outgoing = std::max(max_sent, sent[owner] + charge);
       const double incoming = std::max(max_received, received[guest] + charge);
-      const auto transfer = TransferCost(outgoing, incoming, phases) + matrix_copy * charge;
+      const auto transfer = TransferCost(outgoing, incoming, phases);
       if (selected.guest >= 0 && std::min(room, (loads[owner] - load) / 2) - transfer < std::get<0>(best)) continue;
       for (int e = owner * home; e < (owner + 1) * home; ++e) {
         const auto end = remaining[e];
@@ -65,7 +64,7 @@ inline std::vector<PrefixMove> SearchPrefixes(
         const auto low = cut / quantum * quantum;
         const auto start = (end - low <= room && cut - low <= quantum / 2) ? low : std::min(end, low + quantum);
         const auto moved = end - start;
-        if (moved < minimum_rows) continue;
+        if (moved <= 0) continue;
         const auto relief = loads[owner] - std::max(loads[owner] - moved, load + moved);
         Key key(relief - transfer, -charge, std::min(moved, counts[guest][e]), start == 0, -load, -guest, -e);
         if (selected.guest < 0 || key > best) {

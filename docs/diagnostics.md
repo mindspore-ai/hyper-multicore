@@ -297,8 +297,14 @@ dump 则自动写文件，可向 `dump.tensor_dump(config, schedule=..., on_dump
 通过回调参数的 `last_manifest_paths` 处理刚写出的文件。两种回调都应在数据已就绪时处理结果，而不是再次
 调用 `step()`。
 
+### 分布式采集
+
 分布式采集需区分诊断选择与业务参与。dump 的 `ranks` 只过滤采集结果；Profiler 没有 rank 筛选参数，
 可由应用只在目标进程启用 context。无论是否采集，所有相关 rank 都必须继续参与同一业务通信序列。
+使用 MegaMoE HotReplica 时，EP 组内所有 rank 需在相同调用和窗口启用 Tensor Dump。
+路由交换会检查采集状态。采集时各 rank 使用物化权重的 STAGED 协议，可用 `ranks` 选择保存快照的进程。
+需要采集反向时，让窗口覆盖相应的前向和反向；如果前向绑定了融合副本，随后单独打开 Tensor Dump，
+该次反向继续使用原绑定，跳过快照采集。
 每个 rank 使用独立的 trace 文件。稳态分析应先在 context 外用等价 shape 做真实 warmup，
 同步 NPU，并在需要比较 rank 启动时序时让所有参与 rank 完成 barrier。
 

@@ -29,8 +29,10 @@ from hyper_multicore.experimental import BasePlanner, ExpertPlacement, Placement
 from hyper_multicore.modules.hot_replica import bounded_placement
 from hyper_multicore.modules.hot_replica.mega_moe_adapter import PlacementResources
 from hyper_multicore.modules.hot_replica.shmem_transfer import ExpertWeightBinding, ReplicaExecutionMode
-from hyper_multicore.modules.mega_moe import route
+from hyper_multicore.modules.mega_moe import invocation, route
+from hyper_multicore.modules.mega_moe.backends.bf16 import execution
 from hyper_multicore.modules.mega_moe.heap_manager import _HeapCapacityError
+from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
 from hyper_multicore.modules.hot_replica import shmem_transfer
 
@@ -115,30 +117,63 @@ def test_existing_bank_growth_respects_hard_receive_limit(mandatory):
     """A failed placed growth may retry the original route only when allowed."""
     hidden = torch.empty((1, 4))
     ids = torch.zeros((1, 1), dtype=torch.int32)
-    spec = SimpleNamespace()
-    placement = SimpleNamespace(receive_capacity=4)
-    selected = SimpleNamespace(placement=placement, mandatory=mandatory)
+    spec = SimpleNamespace(dispatch_mode="push", auto_tokens=True)
+    binding = SimpleNamespace(placement=SimpleNamespace(receive_capacity=4), mandatory=mandatory)
     prepare = Mock(side_effect=[_HeapCapacityError("fixed heap"), None])
     original = route._RouteSummary(2, 128, 2)
+    owner = SimpleNamespace(
+        spec=spec, workspace=object(), prepare_auto_workspace=prepare,
+        placement=SimpleNamespace(select=Mock(return_value=binding), uses_placement_wire=lambda: False,
+                                  statistics={"heap_rejections": 0, "placements": 0}),
+    )
 
-    def choose():
+    def exchanged(*_args, **options):
         return route._prepare_placed_route(
-            hidden, ids, spec, None, None, None, None, None, None, prepare, Mock(return_value=selected),
+            hidden, ids, spec, None, None, None, None, None, None,
+            options["prepare_workspace"], options["select_placement"],
         )
 
     with (
+        patch.object(invocation, "prepare_topk_route", side_effect=exchanged),
         patch.object(route, "_read_cached_route", return_value=(original, None, None)),
         patch.object(route, "_materialize_route_permutation", return_value=(hidden, ids)),
         patch.object(route, "_finalize_dynamic_route", return_value="home") as finalize,
     ):
+        call = invocation.prepare_expert_invocation(hidden, ids, hidden, None, (hidden, hidden), owner, planner=Mock())
         if mandatory:
-            with pytest.raises(_HeapCapacityError, match="fixed heap"):
-                choose()
-            prepare.assert_called_once_with(128, 4)
+            with pytest.raises(_HeapCapacityError, match="fixed heap"), call:
+                pytest.fail("required placement exceeded the heap")
+            prepare.assert_called_once_with(128, 4, hidden)
             finalize.assert_not_called()
         else:
-            assert choose() == "home"
-            assert [call.args for call in prepare.call_args_list] == [(128, 4), (128, 2)]
+            with call as prepared:
+                assert prepared == "home"
+            assert [entry.args for entry in prepare.call_args_list] == [(128, 4, hidden), (128, 2, hidden)]
+    assert owner.placement.statistics == {"heap_rejections": 1, "placements": 0}
+
+
+@pytest.mark.parametrize("placement_wire", [False, True])
+def test_mismatched_dump_mode_rejects_cached_counts_before_placement(placement_wire):
+    """Both route readers revalidate control flags even when counts repeat."""
+    spec = MegaMoeSpec(128, 8, 4, 4, 1, 1.25, 256, 2, None, 0, 24)
+    spec = replace(spec, auto_tokens=True)
+    workspace = SimpleNamespace()
+    hidden, ids = torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int32)
+    gathered = torch.tensor([[0, 2, 1, 2, 0, 0, 0], [0, 2, 1, 0, 0, 0, 2]])
+    if placement_wire:
+        bounded_placement.read_placement_wire(gathered, spec, workspace, None)
+    else:
+        summary = route._summarize_host_route(gathered.tolist(), spec)
+        route._cache_host_route(workspace, spec, gathered.tolist(), summary, None, hidden.device)
+    gathered[1, 2] |= route._TENSOR_DUMP_MASK
+    prepare, select = Mock(), Mock()
+    with pytest.raises(RuntimeError, match="Tensor Dump mode differs across EP ranks"):
+        route._prepare_placed_route(
+            hidden, ids, spec, workspace, None, gathered[0, 3:], gathered, None,
+            None, prepare, select, reuse_placement_geometry=placement_wire,
+        )
+    prepare.assert_not_called()
+    select.assert_not_called()
 
 
 def test_tensor_dump_preserves_the_original_replay_binding():
@@ -152,6 +187,40 @@ def test_tensor_dump_preserves_the_original_replay_binding():
     assert diagnostic.snapshot is snapshot and diagnostic.placement is placement
     assert diagnostic.token is not binding.token
     assert binding.mode is ReplicaExecutionMode.FP32_BAND and binding.fused_gradients
+
+
+def test_submission_counts_the_executed_protocol_and_skips_activation_reuse():
+    """A staged diagnostic launch and a fused launch each count once."""
+    spec = SimpleNamespace(dispatch_mode="push", apply_probs_before_fc2=True, num_experts=2, architecture=0)
+    resources = SimpleNamespace(spec=spec, workspace=Mock(), plan_for_tokens=Mock())
+    resources.placement = PlacementResources(resources, {}, False)
+    hidden, ids = torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int32)
+    placement = SimpleNamespace(counts_by_source=torch.ones((2, 4)))
+    pool = Mock()
+    pool.pipeline.plan.return_value = (1, (), (1,))
+    binding = ExpertWeightBinding(pool, placement, "EOI", execution_mode=ReplicaExecutionMode.FP32_BAND)
+    prepared = route.PreparedTopKRoute(hidden, ids, ids, ids, SimpleNamespace(plan_tokens=128),
+                                      weight_binding=binding)
+
+    def forward(current):
+        return execution.forward(None, hidden, hidden, ids, hidden, (hidden, hidden), resources, current)
+
+    with (
+        patch.object(execution, "execute_mega_moe_with_permutation", return_value=hidden) as launch,
+        patch.object(execution, "_CheckpointedMegaMoeFunction") as retained,
+    ):
+        forward(replace(prepared, tensor_dump=True))
+        assert launch.call_args.kwargs["weight_binding"].mode is ReplicaExecutionMode.STAGED
+        forward(prepared)
+        assert launch.call_args.kwargs["weight_binding"] is binding
+        forward(replace(prepared, checkpoint_record=SimpleNamespace(allow_activation=True, activation=())))
+        retained.apply.assert_called_once()
+        launch.side_effect = RuntimeError("launch failed")
+        with pytest.raises(RuntimeError, match="launch failed"):
+            forward(prepared)
+    stats = resources.placement.statistics
+    assert stats["placements"] == 2
+    assert stats["staged_bindings"] == stats["fp32_band_bindings"] == stats["skipped_recomputes"] == 1
 
 
 def test_successful_fused_weight_acquire_records_prefetch_and_returns_operands():

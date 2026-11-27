@@ -12,14 +12,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""BF16 backward scheduling contracts."""
-
-from typing import NamedTuple
-
-
-class BackwardOutputs(NamedTuple):
-    """Expert kernel outputs required by an EP invocation."""
-
-    combine: bool = True  # Returns dX and, for pre-FC2 weighting, dProbs.
-    weight1: bool = True
-    weight2: bool = True

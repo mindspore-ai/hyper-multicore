@@ -17,7 +17,6 @@ from dataclasses import replace
 from typing import Any
 import torch
 from ...resources import _MegaMoeExecutionResources
-from .backward import BackwardOutputs
 from .plan import build_mega_moe_plan
 
 class BF16Resources(_MegaMoeExecutionResources):
@@ -32,7 +31,6 @@ class BF16Resources(_MegaMoeExecutionResources):
         self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
         route_experts: int | None = None,
         replica_pipeline: bool = False, reserve_merge_workers: bool = False,
-        backward_outputs: BackwardOutputs = BackwardOutputs(),
     ) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
@@ -43,7 +41,6 @@ class BF16Resources(_MegaMoeExecutionResources):
                 gradients. Autograd and the caller control the final gradient dtype.
             replica_pipeline: Build the split-weight A3 replica GMM plan.
             reserve_merge_workers: Reserve the even AIV workers on this owner rank.
-            backward_outputs: Expert outputs needed by this invocation's backward.
 
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
@@ -59,8 +56,6 @@ class BF16Resources(_MegaMoeExecutionResources):
             key = (key, route_experts)
         if replica_pipeline:
             key = (key, replica_pipeline, reserve_merge_workers)
-        if backward_outputs != BackwardOutputs():
-            key = (key, backward_outputs)
         plan = self._plans.get(key)
         if plan is None or plan.spec.plan_tokens < tokens:
             spec = self._route_spec(route_experts)
@@ -70,8 +65,6 @@ class BF16Resources(_MegaMoeExecutionResources):
                 if spec.batch_experts:
                     spec = replace(spec, batch_experts=False)
                 options.update(replica_pipeline=True, reserve_merge_workers=reserve_merge_workers)
-            if backward_outputs != BackwardOutputs():
-                options["backward_outputs"] = backward_outputs
             plan = build_mega_moe_plan(replace(spec, schedule_tokens=schedule_tokens), device, **options)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.

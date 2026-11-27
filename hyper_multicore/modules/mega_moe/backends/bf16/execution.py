@@ -21,7 +21,6 @@ from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionM
 from ...route import PreparedTopKRoute, restore_topk_output
 
 from .autograd import _CheckpointedMegaMoeFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
-from .backward import BackwardOutputs
 
 if TYPE_CHECKING:
     from .resources import BF16Resources
@@ -38,35 +37,18 @@ def forward(
     pull = resources.spec.dispatch_mode == "pull"
     before_fc2 = resources.spec.apply_probs_before_fc2
     binding = route.weight_binding
-    ordinary_options = {}
-    if resources.spec.architecture == 2201 and resources.spec.dynamic_tokens and torch.is_grad_enabled():
-        outputs = BackwardOutputs(hidden_flat.requires_grad or (before_fc2 and topk_weights.requires_grad),
-                                  weights[0].requires_grad, weights[1].requires_grad)
-        if (outputs.weight1 and not outputs.weight2 and binding is not None and binding.fused_gradients
-                and not resources.placement.independent_dw):
-            # Older workers start both owner reducers only when W2 has returns.
-            outputs = BackwardOutputs(outputs.combine, weight1=True, weight2=True)
-        if any(outputs) and outputs != BackwardOutputs():
-            ordinary_options["backward_outputs"] = outputs
+    plan_options = {}
     if binding is not None:
         route_experts = binding.placement.counts_by_source.shape[1]
         if route_experts != resources.spec.num_experts:
-            ordinary_options["route_experts"] = route_experts
-    if binding is not None and binding.fused:
-        plan = resources.plan_for_tokens(
-            route.metadata.plan_tokens, hidden_flat.device,
-            weight_grad_dtype=torch.float32 if binding.mode is ReplicaExecutionMode.FP32_BAND else None,
-            replica_pipeline=True,
-            reserve_merge_workers=binding.owns_returns and any(
-                ordinary_options.get("backward_outputs", BackwardOutputs())[1:]),
-            **ordinary_options,
-        )
-        if plan.fwd_diagnostics.is_tensor_dump_active:
-            if binding.mode is ReplicaExecutionMode.FP32_BAND:
-                ordinary_options["weight_grad_dtype"] = torch.float32
+            plan_options["route_experts"] = route_experts
+        if binding.mode is ReplicaExecutionMode.FP32_BAND:
+            plan_options["weight_grad_dtype"] = torch.float32
+        if binding.fused and route.tensor_dump:
             binding = binding.for_tensor_dump()
-    if binding is None or not binding.fused:
-        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **ordinary_options)
+        if binding.fused:
+            plan_options.update(replica_pipeline=True, reserve_merge_workers=binding.owns_returns)
+    plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **plan_options)
     options = {} if binding is None else {"weight_binding": binding}
     record = route.checkpoint_record
     if not torch.is_grad_enabled():
@@ -79,21 +61,23 @@ def forward(
         if record is not None and binding is not route.weight_binding:
             # Both bank layouts save the same owned guest records. The
             # original binding still selects its own replay protocol.
-            record.weight_binding.snapshot = binding.snapshot
-        return output.reshape_as(hidden_states)
-    if record is not None and record.allow_activation:
+            route.weight_binding.snapshot = binding.snapshot
+    elif record is not None and record.allow_activation:
         resources.placement.statistics["skipped_recomputes"] += 1
         return _CheckpointedMegaMoeFunction.apply(
             hidden_flat, *weights, route.metadata, plan, resources.workspace,
             record.activation, topk_weights, binding,
         ).reshape_as(hidden_states)
-    integrated_unpermute = pull or before_fc2
-    output = execute_mega_moe_with_permutation(
-        hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
-        topk_weights=topk_weights if integrated_unpermute else None,
-        workspace_claimed=pull, **options)
-    if not integrated_unpermute:
-        output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
+    else:
+        integrated_unpermute = pull or before_fc2
+        output = execute_mega_moe_with_permutation(
+            hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
+            topk_weights=topk_weights if integrated_unpermute else None,
+            workspace_claimed=pull, **options)
+        if not integrated_unpermute:
+            output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
+    if binding is not None:
+        resources.placement.record_submission(binding.mode)
     return output.reshape_as(hidden_states)
 
 

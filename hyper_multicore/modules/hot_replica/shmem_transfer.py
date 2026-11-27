@@ -87,7 +87,6 @@ class SharedExpertPool:
         self.leased_banks = ()
         self.completion_event = None
         self.completion_stream = None
-        self._replay_stream = None
         self.used = False
         self.generation = 0
         self.in_use = False
@@ -97,7 +96,6 @@ class SharedExpertPool:
         self.statistics = {
             "prefetches": 0, "gradient_returns": 0, "remote_prefetches": 0, "remote_gradient_returns": 0,
             "checkpoint_restores": 0, "backward_cache_hits": 0,
-            "early_restores": 0, "early_restore_hits": 0,
         }
         self.capacity_floor = local_experts
         self.expert_weight_layout = layout
@@ -277,27 +275,6 @@ class SharedExpertPool:
             return self.leased_banks
         return tuple(bank[:extent] for bank in self.leased_banks)
 
-    def stage_snapshot(self, layout: str, snapshot: tuple[tuple[torch.Tensor, ...], Any]) -> int | None:
-        """Submit a local suffix restore and retire its lease on the copy stream."""
-        tails, _ = snapshot
-        if not tails[0].shape[0]:
-            return None
-        with self.access(), self.lock:
-            if self.closed or self.in_use:
-                return None
-            if self._replay_stream is None:
-                self._replay_stream = torch.npu.Stream(device=self.device)
-            with torch.npu.stream(self._replay_stream):
-                self.claim(layout)
-                try:
-                    # Invalidate old tickets before a write, including a failed copy.
-                    self.generation += 1
-                    self.restore_snapshot(snapshot, self.local_experts)
-                    self.statistics["early_restores"] += 1
-                    return self.generation
-                finally:
-                    self.release()
-
     def restore_snapshot(self, snapshot: tuple[tuple[torch.Tensor, ...], Any], start: int) -> None:
         """Copy saved guest operands into the selected prefix or suffix."""
         tails, ready = snapshot
@@ -310,7 +287,6 @@ class SharedExpertPool:
     def prefetch(
         self, weights: tuple[torch.Tensor, ...], copies: torch.Tensor, extra: int,
         *, snapshot: tuple[tuple[torch.Tensor, ...], Any] | None = None,
-        staged_generation: int | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Publish current owner weights and fill borrowed slots on the lease stream."""
         if not self.in_use:
@@ -324,10 +300,7 @@ class SharedExpertPool:
             else:
                 for bank, home in zip(self.leased_banks, weights):
                     bank[:self.local_experts].copy_(home)
-                if staged_generation is not None and staged_generation == self.generation:
-                    self.statistics["early_restore_hits"] += 1
-                else:
-                    self.restore_snapshot(snapshot, self.local_experts)
+                self.restore_snapshot(snapshot, self.local_experts)
                 self.statistics["checkpoint_restores"] += 1
         self.generation += 1
         self.statistics["prefetches"] += 1
@@ -339,32 +312,30 @@ class SharedExpertPool:
 
     def return_generated_gradients(
         self,
-        gradients: tuple[torch.Tensor | None, ...],
+        gradients: tuple[torch.Tensor, ...],
         copies: torch.Tensor,
         active: bool = True,
         *,
         output_dtypes: tuple[torch.dtype, ...] | None = None,
         published_slots: int | None = None,
-    ) -> tuple[torch.Tensor | None, ...]:
+    ) -> tuple[torch.Tensor, ...]:
         """Sum borrowed gradients into the expert producer's home gradients."""
         if self.pipeline is not None:
             self.pipeline.invalidate()
         with _ordered_transfers(self):
-            matrices = [index for index, gradient in enumerate(gradients) if gradient is not None]
-            banks = self._generic_banks()
-            home = iter(reduce_banks(
-                tuple(gradients[index] for index in matrices),
-                tuple(banks[index] for index in matrices),
+            home = reduce_banks(
+                gradients,
+                self._generic_banks(),
                 copies,
                 self.rank,
                 self.blocks,
-                None if output_dtypes is None else tuple(output_dtypes[index] for index in matrices),
+                output_dtypes,
                 published_slots=published_slots,
-            ))
+            )
         self.generation += 1
         self.statistics["gradient_returns"] += 1
         self.statistics["remote_gradient_returns"] += int(active)
-        return tuple(next(home) if gradient is not None else None for gradient in gradients)
+        return tuple(home)
 
     def track_graph(self, ctx: Any) -> None:
         """Keep the bank's owner alive while its autograd graph can replay."""
@@ -411,7 +382,6 @@ class ExpertWeightBinding:
     layout: str
     snapshot: Any = None
     generation: int | None = None
-    staged_generation: int | None = None
     mandatory: bool = False
     token: object = field(default_factory=object)
     transfers: tuple = ()
@@ -445,13 +415,6 @@ class ExpertWeightBinding:
     def owns_returns(self):
         return self.fused_gradients and bool(self.edges[2])
 
-    def prepare_replay(self) -> None:
-        """Restore the saved suffix while the framework replays attention and routing."""
-        # Only the agreed replay can overwrite the fused prefix. Early staging
-        # can run locally before EP agrees that parameter versions still match.
-        if self.snapshot is not None and not self.fused:
-            self.staged_generation = self.pool.stage_snapshot(self.layout, self.snapshot)
-
     def acquire(
         self, weights: tuple[torch.Tensor, ...], *, backward: bool = False,
     ) -> tuple[torch.Tensor, ...]:
@@ -467,10 +430,9 @@ class ExpertWeightBinding:
             if self.generation is not None and self.generation == self.pool.generation:
                 self.pool.statistics["backward_cache_hits"] += 1
                 return self.pool.active_weights(self.placement.borrowed_capacity)
-            staged_generation, self.staged_generation = self.staged_generation, None
             borrowed = self.pool.prefetch(
                 weights, self.placement.copies, self.placement.borrowed_capacity,
-                snapshot=self.snapshot, staged_generation=staged_generation,
+                snapshot=self.snapshot,
             )
             self.generation = self.pool.generation
             return borrowed
@@ -504,8 +466,8 @@ class ExpertWeightBinding:
         self.generation = None
 
     def gradients(
-        self, gradients: tuple[torch.Tensor | None, ...], weights: tuple[torch.Tensor, ...]
-    ) -> tuple[torch.Tensor | None, ...]:
+        self, gradients: tuple[torch.Tensor, ...], weights: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, ...]:
         """Return partial expert gradients to owners before casting parameter gradients."""
         if self.fused_gradients:
             stats = self.pool.statistics

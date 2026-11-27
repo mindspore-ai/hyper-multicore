@@ -19,8 +19,10 @@ from functools import partial
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 import torch
+from hyper_multicore.diagnostics.api import is_tensor_dump_active
+from .heap_manager import _HeapCapacityError
 from .route import (
-    _INVALID_WEIGHT_MASK, PreparedTopKRoute, _materialize_route_permutation, prepare_topk_route,
+    _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK, PreparedTopKRoute, _materialize_route_permutation, prepare_topk_route,
 )
 
 if TYPE_CHECKING:
@@ -41,21 +43,29 @@ def prepare_expert_invocation(
     changes happen before claiming that lease. No precision implementation may
     repeat route preparation or add a second validation collective.
     """
+    placement = getattr(resources, "placement", None)
+    tensor_dump = placement is not None and is_tensor_dump_active()
     mask = _INVALID_WEIGHT_MASK if weight_error else (
         int(torch.is_grad_enabled()) | (int(hidden.requires_grad) << 1)
         | (int(weights[0].requires_grad) << 2) | (int(weights[1].requires_grad) << 3)
         | (int(probs.requires_grad) << 4))
+    if tensor_dump:
+        mask |= _TENSOR_DUMP_MASK
     pull = resources.spec.dispatch_mode == "pull"
     leased_workspace = None
 
-    def prepare_workspace(tokens: int, received: int) -> None:
+    def prepare_workspace(tokens: int, received: int, *, placed: bool = False) -> None:
         """Prepare the capacity before claiming a source publication lease."""
         nonlocal leased_workspace
-        resources.prepare_auto_workspace(tokens, received, hidden)
+        try:
+            resources.prepare_auto_workspace(tokens, received, hidden)
+        except _HeapCapacityError:
+            if placed:
+                placement.statistics["heap_rejections"] += 1
+            raise
         if pull:
             leased_workspace = resources.workspace
 
-    placement = getattr(resources, "placement", None)
     record, replay = None, False
     try:
         if placement is not None:
@@ -66,6 +76,8 @@ def prepare_expert_invocation(
                     record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
                 placement.statistics["route_replays"] += 1
                 route = record.route
+                if tensor_dump:
+                    record.allow_activation = False
                 resources.workspace.wait_for_reuse()
                 if not record.allow_activation:
                     with torch.inference_mode(False), torch.no_grad():
@@ -77,7 +89,7 @@ def prepare_expert_invocation(
                             hidden, virtual_ids, resources.spec, resources.workspace,
                         )
                     route = replace(route, routed_tokens=rows, unpermute_mapping=mapping)
-                yield replace(route, checkpoint_record=record)
+                yield replace(route, checkpoint_record=record, tensor_dump=tensor_dump)
                 return
             if replay:
                 placement.statistics["route_replay_misses"] += 1
@@ -115,5 +127,4 @@ def _record_checkpoint_route(route, record, counts, ids):
         return route
     record.route = replace(route, routed_tokens=None, unpermute_mapping=None)
     record.ids = ids.detach().clone()
-    record.weight_binding = route.weight_binding
     return replace(route, checkpoint_record=record)
