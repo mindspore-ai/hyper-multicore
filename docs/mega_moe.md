@@ -189,6 +189,29 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
 测量稳态性能前应覆盖代表性的路由和容量。
 
+#### 非重入 checkpoint
+
+配置了 `expert_placement` 的 `ascend910_93` BF16 MTE Push 在 FC2 后乘路由概率时，可通过 `ReplayCheckpoint` 启用保存优化。
+每次调用 `checkpoint` 创建一份记录。`parameter_version` 由调用方提供，返回原前向与重算之间可比较的参数逻辑版本。
+
+```python
+from torch.utils.checkpoint import checkpoint
+from hyper_multicore.experimental import ReplayCheckpoint
+
+tape = ReplayCheckpoint(
+    parameter_version,
+    defer_forward_copies=True,
+    guest_snapshot_bytes=132 * 1024**2,
+)
+output = checkpoint(experts_forward, *inputs, use_reentrant=False, context_fn=tape.contexts)
+```
+
+- `defer_forward_copies` 在重算时保存反向所需的 dispatch 和 combine 行，省去原前向对这两处行的保存拷贝。
+- `guest_snapshot_bytes` 为每 rank、每次专家调用可保留的 guest 权重字节数。原落位通过重算校验，且 EP 内每个 rank 都能恢复快照时，
+  重算从本地快照恢复。预算不足时全 EP 走原权重发布路径。多个在途调用各自持有快照。
+
+两个选项默认关闭。使用这两个选项时，原前向和重算均需启用梯度，并在同一 EP 组使用相同的保存策略。
+
 ### 旧 HotReplica 接口退役
 
 独立 Native EP 的 `HotReplica`、`plan_native()` 和旧输入预留参数 `source_token_bound` 已退役。

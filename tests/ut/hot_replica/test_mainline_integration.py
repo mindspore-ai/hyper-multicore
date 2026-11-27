@@ -25,6 +25,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.experimental import (
@@ -397,6 +398,60 @@ def test_checkpoint_agrees_on_version_and_activation(monkeypatch):
     assert wrapped(torch.tensor([1, 1])) == (False, False)
     version[0] += 1
     assert wrapped() == (False, False)
+
+
+@pytest.mark.parametrize(("peer_snapshot", "peer_dump", "route_hit"), [
+    (False, True, True), (True, True, True), (True, False, False),
+])
+def test_checkpoint_guest_snapshots_require_ep_agreement(monkeypatch, peer_snapshot, peer_dump, route_hit):
+    """Use a distinct guest vote and retain the existing Tensor Dump route vote."""
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _device: "stream")
+    local_mask = 15 | route._TENSOR_DUMP_MASK
+    peer_mask = 15 | (route._TENSOR_DUMP_MASK if peer_dump else 0)
+    snapshot = object()
+
+    def gather(out, local, **_):
+        assert local.item() == local_mask | replay._REPLAY_GUEST_MASK
+        peer_vote = peer_mask | (replay._REPLAY_GUEST_MASK if peer_snapshot else 0)
+        out.copy_(out.new_tensor([local.item(), peer_vote]))
+
+    monkeypatch.setattr(replay.dist, "all_gather_into_tensor", gather)
+    spec = SimpleNamespace(ep_size=2, ep_group=object())
+    hidden, probs, ids = torch.ones((1, 4)), torch.ones((1, 2)), torch.tensor([[0, 1]])
+    tape = replay.ReplayCheckpoint(lambda: 0, guest_snapshot_bytes=128)
+    owner = object()
+    with tape.scope(False):
+        original, _ = replay.route_record(owner)
+        assert original.guest_snapshot_bytes == 128
+        original.ids, original.stream, original.route = ids.clone(), "stream", object()
+        original.guest_snapshot = snapshot
+    with tape.scope(True):
+        record, _ = replay.route_record(owner)
+        assert replay.agree_replay(record, hidden, ids, probs, None, spec, local_mask, weight_error=False) is route_hit
+        assert record.allow_guest_restore is (route_hit and peer_snapshot)
+        assert not record.allow_activation
+    assert record.guest_snapshot is snapshot and not original.allow_guest_restore
+
+
+def test_nonreentrant_checkpoint_context_can_replay_a_retained_graph():
+    """Reset the replay cursor for each retained backward through the same checkpoint."""
+    tape = replay.ReplayCheckpoint(lambda: 0, defer_forward_copies=True)
+    owner = object()
+    phases = []
+
+    def layer(value):
+        phase = replay.forward_save_policy()
+        record, is_replay = replay.route_record(owner)
+        assert record.owner is owner and phase == (is_replay, True)
+        phases.append(is_replay)
+        return value.square()
+
+    value = torch.tensor([2.0], requires_grad=True)
+    result = checkpoint(layer, value, use_reentrant=False, context_fn=tape.contexts)
+    result.backward(retain_graph=True)
+    result.backward()
+    torch.testing.assert_close(value.grad, torch.tensor([8.0]))
+    assert phases == [False, True, True] and replay.forward_save_policy() is None
 
 
 @pytest.mark.parametrize("rank", [0, 1])

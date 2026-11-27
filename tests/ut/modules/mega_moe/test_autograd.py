@@ -161,6 +161,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         context.weight_binding = None
         context.has_unpermute = False
+        context.defer_forward_copies = False
         context.needs_input_grad = (False,) * 9
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"

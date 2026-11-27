@@ -237,6 +237,23 @@ def test_successful_fused_weight_acquire_records_prefetch_and_returns_operands()
     with patch.object(shmem_transfer, "_ordered_transfers", return_value=nullcontext()):
         assert binding.acquire(weights) is pool.pipeline.begin.return_value
         binding.release()
-    pool.pipeline.begin.assert_called_once_with(weights, binding, False)
+    pool.pipeline.begin.assert_called_once_with(weights, binding, False, replay_snapshot=None)
     assert pool.statistics["fused_prefetches"] == 1
     pool.release.assert_called_once_with()
+
+
+def test_guest_snapshot_budget_counts_owned_copies():
+    """Copy only published guest slots and leave the shared binding state alone."""
+    pool = Mock(device="cpu")
+    pool.pipeline.plan.return_value = (2, (), ())
+    placement = SimpleNamespace(published_slots=1, borrowed_capacity=2)
+    binding = ExpertWeightBinding(pool, placement, "EOI", execution_mode=ReplicaExecutionMode.FP32_BAND)
+    weights = tuple(torch.ones((2, 4), dtype=torch.bfloat16) for _ in range(2))
+    with patch("torch.npu.Event") as event, patch("torch.npu.current_stream") as stream:
+        assert binding.capture_snapshot(weights, maximum_bytes=15) is None
+        event.assert_not_called()
+        tensors, ready = binding.capture_snapshot(weights, maximum_bytes=16)
+    ready.record.assert_called_once_with(stream.return_value)
+    weights[0].zero_()
+    assert binding.snapshot is None and all(t.shape == (1, 4) for t in tensors)
+    assert all(torch.equal(t, torch.ones_like(t)) for t in tensors)

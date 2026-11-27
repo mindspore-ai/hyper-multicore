@@ -29,7 +29,9 @@ from torch.utils.checkpoint import checkpoint
 
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
 from hyper_multicore.diagnostics import dump, profiler
-from hyper_multicore.experimental import BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions, wrap_checkpoint
+from hyper_multicore.experimental import (
+    BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions, ReplayCheckpoint, wrap_checkpoint,
+)
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.receive import SourceQuota, select_replica_plan
 from hyper_multicore.modules.hot_replica.planner import as_placement
@@ -238,6 +240,58 @@ def test_placement_checkpoint_and_close():
             (Path(result_dir) / f"rank{rank}.json").write_text(json.dumps({
                 "rank": rank, "dispatch_mode": dispatch_mode, "layout": layout, "placements": placement_records,
             }))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_nonreentrant_checkpoint_saves():
+    """Compare output and gradients with deferred saves, full snapshots and a peer budget miss."""
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(rank)
+    dist.init_process_group("hccl")
+    try:
+        torch.manual_seed(817 + rank)
+        device = torch.device("npu", rank)
+        tokens, hidden, intermediate = 1024, 512, 256
+        x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) * .02
+        ids = torch.arange(2, dtype=torch.int32, device=device).expand(tokens, 2).contiguous()
+        probs = torch.rand(tokens, 2, device=device).softmax(-1)
+        weights = tuple(torch.randn(shape, dtype=torch.bfloat16, device=device) * .02
+                        for shape in ((4, hidden, 2 * intermediate), (4, intermediate, hidden)))
+        upstream = torch.randn_like(x)
+        reference = None
+        receipts = []
+        for name, defer, budget, restores in (
+            ("ordinary", False, 0, 0), ("deferred", True, 32 << 20, 1),
+            ("peer_miss", True, 1 if rank == 1 else 32 << 20, 0), ("snapshot_only", False, 32 << 20, 1),
+        ):
+            op = MegaMoeExperts(
+                hidden_size=hidden, intermediate_size=intermediate, num_experts=8, top_k=2,
+                ep_group=dist.group.WORLD, tuning_options=MegaMoeTuningOptions(expert_placement=SkewPlanner()),
+            )
+
+            def run(h, p, w1, w2, execute=op):
+                return execute(h, ids, p, expert_weights=(w1, w2))
+
+            leaves = tuple(t.detach().requires_grad_() for t in (x, probs, *weights))
+            tape = ReplayCheckpoint(lambda: 1, defer_forward_copies=defer, guest_snapshot_bytes=budget)
+            out = checkpoint(run, *leaves, use_reentrant=False, context_fn=tape.contexts)
+            gradients = torch.autograd.grad(out, leaves, upstream)
+            observed = tuple(t.detach().cpu() for t in (out, *gradients))
+            owner = op._resource_group.resources.placement  # pylint: disable=protected-access
+            assert owner.statistics["route_replays"] == 1 and owner.statistics["skipped_recomputes"] == 0
+            assert owner.statistics["placements"] >= 1 and owner.pool is not None
+            assert owner.pool.statistics.get("fused_snapshot_restores", 0) == restores
+            if reference is None:
+                reference = observed
+            else:
+                for value, expected in zip(observed, reference, strict=True):
+                    torch.testing.assert_close(value, expected, rtol=0, atol=0)
+            receipts.append({"mode": name, "route_replays": 1, "snapshot_restores": restores})
+            del out, gradients, leaves, tape
+            op.close()
+        output = Path(os.environ["HOT_REPLICA_TEST_RESULTS"])
+        (output / f"rank{rank}.json").write_text(json.dumps({"rank": rank, "cases": receipts}))
     finally:
         dist.destroy_process_group()
 

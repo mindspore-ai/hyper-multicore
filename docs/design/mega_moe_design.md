@@ -275,6 +275,12 @@ HotReplica 的放置计数以正向执行提交为准（`placements` 及各模�
 `placement_candidates` 记录物化后的候选，`heap_rejections` 和 `protocol_rejections` 记录相应的拒绝原因。
 checkpoint 跳过重算时单独计入 `skipped_recomputes`。
 
+非重入 checkpoint 可把 A3 BF16 MTE Push 的 dispatch 和 combine 保存移到重算阶段。
+原前向在工作区租约内完成反置换，向 Torch 保存对应形状、dtype 和设备的占位张量。
+重算在相同的保存位置写入独立持有的行张量，反向在取得工作区租约前校验这些行已被重算替换。
+可选的 guest 权重快照由原调用记录持有。重算在现有的 EP 路由投票中额外确认快照是否齐备，
+取得 bank 租约后才恢复。每次重算保存自己的投票结果，并可重复使用原记录持有的只读快照。
+
 Ascend950 BF16 Pull 先选择普通或虚拟专家路由，再取得相应工作区租约并置换到对称源区。
 事件容量兼容的两种布局共用工作区。重算复用保存的落位时，在所选租约内重新发布当前输入。
 

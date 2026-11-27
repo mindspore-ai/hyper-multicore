@@ -16,6 +16,7 @@
 from typing import Any, TYPE_CHECKING
 import torch
 
+from hyper_multicore.modules.hot_replica.checkpoint import forward_save_policy
 from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionMode
 
 from ...route import PreparedTopKRoute, restore_topk_output
@@ -62,6 +63,8 @@ def forward(
         ).reshape_as(hidden_states)
     else:
         integrated_unpermute = pull or before_fc2
+        if not integrated_unpermute and resources.placement is not None:
+            integrated_unpermute = _apply_checkpoint_saves(plan.spec, binding, record, options)
         output = execute_mega_moe_with_permutation(
             hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
             topk_weights=topk_weights if integrated_unpermute else None,
@@ -71,6 +74,20 @@ def forward(
     if binding is not None:
         resources.placement.record_submission(binding.mode)
     return output.reshape_as(hidden_states)
+
+
+def _apply_checkpoint_saves(spec, binding, record, options):
+    """Configure after-FC2 A3 Push replay and report whether it owns unpermutation."""
+    policy = forward_save_policy()
+    if policy is None or spec.architecture != 2201 or spec.transport_engine != "mte":
+        return False
+    replay, defer = policy
+    if defer:
+        options["checkpoint_replay"] = replay
+    if (record is not None and record.guest_snapshot_bytes and binding is not None and binding.fused
+            and (not replay or record.allow_guest_restore)):
+        options["checkpoint_record"] = record
+    return defer
 
 
 def _prepare_replica_binding(binding, tensor_dump, num_experts):
