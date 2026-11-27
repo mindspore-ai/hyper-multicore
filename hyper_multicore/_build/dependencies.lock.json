@@ -94,14 +94,6 @@
                 "architectures": [
                   "arch22"
                 ]
-              },
-              {
-                "path": "hyper_multicore/ops/patches/grouped_matmul_direct_split.patch",
-                "sha256": "9710862dcd01fbc9e429b4c3adc73bc1d65bc8333cc455163c5f29009df2c154",
-                "purpose": "pass dynamic per-expert GMM splits without rewriting GM tiling and group lists",
-                "architectures": [
-                  "arch22"
-                ]
               }
             ],
             "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

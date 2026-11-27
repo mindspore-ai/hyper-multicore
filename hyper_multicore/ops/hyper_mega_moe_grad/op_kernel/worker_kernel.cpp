@@ -457,18 +457,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
     auto band = PrepareGradientBand(task_desc.outputs[0], data_index, single_group);
 #endif
-    GM_ADDR grouped_list_real = nullptr;
     GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
     const bool transpose_input = getTransposeData(task_desc.inputs[0].transpose_flag);
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-    const int32_t split_rows = !batched && value > 0 && value <= INT32_MAX ? static_cast<int32_t>(value) : 0;
-    if (split_rows == 0) {
-#endif
-      grouped_list_real = PrepareGroupedMatmulInputs(grouped_list_tensor, tiling_data_addr, expert_num_single_rank,
-                                                     data_index, value, batched, single_group, transpose_input);
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-    }
-#endif
+    GM_ADDR grouped_list_real = PrepareGroupedMatmulInputs(
+        grouped_list_tensor, tiling_data_addr, expert_num_single_rank,
+        data_index, value, batched, single_group, transpose_input);
 
     int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
     int64_t output_0_offset = GmmRowOffset(task_desc.outputs[0], start);
@@ -489,10 +482,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
                    output_base + output_0_offset, input_list[WORKSPACE_IDX],
                    tiling_data_addr, transpose_input,
                    getTransposeData(task_desc.inputs[1].transpose_flag),
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-                   fp32_output, band.flags, band.epoch, band.rows, split_rows, single_group,
-                   single_group ? 0 : data_index);
-#elif !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
+#if !defined(__NPU_ARCH__) || __NPU_ARCH__ != 3510
                    fp32_output, band.flags, band.epoch, band.rows);
 #else
                    fp32_output);

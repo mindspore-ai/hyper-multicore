@@ -301,17 +301,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     }
     const uint32_t weight = task_desc.inputs[1].input_position;
     const bool single_group = GetGroupedMatmulTaskMode(task_desc) == GroupedMatmulTaskMode::SINGLE_GROUP;
-    GM_ADDR grouped_list_real = nullptr;
     GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 2016 * AscendC::GetBlockIdx();
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-    const int32_t split_rows = !batched && value > 0 && value <= INT32_MAX ? static_cast<int32_t>(value) : 0;
-    if (split_rows == 0) {
-#endif
-      grouped_list_real = PrepareGroupedMatmulInputs(grouped_list_tensor, tiling_data_addr,
-                                                     expert_num_single_rank, data_index, value, batched, single_group);
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-    }
-#endif
+    GM_ADDR grouped_list_real = PrepareGroupedMatmulInputs(
+        grouped_list_tensor, tiling_data_addr, expert_num_single_rank, data_index, value, batched, single_group);
 
     int64_t input_0_offset = GmmRowOffset(task_desc.inputs[0], start);
     int64_t output_0_offset = GmmRowOffset(task_desc.outputs[0], start);
@@ -328,12 +320,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
                    nullptr, nullptr, grouped_list_real, nullptr,
                    input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
                    tiling_data_addr, task_desc.inputs[0].transpose_flag == 1,
-#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-                   task_desc.inputs[1].transpose_flag == 1, false, nullptr, 0, 0, split_rows,
-                   single_group, single_group ? 0 : data_index);
-#else
                    task_desc.inputs[1].transpose_flag == 1);
-#endif
   }
 
   __aicore__ inline void ExecuteShmemPutMem(TaskDesc task_desc) {
