@@ -85,6 +85,8 @@ class KernelWorkerBase {
   static constexpr uint32_t PROFILE_DESC_TRIGGER_EVENT = 0x10007;
   static constexpr uint32_t PROFILE_DESC_TASK_TYPE_BASE = 0x20000;
 
+  __aicore__ inline uint32_t GetReadyGroupSize() const { return 1; }
+
   __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr, GM_ADDR *input_list) {
     this->worker_id_ = worker_id;
     this->runtimeConfigPtr = runtimeConfigPtr;
@@ -103,6 +105,7 @@ class KernelWorkerBase {
         input_list[Derived::TILING_IDX] + Derived::RUNTIME_BOUNDS_OFFSET);
       runtime_bytes = bounds->runtime_config_bytes;
       event_bytes = bounds->event_counter_bytes;
+      ep_size = static_cast<const Derived *>(this)->GetReadyGroupSize();
     }
     if (!isRuntimeStorageValid(runtimeConfigPtr, runtime_bytes, event_bytes, ep_size, local_experts)) {
       AscendC::Trap();

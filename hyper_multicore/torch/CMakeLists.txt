@@ -83,7 +83,9 @@ add_library(hyper_multicore_torch SHARED
     csrc/mega_moe_unpermute.cpp
     csrc/mega_gate_registration.cpp
     csrc/mega_gate.cpp
-    csrc/mega_moe_mxfp8.cpp)
+    csrc/mega_moe_mxfp8.cpp
+    csrc/registration_kda.cpp
+    csrc/mega_kda.cpp)
 foreach(utility_arch IN LISTS HP_MULTICORE_NPU_ARCHS)
     target_compile_definitions(hyper_multicore_torch PRIVATE "HMC_UTILITY_ARCH${utility_arch}=1")
 endforeach()

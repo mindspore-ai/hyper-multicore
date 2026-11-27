@@ -75,6 +75,18 @@ npu_op_kernel_sources(ascendc_kernels
     KERNEL_FILE hyper_mega_gate_route_grad.cpp
     SOC_SERIES ${ASCEND_COMPUTE_UNIT}
 )
+npu_op_kernel_sources(ascendc_kernels
+    OP_TYPE HyperMegaKda
+    KERNEL_DIR ./hyper_mega_kda/op_kernel
+    KERNEL_FILE hyper_mega_kda.cpp
+    SOC_SERIES ${ASCEND_COMPUTE_UNIT}
+)
+npu_op_kernel_sources(ascendc_kernels
+    OP_TYPE HyperMegaKdaGrad
+    KERNEL_DIR ./hyper_mega_kda_grad/op_kernel
+    KERNEL_FILE hyper_mega_kda_grad.cpp
+    SOC_SERIES ${ASCEND_COMPUTE_UNIT}
+)
 
 
 if(EXISTS "${HP_MULTICORE_SOURCE_ROOT}/arch35/sources.json")
