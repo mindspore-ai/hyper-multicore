@@ -66,11 +66,8 @@ def build_kernels(output: Path, sdk: Path, npu_arch: int) -> None:
         "-O2",
         "-std=c++17",
         "-Wl,-z,relro,-z,now,-z,noexecstack",
-        *[
-            str(source / name)
-            for name in ("hot_replica_expert_prefetch.cpp", "hot_replica_expert_grad_reduce_fp32.cpp",
-                         "replica_counts.cpp")
-        ],
+        str(source / "hot_replica_expert_prefetch.cpp"),
+        str(source / "hot_replica_expert_grad_reduce_fp32.cpp"),
         "-o",
         str(output / "libhmc_hot_replica_kernels.so"),
         "-Wl,-soname,libhmc_hot_replica_kernels.so",

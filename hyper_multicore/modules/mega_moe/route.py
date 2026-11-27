@@ -957,24 +957,15 @@ def _prepare_dynamic_route(
     route_stream = (torch.npu.current_stream(hidden_states.device)
                     if workspace is not None and hidden_states.device.type == "npu" else None)
     permuted = None
-    payload = None
-    if within_limit and reuse_placement_geometry and supplied_counts is None:
-        from ..hot_replica.counts import route_payload  # pylint: disable=import-outside-toplevel
-
-        payload = route_payload(topk_ids, spec.num_experts, autograd_mask)
-    separate_counts = payload is not None
-    if separate_counts:
-        counts, invalid = payload[3:], False
-    else:
-        if within_limit and _can_fuse_count(hidden_states, spec, supplied_counts):
-            permuted, supplied_counts = _permute_and_count(hidden_states, topk_ids, spec)
-        counts, payload, invalid = _dynamic_route_payload(
-            hidden_states, flat_ids, spec, supplied_counts, autograd_mask, workspace, stream=route_stream)
+    if within_limit and _can_fuse_count(hidden_states, spec, supplied_counts):
+        permuted, supplied_counts = _permute_and_count(hidden_states, topk_ids, spec)
+    counts, payload, invalid = _dynamic_route_payload(
+        hidden_states, flat_ids, spec, supplied_counts, autograd_mask, workspace, stream=route_stream)
     if workspace is not None and spec.dispatch_mode != "pull":
         workspace.wait_for_reuse(stream=route_stream)
     gathered, work = _start_dynamic_gather(payload, spec)
     # Ordinary storage remains valid if count agreement triggers a SHMEM restart.
-    if permuted is None and not separate_counts:
+    if permuted is None:
         permuted = _stage_dynamic_permutation(hidden_states, topk_ids, spec, invalid, workspace)
     if select_placement is not None:
         return _prepare_placed_route(hidden_states, topk_ids, spec, workspace, permuted,
