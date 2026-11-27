@@ -25,7 +25,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 import torch
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from hyper_multicore import MegaMoeExperts
 from hyper_multicore.experimental import (
@@ -439,18 +439,21 @@ def test_nonreentrant_checkpoint_context_can_replay_a_retained_graph():
     owner = object()
     phases = []
 
-    def layer(value):
+    def layer(value: torch.Tensor) -> torch.Tensor:
+        """Record the checkpoint phase before returning the CPU result."""
         phase = replay.forward_save_policy()
         record, is_replay = replay.route_record(owner)
         assert record.owner is owner and phase == (is_replay, True)
         phases.append(is_replay)
         return value.square()
 
-    value = torch.tensor([2.0], requires_grad=True)
-    result = checkpoint(layer, value, use_reentrant=False, context_fn=tape.contexts)
-    result.backward(retain_graph=True)
-    result.backward()
-    torch.testing.assert_close(value.grad, torch.tensor([8.0]))
+    value = torch.tensor([2.0], device="cpu", requires_grad=True)
+    # An installed NPU backend can become the checkpoint fallback even for CPU inputs.
+    with patch.object(DefaultDeviceType, "get_device_type", return_value="cpu"):
+        result = checkpoint(layer, value, use_reentrant=False, context_fn=tape.contexts)
+        result.backward(retain_graph=True)
+        result.backward()
+    torch.testing.assert_close(value.grad, value.new_tensor([8.0]))
     assert phases == [False, True, True] and replay.forward_save_policy() is None
 
 
