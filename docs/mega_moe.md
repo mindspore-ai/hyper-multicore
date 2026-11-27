@@ -192,26 +192,17 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 
 #### 非重入 checkpoint
 
-配置了 `expert_placement` 的 `ascend910_93` BF16 MTE Push 在 FC2 后乘路由概率时，可通过 `ReplayCheckpoint` 启用保存优化。
+配置了 `expert_placement` 时，使用 `ReplayCheckpoint` 在非重入重算中复用原始专家布局。
 每次调用 `checkpoint` 创建一份记录。`parameter_version` 由调用方提供，返回原前向与重算之间可比较的参数逻辑版本。
 
 ```python
 from torch.utils.checkpoint import checkpoint
 from hyper_multicore.experimental import ReplayCheckpoint
 
-tape = ReplayCheckpoint(
-    parameter_version,
-    defer_forward_copies=True,
-    guest_snapshot_bytes=132 * 1024**2,
-)
+tape = ReplayCheckpoint(parameter_version)
 output = checkpoint(experts_forward, *inputs, use_reentrant=False, context_fn=tape.contexts)
 ```
 
-- `defer_forward_copies` 在重算时保存反向所需的 dispatch 和 combine 行，省去原前向对这两处行的保存拷贝。
-- `guest_snapshot_bytes` 为每 rank、每次专家调用可保留的 guest 权重字节数。原落位通过重算校验，且 EP 内每个 rank 都能恢复快照时，
-  重算从本地快照恢复。预算不足时全 EP 走原权重发布路径。多个在途调用各自持有快照。
-
-两个选项默认关闭。使用这两个选项时，原前向和重算均需启用梯度，并在同一 EP 组使用相同的保存策略。
 通过 `context_fn=tape.contexts` 重算时，整个 EP 组必须确认原始布局，否则全组报错。
 调用方应保持参数逻辑版本、有序 Top-K IDs、执行流和诊断模式一致。
 原前向和重算可以都省略 `tokens_per_expert`，或都传入内容相同的逻辑专家计数。

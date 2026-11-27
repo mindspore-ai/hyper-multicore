@@ -161,7 +161,6 @@ class TestMegaMoeFunction(unittest.TestCase):
         context = Mock()
         context.weight_binding = None
         context.has_unpermute = False
-        context.defer_forward_copies = False
         context.needs_input_grad = (False,) * 9
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
@@ -205,7 +204,6 @@ class TestMegaMoeFunction(unittest.TestCase):
             context, rows, rows, rows, route, plan, Mock(), activations, torch.ones(1, 1), None,
         )
         self.assertIs(output, rows)
-        self.assertIs(context.defer_forward_copies, False)
         self.assertIs(context.save_for_backward.call_args.args[0], rows)
         saved, _ = function_module._saved_backward_state(context.save_for_backward.call_args.args)
         self.assertIs(saved.group_list, groups)

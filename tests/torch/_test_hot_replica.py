@@ -244,8 +244,8 @@ def test_placement_checkpoint_and_close():
         dist.destroy_process_group()
 
 
-def test_nonreentrant_checkpoint_saves():
-    """Compare output and gradients with deferred saves, full snapshots and a peer budget miss."""
+def test_nonreentrant_checkpoint_replay():
+    """Compare non-reentrant replay with and without a supplied logical histogram."""
     rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(rank)
     dist.init_process_group("hccl")
@@ -262,38 +262,32 @@ def test_nonreentrant_checkpoint_saves():
         upstream = torch.randn_like(x)
         reference = None
         receipts = []
-        for name, defer, budget, restores, supplied in (
-            ("ordinary", False, 0, 0, False), ("deferred", True, 32 << 20, 1, True),
-            ("peer_miss", True, 1 if rank == 1 else 32 << 20, 0, True),
-            ("snapshot_only", False, 32 << 20, 1, True),
-        ):
+        for supplied in (False, True):
             op = MegaMoeExperts(
                 hidden_size=hidden, intermediate_size=intermediate, num_experts=8, top_k=2,
                 ep_group=dist.group.WORLD, tuning_options=MegaMoeTuningOptions(expert_placement=SkewPlanner()),
             )
 
-            def run(h, p, w1, w2, execute=op):
+            def run(h, p, w1, w2, execute=op, use_counts=supplied):
                 return execute(h, ids, p, expert_weights=(w1, w2),
-                               tokens_per_expert=counts.clone() if supplied else None)
+                               tokens_per_expert=counts.clone() if use_counts else None)
 
             leaves = tuple(t.detach().requires_grad_() for t in (x, probs, *weights))
-            tape = ReplayCheckpoint(lambda: 1, defer_forward_copies=defer, guest_snapshot_bytes=budget)
+            tape = ReplayCheckpoint(lambda: 1)
             out = checkpoint(run, *leaves, use_reentrant=False, context_fn=tape.contexts)
             gradients = torch.autograd.grad(out, leaves, upstream)
             observed = tuple(t.detach().cpu() for t in (out, *gradients))
             owner = op._resource_group.resources.placement  # pylint: disable=protected-access
             assert owner.statistics["route_replays"] == 1 and owner.statistics["skipped_recomputes"] == 0
             assert owner.statistics["placements"] >= 1 and owner.pool is not None
-            assert owner.pool.statistics.get("fused_snapshot_restores", 0) == restores
             if reference is None:
                 reference = observed
             else:
                 for value, expected in zip(observed, reference, strict=True):
                     torch.testing.assert_close(value, expected, rtol=0, atol=0)
-            receipts.append({"mode": name, "route_replays": 1, "snapshot_restores": restores,
-                             "supplied_counts": supplied})
+            receipts.append({"route_replays": 1, "supplied_counts": supplied})
             del out, gradients, leaves, tape
-            if name == "snapshot_only":
+            if supplied:
                 inputs = x, probs, *weights
                 receipts.extend(_check_checkpoint_count_rejections(op, inputs, ids, counts, rank))
             op.close()
