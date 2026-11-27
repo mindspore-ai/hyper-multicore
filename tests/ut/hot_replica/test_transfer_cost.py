@@ -88,8 +88,10 @@ def test_equal_replica_cost_prefers_fewer_cross_node_token_rows():
     options = {"nodes": (0,) * 8 + (1,) * 8, "prices": ReplicaCost(phases=((896., 896.),))}
     neutral = select_replica_plan(counts, config, **options, cross_node_cost=1.0)
     expensive = select_replica_plan(counts, config, **options, cross_node_cost=2.0)
-    assert neutral.transfers and neutral == expensive
-    assert all(edge.owner_rank // 8 == edge.target_rank // 8 for edge in neutral.transfers)
+    assert neutral == expensive and sum(neutral.replica_slots_used) > 0
+    for rank, slots in enumerate(neutral.slot_to_logical):
+        assert all(expert // config.home_experts // 8 == rank // 8
+                   for expert in slots[config.home_experts:] if expert >= 0)
     neutral.validate()
 
 

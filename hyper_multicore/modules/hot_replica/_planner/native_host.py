@@ -25,15 +25,16 @@ def load_replica_planner(library: Path) -> None:
     _backend = module
 
 
-def select_prefix(totals, counts, config, quantum, levels, nodes, multiplier, prices, capacity):
+def select_prefix(totals, counts, config, levels, nodes, multiplier, prices, capacity):
     """Parse the counts once and return the winning moves and best visited peak."""
     if getattr(_backend, "PLANNER_ABI", None) != _PLANNER_ABI:
         return None
-    if len(prices.phases) > 2 or max(quantum, *levels, capacity or 0) > 2**30:
+    if len(prices.phases) > 2 or max(*levels, capacity or 0) > 2**30:
         return None
     ranks = config.ep_size
+    # ABI 3 reserves the row quantum argument. Source-local quotas have unit cuts.
     return _backend.select_prefix(
-        tuple(totals), counts, ranks, config.replica_slots_per_rank, quantum, levels,
+        tuple(totals), counts, ranks, config.replica_slots_per_rank, 1, levels,
         nodes or (0,) * ranks, prices.phases, multiplier, prices.compute, prices.setup,
         -1 if capacity is None else capacity, prices.search_single_slot,
     )

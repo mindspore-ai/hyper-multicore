@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import numpy as np
-
 from .capacity import ExpertReplicaConfig
 from .plan import ExpertExecutionPlan, physical_replica_slots
 
@@ -57,17 +55,8 @@ def _fill_node_quotas(
                     index += 1
 
 
-def _capacity_checked_plan(
-    plan: ExpertExecutionPlan, capacity_limit: int | None, *, copies: list[dict[int, int]]
-) -> ExpertExecutionPlan:
-    """Expose selected quotas and enforce the hard receive allowance."""
-    # Materialization consumes these final quotas without changing them. Keep
-    # their immutable slot totals instead of reducing the full source matrix.
-    destination = tuple(
-        tuple(row.get(expert, 0) if expert >= 0 else 0 for expert in slots)
-        for row, slots in zip(copies, plan.slot_to_logical)
-    )
-    object.__setattr__(plan, "destination_counts", destination)
+def _capacity_checked_plan(plan: ExpertExecutionPlan, capacity_limit: int | None) -> ExpertExecutionPlan:
+    """Enforce the hard receive allowance on the physical dispatch."""
     if capacity_limit is not None and max(plan.destination_loads) > capacity_limit:
         raise ReplicaCapacityError("replica plan exceeds capacity_limit; use a feasible receive bound")
     return plan
@@ -87,16 +76,13 @@ def _pad_owner_rows(counts: tuple[tuple[int, ...], ...], config: ExpertReplicaCo
     return output
 
 
-def _slot_quotas(copies: list[dict[int, int]], config: ExpertReplicaConfig, source_locality: bool) -> tuple:
+def _slot_quotas(copies: list[dict[int, int]], config: ExpertReplicaConfig) -> tuple:
     """Freeze the physical slot order and collect positive guest quotas."""
     slot_map, by_expert = [], {}
     home, width = config.home_experts, config.slots_per_rank
     for rank, row in enumerate(copies):
         guests = [expert for expert, count in row.items() if expert // home != rank and count]
-        if source_locality:
-            guests.sort()
-        else:
-            guests.sort(key=lambda expert, quotas=row: (quotas[expert], expert), reverse=True)
+        guests.sort()
         slot_map.append(physical_replica_slots(config, rank, guests))
         for slot, expert in enumerate(guests, start=home):
             by_expert.setdefault(expert, []).append([rank * width + slot, row[expert]])
@@ -144,47 +130,15 @@ def _assign_expert(
     _fill_remaining(quotas, pending, dispatch)
 
 
-def intersect_source_intervals(counts, logical_slots, destination_starts, destination_ends):
-    """Intersect each physical slot's quota with the original source order."""
-    logical = np.maximum(logical_slots, 0)
-    source_ends = counts.cumsum(axis=0, dtype=np.int32)
-    ends = np.minimum(source_ends[:, logical], destination_ends)
-    starts = np.maximum((source_ends - counts)[:, logical], destination_starts)
-    table = np.maximum(ends - starts, 0).astype(np.int32, copy=False)
-    table[:, logical_slots < 0] = 0
-    return table
-
-
-def _ordered_dispatch(counts, slots, copies):
-    """Build ordered destination intervals before intersecting source quotas."""
-    ranks, experts = counts.shape
-    owners = np.asarray(slots, dtype=np.int32).reshape(-1)
-    destination = np.repeat(np.arange(ranks), len(slots[0]))
-    logical = np.maximum(owners, 0)
-    allocation = np.zeros((ranks, experts), dtype=np.int32)
-    for rank, quotas in enumerate(copies):
-        allocation[rank, list(quotas)] = list(quotas.values())
-    destination_ends = allocation.cumsum(axis=0, dtype=np.int32)[destination, logical]
-    destination_starts = destination_ends - allocation[destination, logical]
-    return intersect_source_intervals(counts, owners, destination_starts, destination_ends)
-
-
 def _materialize(
-    counts: tuple[tuple[int, ...], ...] | np.ndarray,
+    counts: tuple[tuple[int, ...], ...],
     copies: list[dict[int, int]],
     config: ExpertReplicaConfig,
     capacity_limit: int | None = None,
     *,
     rank_nodes: tuple[int, ...] = (),
-    source_locality: bool = True,
 ) -> ExpertExecutionPlan:
     """Materialize only the selected layout, preserving exact source locality."""
-    if not source_locality:
-        slots, _ = _slot_quotas(copies, config, source_locality)
-        table = _ordered_dispatch(counts, slots, copies)
-        plan = ExpertExecutionPlan(config, counts.tolist(), slots, table.tolist())
-        object.__setattr__(plan, "dispatch_counts_bytes", table.tobytes())
-        return _capacity_checked_plan(plan, capacity_limit, copies=copies)
     home, width = config.home_experts, config.slots_per_rank
     has_guests = any(
         expert // home != rank and count for rank, row in enumerate(copies) for expert, count in row.items()
@@ -193,12 +147,12 @@ def _materialize(
         slots = tuple(physical_replica_slots(config, rank) for rank in range(config.ep_size))
         dispatch = tuple(map(tuple, _pad_owner_rows(counts, config))) if config.replica_slots_per_rank else counts
         plan = ExpertExecutionPlan(config, counts, slots, dispatch)
-        return _capacity_checked_plan(plan, capacity_limit, copies=copies)
+        return _capacity_checked_plan(plan, capacity_limit)
     node_sources = {}
     if 1 < len(set(rank_nodes)) < config.ep_size:
         for rank, node in enumerate(rank_nodes):
             node_sources.setdefault(node, []).append(rank)
-    slots, by_expert = _slot_quotas(copies, config, source_locality)
+    slots, by_expert = _slot_quotas(copies, config)
     dispatch = _pad_owner_rows(counts, config)
     for expert, quotas in by_expert.items():
         owner, local_expert = divmod(expert, home)
@@ -210,4 +164,4 @@ def _materialize(
             row[owner_physical] = 0
         _assign_expert(counts, expert, quotas, dispatch, width, rank_nodes, node_sources)
     plan = ExpertExecutionPlan(config, counts, slots, tuple(map(tuple, dispatch)))
-    return _capacity_checked_plan(plan, capacity_limit, copies=copies)
+    return _capacity_checked_plan(plan, capacity_limit)

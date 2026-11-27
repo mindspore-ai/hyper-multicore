@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
@@ -43,33 +43,6 @@ def _destination_counts_from_dispatch(
         raise ValueError("dispatch row does not match physical expert count")
     totals = tuple(map(sum, zip(*dispatch)))
     return tuple(totals[rank * width:(rank + 1) * width] for rank in range(config.ep_size))
-
-
-@dataclass(frozen=True)
-class ExpertReplicaTransfer:
-    """An owner supplying a slot in the target rank's home-plus-guest layout."""
-
-    logical_expert: int
-    owner_rank: int
-    owner_slot: int
-    target_rank: int
-    target_slot: int
-
-    def guest_slot(self, home_experts: int) -> int:
-        """Convert the physical execution slot to a guest-bank index."""
-        return self.target_slot - home_experts
-
-
-def _replica_transfers(
-    copies_by_rank: Iterable[tuple[int, ...]], home_experts: int,
-) -> tuple[ExpertReplicaTransfer, ...]:
-    """Build transfers in target-rank and physical-slot order for all transports."""
-    return tuple(
-        ExpertReplicaTransfer(expert, expert // home_experts, expert % home_experts, rank, slot)
-        for rank, row in enumerate(copies_by_rank)
-        for slot, expert in enumerate(row, start=home_experts)
-        if expert >= 0
-    )
 
 
 @dataclass(frozen=True)
@@ -103,22 +76,6 @@ class ExpertExecutionPlan:
         return tuple(sum(row) for row in self.destination_counts)
 
     @cached_property
-    def _source_slot_order(self) -> tuple[int, ...]:
-        """Share stable expert/slot ordering without materializing every source row."""
-        return tuple(slot for _, slot in sorted((expert, slot)
-                     for slot, expert in enumerate(self.physical_to_logical) if expert >= 0))
-
-    @cached_property
-    def source_runs(self) -> tuple[tuple[tuple[int, int], ...], ...]:
-        """Return stable logical-expert runs as physical slot and source quota."""
-        return tuple(self.source_runs_for(rank) for rank in range(len(self.dispatch_counts)))
-
-    def source_runs_for(self, rank: int) -> tuple[tuple[int, int], ...]:
-        """Return one source row without materializing runs for every source rank."""
-        source = self.dispatch_counts[rank]
-        return tuple((slot, source[slot]) for slot in self._source_slot_order)
-
-    @cached_property
     def physical_to_logical(self) -> tuple[int, ...]:
         """Return flattened physical-slot ownership, using -1 for empty slots."""
         return tuple(expert for row in self.slot_to_logical for expert in row)
@@ -135,20 +92,6 @@ class ExpertExecutionPlan:
         used = max(self.replica_slots_used)
         return min(self.config.replica_slots_per_rank, 1 << (used - 1).bit_length()) if used else 0
 
-    @cached_property
-    def transfers(self) -> tuple[ExpertReplicaTransfer, ...]:
-        """Return transfers in globally identical target/slot order."""
-        home = self.config.home_experts
-        return _replica_transfers((row[home:] for row in self.slot_to_logical), home)
-
-    @cached_property
-    def maximum_transfer_degree(self) -> int:
-        """Count the busiest rank's hosted or published expert copies."""
-        outgoing = [0] * self.config.ep_size
-        for transfer in self.transfers:
-            outgoing[transfer.owner_rank] += 1
-        return max(chain(self.replica_slots_used, outgoing))
-
     def validate(self) -> None:
         """Check per-source conservation and physical ownership invariants."""
         config = self.config
@@ -159,9 +102,6 @@ class ExpertExecutionPlan:
             raise ValueError("plan must contain one dispatch row per source rank")
         for source, row in enumerate(self.dispatch_counts):
             self._validate_source(source, row)
-        if ("destination_counts" in self.__dict__
-                and self.destination_counts != _destination_counts_from_dispatch(self.dispatch_counts, config)):
-            raise ValueError("cached destination quotas must match the physical dispatch")
 
     def _validate_slots(self) -> None:
         """Validate fixed home ownership and unique nonempty slots on every rank."""

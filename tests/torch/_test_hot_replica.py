@@ -33,7 +33,7 @@ from hyper_multicore.experimental import (
     BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions, ReplayCheckpoint, wrap_checkpoint,
 )
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
-from hyper_multicore.modules.hot_replica._planner.receive import SourceQuota, select_replica_plan
+from hyper_multicore.modules.hot_replica._planner.receive import select_replica_plan
 from hyper_multicore.modules.hot_replica.planner import as_placement
 
 
@@ -47,7 +47,7 @@ class SkewPlanner(BasePlanner):
             return None
         target = (request.total_rows + ranks - 1) // ranks
         plan = select_replica_plan(counts, ExpertReplicaConfig(experts, ranks, experts // ranks),
-                                   soft_target=target, source_quota=SourceQuota.RANK_ORDER)
+                                   soft_target=target)
         self.last_placement = None if plan is None else as_placement(plan)
         return self.last_placement
 

@@ -148,7 +148,7 @@ PyObject *SelectPrefix(PyObject *, PyObject *args) {
     Rows weights, nodes, targets;
     std::vector<Rows> counts;
     PhasePrices phases;
-    if (quantum < 1 || !std::isfinite(multiplier) || !std::isfinite(score.compute) ||
+    if (quantum != 1 || !std::isfinite(multiplier) || !std::isfinite(score.compute) ||
         !std::isfinite(score.setup) ||
         !ReadBoundedTuple(levels, 3, int64_t{3} << 30, &targets) ||
         !ReadSearch(totals, topology, ranks, slots, &weights, &nodes) ||
@@ -163,7 +163,7 @@ PyObject *SelectPrefix(PyObject *, PyObject *args) {
     const int compare_ranks = search_single_slot && slots > 1 ? ranks : 0;
     for (const auto target : targets) {
       for (const int budget : {slots, 1}) {
-        auto moves = SearchPrefixes(weights, loads, nodes, counts, budget, quantum, target, multiplier, phases);
+        auto moves = SearchPrefixes(weights, loads, nodes, counts, budget, target, multiplier, phases);
         int width = 0;
         if (!ConsiderPrefixes(std::move(moves), compare_ranks, slots, score, phases, &selection, &width)) {
           Py_RETURN_NONE;

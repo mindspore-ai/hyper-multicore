@@ -16,14 +16,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from enum import Enum
 from heapq import heapify, heappop, heappush
-from itertools import chain
 
 import numpy as np
 
 from ._dispatch import ReplicaCapacityError, _materialize
-from .capacity import _integer
 from .native_host import select_prefix
 from .topology import _validate_rank_nodes
 
@@ -33,13 +30,6 @@ def receive_limit(percent, total, ranks):
     # Only the built-in integer policy supplies a hard ceiling.
     # pylint: disable-next=unidiomatic-typecheck
     return (total * percent + 100 * ranks - 1) // (100 * ranks) if type(percent) is int else None
-
-
-class SourceQuota(Enum):
-    """How source rows are assigned after choosing an expert's execution ranks and shares."""
-
-    LOCAL = "source_local"
-    RANK_ORDER = "rank_order"
 
 
 @dataclass(frozen=True)
@@ -80,28 +70,14 @@ def bf16_cost(hidden_size, intermediate_size, cube_cores, training, *, transport
     return ReplicaCost(rows_per_second * setup_seconds, phases, search_single_slot=search_single_slot)
 
 
-def _lower(matrix, config, totals, moves, nodes, source_quota, limit):
+def _lower(counts, config, totals, moves, nodes, limit):
     """Render the selected shares using the executor's source-order contract."""
-    ordered = source_quota is SourceQuota.RANK_ORDER
-    if ordered:
-        matrix = np.asarray(matrix)
-    elif isinstance(matrix, np.ndarray):
-        matrix = matrix.tolist()
     home = config.home_experts
     rows = [{e: totals[e] for e in range(r * home, (r + 1) * home)} for r in range(config.ep_size)]
     for owner, rank, expert, start, stop in moves:
         rows[owner][expert] -= stop - start
         rows[rank][expert] = stop - start
-    return _materialize(matrix, rows, config, limit, rank_nodes=nodes, source_locality=not ordered)
-
-
-def _tail(remaining, wanted, room, quantum):
-    """Choose the nearest legal cut, respecting the receiver's remaining row budget."""
-    cut = max(0, remaining - min(wanted, room))
-    low = cut // quantum * quantum
-    if remaining - low <= room and cut - low <= quantum // 2:
-        return low
-    return min(remaining, low + quantum)
+    return _materialize(counts, rows, config, limit, rank_nodes=nodes)
 
 
 def _transfer_charge(nodes, owner, guest, multiplier):
@@ -109,7 +85,7 @@ def _transfer_charge(nodes, owner, guest, multiplier):
     return multiplier if nodes and nodes[owner] != nodes[guest] else 1.
 
 
-def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices, source_counts):
+def _prefixes(totals, loads, config, target, nodes, multiplier, prices, source_counts):
     """Drain the busiest owner first. Intermediate equal-peak moves can clear a plateau."""
     after = loads.copy()
     remaining = list(totals)
@@ -140,7 +116,7 @@ def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices,
                 end = remaining[expert]
                 if not end or expert in guests[rank]:
                     continue
-                cut = _tail(end, excess, room, quantum)
+                cut = max(0, end - min(excess, room))
                 moved = end - cut
                 if moved <= 0:
                     continue
@@ -167,21 +143,21 @@ def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices,
         yield (owner, rank, expert, cut, end), max(after), max_sent, max_received, charge
 
 
-def _select_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices, source_counts,
+def _select_prefixes(totals, loads, config, levels, nodes, multiplier, prices, source_counts,
                      capacity):
     """Use the native selector for the built-in score, or evaluate the Python score."""
     # A subclass can override the cost calculation used by the Python selector.
     # pylint: disable-next=unidiomatic-typecheck
     if type(prices) is ReplicaCost:
-        native = select_prefix(totals, source_counts, config, quantum, levels, nodes, multiplier,
+        native = select_prefix(totals, source_counts, config, levels, nodes, multiplier,
                                prices, capacity)
         if native is not None:
             return native
-    return _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices,
+    return _select_python_prefixes(totals, loads, config, levels, nodes, multiplier, prices,
                                    source_counts, capacity)
 
 
-def _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices, source_counts,
+def _select_python_prefixes(totals, loads, config, levels, nodes, multiplier, prices, source_counts,
                             capacity):
     """Score prefixes from each target and legal slot budget in Python."""
     peak = max(loads)
@@ -196,7 +172,7 @@ def _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multi
             weighted_edges = 0.
             length = width = 0
             occupied = [0] * len(loads) if compare_slots else None
-            for move, after, sent, received, edge in _prefixes(totals, loads, budget, target, quantum, nodes,
+            for move, after, sent, received, edge in _prefixes(totals, loads, budget, target, nodes,
                                                               multiplier, prices, source_counts):
                 moves.append(move)
                 best_seen = min(best_seen, after)
@@ -220,34 +196,32 @@ def _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multi
     return selected, best_seen
 
 
-def _fill_capacity(totals, config, limit, quantum, nodes, multiplier):
-    """Fill one receiver at a time from one owner; keep unaligned expert tails at home.
+def _fill_capacity(totals, config, limit, nodes, multiplier):
+    """Fill one receiver at a time from one owner.
 
     Draining past a donor's own excess lets it become a receiver later. For row quotas
     and a full home-sized slot budget this constructs a feasible layout at the mean.
     """
     home, ranks = config.home_experts, config.ep_size
-    left = [n // quantum for n in totals]
+    left = list(totals)
     loads = [sum(left[r * home:(r + 1) * home]) for r in range(ranks)]
-    caps = [(limit - sum(n % quantum for n in totals[r * home:(r + 1) * home])) // quantum
-            for r in range(ranks)]
-    if min(caps) < 0 or sum(caps) < sum(loads):
+    if limit * ranks < sum(loads):
         return None
     moves = []
     while True:
-        owner = max(range(ranks), key=lambda r: loads[r] - caps[r])
-        if loads[owner] <= caps[owner]:
+        owner = max(range(ranks), key=loads.__getitem__)
+        if loads[owner] <= limit:
             return moves
-        peers = [r for r in range(ranks) if loads[r] < caps[r]]
-        rank = min(peers, key=lambda r: (_transfer_charge(nodes, owner, r, multiplier), caps[r] - loads[r], r))
-        need = caps[rank] - loads[rank]
+        peers = [r for r in range(ranks) if loads[r] < limit]
+        rank = min(peers, key=lambda r: (_transfer_charge(nodes, owner, r, multiplier), limit - loads[r], r))
+        need = limit - loads[rank]
         experts = sorted(range(owner * home, (owner + 1) * home), key=lambda e: -left[e])
         for expert in experts[:config.replica_slots_per_rank]:
             blocks = min(need, left[expert])
             if not blocks:
                 break
-            start = (totals[expert] // quantum - left[expert]) * quantum
-            moves.append((owner, rank, expert, start, start + blocks * quantum))
+            start = totals[expert] - left[expert]
+            moves.append((owner, rank, expert, start, start + blocks))
             left[expert] -= blocks
             loads[owner] -= blocks
             loads[rank] += blocks
@@ -256,8 +230,8 @@ def _fill_capacity(totals, config, limit, quantum, nodes, multiplier):
             return None
 
 
-def _pack_capacity(totals, config, limit, quantum):
-    """Search small residual hard cases, including moving a short K64 tail off its owner."""
+def _pack_capacity(totals, config, limit):
+    """Search small residual hard cases when greedy allocation cannot fit."""
     ranks, home = config.ep_size, config.home_experts
     experts = sorted((e for e, n in enumerate(totals) if n), key=lambda e: -totals[e])
     if ranks > 8 or len(experts) > 32:
@@ -278,9 +252,7 @@ def _pack_capacity(totals, config, limit, quantum):
             return False
         for rank in sorted(ranks_left, key=lambda r: (r != owner, -space[r], r)):
             stop = min(end, start + space[rank])
-            first_aligned = (stop - 1) // quantum * quantum if stop == end else stop // quantum * quantum
-            stops = range(first_aligned, start, -quantum)
-            for cut in chain((end,) if stop == end else (), stops):
+            for cut in range(stop, start, -1):
                 if checks <= 0:
                     return False
                 checks -= 1
@@ -300,18 +272,15 @@ def _pack_capacity(totals, config, limit, quantum):
     return moves if place(0, 0, set()) else None
 
 
-def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="auto", limit=None,
-                        nodes=(), cross_node_cost=None, prices=ReplicaCost(), source_quota=SourceQuota.LOCAL,
+def select_replica_plan(matrix, config, *, receive_capacity_percent="auto", limit=None,
+                        nodes=(), cross_node_cost=None, prices=ReplicaCost(),
                         totals=None, soft_target=None):
     """Minimize exposed rank work subject to physical slots, legal cuts and the receive limit.
 
     The optional absolute limit is for callers that already own a row budget. All built-in
     planners use the percentage of this invocation's actual rows. An empty result is B0.
-    The row cut quantum and source quota policy are independent.
     """
     ranks, home = config.ep_size, config.home_experts
-    _integer(quantum, "Fragment quantum", 1)
-    source_quota = SourceQuota(source_quota)
     nodes = _validate_rank_nodes(nodes, ranks)
     if totals is None:
         totals = (matrix.sum(0, dtype=np.int64).tolist() if isinstance(matrix, np.ndarray)
@@ -342,21 +311,17 @@ def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="
     if soft_target is not None:
         levels = (max(mean, soft_target),)
     selected, best_seen = _select_prefixes(
-        totals, loads, config, tuple(dict.fromkeys(levels)), quantum, nodes, multiplier, prices, source_counts,
+        totals, loads, config, tuple(dict.fromkeys(levels)), nodes, multiplier, prices, source_counts,
         limit if mandatory else None,
     )
     if mandatory and not selected:
-        selected = _fill_capacity(totals, config, limit, quantum, nodes, multiplier)
+        selected = _fill_capacity(totals, config, limit, nodes, multiplier)
         if selected is None:
-            selected = _pack_capacity(totals, config, limit, quantum)
+            selected = _pack_capacity(totals, config, limit)
         if selected is None:
             raise ReplicaCapacityError(f"No placement found within receive limit {limit} rows with "
-                                       f"{config.replica_slots_per_rank} guest slots/rank, quantum {quantum}. "
+                                       f"{config.replica_slots_per_rank} guest slots/rank. "
                                        f"Best peak visited by the balancing search: {best_seen} rows")
     if not selected:
         return None
-    counts = matrix if source_quota is SourceQuota.RANK_ORDER else source_counts
-    plan = _lower(counts, config, totals, selected, nodes, source_quota, limit)
-    if limit is not None and max(plan.destination_loads) > limit:
-        raise ReplicaCapacityError(f"Placement exceeds receive limit {limit} rows")
-    return plan
+    return _lower(source_counts, config, totals, selected, nodes, limit)

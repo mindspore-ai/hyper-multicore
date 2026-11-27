@@ -24,7 +24,7 @@ import torch
 from hyper_multicore.experimental import HotReplicaPlanner, PlacementRequest
 from hyper_multicore.modules.hot_replica.bounded_placement import render_geometry
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
-from hyper_multicore.modules.hot_replica._planner.receive import SourceQuota, receive_limit, select_replica_plan
+from hyper_multicore.modules.hot_replica._planner.receive import receive_limit, select_replica_plan
 
 
 class TestHotReplicaPlacement(unittest.TestCase):
@@ -35,13 +35,12 @@ class TestHotReplicaPlacement(unittest.TestCase):
         self.assertEqual(receive_limit(102, 525, 4), 134)
         self.assertEqual(receive_limit(100, 525, 4), 132)
 
-    def test_capacity_placement_preserves_source_intervals(self) -> None:
-        """Split the same logical expert in source-rank order for both wire dtypes."""
+    def test_capacity_placement_preserves_source_quotas(self) -> None:
+        """Conserve each source quota for both wire dtypes."""
         for dtype in (torch.int32, torch.int64):
             with self.subTest(dtype=dtype):
                 counts = torch.tensor([[4, 0], [2, 0]], dtype=dtype)
-                plan = select_replica_plan(counts.numpy(), ExpertReplicaConfig(2, 2, 1), soft_target=3,
-                                           source_quota=SourceQuota.RANK_ORDER)
+                plan = select_replica_plan(counts.numpy(), ExpertReplicaConfig(2, 2, 1), soft_target=3)
                 ids = torch.zeros(4, 1, dtype=torch.int32)
                 geometry = render_geometry(plan, SimpleNamespace(rank_id=0), ids.device, 4, prepare_metadata=False)
                 result = geometry.lower(torch.empty(4, 4), ids, torch.arange(4, dtype=torch.int32))
