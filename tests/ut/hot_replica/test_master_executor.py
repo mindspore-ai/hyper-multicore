@@ -203,21 +203,21 @@ def test_replica_banks_share_only_compatible_owners():
 @pytest.mark.parametrize("home", range(4, 17))
 @pytest.mark.parametrize("layout", ["EIO", "EOI"])
 def test_bf16_partial_return_only_replaces_wide_native_routes(home, layout):
-    """Keep narrow FP32 fusion and a full-width path for each partial dtype."""
+    """Choose the fused bands or the staged fallback for each bank width."""
     spec = _a3_push_spec(home, layout, 5120, 1792, batch_experts=False, num_experts=2 * home,
                          ep_size=2, top_k=4, num_cube_cores=24, partial_weight_grad_dtype=None)
     parent = SimpleNamespace(spec=spec)
     empty = (-1,) * home
     hidden = torch.empty((0, spec.hidden_size), dtype=torch.bfloat16)
-    for dtype, capability, expected in ((None, False, (False, False)),
-                                        (None, True, (True, True)),
-                                        ("float32", True, (True, False))):
+    for dtype, capability, expected in ((None, False, ReplicaExecutionMode.STAGED),
+                                        (None, True, ReplicaExecutionMode.BF16_BAND),
+                                        ("float32", True, ReplicaExecutionMode.FP32_BAND)):
         spec.partial_weight_grad_dtype = dtype
         owner = _builtin_placement(parent, bf16_partials=capability)
         pool = SimpleNamespace(local_experts=home, rank=0, blocks=spec.num_cube_cores, bank_experts=owner.bank_extent)
         pool.pipeline = ReplicaPipeline(pool)
         owner.pool = pool
-        for used, mode in ((1, (True, False)), (home, expected)):
+        for used, mode in ((1, ReplicaExecutionMode.FP32_BAND), (home, expected)):
             incoming = tuple(range(home, home + used)) + empty[used:]
             placement = SimpleNamespace(borrowed_capacity=home, copies_by_rank=(incoming, empty),
                                         counts_by_source=torch.empty((2, 4 * home)))
@@ -227,8 +227,7 @@ def test_bf16_partial_return_only_replaces_wide_native_routes(home, layout):
                     owner.bind(hidden, placement, tokens=4096, mandatory=True)
                 continue
             binding = owner.bind(hidden, placement, tokens=4096)
-            assert binding.fused
-            assert (binding.fused, binding.mode is ReplicaExecutionMode.BF16_BAND) == mode
+            assert binding.mode is mode
 
 
 @pytest.mark.parametrize(("hidden", "intermediate"), [(5120, 1800), (5120, 1793), (5112, 1792), (5112, 1793)])
