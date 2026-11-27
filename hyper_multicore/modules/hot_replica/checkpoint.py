@@ -182,6 +182,14 @@ def agree_replay(
     counts: torch.Tensor | None, spec: Any, mask: int, *, weight_error: bool,
 ) -> bool:
     """Agree across EP on exact routing, activation validity and guest snapshots."""
+    flag = local_replay_vote(record, hidden, ids, probs, counts, mask, weight_error)
+    gathered = flag.new_empty(spec.ep_size)
+    dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
+    return resolve_replay_vote(record, gathered.tolist())
+
+
+def local_replay_vote(record, hidden, ids, probs, counts, mask, weight_error):
+    """Calculate the local vote on the caller's original computation stream."""
     scope = _ACTIVE.get()
     valid = (
         not weight_error and counts is None and record is not None
@@ -191,11 +199,12 @@ def agree_replay(
         and scope is not None and scope.same_parameters
     )
     with torch.no_grad():
-        flag = (_replay_vote(record, hidden, ids, probs, mask) if valid else
+        return (_replay_vote(record, hidden, ids, probs, mask) if valid else
                 torch.zeros(1, dtype=torch.int32, device=hidden.device))
-        gathered = flag.new_empty(spec.ep_size)
-        dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
-        flags = gathered.tolist()
+
+
+def resolve_replay_vote(record, flags):
+    """Use the same group decision for synchronous and staged agreements."""
     route_mask = ~(_REPLAY_ACTIVATION_MASK | _REPLAY_GUEST_MASK)
     first = flags[0] & route_mask
     reuse = first != 0 and all((value & route_mask) == first for value in flags)

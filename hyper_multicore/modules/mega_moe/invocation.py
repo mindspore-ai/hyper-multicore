@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Per-invocation routing and leases shared by all expert precision backends."""
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from functools import partial
 from collections.abc import Iterator
@@ -22,7 +22,8 @@ import torch
 from hyper_multicore.diagnostics.api import is_tensor_dump_active
 from .heap_manager import _HeapCapacityError
 from .route import (
-    _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK, PreparedTopKRoute, _materialize_route_permutation, prepare_topk_route,
+    _INVALID_WEIGHT_MASK, _TENSOR_DUMP_MASK, PreparedTopKRoute, _materialize_route_permutation,
+    _prepare_placed_route, prepare_topk_route,
 )
 
 if TYPE_CHECKING:
@@ -30,15 +31,15 @@ if TYPE_CHECKING:
     from .resources import _MegaMoeExecutionResources
 
 
-@contextmanager
 def prepare_expert_invocation(
     hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
     counts: torch.Tensor | None, weights: tuple[torch.Tensor, torch.Tensor],
     resources: "_MegaMoeExecutionResources", *, weight_error: bool = False,
-    planner: "BasePlanner | None" = None,
-) -> Iterator[PreparedTopKRoute]:
+    planner: "BasePlanner | None" = None, scheduled: bool = False,
+) -> AbstractContextManager[PreparedTopKRoute]:
     """Converge weight errors on the existing route collective before physical binding.
 
+    Scheduled calls queue the agreement now and wait on context entry.
     Pull source publication and consumption share one lease. Automatic capacity
     changes happen before claiming that lease. No precision implementation may
     repeat route preparation or add a second validation collective.
@@ -67,44 +68,70 @@ def prepare_expert_invocation(
             leased_workspace = resources.workspace
 
     record, replay = None, False
-    try:
-        if placement is not None:
-            from hyper_multicore.modules.hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
+    finish_vote, pending = None, None
+    if placement is not None:
+        from ..hot_replica.checkpoint import agree_replay, route_record  # pylint: disable=import-outside-toplevel
 
-            record, replay = route_record(resources)
-            if replay and agree_replay(
-                    record, hidden, ids, probs, counts, resources.spec, mask, weight_error=weight_error):
+        record, replay = route_record(resources)
+    if scheduled:
+        from ..hot_replica.prefetch import start_replay_vote, start_wire  # pylint: disable=import-outside-toplevel
+
+        if replay:
+            finish_vote = start_replay_vote(record, hidden, ids, probs, counts, resources, mask, weight_error)
+        else:
+            pending = start_wire(hidden, ids, probs, counts, resources, mask)
+    elif replay:
+        finish_vote = partial(agree_replay, record, hidden, ids, probs, counts, resources.spec,
+                              mask, weight_error=weight_error)
+
+    @contextmanager
+    def consume() -> Iterator[PreparedTopKRoute]:
+        nonlocal leased_workspace, record
+        try:
+            if finish_vote is not None and finish_vote():
                 placement.statistics["route_replays"] += 1
                 yield _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump)
                 return
             if replay:
                 placement.statistics["route_replay_misses"] += 1
                 record = None
+            options = {"autograd_mask": mask}
+            if planner is not None:
+                options["select_placement"] = partial(placement.select, planner=planner)
+                if placement.uses_placement_wire():
+                    options["reuse_placement_geometry"] = resources.spec.ep_size * resources.spec.num_experts <= 16384
+            if resources.spec.auto_tokens:
+                options["prepare_workspace"] = prepare_workspace
+            elif pull:
+                with torch.inference_mode(False):
+                    resources.workspace.ensure(resources.spec, hidden.dtype, hidden.device)
+                resources.workspace.claim()
+                leased_workspace = resources.workspace
+            if record is not None and counts is None and not weight_error:
+                record.stream = torch.npu.current_stream(hidden.device)
+            with torch.inference_mode(False), torch.no_grad():
+                if pending is None:
+                    route = prepare_topk_route(hidden, ids, probs, resources.spec, counts,
+                                               workspace=resources.workspace, **options)
+                else:
+                    stream = torch.npu.current_stream(hidden.device)
+                    if not pull:
+                        resources.workspace.wait_for_reuse(stream=stream)
+                    snapshot = pending.snapshot(resources.spec, resources.workspace, stream)
+                    route = _prepare_placed_route(
+                        hidden, ids, resources.spec, resources.workspace, None, pending.payload[3:], pending.gathered,
+                        None, stream, prepare_workspace, options["select_placement"], mask,
+                        reuse_placement_geometry=True, snapshot=snapshot,
+                    )
+            if not pull and not resources.spec.auto_tokens:
+                with torch.inference_mode(False):
+                    resources.ensure_capacity(route.maximum_received_slots)
+            yield _record_checkpoint_route(route, record, counts, ids)
+        finally:
+            if leased_workspace is not None:
+                leased_workspace.release()
 
-        options = {"autograd_mask": mask}
-        if planner is not None:
-            options["select_placement"] = partial(placement.select, planner=planner)
-            if placement.uses_placement_wire():
-                options["reuse_placement_geometry"] = resources.spec.ep_size * resources.spec.num_experts <= 16384
-        if resources.spec.auto_tokens:
-            options["prepare_workspace"] = prepare_workspace
-        elif pull:
-            with torch.inference_mode(False):
-                resources.workspace.ensure(resources.spec, hidden.dtype, hidden.device)
-            resources.workspace.claim()
-            leased_workspace = resources.workspace
-        if record is not None and counts is None and not weight_error:
-            record.stream = torch.npu.current_stream(hidden.device)
-        with torch.inference_mode(False), torch.no_grad():
-            route = prepare_topk_route(hidden, ids, probs, resources.spec, counts,
-                                       workspace=resources.workspace, **options)
-        if not pull and not resources.spec.auto_tokens:
-            with torch.inference_mode(False):
-                resources.ensure_capacity(route.maximum_received_slots)
-        yield _record_checkpoint_route(route, record, counts, ids)
-    finally:
-        if leased_workspace is not None:
-            leased_workspace.release()
+    return consume()
 
 
 def _restore_checkpoint_route(record, hidden, ids, resources, prepare_workspace, tensor_dump):

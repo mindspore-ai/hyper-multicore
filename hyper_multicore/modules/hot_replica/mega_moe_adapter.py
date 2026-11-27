@@ -152,6 +152,7 @@ class PlacementResources:
                 self.bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent, bf16_partials=True)
                 or not self.prefer_bf16_partials and supports_pipeline(spec, 1, bank_experts=self.bank_extent)
             )
+        self.route_control_stream = None
         self.statistics = {
             "invocations": 0, "placement_candidates": 0, "placements": 0,
             "heap_rejections": 0, "protocol_rejections": 0,

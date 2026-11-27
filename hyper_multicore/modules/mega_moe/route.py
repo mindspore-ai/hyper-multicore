@@ -962,7 +962,7 @@ def _prepare_dynamic_route(
 
 def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,
                           work, stream, prepare_workspace, select_placement, autograd_mask=0,
-                          reuse_placement_geometry=False):
+                          reuse_placement_geometry=False, snapshot=None):
     """Select a per-call route between count validation and capacity commitment."""
     if work is not None:
         work.wait()
@@ -970,7 +970,8 @@ def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gather
     if reuse_placement_geometry:
         from ..hot_replica.bounded_placement import read_placement_wire  # pylint: disable=import-outside-toplevel
 
-        snapshot = read_placement_wire(gathered, spec, workspace, stream)
+        if snapshot is None:
+            snapshot = read_placement_wire(gathered, spec, workspace, stream)
         summary = snapshot.summary
         host_rows = None
         metadata = None

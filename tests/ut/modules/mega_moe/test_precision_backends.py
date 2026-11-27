@@ -33,7 +33,8 @@ def test_one_frontend_dispatches_without_owning_external_weights(precision):
               patch.object(backend, 'forward', return_value=object()) as forward):
             result = layer(hidden, ids, probs, tokens_per_expert=counts, expert_weights=roots)
             assert result is forward.return_value
-            prepare.assert_called_once_with(flat, ids, probs, counts, roots, resources, weight_error=False, planner=None)
+            prepare.assert_called_once_with(flat, ids, probs, counts, roots, resources, weight_error=False,
+                                            planner=None, scheduled=False)
             forward.assert_called_once_with(layer, hidden, flat, ids, probs, roots, resources, route)
         assert not layer.state_dict()
     finally:

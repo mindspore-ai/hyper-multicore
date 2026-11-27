@@ -80,3 +80,35 @@ def test_mx_plan_cache_distinguishes_committed_token_coverage():
         assert small.forward.graph.get_op('dispatch').task_num < large.forward.graph.get_op('dispatch').task_num
         with pytest.raises(ValueError, match='committed'):
             resources.plan_for_capacity(8192, 'cpu', tokens=2048)
+
+
+def test_scheduled_routes_start_before_either_workspace_is_used(monkeypatch):
+    """Stage both masks and retain separate receipts, including a failing second read."""
+    from hyper_multicore.modules.hot_replica import prefetch
+
+    spec = SimpleNamespace(auto_tokens=True, dispatch_mode="push", ep_size=2, num_experts=4)
+    resources = SimpleNamespace(spec=spec, workspace=Mock(), placement=Mock())
+    resources.placement.uses_placement_wire.return_value = True
+    first, second = Mock(), Mock()
+    first.payload = second.payload = torch.zeros(7)
+    second.snapshot.side_effect = ValueError("bad peer weight")
+    start = Mock(side_effect=[first, second])
+    monkeypatch.setattr(prefetch, "start_wire", start)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _: "compute")
+    finish = Mock(return_value=object())
+    monkeypatch.setattr(invocation, "_prepare_placed_route", finish)
+    h = torch.ones(1, 2, requires_grad=True)
+    ids, probs = torch.zeros(1, 1, dtype=torch.int32), torch.ones(1, 1, requires_grad=True)
+    args = (h, ids, probs, None, (h, h), resources)
+    u = invocation.prepare_expert_invocation(*args, planner=object(), scheduled=True)
+    g = invocation.prepare_expert_invocation(*args, planner=object(), scheduled=True, weight_error=True)
+    assert [call.args[-1] for call in start.call_args_list] == [31, _INVALID_WEIGHT_MASK]
+    resources.workspace.wait_for_reuse.assert_not_called()
+    first.snapshot.assert_not_called()
+    second.snapshot.assert_not_called()
+    with u as routed:
+        assert routed is finish.return_value
+        assert finish.call_args.kwargs["snapshot"] is first.snapshot.return_value
+    with pytest.raises(ValueError, match="bad peer weight"), g:
+        pytest.fail("a rejected route may not start the expert kernel")
+    finish.assert_called_once()

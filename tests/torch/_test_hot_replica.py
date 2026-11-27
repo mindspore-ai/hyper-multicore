@@ -355,5 +355,72 @@ def test_wide_placement_and_hard_receive_limit():
         dist.destroy_process_group()
 
 
+def test_paired_routes():
+    """Compare serial and staged EOI expert outputs/gradients through a full two-call replay."""
+    from torch.utils.checkpoint import set_checkpoint_early_stop
+    from hyper_multicore.experimental import ReplayCheckpoint
+
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(rank)
+    dist.init_process_group("hccl")
+    try:
+        device = torch.device("npu", rank)
+        torch.manual_seed(901 + rank)
+        experts = [MegaMoeExperts(hidden_size=512, intermediate_size=128, num_experts=8, top_k=2,
+                                  ep_group=dist.group.WORLD,
+                                  tuning_options=MegaMoeTuningOptions(expert_placement=HotReplicaPlanner()))
+                   for _ in range(2)]
+        MegaMoeExperts.share_execution_resources(experts)
+        ids, values = [], []
+        for branch in range(2):
+            tokens = 128 * (1 + branch + rank)
+            ids.append(torch.arange(2, device=device, dtype=torch.int32).add(4 * branch).expand(tokens, -1).contiguous())
+            values.extend((torch.randn(tokens, 512, device=device, dtype=torch.bfloat16) * .1,
+                           torch.rand(tokens, 2, device=device),
+                           torch.randn(4, 256, 512, device=device, dtype=torch.bfloat16) * .02,
+                           torch.randn(4, 512, 128, device=device, dtype=torch.bfloat16) * .02))
+
+        def run(staged):
+            def pair(*inputs):
+                def call(branch, **options):
+                    h, p, gate_up, down = inputs[4 * branch:4 * branch + 4]
+                    return experts[branch](h, ids[branch], p, expert_weights=(gate_up, down), **options)
+
+                if not staged:
+                    return call(0), call(1)
+                generation = None
+
+                def first(understanding):
+                    nonlocal generation
+                    result = None
+
+                    def second(execute):
+                        nonlocal result
+                        result = understanding()
+                        return execute()
+
+                    generation = call(1, route_schedule=second)
+                    return result
+
+                u = call(0, route_schedule=first)
+                return u, generation
+
+            leaves = [v.detach().requires_grad_() for v in values]
+            tape = ReplayCheckpoint(lambda: 1)
+            with set_checkpoint_early_stop(False):
+                out = checkpoint(pair, *leaves, use_reentrant=False, context_fn=tape.contexts)
+            sum(x.float().square().mean() for x in out).backward()
+            assert len(tape.records) == 2
+            return [v.detach().cpu() for v in (*out, *(leaf.grad for leaf in leaves))]
+
+        serial, staged = run(False), run(True)
+        for actual, expected in zip(staged, serial, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for expert in experts:
+            expert.close()
+    finally:
+        dist.destroy_process_group()
+
+
 if __name__ == "__main__":
     test_placement_checkpoint_and_close()

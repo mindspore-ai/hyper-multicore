@@ -72,6 +72,11 @@ def read_placement_wire(payload, spec, workspace, stream):
             return previous
         if payload.device.type == "cpu":
             wire = wire.copy()
+    return decode_placement_wire(wire, spec, workspace, stream)
+
+
+def decode_placement_wire(wire, spec, workspace, stream):
+    """Validate an owned host snapshot and cache descriptors on the execution stream."""
     counts = wire[:, 3:]
     loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum(axis=(0, 2), dtype=np.int64)
     rows = np.column_stack((wire[:, :3], counts.sum(1, dtype=np.int64), counts.min(1), counts.max(1), loads)).tolist()

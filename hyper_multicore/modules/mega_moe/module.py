@@ -18,7 +18,7 @@ from __future__ import annotations
 
 __all__ = ["MegaMoeExperts"]
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -490,6 +490,7 @@ class MegaMoeExperts(MulticoreModule):
         *,
         expert_weights: tuple[torch.Tensor, torch.Tensor],
         tokens_per_expert: torch.Tensor | None = None,
+        route_schedule: Callable[[Callable[[], torch.Tensor]], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Route token states through the configured experts.
 
@@ -503,6 +504,8 @@ class MegaMoeExperts(MulticoreModule):
                 contiguous. MXFP8 accepts EIO roots with packed column data and
                 scales for forward, and packed row data and scales for backward.
             tokens_per_expert: Trusted exact global-expert histogram; skips histogram recomputation.
+            route_schedule: For bounded HotReplica, run other work after submitting the count exchange.
+                Call the supplied expert function exactly once before returning its result, on the calling stream.
 
         Note:
             Returns the input shape and dtype. EOI noncontiguity raises ValueError;
@@ -516,13 +519,30 @@ class MegaMoeExperts(MulticoreModule):
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
-        with prepare_expert_invocation(
+        invocation = prepare_expert_invocation(
             hidden_flat, topk_ids, topk_weights, tokens_per_expert, weights, resources,
-            weight_error=weight_error, planner=self._planner,
-        ) as route:
-            return self._backend.forward(
-                self, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route,
-            )
+            weight_error=weight_error, planner=self._planner, scheduled=route_schedule is not None,
+        )
+
+        def execute():
+            nonlocal invocation
+            if invocation is None:
+                raise RuntimeError("Scheduled experts must execute once within forward")
+            current, invocation = invocation, None
+            with current as route:
+                return self._backend.forward(
+                    self, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route,
+                )
+
+        if route_schedule is None:
+            return execute()
+        try:
+            result = route_schedule(execute)
+            if invocation is not None:
+                raise RuntimeError("route_schedule returned without executing experts")
+            return result
+        finally:
+            invocation = None
 
     def _create_execution_resources(
         self,

@@ -189,6 +189,23 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
 测量稳态性能前应覆盖代表性的路由和容量。
 
+#### 双分支路由准备
+
+模型有两个独立 router 时，可以给两个 `MegaMoeExperts.forward` 传入 `route_schedule`。
+该参数适用于使用内置 `HotReplicaPlanner` 的 A3 MTE、自动容量、逐专家描述符，并要求
+`ep_size × num_experts ≤ 16384`。每个 EP rank 使用相同的调度次序，包括本地零行的调用。
+
+执行器在控制流上等待 router 产出 Top-K，提交本地计数、EP all-gather 和到独立 pinned CPU 缓冲的拷贝，
+随后在调用线程进入 `route_schedule(execute)`。回调可以下发另一分支的 router 或 shared expert。
+它必须在返回前、在原计算流和原 autograd 模式下调用一次 `execute()`，并返回该调用的输出。
+`execute()` 等待本次回读、执行 host 规划，然后提交权重发布和专家计算。
+两个分支可以同时等待计数，依次执行专家，共用 workspace 和副本 bank。外部 FSDP 模块在自己的
+forward 返回前保持专家权重有效。两组已展开的权重可能同时驻留，应实测峰值显存。
+
+`ReplayCheckpoint` 重算时，同样提前提交两支的 Top-K 和参数版本校验投票。全组同意就复用已有路由；
+校验未通过的分支在执行时使用常规计数与规划。双卡前反向回归入口为
+`python -m pytest -q tests/torch/test_hot_replica.py::test_paired_routes`。
+
 #### 非重入 checkpoint
 
 配置了 `expert_placement` 的 `ascend910_93` BF16 MTE Push 在 FC2 后乘路由概率时，可通过 `ReplayCheckpoint` 启用保存优化。

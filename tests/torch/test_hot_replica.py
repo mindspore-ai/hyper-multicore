@@ -83,3 +83,13 @@ def test_placement_edge_cases(monkeypatch, tmp_path, ranks):
     with without_inherited_rank_environment():
         run_multicore_case(str(Path(__file__).with_name("_test_hot_replica_edge_cases.py")),
                            "test_placement_edge_cases", num_proc=ranks, timeout=600)
+
+
+@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_paired_routes(monkeypatch):
+    """Exercise two staged count wires, a shared workspace and two replay records on A3."""
+    prepare_multicore_test_environment()
+    monkeypatch.setenv("HYPER_MULTICORE_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
+    with without_inherited_rank_environment():
+        run_multicore_case(str(Path(__file__).with_name("_test_hot_replica.py")),
+                           "test_paired_routes", num_proc=2, timeout=420)
