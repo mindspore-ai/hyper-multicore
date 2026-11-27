@@ -18,6 +18,7 @@ from dataclasses import replace
 
 import pytest
 
+from hyper_multicore.modules.base_planner import PlacementRequest
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.receive import ReplicaCost, bf16_cost, select_replica_plan
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner, as_placement
@@ -54,6 +55,23 @@ def test_cross_node_cost_does_not_veto_mandatory_receive_capacity():
                                cross_node_cost=2.0)
     assert max(plan.destination_loads) <= 2048
     plan.validate()
+
+
+@pytest.mark.parametrize(("home_count", "receive_percent", "uses_replica"), [
+    (10000, "auto", False),
+    (10000, 100, True),
+    (15500, "auto", True),
+])
+def test_builtin_planner_scores_independently_of_committed_receive_rows(home_count, receive_percent, uses_replica):
+    """Keep the same quotas across growth and retain explicit capacity requirements."""
+    other_count = 16000 - home_count
+    counts = ((home_count, home_count, other_count, other_count),) * 2
+    request = PlacementRequest(counts, 4 * home_count, 64000, 0, 5120, 1792, 24, True, rank_nodes=(0, 0))
+    planner = HotReplicaPlanner(replica_slots_per_rank=1, receive_capacity_percent=receive_percent)
+    expected = planner.plan(request)
+    assert (expected is not None) == uses_replica
+    for capacity in (16000, 32000, 40064, 64000):
+        assert planner.plan(replace(request, ordinary_receive_capacity=capacity)) == expected
 
 
 def test_equal_replica_cost_prefers_fewer_cross_node_token_rows():

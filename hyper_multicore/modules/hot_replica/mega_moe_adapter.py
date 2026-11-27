@@ -163,7 +163,7 @@ class PlacementResources:
         return self.bounded is not None and not self.parent.spec.batch_experts
 
     def shared_receive_rows(self) -> int | None:
-        """Read the committed token workspace used by both ordinary and placed Push routes."""
+        """Expose the committed Push receive rows to a custom planner."""
         if self.parent.spec.dispatch_mode == "push":
             workspace = getattr(self.parent, "workspace", None)
             if workspace is not None:
@@ -190,22 +190,21 @@ class PlacementResources:
         total = sum(source_rows)
         checkpointing = is_checkpointing()
         training = checkpointing or (autograd_mask & 13) == 13
-        resident = self.shared_receive_rows()
         if self.bounded is None:
             limit = receive_limit(self.receive_capacity_percent, total, spec.ep_size)
-            request = self.request(hidden, gathered, summary, total, training, checkpointing, resident, host_rows)
+            request = self.request(hidden, gathered, summary, total, training, checkpointing, host_rows)
             placement = self._select_custom(planner, request, hidden, ids, inverse, limit,
                                             mandatory=limit is not None and summary.maximum > limit)
         else:
             prices, limit, keep_home = planner._policy(  # pylint: disable=protected-access
                 spec.hidden_size, spec.intermediate_size, spec.num_cube_cores, training,
-                spec.transport_engine, summary.maximum, total, spec.ep_size, resident,
+                spec.transport_engine, summary.maximum, total, spec.ep_size,
             )
             if keep_home:
                 return None
             placement = self.bounded.select(
                 hidden, ids, gathered[:, 3:], source_rows, inverse, prices, snapshot,
-                host_rows=host_rows, limit=limit, resident=resident,
+                host_rows=host_rows, limit=limit,
             )
         mandatory = limit is not None and summary.maximum > limit
         return self.bind(hidden, placement, tokens=summary.plan_tokens,
@@ -248,14 +247,14 @@ class PlacementResources:
             raise ValueError("HotReplica planner placement differs across EP ranks")
         return placement
 
-    def request(self, hidden, gathered, summary, total, training, checkpointing, resident, host_rows):
+    def request(self, hidden, gathered, summary, total, training, checkpointing, host_rows):
         """Pass immutable logical counts from the count exchange to the custom planner."""
         spec = self.parent.spec
         rows = gathered[:, 3:].tolist() if host_rows is None else [row[3:] for row in host_rows]
         return PlacementRequest(
             tuple(tuple(row) for row in rows), summary.maximum, total, spec.rank_id, hidden.shape[-1],
             spec.intermediate_size, spec.num_cube_cores, training, checkpointing=checkpointing,
-            apply_probs_before_fc2=spec.apply_probs_before_fc2, ordinary_receive_capacity=resident,
+            apply_probs_before_fc2=spec.apply_probs_before_fc2, ordinary_receive_capacity=self.shared_receive_rows(),
             rank_nodes=self.rank_nodes, dispatch_mode=spec.dispatch_mode, transport_engine=spec.transport_engine,
         )
 

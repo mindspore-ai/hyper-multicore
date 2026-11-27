@@ -80,14 +80,14 @@ class HotReplicaPlanner(BasePlanner):
         return ",".join(settings)
 
     def _policy(self, hidden_size, intermediate_size, cube_cores, training, transport_engine,
-                peak, total, ranks, resident):
+                peak, total, ranks):
         """Use one cost, capacity and home-admission rule for both planner callers."""
         prices = bf16_cost(
             hidden_size, intermediate_size, cube_cores, training, transport_engine=transport_engine,
             search_single_slot=self.receive_capacity_percent == "auto",
         )
         limit = receive_limit(self.receive_capacity_percent, total, ranks)
-        return prices, limit, prices.keep_home(peak, total, ranks, limit=limit, resident=resident)
+        return prices, limit, prices.keep_home(peak, total, ranks, limit=limit)
 
     def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
         """Return host quotas if saved work repays movement."""
@@ -101,15 +101,14 @@ class HotReplicaPlanner(BasePlanner):
             raise ValueError("HotReplica counts must be nonnegative and within the INT32 planner limit")
         budget = replica_slot_budget(experts // ranks, self.replica_slots_per_rank)
         config = ExpertReplicaConfig(experts, ranks, budget)
-        resident = request.ordinary_receive_capacity
         prices, limit, keep_home = self._policy(
             request.hidden_size, request.intermediate_size, request.cube_cores, request.training,
             request.transport_engine, request.maximum_received, request.total_rows,
-            ranks, resident,
+            ranks,
         )
         if keep_home:
             return None
-        plan = select_replica_plan(counts, config, prices=prices, limit=limit, resident=resident,
+        plan = select_replica_plan(counts, config, prices=prices, limit=limit,
                                    nodes=request.rank_nodes, cross_node_cost=self.cross_node_cost)
         if plan is None:
             return None

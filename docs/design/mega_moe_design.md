@@ -272,6 +272,8 @@ source 容量、调度行数与实际 owner 接收量分别维护：source/返�
 各后端独立管理 plan 缓存；反向保留原调用需要的 plan 和状态，不使用模块后来一次调用的“最新结果”。
 
 HotReplica 的放置计数以正向执行提交为准（`placements` 及各模式的 `*_bindings`）。
+内置 planner 根据逻辑路由、拓扑、槽位预算和显式接收上限选择放置，按计算节省、副本启用和搬运成本评分。
+接收工作区扩容及实际 SHMEM 字节预算由资源管理路径处理。
 `placement_candidates` 记录物化后的候选，`heap_rejections` 和 `protocol_rejections` 记录相应的拒绝原因。
 checkpoint 跳过重算时单独计入 `skipped_recomputes`。
 

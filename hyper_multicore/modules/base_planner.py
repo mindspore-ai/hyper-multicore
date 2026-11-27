@@ -21,7 +21,10 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class PlacementRequest:
-    """Logical routed counts and execution geometry for an ordered EP group."""
+    """Logical routed counts and execution geometry for an ordered EP group.
+
+    `ordinary_receive_capacity` exposes the committed Push workspace rows to custom planners.
+    """
 
     counts_by_source: tuple[tuple[int, ...], ...]
     maximum_received: int

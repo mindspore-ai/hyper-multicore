@@ -157,12 +157,13 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 
 - 省略 `expert_placement` 时使用原属路由。Push 和 Pull 的默认 guest 槽上限都是每 rank 的原属专家数 L。显式槽数须在 1 到 L 之间。自动模式在槽位预算内比较原属、单槽和多槽布局。
 - `cross_node_cost` 表示跨节点副本矩阵搬运的相对代价。`None` 和 `1.0` 的倍率相同。Push 和 Pull 都接受显式倍率，EP 组内使用相同配置。
-- `receive_capacity_percent="auto"` 默认按预计净收益选点。Push 评分同时考虑已经预留的接收区。
+- `receive_capacity_percent="auto"` 默认按预计计算节省、副本启用和搬运成本选择放置。Push 和 Pull 的评分均独立于接收工作区的当前容量。
   显式 `receive_capacity_percent=102` 将各 rank 的实际接收行数限制在 EP 均值的 102%，向上取整到一行。
   两种设置共用评分和源端配额规则。EP 组内使用相同设置。槽位不足或搜索无法找到合规计划时，调用报错。
 - `ascend910_93` 支持 BF16 EIO 和 EOI 的 MTE Push 和 Pull。槽位和资源满足条件时使用分投影权重预取和融合梯度回传。
   Pull 需要支持按实际行数切分 GET 的 A3 制品。默认放置策略沿用 Push 的配额计算，由执行 rank 从对称源区拉取 token。
   自定义策略从 `hyper_multicore.experimental` 导入 `BasePlanner`、`PlacementRequest` 和 `ExpertPlacement`。
+  `PlacementRequest.ordinary_receive_capacity` 向自定义策略提供 Push 接收工作区已提交的行数。
   各 rank 根据同一份逐源逻辑计数返回一致的 Host 配额与 guest 槽映射，无需借槽时均返回 `None`。
   每个 source 的行按目的 rank、home 槽、guest 槽的顺序排列。空槽用 -1 表示，接收行数为零。
   执行器在申请副本 bank 前校验所有 source 的逻辑专家守恒、逐位置 Top-K 身份、物理槽直方图和全组配额一致性。

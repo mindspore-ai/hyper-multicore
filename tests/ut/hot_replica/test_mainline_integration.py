@@ -658,12 +658,14 @@ def test_experimental_placement_uses_host_quotas():
     assert plan.slot_to_logical == ((0, 1, 2, -1), (2, 3, -1, -1))
 
 
-def test_checkpoint_request_uses_the_agreed_training_phase():
-    """A no-grad checkpoint forward uses the cost of subsequent training."""
+@pytest.mark.parametrize("receive_capacity", [0, 384])
+def test_checkpoint_request_uses_the_agreed_training_phase(receive_capacity):
+    """Pass the training phase and committed Push capacity to a custom planner."""
     spec = SimpleNamespace(architecture=0, rank_id=0, intermediate_size=4, num_cube_cores=24,
                            apply_probs_before_fc2=True, dispatch_mode="push", transport_engine="mte",
                            ep_size=2)
-    resources = PlacementResources(SimpleNamespace(spec=spec), {}, False)
+    workspace = SimpleNamespace(capacity_floor=receive_capacity)
+    resources = PlacementResources(SimpleNamespace(spec=spec, workspace=workspace), {}, False)
     ids = torch.tensor([[0]])
     planner = Mock()
     with (
@@ -674,12 +676,12 @@ def test_checkpoint_request_uses_the_agreed_training_phase():
                          route._RouteSummary(1, 128, 1), [1, 1], None, 0, planner=planner)
     request = select.call_args.args[1]
     assert request.training and request.checkpointing
-    assert request.ordinary_receive_capacity is None
+    assert request.ordinary_receive_capacity == (receive_capacity or None)
 
 
 @pytest.mark.parametrize("batch_experts", [False, True])
 def test_a3_wide_receive_limit_uses_the_same_plan_as_auto(batch_experts):
-    """Keep the same geometry in training, checkpoint and nonbinding-cap calls."""
+    """Keep the same geometry across checkpoint phases, nonbinding caps and heap growth."""
     spec = MegaMoeSpec(128, 4096, 1408, 8, 2, 1.25, 384, 2, None, 0, 24,
                        expert_weight_layout="EOI", batch_experts=batch_experts, auto_tokens=True)
     parent = SimpleNamespace(spec=spec, workspace=SimpleNamespace(capacity_floor=384))
@@ -699,8 +701,15 @@ def test_a3_wide_receive_limit_uses_the_same_plan_as_auto(batch_experts):
             patch.object(resources, "bind", side_effect=lambda _, placement, **_kwargs: placement),
             patch("hyper_multicore.modules.hot_replica.mega_moe_adapter.is_checkpointing", return_value=checkpointing),
         ):
-            return resources.select(hidden, ids, wire, snapshot.summary, snapshot.source_rows, None,
-                                    mask, planner=planner, snapshot=snapshot)
+            placed = resources.select(hidden, ids, wire, snapshot.summary, snapshot.source_rows, None,
+                                      mask, planner=planner, snapshot=snapshot)
+            geometry = resources.bounded.geometry
+            with patch.object(parent.workspace, "capacity_floor", snapshot.summary.maximum):
+                grown = resources.select(hidden, ids, wire, snapshot.summary, snapshot.source_rows, None,
+                                          mask, planner=planner, snapshot=snapshot)
+            assert geometry is not None and resources.bounded.geometry is geometry
+            torch.testing.assert_close(grown.virtual_ids, placed.virtual_ids)
+            return placed
     auto = select("auto", False, 13)
     assert auto is not None
     for percent, checkpointing, mask in (("auto", True, 0), (200, False, 13), (200, True, 0)):

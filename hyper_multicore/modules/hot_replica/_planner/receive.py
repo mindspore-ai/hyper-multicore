@@ -54,13 +54,11 @@ class ReplicaCost:
     def transfer(self, sent, received):
         return sum(max(owner * sent, guest * received) for owner, guest in self.phases)
 
-    def keep_home(self, peak, total, ranks, *, limit=None, resident=None):
+    def keep_home(self, peak, total, ranks, *, limit=None):
         """Skip the search when even perfect balance cannot repay activation."""
         if limit is not None and peak > limit:
             return False
         mean = (total + ranks - 1) // ranks
-        if resident is not None and mean <= resident < peak:
-            return False
         return (peak - mean) * self.compute <= self.setup
 
 
@@ -170,21 +168,21 @@ def _prefixes(totals, loads, config, target, quantum, nodes, multiplier, prices,
 
 
 def _select_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices, source_counts,
-                     capacity, resident, resize):
+                     capacity):
     """Use the native selector for the built-in score, or evaluate the Python score."""
     # A subclass can override the cost calculation used by the Python selector.
     # pylint: disable-next=unidiomatic-typecheck
     if type(prices) is ReplicaCost:
         native = select_prefix(totals, source_counts, config, quantum, levels, nodes, multiplier,
-                               prices, capacity, resident, resize)
+                               prices, capacity)
         if native is not None:
             return native
     return _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices,
-                                   source_counts, capacity, resident, resize)
+                                   source_counts, capacity)
 
 
 def _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multiplier, prices, source_counts,
-                            capacity, resident, resize):
+                            capacity):
     """Score prefixes from each target and legal slot budget in Python."""
     peak = max(loads)
     best_seen = peak
@@ -211,8 +209,6 @@ def _select_python_prefixes(totals, loads, config, levels, quantum, nodes, multi
                 if capacity is not None and after > capacity:
                     continue
                 delta = (after - peak) * prices.compute + prices.setup + prices.transfer(sent, received)
-                if resize and after <= resident:
-                    delta -= resize
                 key = (delta, width, weighted_edges, len(moves), after)
                 if best is None or key < best:
                     best, length = key, len(moves)
@@ -306,7 +302,7 @@ def _pack_capacity(totals, config, limit, quantum):
 
 def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="auto", limit=None,
                         nodes=(), cross_node_cost=None, prices=ReplicaCost(), source_quota=SourceQuota.LOCAL,
-                        totals=None, soft_target=None, resident=None):
+                        totals=None, soft_target=None):
     """Minimize exposed rank work subject to physical slots, legal cuts and the receive limit.
 
     The optional absolute limit is for callers that already own a row budget. All built-in
@@ -327,10 +323,7 @@ def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="
         limit = receive_limit(receive_capacity_percent, total, ranks)
     mandatory = limit is not None and peak > limit
     multiplier = 1. if cross_node_cost is None else cross_node_cost
-    # A shared receive layout already owns these rows. Charge at most one activation for
-    # replacing it. Growing remains legal and competes with all in-reservation candidates.
-    resize = max(0., prices.setup) if resident is not None and mean <= resident < peak else 0.
-    if not mandatory and (not config.replica_slots_per_rank or (peak - mean) * prices.compute <= prices.setup - resize):
+    if not mandatory and (not config.replica_slots_per_rank or prices.keep_home(peak, total, ranks)):
         return None
     if mandatory:
         available = (ranks - 1) * config.replica_slots_per_rank
@@ -348,11 +341,9 @@ def select_replica_plan(matrix, config, *, quantum=1, receive_capacity_percent="
     levels = (limit, mean) if mandatory else (mean, (mean + peak + 1) // 2)
     if soft_target is not None:
         levels = (max(mean, soft_target),)
-    if resize > 0:
-        levels += (resident,)
     selected, best_seen = _select_prefixes(
         totals, loads, config, tuple(dict.fromkeys(levels)), quantum, nodes, multiplier, prices, source_counts,
-        limit if mandatory else None, resident, resize,
+        limit if mandatory else None,
     )
     if mandatory and not selected:
         selected = _fill_capacity(totals, config, limit, quantum, nodes, multiplier)

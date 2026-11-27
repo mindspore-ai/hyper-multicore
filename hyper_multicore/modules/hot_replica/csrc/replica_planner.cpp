@@ -86,8 +86,8 @@ struct PrefixSelection {
 };
 
 struct PrefixScore {
-  PyLongValue capacity, resident;
-  double compute, setup, resize;
+  PyLongValue capacity;
+  double compute, setup;
 };
 
 bool ConsiderPrefixes(std::vector<PrefixMove> moves, int ranks, int slots, const PrefixScore &score,
@@ -101,9 +101,8 @@ bool ConsiderPrefixes(std::vector<PrefixMove> moves, int ranks, int slots, const
     weighted_edges += move.charge;
     if (!occupied.empty() && ++occupied[move.guest] > *width) *width = std::min(slots, std::max(1, *width * 2));
     if (score.capacity >= 0 && move.peak > score.capacity) continue;
-    double delta = (move.peak - selection->peak) * score.compute + score.setup +
+    const double delta = (move.peak - selection->peak) * score.compute + score.setup +
         TransferCost(move.sent, move.received, phases);
-    if (score.resize != 0. && move.peak <= score.resident) delta -= score.resize;
     if (!std::isfinite(delta) || !std::isfinite(weighted_edges)) return false;
     const auto key = std::make_tuple(delta, *width, weighted_edges, i + 1, move.peak);
     if (!selection->has_best || key < selection->best) {
@@ -142,15 +141,15 @@ PyObject *SelectPrefix(PyObject *, PyObject *args) {
   int ranks, slots, quantum, search_single_slot;
   PrefixScore score;
   double multiplier;
-  if (!PyArg_ParseTuple(args, "OOiiiOOOddddLLp", &totals, &matrix, &ranks, &slots, &quantum,
+  if (!PyArg_ParseTuple(args, "OOiiiOOOdddLp", &totals, &matrix, &ranks, &slots, &quantum,
                         &levels, &topology, &phase_tuple, &multiplier, &score.compute, &score.setup,
-                        &score.resize, &score.capacity, &score.resident, &search_single_slot)) return nullptr;
+                        &score.capacity, &search_single_slot)) return nullptr;
   try {
     Rows weights, nodes, targets;
     std::vector<Rows> counts;
     PhasePrices phases;
     if (quantum < 1 || !std::isfinite(multiplier) || !std::isfinite(score.compute) ||
-        !std::isfinite(score.setup) || !std::isfinite(score.resize) ||
+        !std::isfinite(score.setup) ||
         !ReadBoundedTuple(levels, 3, int64_t{3} << 30, &targets) ||
         !ReadSearch(totals, topology, ranks, slots, &weights, &nodes) ||
         !ReadCountMatrix(matrix, ranks, weights.size(), &counts)) Py_RETURN_NONE;
@@ -190,7 +189,7 @@ PyModuleDef module = {PyModuleDef_HEAD_INIT, "_replica_host", nullptr, -1, metho
 
 PyMODINIT_FUNC PyInit__replica_host() {
   PyObject *result = PyModule_Create(&module);
-  if (result != nullptr && PyModule_AddIntConstant(result, "PLANNER_ABI", 2) < 0) {
+  if (result != nullptr && PyModule_AddIntConstant(result, "PLANNER_ABI", 3) < 0) {
     Py_DECREF(result);
     return nullptr;
   }
