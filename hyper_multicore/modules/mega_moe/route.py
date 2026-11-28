@@ -169,15 +169,20 @@ def _resolve_counts(
     spec: MegaMoeSpec,
 ) -> torch.Tensor:
     """Use validated Router counts or compute them only when omitted."""
-    if supplied_counts is None:
-        return (
-            torch.bincount(flat_ids.to(torch.int64), minlength=spec.num_experts)
-            .to(torch.int32)
-            .contiguous()
-        )
-    if supplied_counts.dtype == torch.int32 and supplied_counts.is_contiguous():
-        return supplied_counts
-    return supplied_counts.to(torch.int32).contiguous()
+    if supplied_counts is not None:
+        if supplied_counts.dtype == torch.int32 and supplied_counts.is_contiguous():
+            return supplied_counts
+        return supplied_counts.to(torch.int32).contiguous()
+
+    num_experts = spec.num_experts
+    bins = num_experts + 1
+    # Unit-width bins and their counts must be representable in FP32.
+    if spec.dynamic_tokens and flat_ids.device.type == "npu" and max(bins, flat_ids.numel()) <= 2**24:
+        # Exclude ID num_experts so the existing total-count check rejects it across EP.
+        counts = torch.histc(flat_ids, bins=bins, min=0, max=bins)[:num_experts]
+    else:
+        counts = torch.bincount(flat_ids.to(torch.int64), minlength=num_experts)
+    return counts.to(torch.int32).contiguous()
 
 
 def _start_count_gather(

@@ -399,10 +399,12 @@ class TestMegaMoeRoute(unittest.TestCase):
         flat_ids = torch.tensor([0, 1, 1, 3], dtype=torch.int32)
         supplied_counts = torch.tensor([4, 0, 0, 0], dtype=torch.int32)
 
-        with patch.object(torch, "bincount") as mock_bincount:
+        with (patch.object(torch, "bincount") as mock_bincount,
+              patch.object(torch, "histc") as mock_histc):
             supplied = _resolve_counts(flat_ids, supplied_counts, spec)
 
         mock_bincount.assert_not_called()
+        mock_histc.assert_not_called()
         self.assertIs(supplied, supplied_counts)
         computed = _resolve_counts(flat_ids, None, spec)
         expected = torch.tensor([1, 2, 0, 1], dtype=torch.int32)
@@ -410,6 +412,20 @@ class TestMegaMoeRoute(unittest.TestCase):
             torch.equal(computed, expected),
             f"computed counts mismatch: expected={expected}, got={computed}",
         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dynamic_npu_histogram_excludes_out_of_range_bin(self) -> None:
+        """Check that the NPU histogram retains only the logical expert bins."""
+        spec = replace(self._spec(ep_size=1), auto_tokens=True)
+        flat_ids = Mock(device=SimpleNamespace(type="npu"))
+        flat_ids.numel.return_value = 5
+        with patch.object(torch, "histc", return_value=torch.tensor([1., 2., 0., 1., 1.])) as histc:
+            counts = _resolve_counts(flat_ids, None, spec)
+
+        histc.assert_called_once_with(flat_ids, bins=5, min=0, max=5)
+        torch.testing.assert_close(counts, torch.tensor([1, 2, 0, 1], dtype=torch.int32))
+        self.assertTrue(counts.is_contiguous())
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
