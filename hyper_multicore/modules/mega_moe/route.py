@@ -46,6 +46,7 @@ _ROUTE_CACHE_REPROBE_STEPS = 8
 _HOST_ROUTE_CACHE_ENTRIES = 8
 _METADATA_ALIGNMENT = 512
 _PULL_STAGING_MAX_BYTES = 64 * 1024 * 1024
+_HISTC_FP32_LIMIT = 2**24
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,12 @@ def _validate_supplied_counts(
         )
 
 
+def _histc_counts(flat_ids: torch.Tensor, bins: int) -> torch.Tensor:
+    """Count one chunk, dropping the bin for out-of-range IDs."""
+    # Drop ID num_experts so the existing total-count check rejects it across EP.
+    return torch.histc(flat_ids, bins=bins, min=0, max=bins)[:-1].to(torch.int32).contiguous()
+
+
 def _resolve_counts(
     flat_ids: torch.Tensor,
     supplied_counts: torch.Tensor | None,
@@ -176,13 +183,16 @@ def _resolve_counts(
 
     num_experts = spec.num_experts
     bins = num_experts + 1
-    # Unit-width bins and their counts must be representable in FP32.
-    if spec.dynamic_tokens and flat_ids.device.type == "npu" and max(bins, flat_ids.numel()) <= 2**24:
-        # Exclude ID num_experts so the existing total-count check rejects it across EP.
-        counts = torch.histc(flat_ids, bins=bins, min=0, max=bins)[:num_experts]
-    else:
-        counts = torch.bincount(flat_ids.to(torch.int64), minlength=num_experts)
-    return counts.to(torch.int32).contiguous()
+    if spec.dynamic_tokens and flat_ids.device.type == "npu" and bins <= _HISTC_FP32_LIMIT:
+        if flat_ids.numel() <= _HISTC_FP32_LIMIT:
+            return _histc_counts(flat_ids, bins)
+        # FP32 represents each partial exactly. Accumulate the partials in INT32.
+        first, *remaining = flat_ids.split(_HISTC_FP32_LIMIT)
+        counts = _histc_counts(first, bins)
+        for chunk in remaining:
+            counts.add_(_histc_counts(chunk, bins))
+        return counts
+    return torch.bincount(flat_ids.to(torch.int64), minlength=num_experts).to(torch.int32).contiguous()
 
 
 def _start_count_gather(

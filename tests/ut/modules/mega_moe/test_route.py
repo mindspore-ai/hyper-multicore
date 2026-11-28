@@ -429,6 +429,24 @@ class TestMegaMoeRoute(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_large_npu_histogram_accumulates_exact_integer_counts(self) -> None:
+        """Keep the low bit of a large count by casting each chunk before addition."""
+        spec = replace(self._spec(ep_size=1), auto_tokens=True)
+        limit = 2**24
+        flat_ids = Mock(device=SimpleNamespace(type="npu"))
+        flat_ids.numel.return_value = limit + 2
+        flat_ids.split.return_value = (Mock(), Mock())
+        chunks = (torch.tensor([limit, 0, 0, 0, 0], dtype=torch.float32),
+                  torch.tensor([1, 0, 0, 0, 1], dtype=torch.float32))
+        with patch.object(torch, "histc", side_effect=chunks) as histc:
+            counts = _resolve_counts(flat_ids, None, spec)
+
+        flat_ids.split.assert_called_once_with(limit)
+        self.assertEqual(histc.call_count, len(chunks))
+        torch.testing.assert_close(counts, torch.tensor([limit + 1, 0, 0, 0], dtype=torch.int32))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_async_count_gather_overlaps_permute_and_builds_metadata(self) -> None:
         """Feature: MegaMoe route preparation.
 
