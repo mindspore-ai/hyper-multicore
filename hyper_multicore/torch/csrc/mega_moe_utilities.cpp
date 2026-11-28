@@ -188,7 +188,8 @@ PreparedRoute PrepareRoute(const at::Tensor& payload, int64_t rank, int64_t ub, 
   const auto g = CheckRouteLayout(payload, rank, ub, hidden_size, 3);
   c10::DeviceGuard guard(payload.device());
   auto summary = at::empty({g.peers, 8}, payload.options().dtype(at::kLong));
-  auto buffers = BuildRouteMetadata(payload, g, "HmcPrepareRoute", [=](const auto& offsets, const auto& sizes, void* stream) {
+  auto buffers = BuildRouteMetadata(payload, g, "HmcPrepareRoute",
+      [=](const auto& offsets, const auto& sizes, void* stream) {
     auto launch = SelectUtility(payload.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRoutePreparation),
                                 HMC_UTILITY_ARCH35(HmcLaunchRoutePreparation));
     launch(2 * g.programs, stream, static_cast<uint8_t*>(payload.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
@@ -203,7 +204,8 @@ std::vector<at::Tensor> BoundedRoute(const at::Tensor& payload, int64_t rank,
   TORCH_CHECK(capacity > 0 && capacity <= INT32_MAX / hidden_size && tokens >= 0 &&
               tokens <= INT32_MAX / hidden_size && topk > 0 && topk <= g.experts &&
               tokens <= INT32_MAX / topk, "invalid device route capacity or input bound");
-  auto buffers = BuildRouteMetadata(payload, g, "HmcBoundedRoute", [=](const auto& offsets, const auto& sizes, void* stream) {
+  auto buffers = BuildRouteMetadata(payload, g, "HmcBoundedRoute",
+      [=](const auto& offsets, const auto& sizes, void* stream) {
     auto launch = SelectUtility(payload.get_device(), HMC_UTILITY_ARCH22(HmcLaunchBoundedRoute),
                                 HMC_UTILITY_ARCH35(HmcLaunchBoundedRoute));
     launch(2 * g.programs, stream, static_cast<uint8_t*>(payload.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
@@ -262,7 +264,8 @@ std::vector<at::Tensor> Bf16BackwardBuffers(const at::Tensor& like, const at::Te
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
   m.def("route_offsets(Tensor counts, int rank, int ub, int hidden_size=1) -> (Tensor, Tensor)");
   m.def("prepare_route(Tensor payload, int rank, int ub, int hidden_size) -> (Tensor, Tensor, Tensor)");
-  m.def("bounded_route(Tensor payload, int rank, int ub, int hidden_size, int capacity, int tokens, int topk) -> Tensor[]");
+  m.def("bounded_route(Tensor payload, int rank, int ub, int hidden_size, "
+        "int capacity, int tokens, int topk) -> Tensor[]");
   m.def("bf16_forward_buffers(Tensor like, int rows, int intermediate, bool include_dispatch) -> Tensor[]");
   m.def("bf16_backward_buffers(Tensor like, Tensor weight1, Tensor weight2, int rows, int intermediate, "
         "bool include_dx, bool zero_weights, ScalarType? weight_grad_dtype=None) -> Tensor[]");

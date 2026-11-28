@@ -90,7 +90,7 @@ class RouteMetadata:
     def with_active_experts(self, active: bool, tokens: int, plan_tokens: int,
                             *, capacity: int | None = None) -> RouteMetadata:
         """Bind current geometry to both views without changing device descriptors."""
-        values = dict(all_experts_active=active, local_num_tokens=tokens, plan_tokens=plan_tokens)
+        values = {"all_experts_active": active, "local_num_tokens": tokens, "plan_tokens": plan_tokens}
         if capacity is not None:
             values["expert_capacity"] = capacity
         native = self._elements
@@ -1154,35 +1154,9 @@ def _prepare_parallel_route(hidden: torch.Tensor, ids: torch.Tensor, flat_ids: t
             counts, payload, invalid = _dynamic_route_payload(
                 hidden, flat_ids, spec, supplied_counts, autograd_mask, workspace, stream=stream)
             gathered, work = _start_dynamic_gather(payload, spec)
-        permuted, source_owner = None, None
-        if not invalid:
-            if spec.dispatch_mode == "push":
-                permuted = _permute_topk_input(hidden, ids)
-            elif (workspace.source_buffer is not None
-                  and hidden.shape[0] * spec.top_k <= workspace.source_buffer.shape[0]):
-                # Local output shape is known without routing counts. Do not
-                # publish a peer-ready signal or assume other ranks fit yet.
-                workspace.claim()
-                try:
-                    source_owner = workspace.source_buffer
-                    permuted = _permute_dynamic_pull(hidden, ids, spec, workspace)
-                finally:
-                    workspace.release(stream=caller)
-        with torch.npu.stream(stream):
-            if work is not None:
-                work.wait()
-            pending = _start_prepared_device_route(gathered, spec)
-            if pending is None:
-                summary, host_rows, metadata = _read_cached_route(
-                    gathered, spec, workspace, hidden.device, stream=stream)
-            else:
-                summary, host_rows, metadata = pending.finish(spec)
-            if metadata is None:
-                metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, summary[0])
-                active = False if host_rows is None else all(
-                    sum(row[3 + expert] for row in host_rows) > 0
-                    for expert in range(spec.rank_id * spec.local_experts, (spec.rank_id + 1) * spec.local_experts))
-                metadata = metadata.with_active_experts(active, hidden.shape[0], summary[1], capacity=summary[0])
+        permuted, source_owner = _stage_parallel_permutation(hidden, ids, spec, workspace, caller, invalid)
+        summary, host_rows, metadata, pending = _collect_parallel_metadata(
+            hidden, counts, gathered, work, spec, workspace, stream)
         # D2H completion already proves the normal path's descriptors ready.
         # Only fallback metadata needs another device-stream dependency.
         if pending is None:
@@ -1207,6 +1181,46 @@ def _prepare_parallel_route(hidden: torch.Tensor, ids: torch.Tensor, flat_ids: t
         if not joined:
             caller.wait_stream(stream)
 
+
+
+def _stage_parallel_permutation(hidden, ids, spec, workspace, caller, invalid):
+    """Prepare input rows early when the current source storage fits."""
+    if invalid:
+        return None, None
+    if spec.dispatch_mode == "push":
+        return _permute_topk_input(hidden, ids), None
+    if (workspace.source_buffer is not None
+          and hidden.shape[0] * spec.top_k <= workspace.source_buffer.shape[0]):
+        # Local output shape is known without routing counts. Do not
+        # publish a peer-ready signal or assume other ranks fit yet.
+        workspace.claim()
+        try:
+            source_owner = workspace.source_buffer
+            permuted = _permute_dynamic_pull(hidden, ids, spec, workspace)
+        finally:
+            workspace.release(stream=caller)
+        return permuted, source_owner
+    return None, None
+
+
+def _collect_parallel_metadata(hidden, counts, gathered, work, spec, workspace, stream):
+    """Consume the count exchange on the side stream and return ready or queued metadata."""
+    with torch.npu.stream(stream):
+        if work is not None:
+            work.wait()
+        pending = _start_prepared_device_route(gathered, spec)
+        if pending is None:
+            summary, host_rows, metadata = _read_cached_route(
+                gathered, spec, workspace, hidden.device, stream=stream)
+        else:
+            summary, host_rows, metadata = pending.finish(spec)
+        if metadata is None:
+            metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, summary[0])
+            active = False if host_rows is None else all(
+                sum(row[3 + expert] for row in host_rows) > 0
+                for expert in range(spec.rank_id * spec.local_experts, (spec.rank_id + 1) * spec.local_experts))
+            metadata = metadata.with_active_experts(active, hidden.shape[0], summary[1], capacity=summary[0])
+    return summary, host_rows, metadata, pending
 
 
 def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,

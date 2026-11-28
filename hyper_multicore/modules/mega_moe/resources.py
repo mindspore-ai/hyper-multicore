@@ -147,7 +147,7 @@ class _MegaMoeExecutionResources:
 
     def prepare_forward(self, tokens: int, capacity: int, rows: torch.Tensor) -> Any:
         """Optionally prepare backend-owned, count-independent per-call storage."""
-        return None
+        del tokens, capacity, rows
 
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""

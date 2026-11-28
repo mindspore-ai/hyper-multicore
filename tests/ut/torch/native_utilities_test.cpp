@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include "ATen/ATen.h"
 #include "ATen/core/dispatch/Dispatcher.h"
@@ -62,7 +63,7 @@ extern "C" void HmcLaunchBoundedRoute_arch3510(unsigned, void*, uint8_t*, uint8_
   launch_test::last_status = launch_test::injected_status;
 }
 
-void CheckAllocations() {
+void CheckForwardAllocations() {
   const auto options = at::TensorOptions().dtype(at::kBFloat16);
   auto like = at::empty({7, 4}, options);
   using Forward = std::vector<at::Tensor>(const at::Tensor&, int64_t, int64_t, bool);
@@ -87,6 +88,11 @@ void CheckAllocations() {
   const auto next = forward.call(like, 3, 8, true);
   next[0].fill_(5);
   TORCH_CHECK(previous[0].eq(2).all().item<bool>(), "a later invocation overwrote saved expert input");
+}
+
+void CheckBackwardAllocations() {
+  const auto options = at::TensorOptions().dtype(at::kBFloat16);
+  auto like = at::empty({7, 4}, options);
   auto first = at::empty({2, 16, 4}, options), second = at::empty({2, 4, 8}, options);
   using Backward = std::vector<at::Tensor>(const at::Tensor&, const at::Tensor&, const at::Tensor&,
       int64_t, int64_t, bool, bool, std::optional<at::ScalarType>);
@@ -121,41 +127,50 @@ extern "C" void HmcLaunchPermuteFromMapping_arch3510(unsigned, void*, uint8_t*, 
   throw std::logic_error("unexpected permutation launch");
 }
 
+void CheckRouteLaunch(const std::string& mode) {
+  auto counts = at::zeros({2, 4}, at::TensorOptions().dtype(at::kInt));
+  if (mode == "bounded") {
+    using Route = std::vector<at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t,
+                                          int64_t, int64_t, int64_t);
+    auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::bounded_route", "").typed<Route>();
+    auto payload = at::zeros({2, 7}, counts.options());
+    auto views = route.redispatch(c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), payload,
+                                  0, 262144, 128, 384, 128, 2);
+    TORCH_CHECK(views.size() == 14 && views[6].numel() == 2 && views[13].numel() == 2,
+                "bounded route must return row and element views");
+    TORCH_CHECK(views[0].data_ptr() == views[4].data_ptr() && views[1].data_ptr() == views[3].data_ptr() &&
+                views[2].data_ptr() == views[5].data_ptr(), "Pull metadata aliases changed");
+  } else if (mode == "prepare") {
+    using Route = std::tuple<at::Tensor, at::Tensor, at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t);
+    auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::prepare_route", "").typed<Route>();
+    auto payload = at::zeros({2, 7}, counts.options());
+    route.redispatch(c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), payload, 0, 262144, 128);
+  } else {
+    using Route = std::tuple<at::Tensor, at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t);
+    auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::route_offsets", "").typed<Route>();
+    route.redispatch(c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), counts, 0, 262144, 128);
+  }
+}
+
+bool IsExpectedUnsupported(const c10::Error& error) {
+  return std::string(error.what()).find("unsupported NPU architecture for MoE utility") != std::string::npos &&
+         launch_test::launch_calls == 0 && launch_test::status_reads == 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 4) {
     return 2;
   }
   launch_test::injected_status = std::stoi(argv[1]);
   launch_test::npu_arch = std::stoi(argv[2]);
-  CheckAllocations();
+  CheckForwardAllocations();
+  CheckBackwardAllocations();
   const bool supported = launch_test::npu_arch == 2201 || launch_test::npu_arch == 3510;
   bool raised = false;
   try {
-    auto counts = at::zeros({2, 4}, at::TensorOptions().dtype(at::kInt));
-    if (std::string(argv[3]) == "bounded") {
-      using Route = std::vector<at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t,
-                                            int64_t, int64_t, int64_t);
-      auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::bounded_route", "").typed<Route>();
-      auto payload = at::zeros({2, 7}, counts.options());
-      auto views = route.redispatch(c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), payload,
-                                    0, 262144, 128, 384, 128, 2);
-      TORCH_CHECK(views.size() == 14 && views[6].numel() == 2 && views[13].numel() == 2,
-                  "bounded route must return row and element views");
-      TORCH_CHECK(views[0].data_ptr() == views[4].data_ptr() && views[1].data_ptr() == views[3].data_ptr() &&
-                  views[2].data_ptr() == views[5].data_ptr(), "Pull metadata aliases changed");
-    } else if (std::string(argv[3]) == "prepare") {
-      using Route = std::tuple<at::Tensor, at::Tensor, at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t);
-      auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::prepare_route", "").typed<Route>();
-      auto payload = at::zeros({2, 7}, counts.options());
-      route.redispatch(c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), payload, 0, 262144, 128);
-    } else {
-      using Route = std::tuple<at::Tensor, at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t);
-      auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::route_offsets", "").typed<Route>();
-      route.redispatch(c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), counts, 0, 262144, 128);
-    }
+    CheckRouteLaunch(argv[3]);
   } catch (const c10::Error& error) {
-    if (!supported && std::string(error.what()).find("unsupported NPU architecture for MoE utility") !=
-                          std::string::npos && launch_test::launch_calls == 0 && launch_test::status_reads == 0) {
+    if (!supported && IsExpectedUnsupported(error)) {
       return 0;
     }
     std::cerr << error.what() << '\n';

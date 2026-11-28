@@ -1,4 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Device routing configuration and the no-readback routing contract."""
 from contextlib import nullcontext
 from dataclasses import replace
@@ -100,38 +113,42 @@ def test_bounded_route_joins_device_stream_without_host_readback(fail, growth):
               'combine_target_off', 'combine_size', 'group_list')
     views = [getattr(metadata.for_kernel(unit), name) for unit in (1, spec.hidden_size) for name in fields]
     prepared = object()
-    def prepare(*args):
+    def _prepare(*args):
         assert events[-2:] == ['workspace', 'permute']
         assert args == (128, 128, tensor)
         events.append('prepare')
         return prepared
-    def permute(*_):
+    def _permute(*_):
         events.append('permute')
         return tensor, tensor
-    def bind(*_):
+    def _bind(*_):
         assert not events
         events.append('metadata')
         if fail:
             raise RuntimeError('native launch failed')
         return views
-    def prepare_workspace(*_):
+    def _prepare_workspace(*_):
         events.append('workspace')
     with (patch.object(route.torch.npu, 'current_stream', return_value=caller),
           patch.object(route.torch.npu, 'stream', return_value=nullcontext()),
           patch.object(route, '_dynamic_route_payload', return_value=(counts, object(), False)),
           patch.object(route, '_start_dynamic_gather', return_value=(counts, Mock())),
-          patch.object(route.multicore_ops, 'bounded_route', side_effect=bind),
+          patch.object(route.multicore_ops, 'bounded_route', side_effect=_bind),
           patch('hyper_multicore._device.device_ub_bytes', return_value=192*1024),
-          patch.object(route, '_permute_dynamic_pull', side_effect=permute),
+          patch.object(route, '_permute_dynamic_pull', side_effect=_permute),
           patch.object(torch.Tensor, 'record_stream'),
           patch.object(route, '_read_cached_route', side_effect=AssertionError('D2H')),
           patch.object(route, '_read_dynamic_route', side_effect=AssertionError('D2H')),
           patch.object(torch.Tensor, 'tolist', side_effect=AssertionError('D2H'))):
         if fail:
             with pytest.raises(RuntimeError, match='native launch'):
-                route._prepare_bounded_route(tensor, tensor, tensor, spec, None, workspace, 15, prepare_workspace, prepare)
+                route._prepare_bounded_route(
+                    tensor, tensor, tensor, spec, None, workspace, 15, _prepare_workspace, _prepare,
+                )
         else:
-            result = route._prepare_bounded_route(tensor, tensor, tensor, spec, None, workspace, 15, prepare_workspace, prepare)
+            result = route._prepare_bounded_route(
+                tensor, tensor, tensor, spec, None, workspace, 15, _prepare_workspace, _prepare,
+            )
             assert result.forward_preparation is prepared
             assert result.metadata.expert_capacity == 128
             torch.testing.assert_close(result.metadata.group_list, torch.tensor([4, 6]))

@@ -1,4 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Real-device bounded metadata and equal-input BF16/MXFP8 training checks."""
 import os
 import json
@@ -18,6 +31,8 @@ from hyper_multicore.modules.mega_moe import route
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec, _device_route_capacity
 from hyper_multicore.torch import ops
 from tests.common.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
+from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts
+from tests.torch import _test_mega_moe_dynamic_tokens as reference
 
 
 def test_shared_metadata_entries():
@@ -74,7 +89,7 @@ def test_shared_metadata_entries():
                                          'combine_src_off', 'combine_target_off', 'combine_size', 'group_list'):
                                 torch.testing.assert_close(getattr(value.for_kernel(unit), name).cpu(),
                                                            getattr(expected.for_kernel(unit), name), rtol=0, atol=0)
-                    checked.append(dict(ep=ep, hidden=hidden, unequal=unequal, rank=rank))
+                    checked.append({'ep': ep, 'hidden': hidden, 'unequal': unequal, 'rank': rank})
     output = Path(os.environ['HP_MEGA_MOE_EVIDENCE_DIR'])
     output.mkdir(parents=True, exist_ok=True)
     (output / 'shared-metadata.json').write_text(json.dumps(checked, indent=2))
@@ -117,7 +132,7 @@ def test_bounded_metadata():
                                  'combine_src_off', 'combine_target_off', 'combine_size', 'group_list'):
                         torch.testing.assert_close(getattr(actual.for_kernel(unit), name).cpu(),
                                                    getattr(expected.for_kernel(unit), name), rtol=0, atol=0)
-                checked.append(dict(ep=ep, changed=changed, rank=rank, capacity=capacity))
+                checked.append({'ep': ep, 'changed': changed, 'rank': rank, 'capacity': capacity})
     output = Path(os.environ['HP_MEGA_MOE_EVIDENCE_DIR'])
     output.mkdir(parents=True, exist_ok=True)
     (output / 'bounded-metadata.json').write_text(json.dumps({'bounded_metadata': checked}, indent=2))
@@ -125,8 +140,6 @@ def test_bounded_metadata():
 
 def test_bounded_training():
     """Retain actual per-call counts and autograd outputs with no NPU-to-CPU reads."""
-    from tests.torch import _test_mega_moe_dynamic_tokens as reference
-    from tests.common.multicore.owned_mega_moe import OwnedMegaMoeExperts
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
     torch.set_num_threads(1)
     dist.init_process_group('hccl')
@@ -135,12 +148,14 @@ def test_bounded_training():
     start_shmem_lifetime()
     experts, topk = 6 * world, 2
     weights = reference._weights(experts)
-    mega = OwnedMegaMoeExperts(hidden_size=512, intermediate_size=128, num_experts=experts,
-                               top_k=topk, dispatch_mode='pull', ep_group=dist.group.WORLD).to(device=device, dtype=torch.bfloat16)
+    mega = OwnedMegaMoeExperts(
+        hidden_size=512, intermediate_size=128, num_experts=experts,
+        top_k=topk, dispatch_mode='pull', ep_group=dist.group.WORLD,
+    ).to(device=device, dtype=torch.bfloat16)
     with torch.no_grad():
         mega.gate_up_weight.copy_(weights[0][rank*6:(rank+1)*6])
         mega.down_weight.copy_(weights[1][rank*6:(rank+1)*6])
-    def balanced_inputs(tokens):
+    def _balanced_inputs(tokens):
         states, _, probs, upstream = reference._inputs([tokens] * world, experts, topk)
         ids = [_balanced_ids(tokens, topk, world, experts, peer * topk) for peer in range(world)]
         return states, ids, probs, upstream
@@ -151,7 +166,7 @@ def test_bounded_training():
         # shape per group, including retained ctx across changing input sizes.
         for tokens, distribution in ((128, 'balanced'), (257, 'balanced'), (257, 'cold'),
                                      (257, 'concentrated'), (0, 'balanced')):
-            inputs = balanced_inputs(tokens)
+            inputs = _balanced_inputs(tokens)
             if distribution == 'cold':
                 # Each destination receives its usual total but only two of its
                 # six local experts are active. This is not a cached fix route.
@@ -173,13 +188,13 @@ def test_bounded_training():
             mega.zero_grad(set_to_none=True)
             # Any regression into the exact-count Host path must fail this test.
             original_cpu, original_tolist = torch.Tensor.cpu, torch.Tensor.tolist
-            def cpu(value, *args, **kwargs):
+            def _cpu(value, *args, **kwargs):
                 assert value.device.type != 'npu', 'unexpected NPU D2H during MegaMoE'
                 return original_cpu(value, *args, **kwargs)
-            def tolist(value, *args, **kwargs):
+            def _tolist(value, *args, **kwargs):
                 assert value.device.type != 'npu', 'unexpected count D2H during MegaMoE'
                 return original_tolist(value, *args, **kwargs)
-            with (patch.object(torch.Tensor, 'cpu', cpu), patch.object(torch.Tensor, 'tolist', tolist),
+            with (patch.object(torch.Tensor, 'cpu', _cpu), patch.object(torch.Tensor, 'tolist', _tolist),
                   patch.object(route._PendingDeviceRoute, 'finish', side_effect=AssertionError('count D2H'))):
                 invocation = reference._forward(mega, inputs, rank, device)
                 x, probs, output, dy = invocation
@@ -190,16 +205,16 @@ def test_bounded_training():
                         expected[3][rank*6:(rank+1)*6], expected[4][rank*6:(rank+1)*6])
             errors = [reference._assert_close(str(index), found, want)
                       for index, (found, want) in enumerate(zip(actual, expected))]
-            evidence.append(dict(tokens=tokens, distribution=distribution, max_errors=errors))
+            evidence.append({'tokens': tokens, 'distribution': distribution, 'max_errors': errors})
         # New early-prepared buffers must survive several later source writes.
-        batches = [balanced_inputs(n) for n in (128, 257, 128)]
+        batches = [_balanced_inputs(n) for n in (128, 257, 128)]
         expected_batches = [reference._rounded_oracle(weights, batch) for batch in batches]
         pending = [reference._forward(mega, batch, rank, device) for batch in batches]
         for index in (2, 0, 1):
             mega.zero_grad(set_to_none=True)
             errors = reference._check_gradients(mega, pending[index], expected_batches[index],
                                                 [pending[index][0].shape[0]] * world, rank)
-            evidence.append(dict(pending_invocation=index, errors=errors))
+            evidence.append({'pending_invocation': index, 'errors': errors})
     finally:
         mega.close()
     write_evidence({'device_route_training': evidence})
@@ -227,11 +242,16 @@ def test_bounded_rejection():
             counts[:, -8:] = 256
             capacity = 65536
         payload = torch.cat((torch.tensor([[0, 256, 15]] * 64, dtype=torch.int32, device=device), counts), 1)
-        if kind == 'remote_source': payload[-1, 1] = 255
-    if kind == 'negative': payload[0, 3] = -1
-    if kind == 'tokens': payload[1, 1] = 255
-    if kind == 'weights': payload[1, 2] = route._INVALID_WEIGHT_MASK
-    if kind == 'participation': payload[1, 2] = 7
+        if kind == 'remote_source':
+            payload[-1, 1] = 255
+    if kind == 'negative':
+        payload[0, 3] = -1
+    if kind == 'tokens':
+        payload[1, 1] = 255
+    if kind == 'weights':
+        payload[1, 2] = route._INVALID_WEIGHT_MASK
+    if kind == 'participation':
+        payload[1, 2] = 7
     try:
         ops.bounded_route(payload, 0, device_ub_bytes(device.index), 512, capacity, 256, topk)
         torch.npu.synchronize()
@@ -239,7 +259,7 @@ def test_bounded_rejection():
         # A trapping context cannot be reused. The launcher owns process and
         # device cleanup; leave evidence before skipping Python finalizers.
         Path(os.environ['HMC_REJECTION_RESULT']).write_text(json.dumps(
-            {'kind': kind, 'rejected': True, 'error': str(error)}))
+            {'kind': kind, 'rejected': True, 'error': str(error)}), encoding='utf-8')
         os._exit(0)
     raise AssertionError(f'Device accepted invalid bounded metadata: {kind}')
 

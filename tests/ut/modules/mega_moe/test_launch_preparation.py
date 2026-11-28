@@ -1,16 +1,33 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Immutable launch bounds must not retain a previous invocation's operands."""
 from collections import OrderedDict
 from dataclasses import replace
 import ctypes
+from unittest.mock import patch
 
 import torch
 
+from hyper_multicore.modules.mega_moe.backends.mxfp8 import launch
 from hyper_multicore.modules.mega_moe.backends.mxfp8.launch import prepare_mxfp8_launch
 from hyper_multicore.modules.mega_moe.backends.mxfp8.launch_contract import MxLaunchDescriptor
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
 
-def specification():
+def specification() -> MegaMoeSpec:
+    """Return the fixed launch geometry for the test."""
     return MegaMoeSpec(local_num_tokens=4096,hidden_size=5120,intermediate_size=1792,
                        num_experts=384,top_k=8,initial_capacity_factor=None,
                        receive_capacity=32768,ep_size=64,ep_group=None,rank_id=48,
@@ -48,8 +65,6 @@ def test_launch_cache_is_bounded_and_eviction_preserves_live_descriptors():
 
 
 def test_cache_hit_avoids_reserializing_but_tracks_changed_bounds():
-    from unittest.mock import patch
-    from hyper_multicore.modules.mega_moe.backends.mxfp8 import launch
     cache = OrderedDict()
     runtime, events = torch.empty(128, dtype=torch.uint8), torch.empty(256, dtype=torch.uint8)
     spec = specification()
@@ -61,5 +76,7 @@ def test_cache_hit_avoids_reserializing_but_tracks_changed_bounds():
         assert other is not first and serialize.call_count == 2
         record = MxLaunchDescriptor.from_buffer_copy(other.numpy().tobytes())
         assert record.event_bytes == 128
-        changed = launch.prepare_mxfp8_launch([torch.ones(64)], runtime, events, replace(spec,local_num_tokens=8192), cache=cache)
+        changed = launch.prepare_mxfp8_launch(
+            [torch.ones(64)], runtime, events, replace(spec, local_num_tokens=8192), cache=cache,
+        )
         assert changed is not first and serialize.call_count == 3

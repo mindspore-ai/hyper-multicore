@@ -1,4 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Orchestrate native MX expert graphs without retaining gathered weight views."""
 
 from dataclasses import dataclass
@@ -63,6 +76,7 @@ class MXFP8Execution:
     """Own one autograd invocation's orchestration while borrowing serial resources."""
 
     def __init__(self, resources: Any, *, nograd_no_clone: bool = True) -> None:
+        """Bind the execution to the backend resources for this invocation."""
         self.resources = resources
         self.nograd_no_clone = nograd_no_clone
         self._profile_scope = None
@@ -132,11 +146,13 @@ class MXFP8Execution:
                 raise RuntimeError('No-grad MX unpermute output must not alias shared routed storage.')
             saved = ((x_col, x_col_scale, a_col, a_col_scale, up, expert_output, probabilities,
                       route.unpermute_mapping, metadata.group_list, kernel_metadata.dispatch_target_off,
-                      kernel_metadata.dispatch_src_off, kernel_metadata.dispatch_size, kernel_metadata.combine_target_off,
+                      kernel_metadata.dispatch_src_off, kernel_metadata.dispatch_size,
+                      kernel_metadata.combine_target_off,
                       kernel_metadata.combine_src_off, kernel_metadata.combine_size) if retain_backward else ())
             return MXFP8ForwardState(
                 output.reshape_as(hidden), saved,
-                _ExecutionMetadata(plan, tuple(hidden.shape), route.routed_tokens.shape[0], probs.dtype), workspace,
+                _ExecutionMetadata(plan, tuple(hidden.shape), route.routed_tokens.shape[0], probs.dtype),
+                workspace,
             )
         finally:
             if not pull:

@@ -30,7 +30,8 @@ void MegaMoeMxfp8(at::TensorList buffers, const at::Tensor& runtime, const at::T
   const hyper_multicore::mxfp8_binding::ByteTensorList byte_buffers{buffers, {}};
   RECORD_FUNCTION("hmc_prepare/mxfp8/native_submit", c10::ArrayRef<c10::IValue>{});
   int64_t count = buffers.size();
-  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8, byte_buffers, runtime, events, diagnostic, launch, byte_buffers, count);
+  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8, byte_buffers, runtime, events, diagnostic,
+                         launch, byte_buffers, count);
 }
 void MegaMoeMxfp8Grad(at::TensorList buffers, const at::Tensor& runtime, const at::Tensor& events,
                        const at::Tensor& diagnostic, const at::Tensor& launch) {
@@ -38,7 +39,8 @@ void MegaMoeMxfp8Grad(at::TensorList buffers, const at::Tensor& runtime, const a
   const hyper_multicore::mxfp8_binding::ByteTensorList byte_buffers{buffers, {}};
   RECORD_FUNCTION("hmc_prepare/mxfp8/native_submit", c10::ArrayRef<c10::IValue>{});
   int64_t count = buffers.size();
-  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8Grad, byte_buffers, runtime, events, diagnostic, launch, byte_buffers, count);
+  HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeMxfp8Grad, byte_buffers, runtime, events, diagnostic,
+                         launch, byte_buffers, count);
 }
 }  // namespace
 

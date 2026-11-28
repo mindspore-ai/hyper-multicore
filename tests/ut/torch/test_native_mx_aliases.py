@@ -1,4 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Validate native MX byte views without requiring an MXFP8-capable device."""
 from pathlib import Path
 import re
@@ -8,7 +21,7 @@ import subprocess
 import pytest
 import torch
 
-from tests.common.native_sources import native_source
+from tests.common.native_sources import MXFP8_DESCRIPTOR_STUB, native_source
 
 
 def test_native_mx_operands_preserve_storage_and_reject_implicit_copies(tmp_path):
@@ -17,36 +30,48 @@ def test_native_mx_operands_preserve_storage_and_reject_implicit_copies(tmp_path
         pytest.skip("g++ is required for native alias validation")
     header = tmp_path / "csrc/cached_op_api.h"
     header.parent.mkdir()
-    header.write_text('''#pragma once
-#include <ATen/ATen.h>
+    header.write_text(MXFP8_DESCRIPTOR_STUB + r"""
+#include <tuple>
+template <typename T>
+auto CopyTypesV2(const T& value) { return std::make_tuple(CopyTypeV2(value)); }
+template <typename T>
+auto ConvertTypes(const T& value) { return std::make_tuple(ConvertType(value)); }
+namespace hyper_multicore::mxfp8_binding { struct ByteTensorList; }
 namespace launch_test {
-void Capture(at::TensorList, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-             const at::Tensor&, at::TensorList, int64_t);
+using ByteBuffers = hyper_multicore::mxfp8_binding::ByteTensorList;
+void Capture(const ByteBuffers&, const at::Tensor&, const at::Tensor&,
+             const at::Tensor&, const at::Tensor&, const ByteBuffers&, int64_t);
 }
 #define HYPER_EXEC_NPU_CMD_EXT(api, ...) launch_test::Capture(__VA_ARGS__)
-''')
+""")
+    byte_header = native_source(Path("hyper_multicore/torch/csrc/mxfp8_byte_tensor_list.h"), tmp_path)
+    shutil.copy2(byte_header, tmp_path / "csrc/mxfp8_byte_tensor_list.h")
     source = native_source(Path("hyper_multicore/torch/csrc/mega_moe_mxfp8.cpp"), tmp_path)
     program = tmp_path / "aliases.cpp"
     program.write_text('''
 #include <ATen/ATen.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <vector>
+#include "csrc/mxfp8_byte_tensor_list.h"
 namespace launch_test {
-std::vector<at::Tensor> originals, retained;
+std::vector<at::Tensor> originals;
 int calls = 0;
-void Capture(at::TensorList aliases, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-             const at::Tensor&, at::TensorList outputs, int64_t count) {
+void Capture(const ByteBuffers& buffers, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+             const at::Tensor&, const ByteBuffers& outputs, int64_t count) {
   ++calls;
-  TORCH_CHECK(count == originals.size() && aliases.size() == originals.size());
+  const auto descriptors = CopyTypeV2(buffers);
+  TORCH_CHECK(count == originals.size() && descriptors.size() == originals.size());
   for (int64_t i = 0; i < count; ++i) {
-    TORCH_CHECK(aliases[i].scalar_type() == at::kByte && aliases[i].dim() == 1);
-    TORCH_CHECK(aliases[i].data_ptr() == originals[i].data_ptr());
-    TORCH_CHECK(aliases[i].numel() == originals[i].numel() * originals[i].element_size());
-    TORCH_CHECK(aliases[i].storage().unsafeGetStorageImpl() == originals[i].storage().unsafeGetStorageImpl());
-    TORCH_CHECK(outputs[i].data_ptr() == aliases[i].data_ptr());
+    const auto& original = originals[i];
+    const auto& descriptor = *descriptors[i];
+    TORCH_CHECK(buffers.tensors[i].storage().unsafeGetStorageImpl() == original.storage().unsafeGetStorageImpl());
+    TORCH_CHECK(descriptor.acl_type == ACL_UINT8 && descriptor.itemsize == 1);
+    TORCH_CHECK(descriptor.sizes == std::vector<int64_t>{original.numel() * original.element_size()});
+    TORCH_CHECK(descriptor.data_ptr == original.storage().data());
+    TORCH_CHECK(descriptor.storage_offset == original.storage_offset() * original.element_size());
   }
-  aliases[0].zero_();
-  retained.assign(aliases.begin(), aliases.end());
+  TORCH_CHECK(CopyTypeV2(outputs) == descriptors);
+  buffers.tensors[0].zero_();
 }
 }
 int main() {
@@ -66,7 +91,6 @@ int main() {
     TORCH_CHECK(base.slice(0, 2, 5).eq(0).all().item<bool>());
     TORCH_CHECK(base.slice(0, 0, 2).eq(1).all().item<bool>());
     launch_test::originals.clear();
-    TORCH_CHECK(launch_test::retained[0].eq(0).all().item<bool>());
     const auto before = launch_test::calls;
     launch_test::originals = {base.transpose(0, 1)};
     bool rejected = false;
@@ -85,10 +109,13 @@ int main() {
     if standard is None:
         raise RuntimeError("Torch does not report its C++ standard")
     cpp_standard = "c++20" if int(standard[1]) >= 202002 else "c++17"
-    command = [compiler, f"-std={cpp_standard}", "-O0", f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
+    command = [compiler, f"-std={cpp_standard}", "-O0",
+               f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
                "-I", str(tmp_path), "-I", str(torch_root / "include"),
                "-I", str(torch_root / "include/torch/csrc/api/include"), str(program), str(source),
                "-L", str(torch_root / "lib"), f"-Wl,-rpath,{torch_root / 'lib'}",
                "-ltorch", "-ltorch_cpu", "-lc10", "-o", str(binary)]
-    subprocess.run(command, check=True, capture_output=True, text=True)
-    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+    compiled = subprocess.run(command, check=False, capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    test = subprocess.run([str(binary)], check=False, capture_output=True, text=True)
+    assert test.returncode == 0, test.stdout + test.stderr

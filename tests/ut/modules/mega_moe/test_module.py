@@ -739,7 +739,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                                                          apply_probs_before_fc2=False),
                                     plan=object(), workspace=object(), ensure_capacity=Mock(), placement=None,
                                     plan_for_tokens=Mock())
-        route = SimpleNamespace(forward_preparation=None, execution_resources=None, weight_binding=None, checkpoint_record=None,
+        route = SimpleNamespace(forward_preparation=None, execution_resources=None,
+                                weight_binding=None, checkpoint_record=None,
             routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
             unpermute_mapping=object(), maximum_received_slots=512
         )

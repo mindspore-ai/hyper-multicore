@@ -1,8 +1,25 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """MX experts reuse the managed MoE lifecycle and precision-independent transport."""
+from __future__ import annotations
+
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import cached_property
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -13,6 +30,11 @@ from .execution import MXFP8Execution, _ForwardBuffers, _prepare_forward_buffers
 from .autograd import execute_mxfp8_experts
 from .graph import build_mxfp8_runtime
 from .weights import MXFP8ExpertWeightBinding
+
+
+if TYPE_CHECKING:
+    from ...module import MegaMoeExperts
+    from ...route import PreparedTopKRoute
 
 
 def _device_bytes(data, device):
@@ -30,7 +52,7 @@ class _DeviceRuntime:
     spec: object
 
     @cached_property
-    def diagnostics(self):
+    def diagnostics(self) -> Any:
         """Build the diagnostic binding only on first use."""
         return prepare_mx_diagnostics(self.host, self.spec, self.runtime.device)
 
@@ -50,7 +72,16 @@ class _MXFP8Plan:
 
 class Resources(_MegaMoeExecutionResources):
     """Own MX execution plans for the bound workspace."""
-    def __init__(self, specification, tensor, *, expert_weight_layout, shared, active_specifications):
+    def __init__(
+        self,
+        specification: dict[str, Any],
+        tensor: torch.Tensor,
+        *,
+        expert_weight_layout: str,
+        shared: bool,
+        active_specifications: tuple[Mapping[str, Any], ...],
+    ) -> None:
+        """Initialize MXFP8 execution and launch caches."""
         super().__init__(
             specification, tensor, expert_weight_layout=expert_weight_layout, shared=shared,
             active_specifications=active_specifications,
@@ -60,7 +91,8 @@ class Resources(_MegaMoeExecutionResources):
         # belong to each invocation and never participate in this cache.
         self.launch_cache = OrderedDict()
 
-    def close(self):
+    def close(self) -> None:
+        """Release shared resources and clear the launch cache."""
         super().close()
         self.launch_cache.clear()
 
@@ -77,7 +109,8 @@ class Resources(_MegaMoeExecutionResources):
         events = self.workspace.prepare_event_counters(forward=True)
         return plan, (buffers, events)
 
-    def plan_for_capacity(self, capacity, device, *, tokens=None):
+    def plan_for_capacity(self, capacity: int, device: torch.device, *,
+                          tokens: int | None = None) -> _MXFP8Plan:
         """Cache pointer-free Pull plans independently of the live per-expert loads."""
         coverage = self.spec.local_num_tokens if tokens is None else tokens
         if coverage > self._token_capacity:
@@ -100,7 +133,8 @@ class Resources(_MegaMoeExecutionResources):
         return self._plans[key]
 
 
-def validate_weights(module, weights, hidden):
+def validate_weights(module: MegaMoeExperts, weights: tuple[torch.Tensor, torch.Tensor],
+                     hidden: torch.Tensor) -> None:
     """Check logical shapes and physical forward inputs."""
     shapes = ((module.local_experts, module.hidden_size, 2 * module.intermediate_size),
               (module.local_experts, module.intermediate_size, module.hidden_size))
@@ -111,7 +145,11 @@ def validate_weights(module, weights, hidden):
             raise ValueError("MX physical weights and hidden states must share a device")
 
 
-def forward(module, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route):
+def forward(
+    module: MegaMoeExperts, hidden_states: torch.Tensor, hidden_flat: torch.Tensor,
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, weights: tuple[torch.Tensor, torch.Tensor],
+    resources: Resources, route: PreparedTopKRoute,
+) -> torch.Tensor:
     """Launch MX experts over the route already prepared by the frontend."""
     del hidden_flat, topk_ids
     shapes = ((module.local_experts, module.hidden_size, 2 * module.intermediate_size),

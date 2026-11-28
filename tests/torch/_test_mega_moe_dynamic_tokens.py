@@ -552,12 +552,12 @@ def _forward_with_metadata(mega, inputs, rank, device, *, supplied_counts=None):
     retained = []
     prepare = invocation_module.prepare_topk_route
 
-    def record(*args, **kwargs):
+    def _record(*args, **kwargs):
         prepared = prepare(*args, **kwargs)
         retained.append(prepared.metadata)
         return prepared
 
-    with patch.object(invocation_module, "prepare_topk_route", side_effect=record):
+    with patch.object(invocation_module, "prepare_topk_route", side_effect=_record):
         invocation = _forward(mega, inputs, rank, device, supplied_counts=supplied_counts)
     assert len(retained) == 1, "one invocation must have one prepared route"
     return invocation, retained[0]

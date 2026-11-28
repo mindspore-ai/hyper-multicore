@@ -1,4 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """Check the production bounded-route validator against an independent count oracle."""
 import random
 import shutil
@@ -23,8 +36,8 @@ def _expected(payload, peers, experts, hidden, capacity, tokens, topk):
                for dest in range(peers))
 
 
-def test_bounded_route_validation_preserves_all_checks(tmp_path):
-    """Exercise actual scalar device logic, including non-local overflow and empty ranks."""
+def _compile_validator(tmp_path):
+    """Build the real scalar validator with a minimal CPU AscendC mock."""
     compiler = shutil.which('g++')
     if compiler is None:
         pytest.skip('g++ is required for the device validation logic check')
@@ -86,6 +99,10 @@ int main() {
     executable = tmp_path / 'validate'
     subprocess.run([compiler, '-std=c++17', '-O2', '-I', str(tmp_path), str(program), '-o', str(executable)],
                    check=True, capture_output=True, text=True)
+    return executable
+
+
+def _validation_cases():
     rng = random.Random(20261128)
     cases = []
     for peers, local in ((1, 1), (2, 3), (3, 7), (8, 6), (16, 3), (64, 6)):
@@ -121,6 +138,13 @@ int main() {
                 cases.append((args, changed))
     # Valid counts can still exceed the element-offset integer bound.
     cases.append(((1, 1, 2, 2**31 - 1, 2**31 - 1, 1), [0, 2**31 - 1, 15, 2**31 - 1]))
+    return cases
+
+
+def test_bounded_route_validation_preserves_all_checks(tmp_path):
+    """Exercise actual scalar device logic, including non-local overflow and empty ranks."""
+    executable = _compile_validator(tmp_path)
+    cases = _validation_cases()
     text = '\n'.join(' '.join(map(str, (*args, *rows))) for args, rows in cases)
     result = subprocess.run([str(executable)], input=text, check=True, capture_output=True, text=True)
     observed = [bool(int(value)) for value in result.stdout.splitlines()]
