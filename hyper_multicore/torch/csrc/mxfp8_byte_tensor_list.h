@@ -51,18 +51,27 @@ inline const std::vector<TensorStructPtr>& Descriptors(const ByteTensorList& buf
   return buffers.descriptors;
 }
 
+// The torch-npu V2 task queue takes descriptor snapshots before submission.
+// Its worker uses those descriptors for both cache lookup and ACL conversion.
 inline std::vector<TensorStructPtr> CopyTypeV2(const ByteTensorList& buffers) {
   return Descriptors(buffers);
 }
+
+// On a V1 cache miss, ConvertTypes calls this overload on the submitting thread.
+// ConvertTypeV2 is the native descriptor-to-ACL converter, independent of
+// which task queue selected this overload.
 inline aclTensorList* ConvertType(const ByteTensorList& buffers) {
   return ::ConvertTypeV2(Descriptors(buffers));
 }
+
 inline void add_param_to_buf(const ByteTensorList& buffers) {
-  // V1 hashing original metadata is conservative: different original shapes
-  // can miss the same byte-layout entry, never alias a different byte layout.
-  // Native hashing still sees current data pointers, including slice offsets.
-  const int64_t byte_binding_tag = 0x484d434259544553;
-  ::add_param_to_buf(byte_binding_tag);
+  // The V1 executor cache looks up the original arguments before converting
+  // them. Tag the TensorList key so the original dtype/shape is interpreted as
+  // a flat byte descriptor, distinct from ordinary TensorList binding to the
+  // same ACLNN entry. Native hashing still handles the original tensors and
+  // their addresses. The tag does not become an ACLNN argument.
+  constexpr int64_t kByteDescriptorCacheTag = 0x484d434259544553;  // ASCII "HMCBYTES"
+  ::add_param_to_buf(kByteDescriptorCacheTag);
   ::add_param_to_buf(buffers.tensors);
 }
 }  // namespace hyper_multicore::mxfp8_binding
