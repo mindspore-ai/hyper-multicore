@@ -64,6 +64,7 @@ source "$(command -v hyper_multicore_set_env.bash)"
 | 准备环境、构建和安装 | [构建指南](docs/build.md) |
 | 接入已有模型与保留参数 | [模型接入与示例](examples/README.md) |
 | 理解框架的职责与执行方式 | [系统架构](docs/architecture.md) |
+| 了解 MegaMoE 的通算融合与任务调度 | [HyperParallel MegaMoE 技术博客](docs/blog/hyperparallel_megamoe.md) |
 | 采集时间线与检查张量值 | [诊断指南](docs/diagnostics.md) |
 | 准备开发环境、运行测试与静态检查 | [测试指南](tests/README.md) |
 
