@@ -93,7 +93,7 @@ class MegaMoeSpec:
 
 
 def _device_route_capacity_factor() -> float | None:
-    """Resolve the experimental fixed-input Pull budget once per executor."""
+    """Resolve the device routing capacity factor once per executor."""
     enabled = os.environ.get("HYPER_MULTICORE_MEGAMOE_DEVICE_ROUTE", "0")
     if enabled not in ("0", "1"):
         raise ValueError("HYPER_MULTICORE_MEGAMOE_DEVICE_ROUTE must be 0 or 1")
@@ -110,7 +110,7 @@ def _device_route_capacity(spec: MegaMoeSpec, tokens: int) -> int:
     rows = _align_capacity(math.ceil(min(factor, spec.ep_size) * tokens * spec.top_k))
     rows = max(128, rows)
     if rows * spec.hidden_size > 2**31 - 1:
-        raise ValueError("Device routing receive budget exceeds int32 element offsets")
+        raise ValueError("Device routing receive capacity exceeds int32 element offsets")
     return rows
 
 

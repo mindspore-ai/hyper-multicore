@@ -245,7 +245,7 @@ def test_bounded_rejection():
 
 
 def test_mxfp8_bounded_training():
-    """Compare exact and budget F/R/B with changing counts and fresh weight _axes."""
+    """Compare exact and bounded routing with changing counts and fresh weight axes."""
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
     if query_npu_arch(torch.npu.current_device()) != 3510:
         pytest.skip('MXFP8 requires arch35')

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-"""Budget configuration and the no-readback routing contract."""
+"""Device routing configuration and the no-readback routing contract."""
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -41,7 +41,7 @@ def test_invalid_device_route_setting_is_rejected(monkeypatch):
         _device_route_capacity_factor()
 
 
-def test_receive_budget_uses_known_input_not_received_counts():
+def test_receive_bound_uses_known_input_not_received_counts():
     spec = replace(specification(), num_experts=384, ep_size=64, top_k=8,
                    hidden_size=5120, device_route_capacity_factor=1.0)
     assert _device_route_capacity(spec, 4096) == 32768
@@ -51,8 +51,8 @@ def test_receive_budget_uses_known_input_not_received_counts():
 
 
 @pytest.mark.parametrize('factor', [None, 1.0])
-def test_exact_and_budget_routes_keep_separate_selection(factor):
-    """Only an explicit budget selects the equal-input experimental route."""
+def test_exact_and_bounded_routes_keep_separate_selection(factor):
+    """Only the explicit device routing option selects the bounded route."""
     spec = replace(specification(), auto_tokens=True, device_route_capacity_factor=factor)
     tensor = SimpleNamespace(device=SimpleNamespace(type='npu'))
     workspace = object()

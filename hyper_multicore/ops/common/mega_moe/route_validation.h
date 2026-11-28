@@ -8,7 +8,7 @@ namespace hyper_multicore::moe_route {
 using AscendC::LocalTensor;
 
 // The exact-count path validates the returned summary on Host. Its device
-// metadata traversal carries no receive-budget contract or per-count checks.
+// metadata traversal carries no receive bound or per-count checks.
 struct ExactRouteValidation {
     __aicore__ inline void Source(LocalTensor<int32_t>, int64_t) const {}
     __aicore__ inline void Count(int32_t, int32_t) const {}
@@ -19,7 +19,7 @@ struct ExactRouteValidation {
 // Only the explicitly enabled no-D2H entry constructs this policy. Every
 // source and destination is checked by its existing metadata owner block;
 // dependent expert work waits for the complete metadata kernel.
-struct BudgetRouteValidation {
+struct BoundedRouteValidation {
     int64_t capacity;
     int32_t tokens;
     int32_t topk;

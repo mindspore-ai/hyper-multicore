@@ -1062,7 +1062,7 @@ def _prepare_bounded_route(hidden: torch.Tensor, ids: torch.Tensor, flat_ids: to
                            workspace: MegaMoeWorkspace, autograd_mask: int,
                            prepare_workspace: Callable[[int, int], None] | None,
                            prepare_execution: Callable | None = None) -> PreparedTopKRoute:
-    """Keep current counts on Device and size activations from a fixed input budget.
+    """Keep current counts on Device and size activations from the aligned average load.
 
     All EP ranks must have the same input length for this invocation.
     Actual counts, input lengths and gradient participation are validated by the

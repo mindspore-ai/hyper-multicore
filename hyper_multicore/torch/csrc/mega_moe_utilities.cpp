@@ -27,23 +27,27 @@ extern "C" void HmcLaunchZeroCold_arch3510(unsigned blocks, void* stream, uint8_
 #define HMC_UTILITY_ARCH35(name) (static_cast<decltype(&name##_arch3510)>(nullptr))
 #endif
 namespace {
-int64_t UtilityArchitecture(int32_t device) {
-  // Hardware identity is stable for a process-local device; route contents are not cached.
+template <int32_t Attribute>
+int64_t UtilityDeviceAttribute(int32_t device, const char* name) {
+  // Cache immutable device attributes on the calling thread, keyed by the
+  // logical device. Dynamic execution limits are read separately by the plan.
   thread_local int32_t previous_device = INT32_MIN;
-  thread_local int64_t previous_arch = 0;
-  if (device == previous_device) return previous_arch;
-  int64_t npu_arch = 0;
-  // Older PTA-bundled ACL headers omit the enum name; CANN's public attribute
-  // number matches _loader._ACL_DEV_ATTR_NPU_ARCH and is supported by the runtime.
-  constexpr auto kNpuArchAttribute = static_cast<aclrtDevAttr>(601);
-  const auto status = aclrtGetDeviceInfo(device, kNpuArchAttribute, &npu_arch);
-  TORCH_CHECK(status == ACL_SUCCESS, "cannot query NPU architecture for device ", device, ": ", status);
+  thread_local int64_t previous_value = 0;
+  if (device == previous_device) return previous_value;
+  int64_t value = 0;
+  const auto status = aclrtGetDeviceInfo(device, static_cast<aclrtDevAttr>(Attribute), &value);
+  TORCH_CHECK(status == ACL_SUCCESS && value > 0, "cannot query NPU ", name, " for device ", device,
+              ": status=", status, ", value=", value);
   previous_device = device;
-  previous_arch = npu_arch;
-  return npu_arch;
+  previous_value = value;
+  return value;
 }
+
+// Older PTA-bundled ACL headers omit the NPU architecture attribute name.
+constexpr int32_t kNpuArchAttribute = 601;
+
 template <typename Fn> Fn SelectUtility(int32_t device, Fn arch22, Fn arch35) {
-  const auto npu_arch = UtilityArchitecture(device);
+  const auto npu_arch = UtilityDeviceAttribute<kNpuArchAttribute>(device, "architecture");
   switch (npu_arch) {
     case 2201:
       TORCH_CHECK(arch22 != nullptr, "MoE utility provider is missing arch22 (Atlas A2/A3 series)");
@@ -83,9 +87,7 @@ Outputs ZeroEmptyNpu(at::Tensor& first, at::Tensor& second, const at::Tensor& gr
   }
   const c10::DeviceGuard guard(first.device());
   const int32_t device = first.get_device();
-  int64_t cores = 0;
-  const auto status = aclrtGetDeviceInfo(device, ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
-  TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
+  const auto cores = UtilityDeviceAttribute<ACL_DEV_ATTR_VECTOR_CORE_NUM>(device, "vector-core count");
   const int64_t experts = groups.numel();
   const int64_t first_bytes = first.numel() * first.element_size() / experts;
   const int64_t second_bytes = second.numel() * second.element_size() / experts;
@@ -331,12 +333,11 @@ Outputs PermuteFromMappingNpu(const at::Tensor& tokens, const at::Tensor& mappin
     return {output, output_probabilities};
   }
   const c10::DeviceGuard guard(tokens.device());
-  int64_t cores = 0;
-  const auto status = aclrtGetDeviceInfo(tokens.get_device(), ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
-  TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
-  auto stream = c10_npu::getCurrentNPUStream(tokens.get_device()).stream(false);
+  const int32_t device = tokens.get_device();
+  const auto cores = UtilityDeviceAttribute<ACL_DEV_ATTR_VECTOR_CORE_NUM>(device, "vector-core count");
+  auto stream = c10_npu::getCurrentNPUStream(device).stream(false);
   auto run = [=]() -> int {
-    auto launch = SelectUtility(tokens.get_device(), HMC_UTILITY_ARCH22(HmcLaunchPermuteFromMapping),
+    auto launch = SelectUtility(device, HMC_UTILITY_ARCH22(HmcLaunchPermuteFromMapping),
                                 HMC_UTILITY_ARCH35(HmcLaunchPermuteFromMapping));
     launch(cores, stream, static_cast<uint8_t*>(tokens.data_ptr()), static_cast<uint8_t*>(mapping.data_ptr()),
            static_cast<uint8_t*>(probabilities.data_ptr()), static_cast<uint8_t*>(output.data_ptr()),

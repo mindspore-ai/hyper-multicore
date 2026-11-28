@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-"""Check the production budget validator against an independent count oracle."""
+"""Check the production bounded-route validator against an independent count oracle."""
 import random
 import shutil
 import subprocess
@@ -23,7 +23,7 @@ def _expected(payload, peers, experts, hidden, capacity, tokens, topk):
                for dest in range(peers))
 
 
-def test_device_budget_validation_preserves_all_checks(tmp_path):
+def test_bounded_route_validation_preserves_all_checks(tmp_path):
     """Exercise actual scalar device logic, including non-local overflow and empty ranks."""
     compiler = shutil.which('g++')
     if compiler is None:
@@ -42,7 +42,7 @@ template<typename T> struct LocalTensor {
     std::vector<T>& values;
     T GetValue(int64_t index) { return values.at(index); }
 };
-inline void Trap() { throw std::runtime_error("invalid budget"); }
+inline void Trap() { throw std::runtime_error("invalid bounded route"); }
 }
 ''')
     policy = root / 'hyper_multicore/ops/common/mega_moe/route_validation.h'
@@ -57,7 +57,7 @@ int main() {
         std::vector<int32_t> counts(p * (e + 3));
         for (auto& value : counts) std::cin >> value;
         try {
-            BudgetRouteValidation validation{capacity, t, k};
+            BoundedRouteValidation validation{capacity, t, k};
             for (int source = 0; source < p; ++source) {
                 const auto base = source * (e + 3);
                 validation.Source({counts}, base);
