@@ -80,6 +80,13 @@ def test_shared_metadata_entries():
     (output / 'shared-metadata.json').write_text(json.dumps(checked, indent=2))
 
 
+def _balanced_ids(tokens, topk, peers, experts, shift=0):
+    """Cycle over destinations before cycling the local expert within each."""
+    slots = torch.arange(tokens * topk).reshape(tokens, topk) + shift
+    local = experts // peers
+    return ((slots % peers) * local + (slots // peers) % local).int()
+
+
 def test_bounded_metadata():
     """Exercise actual count tables up to EP64 without needing 64 physical cards."""
     torch.npu.set_device(int(os.environ.get('LOCAL_RANK', 0)))
@@ -89,7 +96,7 @@ def test_bounded_metadata():
         for changed in (False, True):
             counts = []
             for peer in range(ep):
-                ids = (torch.arange(tokens * topk) + (peer * 13 if changed else 0)) % experts
+                ids = _balanced_ids(tokens, topk, ep, experts, peer * 13 if changed else 0).flatten()
                 counts.append(torch.bincount(ids, minlength=experts).int())
             counts = torch.stack(counts)
             payload = torch.cat((torch.tensor([[0, tokens, 15]] * ep).int(), counts), 1).to(device)
@@ -98,7 +105,7 @@ def test_bounded_metadata():
                                    num_experts=experts, top_k=topk, initial_capacity_factor=None,
                                    receive_capacity=0, ep_size=ep, ep_group=None, rank_id=rank,
                                    num_cube_cores=24, auto_tokens=True, dispatch_mode='pull',
-                                   device_route_capacity_factor=1.05)
+                                   device_route_capacity_factor=1.0)
                 capacity = _device_route_capacity(spec, tokens)
                 views = ops.bounded_route(payload, rank, device_ub_bytes(device.index), 5120,
                                           capacity, tokens, topk)
@@ -133,13 +140,18 @@ def test_bounded_training():
     with torch.no_grad():
         mega.gate_up_weight.copy_(weights[0][rank*6:(rank+1)*6])
         mega.down_weight.copy_(weights[1][rank*6:(rank+1)*6])
+    def balanced_inputs(tokens):
+        states, _, probs, upstream = reference._inputs([tokens] * world, experts, topk)
+        ids = [_balanced_ids(tokens, topk, world, experts, peer * topk) for peer in range(world)]
+        return states, ids, probs, upstream
+
     evidence = []
     try:
         # Full, changed, cold-expert and empty local expert work; fixed input
         # shape per group, including retained ctx across changing input sizes.
         for tokens, distribution in ((128, 'balanced'), (257, 'balanced'), (257, 'cold'),
                                      (257, 'concentrated'), (0, 'balanced')):
-            inputs = reference._inputs([tokens] * world, experts, topk)
+            inputs = balanced_inputs(tokens)
             if distribution == 'cold':
                 # Each destination receives its usual total but only two of its
                 # six local experts are active. This is not a cached fix route.
@@ -180,7 +192,7 @@ def test_bounded_training():
                       for index, (found, want) in enumerate(zip(actual, expected))]
             evidence.append(dict(tokens=tokens, distribution=distribution, max_errors=errors))
         # New early-prepared buffers must survive several later source writes.
-        batches = [reference._inputs([n] * world, experts, topk) for n in (128, 257, 128)]
+        batches = [balanced_inputs(n) for n in (128, 257, 128)]
         expected_batches = [reference._rounded_oracle(weights, batch) for batch in batches]
         pending = [reference._forward(mega, batch, rank, device) for batch in batches]
         for index in (2, 0, 1):
@@ -200,7 +212,11 @@ def test_bounded_rejection():
     device = torch.device('npu', torch.npu.current_device())
     kind = os.environ['HMC_BOUNDED_REJECTION']
     payload = torch.tensor([[0, 256, 15, 128, 128, 128, 128]] * 2, dtype=torch.int32, device=device)
-    capacity = 128 if kind == 'capacity' else 640
+    capacity = 512 if kind == 'capacity' else 640
+    if kind == 'capacity':
+        # A single extra row on a destination already at the average must fail.
+        payload[0, 3] += 1
+        payload[0, 5] -= 1
     topk = 2
     if kind in ('remote_source', 'remote_capacity'):
         counts = torch.full((64, 384), 5, dtype=torch.int32, device=device)
@@ -280,7 +296,7 @@ def test_mxfp8_bounded_training():
     for tokens, cold in ((128, False), (257, False), (257, True), (128, False), (0, False)):
         x = (torch.randn(tokens, h, generator=generator) * 0.1).to(device=device, dtype=torch.bfloat16)
         probabilities = torch.softmax(torch.randn(tokens, topk, generator=generator), -1).to(device)
-        ids = ((torch.arange(tokens * topk).reshape(tokens, topk) + rank * 13) % experts).int()
+        ids = _balanced_ids(tokens, topk, world, experts, rank * 13)
         if cold:
             ids = (ids // local) * local + ids % topk
         fixtures.append((x, probabilities, ids.to(device), torch.full_like(x, 0.01)))
@@ -322,10 +338,10 @@ def test_repeated_metadata_launches():
     device = torch.device('npu', torch.npu.current_device())
     for peers, experts in ((2, 12), (4, 24), (8, 48), (64, 384)):
         tokens, topk = 4096, 8
-        counts = torch.stack([torch.bincount((torch.arange(tokens * topk) + rank * 13) % experts,
+        counts = torch.stack([torch.bincount(_balanced_ids(tokens, topk, peers, experts, rank * 13).flatten(),
                                             minlength=experts).int() for rank in range(peers)])
         payload = torch.cat((torch.tensor([[0, tokens, 15]] * peers).int(), counts), 1).to(device)
-        capacity = ((int(1.05 * tokens * topk) + 127) // 128) * 128
+        capacity = route._align_capacity(tokens * topk)
         for entry in ('offsets', 'summary', 'bounded'):
             for _ in range(128):
                 if entry == 'offsets':

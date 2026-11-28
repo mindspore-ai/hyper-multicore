@@ -97,16 +97,9 @@ def _device_route_capacity_factor() -> float | None:
     enabled = os.environ.get("HYPER_MULTICORE_MEGAMOE_DEVICE_ROUTE", "0")
     if enabled not in ("0", "1"):
         raise ValueError("HYPER_MULTICORE_MEGAMOE_DEVICE_ROUTE must be 0 or 1")
-    if enabled == "0":
-        return None
-    name = "HYPER_MULTICORE_MEGAMOE_RECEIVE_CAPACITY_FACTOR"
-    try:
-        factor = float(os.environ.get(name, "1.05"))
-    except ValueError as error:
-        raise ValueError(f"{name} must be a finite number >= 1") from error
-    if not math.isfinite(factor) or factor < 1:
-        raise ValueError(f"{name} must be a finite number >= 1")
-    return factor
+    # The supported device-routing contract uses the average receive load.
+    # Keep the effective bound internal to the execution specification.
+    return 1.0 if enabled == "1" else None
 
 
 def _device_route_capacity(spec: MegaMoeSpec, tokens: int) -> int:

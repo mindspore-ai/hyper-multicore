@@ -540,9 +540,16 @@ def prepare_topk_route(
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    if spec.device_route_capacity_factor is not None:
+        if not spec.auto_tokens or workspace is None or hidden_states.device.type != "npu":
+            raise ValueError("MegaMoE device routing requires automatic NPU workspace management")
+        if select_placement is not None:
+            raise ValueError("MegaMoE device routing does not support expert placement")
+        return _prepare_bounded_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
+                                      workspace, autograd_mask, prepare_workspace, prepare_execution)
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
-                                      workspace, autograd_mask, prepare_workspace, select_placement, prepare_execution)
+                                      workspace, autograd_mask, prepare_workspace, select_placement)
     permuted = None
     if _can_fuse_count(hidden_states, spec, tokens_per_expert):
         permuted, counts = _permute_and_count(hidden_states, topk_ids, spec)
@@ -1016,14 +1023,10 @@ def _prepare_dynamic_route(
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
     prepare_workspace: Callable[[int, int], None] | None = None,
     select_placement: Callable | None = None,
-    prepare_execution: Callable | None = None,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
     if (spec.auto_tokens and hidden_states.device.type == "npu"
             and workspace is not None and select_placement is None):
-        if spec.device_route_capacity_factor is not None:
-            return _prepare_bounded_route(hidden_states, topk_ids, flat_ids, spec, supplied_counts,
-                                           workspace, autograd_mask, prepare_workspace, prepare_execution)
         return _prepare_parallel_route(hidden_states, topk_ids, flat_ids, spec, supplied_counts,
                                        workspace, autograd_mask, prepare_workspace)
     # Invalid dynamic ranks must still enter the original collective before failing.
@@ -1061,17 +1064,16 @@ def _prepare_bounded_route(hidden: torch.Tensor, ids: torch.Tensor, flat_ids: to
                            prepare_execution: Callable | None = None) -> PreparedTopKRoute:
     """Keep current counts on Device and size activations from a fixed input budget.
 
-    The experimental contract requires the same input length on all EP ranks.
+    All EP ranks must have the same input length for this invocation.
     Actual counts, input lengths and gradient participation are validated by the
     metadata kernel before expert execution. No exact receive count is cached.
     """
     if prepare_workspace is None or spec.dispatch_mode != "pull":
-        raise RuntimeError("Device routing requires automatic Pull workspace preparation")
+        raise RuntimeError("MegaMoE device routing requires automatic Pull workspace management")
     from hyper_multicore._device import device_ub_bytes  # pylint: disable=import-outside-toplevel
     tokens = hidden.shape[0]
     capacity = _device_route_capacity(spec, tokens)
     plan_tokens = max(128, _align_capacity(tokens))
-    prepare_workspace(plan_tokens, capacity)
     caller = torch.npu.current_stream(hidden.device)
     stream = workspace.route_preparation_stream
     if stream is None:
@@ -1088,23 +1090,22 @@ def _prepare_bounded_route(hidden: torch.Tensor, ids: torch.Tensor, flat_ids: to
             gathered, work = _start_dynamic_gather(payload, spec)
             if work is not None:
                 work.wait()  # Orders HCCL on this stream; never consumes counts on Host.
-        # Source storage depends only on T*K, not the receive distribution.
-        # It remains private until the main kernel publishes peer-ready events.
+            views = multicore_ops.bounded_route(
+                gathered, spec.rank_id, device_ub_bytes(hidden.device.index), spec.hidden_size,
+                capacity, tokens, spec.top_k)
+        source = workspace.source_buffer
+        if source is None or source.shape[0] < plan_tokens * spec.top_k:
+            # Check the group contract before a rank enters collective SHMEM
+            # growth. Unequal token counts can make only some ranks need growth.
+            # The steady path joins the side stream on Device.
+            stream.synchronize()
+        prepare_workspace(plan_tokens, capacity)
+        # Counts and metadata depend on the indices, not the reordered input.
         permuted = _permute_dynamic_pull(hidden, ids, spec, workspace)
-        # Sizes and plan coverage are known without consuming any route count.
-        # Prepare while permutation/metadata kernels run; keep activations owned
-        # by this invocation so pending backward graphs cannot be overwritten.
         prepared = (None if prepare_execution is None else
                     prepare_execution(plan_tokens, capacity, permuted[0]))
     finally:
         caller.wait_stream(stream)
-    # Both producers are now ordered on the caller: metadata no longer
-    # competes with the full-width AIV permutation. Keep count exchange async
-    # and prepare invocation-owned activations while these producers run.
-    gathered.record_stream(caller)
-    views = multicore_ops.bounded_route(
-        gathered, spec.rank_id, device_ub_bytes(hidden.device.index), spec.hidden_size,
-        capacity, tokens, spec.top_k)
     # All views share two packed allocations; register each owner only once.
     for buffer in (views[0], views[2], counts):
         buffer.record_stream(caller)
