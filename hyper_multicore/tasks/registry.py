@@ -30,11 +30,10 @@ from hyper_multicore.scheduler.graph import OpType
 from hyper_multicore.tasks.task_base import FillConfig
 from hyper_multicore.tasks.alltoall import AllToAllFillConfig
 from hyper_multicore.tasks.gmm import GmmFillConfig
-from hyper_multicore.tasks.swiglu import SwiGLUFillConfig
+from hyper_multicore.tasks.activation import ACTIVATION_TASK_TYPES, ActivationFillConfig
 
 FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
     OpType.ALLTOALL:    AllToAllFillConfig,
     OpType.GMM:         GmmFillConfig,
-    OpType.SWIGLU:      SwiGLUFillConfig,
-    OpType.SWIGLU_GRAD: SwiGLUFillConfig,
+    **dict.fromkeys(ACTIVATION_TASK_TYPES, ActivationFillConfig),
 }

@@ -37,6 +37,8 @@ class OpType(Enum):
     SWIGLU_GRAD_QUANT = "swiglu_grad_quant"
     SWIGLU      = "swiglu"
     SWIGLU_GRAD = "swiglu_grad"
+    SITU_GLU = "situ_glu"
+    SITU_GLU_GRAD = "situ_glu_grad"
     MHC_POST    = "mhc_post"
     MHC_NORM_CAST = "mhc_norm_cast"
     MHC_PROJECTION = "mhc_projection"

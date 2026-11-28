@@ -198,6 +198,13 @@ def bind_mega_moe_spec(
     )
     core_spec = get_device_core_spec(device_index)
     architecture = query_npu_arch(device_index)
+    activation = specification["activation_parameters"]
+    if isinstance(activation, SiTUGLUParameters):
+        if architecture not in (2201, 3510):
+            raise ValueError("SiTUGLU requires arch22 or arch35")
+        activation.validate_bf16()
+        if specification["intermediate_size"] % 16:
+            raise ValueError("SiTUGLU intermediate_size must be a multiple of 16")
     transport_engine = specification.get("transport_engine", "mte")
     if transport_engine == "udma" and architecture != 3510:
         raise ValueError("UDMA expert transport requires arch35")
@@ -222,7 +229,7 @@ def bind_mega_moe_spec(
         ep_group=ep_group,
         rank_id=rank_id,
         num_cube_cores=core_spec.num_cube_cores,
-        activation_parameters=specification["activation_parameters"],
+        activation_parameters=activation,
         partial_weight_grad_dtype=specification.get("partial_weight_grad_dtype"),
         dispatch_mode=specification.get("dispatch_mode", "push"),
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),

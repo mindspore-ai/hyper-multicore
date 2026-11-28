@@ -100,6 +100,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   }
   tiling.set_runtimeConfigBytes(runtimeBytes);
   tiling.set_eventCounterBytes(eventBytes);
+  const auto *activationShape = context->GetInputShape(18);
+  OP_CHECK_NULL_WITH_CONTEXT(context, activationShape);
+  tiling.set_activationTilingBytes(activationShape->GetStorageShape().GetShapeSize());
 
   auto rawTilingData = context->GetRawTilingData();
   OP_CHECK_NULL_WITH_CONTEXT(context, rawTilingData);

@@ -88,7 +88,7 @@ def can_reuse_backward_dispatch(cfg: RuntimeConfigC, num_experts: int, num_cores
         return False
     acts = cube[cube_out == _ACTIVATION_GRAD]
     gates = cube[cube_out == _INPUT_GRAD]
-    swiglu = vector[kinds[vector] == TaskType.TASK_SWI_GLU_GRAD]
+    swiglu = vector[np.isin(kinds[vector], (TaskType.TASK_SWI_GLU_GRAD, TaskType.TASK_SITU_GLU_GRAD))]
     splits = tasks["task_split_num"][swiglu]
     if np.any(splits < num_experts) or np.any(splits % num_experts) or np.any(out[swiglu] != _SWIGLU_GRAD):
         return False

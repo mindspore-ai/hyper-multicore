@@ -9,8 +9,9 @@ Dependency scope and versions
 
 Source incorporated into native artifacts (versions are locked in
 hyper_multicore/_build/dependencies.lock.json):
-- ops-nn v9.1.0.pre:
-  selected RMSNorm/SwiGLU source primitives, with local patches.
+- ops-nn v9.1.0.pre and v9.2.0:
+  selected RMSNorm/SwiGLU primitives from v9.1.0.pre and SiTUGLU forward and
+  backward kernels from v9.2.0, with local patches.
   Source: https://gitcode.com/cann/ops-nn.git
 - ops-transformer: GMM v9.1.0.pre and the MHC sources selected by the lock file:
   selected GMM/MHC source primitives, with local patches.

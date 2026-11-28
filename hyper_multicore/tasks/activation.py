@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""SwiGLU fill config: forward (TASK_SWI_GLU) and backward gradient (TASK_SWI_GLU_GRAD)."""
+"""Lower BF16 GLU activations to vector tasks with shared row and event splitting."""
 
 import math
 import struct
@@ -22,11 +22,19 @@ from enum import IntEnum
 from hyper_multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
     TaskAiCoreType, TaskType, TaskSplitValue,
-    MAX_TENSOR_DIMS,
+    MAX_TENSOR_DIMS, SITU_TASKS, SITU_RUNTIME_PROTOCOL_VERSION,
 )
 from hyper_multicore.scheduler.graph import OperatorNode, OpType
 from hyper_multicore.tasks.task_base import FillConfig
 from hyper_multicore.tasks.utils import advance_tsv_vector
+
+
+ACTIVATION_TASK_TYPES = {
+    OpType.SWIGLU: TaskType.TASK_SWI_GLU,
+    OpType.SWIGLU_GRAD: TaskType.TASK_SWI_GLU_GRAD,
+    OpType.SITU_GLU: TaskType.TASK_SITU_GLU,
+    OpType.SITU_GLU_GRAD: TaskType.TASK_SITU_GLU_GRAD,
+}
 
 
 class SwiGluClampPosition(IntEnum):
@@ -36,7 +44,7 @@ class SwiGluClampPosition(IntEnum):
     AFTER_SILU = 1
 
 
-class SwiGluTaskIteration(IntEnum):
+class ActivationTaskIteration(IntEnum):
     """TILED covers one tile; PERSISTENT_LANES visits tile lane + n * lanes.
 
     Persistent descriptors encode group * lanes + lane in task_index and
@@ -48,36 +56,44 @@ class SwiGluTaskIteration(IntEnum):
     PERSISTENT_LANES = 2
 
 
-def _encode_clamp_limit(clamp_limit: float | None) -> int:
-    """Encode a positive float32 clamp limit, reserving zero for no clamp."""
-    if clamp_limit is None:
+def encode_activation_bound(value: float | None, *, name: str) -> int:
+    """Validate and encode an optional positive float32 activation bound.
+
+    Args:
+        value: Activation bound; None encodes the disabled value zero.
+        name: Configuration field used in validation errors.
+
+    Returns:
+        Unsigned integer carrying the bound's float32 bit pattern.
+
+    Raises:
+        ValueError: If the bound is not a finite positive float32 value.
+    """
+    if value is None:
         return 0
-    valid_type = isinstance(clamp_limit, (int, float)) and not isinstance(
-        clamp_limit, bool
-    )
     try:
-        clamp_bits = struct.unpack(
-            "<I", struct.pack("<f", float(clamp_limit))
-        )[0]
-        encoded_limit = struct.unpack("<f", struct.pack("<I", clamp_bits))[0]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("expected a real activation bound")
+        encoded = struct.pack("<f", value)
+        rounded = struct.unpack("<f", encoded)[0]
+        if not math.isfinite(rounded) or rounded <= 0:
+            raise ValueError("activation bound is not positive and finite")
     except (OverflowError, TypeError, ValueError, struct.error):
-        encoded_limit = 0.0
-        clamp_bits = 0
-    if not valid_type or not math.isfinite(encoded_limit) or encoded_limit <= 0:
         raise ValueError(
-            "clamp_limit must be finite, positive, and float32-representable "
-            "when provided"
-        )
-    return clamp_bits
+            f"{name} must be None or a finite positive float32-representable number, "
+            f"got {value!r}."
+        ) from None
+    return struct.unpack("<I", encoded)[0]
 
 
 @dataclass
-class SwiGLUFillConfig(FillConfig):
+class ActivationFillConfig(FillConfig):
     """
-    SwiGLU fill config — forward (TASK_SWI_GLU) and backward (TASK_SWI_GLU_GRAD).
+    Fill an activation task with its tensor operands, row partition and completion events.
 
     ``clamp_limit`` is serialized in ``TaskDesc.extra_value_0``.  Zero keeps
     the unclamped path; a positive value enables clipped SwiGLU.
+    SiTUGLU parameters are carried in the activation tiling input.
     """
 
     clamp_limit: float | None = None
@@ -89,16 +105,19 @@ class SwiGLUFillConfig(FillConfig):
         op: OperatorNode,
         tsv: TaskSplitValue,
     ) -> None:
-        """Serialize SwiGLU tasks into the runtime configuration.
+        """Serialize activation tasks into the runtime configuration.
 
         Args:
             cfg: Runtime configuration receiving task descriptors.
-            op: SwiGLU operator node to serialize.
+            op: Activation operator node to serialize.
             tsv: Topology and task split values for the current graph.
         """
-        task_type = (TaskType.TASK_SWI_GLU if op.op_type == OpType.SWIGLU
-                     else TaskType.TASK_SWI_GLU_GRAD)
-        clamp_bits = _encode_clamp_limit(self.clamp_limit)
+        task_type = ACTIVATION_TASK_TYPES[op.op_type]
+        clamp_bits = encode_activation_bound(self.clamp_limit, name="clamp_limit")
+        if task_type in SITU_TASKS:
+            if clamp_bits or self.clamp_after_activation:
+                raise ValueError("SiTUGLU does not support SwiGLU clipping")
+            cfg.protocol_version |= SITU_RUNTIME_PROTOCOL_VERSION
 
         num_triggers = getattr(op, "compact_lanes", tsv.per_expert_seq // op.split_value)
         task_num     = op.task_num
@@ -113,7 +132,7 @@ class SwiGLUFillConfig(FillConfig):
 
             for j, spec in enumerate(op.inputs):
                 td = TensorDescC()
-                td.tensor_type     = 1   # all SwiGLU inputs are tensor lists
+                td.tensor_type     = 1   # all activation inputs are tensor lists
                 td.data_type       = spec.dtype_size
                 td.input_position  = param[j]
                 td.base_ptr_offset = i * spec.shape[1] * op.split_value
@@ -124,7 +143,7 @@ class SwiGLUFillConfig(FillConfig):
 
             for j, spec in enumerate(op.outputs):
                 td = TensorDescC()
-                td.tensor_type     = 1   # all SwiGLU outputs are tensor lists
+                td.tensor_type     = 1   # all activation outputs are tensor lists
                 td.data_type       = spec.dtype_size
                 td.input_position  = param[task.num_inputs + j]
                 td.base_ptr_offset = i * spec.shape[1] * op.split_value
@@ -145,7 +164,7 @@ class SwiGLUFillConfig(FillConfig):
             task.extra_value_1        = (SwiGluClampPosition.AFTER_SILU
                                         if self.clamp_after_activation and clamp_bits else 0)
             if hasattr(op, "compact_lanes"):
-                task.extra_value_1 |= SwiGluTaskIteration.PERSISTENT_LANES
+                task.extra_value_1 |= ActivationTaskIteration.PERSISTENT_LANES
             task.tiling_data_position = op.tiling_position
 
             cfg.all_tasks[tsv.pre_task_num + i]               = task

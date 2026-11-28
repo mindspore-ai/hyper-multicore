@@ -230,8 +230,7 @@ M 和 N 必须均为 64 的倍数。root 上的物理字段按以下布局解释
 | `SiTUGLUParameters.beta` | 必填 | 有限正数，转换为 FP32 后仍为有限正数。 |
 | `SiTUGLUParameters.linear_beta` | `0.0` | 有限数值；非正值关闭 up 分支 tanh，正值需转换为有效 FP32 正数。 |
 
-当前可独立构造 `SiTUGLUParameters`。设备实现接入前，将它传给 `MegaMoeExperts` 会在构造时抛出
-`NotImplementedError`。MXFP8 当前只支持普通 SwiGLU。
+SiTUGLU 使用 BF16，专家中间维度须为 16 的倍数。启用的 beta 及其倒数须落在 FP32 正常数范围内。MXFP8 当前只支持普通 SwiGLU。
 
 `MegaMoeNumericsOptions` 通过 `numerics_options=` 配置通用数值选项：
 

@@ -16,7 +16,7 @@
 #include <cstddef>
 
 #include "kernel_operator.h"
-#include "swi_glu/swi_glu.cpp"
+#include "common/mega_moe/activation.h"
 #include "swi_glu_grad/swi_glu_grad.cpp"
 #include "grouped_matmul/grouped_matmul.cpp"
 #include "put_mem_signal/put_mem_signal_kernel.cpp"
@@ -68,6 +68,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     if (!IsMoeTaskOptionsValid(task_desc, WORKSPACE_IDX)) AscendC::Trap();
+    ValidateSituLaunch(task_desc, TaskType::TASK_SITU_GLU_GRAD, 24,
+                       this->runtimeConfigPtr, input_list[TILING_IDX]);
     switch (task_desc.task_type) {
       case TaskType::TASK_BEGIN_TASK_GRAPH:
         break;
@@ -93,8 +95,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
         ExecuteMoeShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc, input_list, input_list[TILING_IDX]);
 #endif
         break;
+      case TaskType::TASK_SITU_GLU_GRAD:
       case TaskType::TASK_SWI_GLU_GRAD:
-        ExecuteSwiGluGrad(task_desc);
+        ExecuteActivationGrad(task_desc);
         break;
       default:
         break;
@@ -102,15 +105,6 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
   }
 
  private:
-  __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
-    union {
-      uint32_t bits;
-      float value;
-    } encoded = {};
-    encoded.bits = task_desc.extra_value_0;
-    return encoded.value;
-  }
-
   __aicore__ inline bool getTransposeData(uint32_t data) { return data == 1; }
 
   __aicore__ inline void ExecuteMatmul(const TaskDesc &task_desc) {}
@@ -134,35 +128,29 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
     }
   }
 
-  __aicore__ inline void ExecuteSwiGluGrad(const TaskDesc &task_desc) {
-    if (GetSwiGluTaskIteration(task_desc) == SwiGluTaskIteration::TILED) {
-      ExecuteSwiGluGradLegacy(task_desc);
-      return;
-    }
-    DynamicData data;
-    getDynamicData(this->runtimeConfigPtr, &data);
-    const uint32_t lanes = task_desc.task_split_num / data.dynamic_group_size;
-    const uint32_t expert = task_desc.task_index / lanes;
-    const uint32_t lane = task_desc.task_index % lanes;
-    GlobalTensor<int64_t> groups;
-    groups.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(input_list[data.dynamic_input_position]),
-                           data.dynamic_group_size);
-    const int64_t start = expert == 0 ? 0 : groups.GetValue(expert - 1);
-    const int64_t rows = groups.GetValue(expert) - start;
-    const uint32_t tiles = static_cast<uint32_t>((rows + task_desc.task_split_value - 1) /
-                                                task_desc.task_split_value);
-    const uint32_t legacy_tiles = tiles > 0 ? tiles : 1;
-    TaskDesc tile = task_desc;
-    tile.extra_value_1 &= ~static_cast<uint32_t>(SwiGluTaskIteration::PERSISTENT_LANES);
-    tile.task_split_num = legacy_tiles * data.dynamic_group_size;
-    for (uint32_t index = lane; index < tiles; index += lanes) {
-      tile.task_index = expert * legacy_tiles + index;
-      ExecuteSwiGluGradLegacy(tile);
+  __aicore__ inline void ExecuteActivationGrad(const TaskDesc &task) {
+    if (!IsSituGluTask(task) && !task.inputs[0].dynamic_shape && !task.outputs[0].dynamic_shape) return;
+    const auto range = GetActivationRows(task, task.inputs[0], input_list, this->runtimeConfigPtr);
+    for (int64_t row = range.first; row < range.end; row += range.stride) {
+      const int64_t rows = range.end - row < task.task_split_value ? range.end - row : task.task_split_value;
+      GM_ADDR tiling = input_list[task.tiling_data_position] + task.tiling_data_offset;
+      if (!IsSituGluTask(task) && rows < task.task_split_value) {
+        tiling = input_list[task.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
+        auto *tail = reinterpret_cast<__gm__ SwiGluTilingData *>(tiling);
+        tail->rowLen = rows;
+        tail->baseRowLen = rows < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT ? rows : SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT;
+        cacheWriteThrough(tiling + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
+        PipeBarrier<PIPE_ALL>();
+      }
+      RunActivationTile(task, row, rows, ActivationOperand(input_list, task.inputs[0], row),
+                        ActivationOperand(input_list, task.inputs[1], row),
+                        ActivationOperand(input_list, task.outputs[0], row), tiling);
     }
   }
 
-  __aicore__ inline void RunSwiGluGrad(const TaskDesc &task, int64_t row, int64_t rows,
-                                         GM_ADDR gradient, GM_ADDR input, GM_ADDR output, GM_ADDR tiling) {
+  __aicore__ inline void RunActivationTile(const TaskDesc &task, int64_t row, int64_t rows,
+                                           GM_ADDR gradient, GM_ADDR input, GM_ADDR output, GM_ADDR tiling) {
+    const auto params = IsSituGluTask(task) ? ReadSituParameters(tiling) : SituParameters{};
     if (GetMegaMoeActivationWeighting(task) == MegaMoeActivationWeighting::BEFORE_FC2) {
       const auto &aux = task.outputs[task.num_outputs - 1];
       const int64_t width = task.inputs[0].dim[1];
@@ -170,8 +158,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
                                                                        task.task_split_value * width *
                                                                        sizeof(DTYPE_DISPATCH_TARGET);
       // Recompute only a worker tile, not a per-graph activation tensor.
-      swi_glu(input, activation, nullptr, tiling, GetSwiGluClampLimit(task),
-              GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
+      RunMoeActivationForward(task, input, activation, rows, width, tiling, params);
       {
         RoutingProbabilityTile<DTYPE_DISPATCH_TARGET> operation;
         operation.Backward(
@@ -181,6 +168,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
             ProbabilityPlane(input_list[aux.input_position], aux.dim[1], ProbabilityLayout::RECEIVED_GRADIENT) +
                 row * sizeof(float), rows, width);
       }
+    }
+    if (IsSituGluTask(task)) {
+      RunSiTUGlu<true>(input, gradient, output, rows, task.inputs[0].dim[1], params);
+      return;
     }
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510 && !defined(__DAV_CUBE__)
     if constexpr (AscendC::IsSameType<DTYPE_DISPATCH_TARGET, bfloat16_t>::value) {
@@ -192,72 +183,6 @@ class KernelWorker : public KernelWorkerBase<KernelWorker, VectorWorkerPolicy::L
 #endif
     swi_glu_grad(gradient, input, output, input_list[SWIGLU_GRAD_WORKSPACE_IDX], tiling,
                  GetSwiGluClampLimit(task), GetSwiGluClampPosition(task) == SwiGluClampPosition::AFTER_SILU);
-  }
-
-  __aicore__ inline void ExecuteSwiGluGradLegacy(const TaskDesc &task_desc) {
-    if (task_desc.inputs[0].dynamic_shape == 1 || task_desc.outputs[0].dynamic_shape == 1) {
-      DynamicData dynamic_data;
-      getDynamicData(this->runtimeConfigPtr, &(dynamic_data));
-      if (dynamic_data.dynamic_type == DynamicType::DYNAMIC_DSV3_MOE) {
-        GM_ADDR grouped_list = input_list[dynamic_data.dynamic_input_position];
-        GlobalTensor<int64_t> grouped_list_tensor;
-        int64_t ep = getExtraValueFromTiling(input_list[TILING_IDX], 1);
-        int64_t expert_num = getExtraValueFromTiling(input_list[TILING_IDX], 2);
-        int64_t expert_num_single_rank = expert_num / ep;
-        grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
-
-        uint32_t grouped_list_shape = dynamic_data.dynamic_group_size;
-        uint32_t per_task_num = task_desc.task_split_num / grouped_list_shape;
-        uint32_t data_index = task_desc.task_index / per_task_num;
-        uint32_t task_index = task_desc.task_index % per_task_num;
-        int64_t start = 0;
-        int64_t end = grouped_list_tensor.GetValue(data_index);
-        if (data_index != 0) {
-          start = grouped_list_tensor.GetValue(data_index - 1);
-        }
-        int64_t current_seq_start = task_index * task_desc.task_split_value;
-        int64_t current_seq_end = (task_index + 1) * task_desc.task_split_value;
-        int64_t base_ptr_offset = start + current_seq_start;
-
-        if (base_ptr_offset >= end) {
-          return;
-        }
-        int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
-                                   ? base_ptr_offset * task_desc.inputs[0].dim[1] * task_desc.inputs[0].data_type
-                                   : task_desc.inputs[0].base_ptr_offset * task_desc.inputs[0].data_type;
-        int64_t input_1_offset = task_desc.inputs[1].dynamic_shape == 1
-                                   ? base_ptr_offset * task_desc.inputs[1].dim[1] * task_desc.inputs[1].data_type
-                                   : task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type;
-        int64_t output_0_offset = task_desc.outputs[0].dynamic_shape == 1
-                                    ? base_ptr_offset * task_desc.outputs[0].dim[1] * task_desc.outputs[0].data_type
-                                    : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
-        if (start + current_seq_end <= end) {
-          RunSwiGluGrad(task_desc, base_ptr_offset, task_desc.task_split_value,
-                        input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
-                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
-                        input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
-          return;
-        } else {
-          GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
-          __gm__ SwiGluTilingData *tilingdata_data = reinterpret_cast<__gm__ SwiGluTilingData *>(tiling_data_addr);
-          tilingdata_data->rowLen = end - (start + current_seq_start);
-          if (tilingdata_data->rowLen == 0) {
-            return;
-          }
-          tilingdata_data->baseRowLen = tilingdata_data->rowLen < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT
-                                           ? tilingdata_data->rowLen : SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT;
-          cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
-          PipeBarrier<PIPE_ALL>();
-
-          RunSwiGluGrad(task_desc, base_ptr_offset, end - base_ptr_offset,
-                        input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
-                        input_list[task_desc.outputs[0].input_position] + output_0_offset, tiling_data_addr);
-        }
-      }
-      return;
-    }
   }
 
   __aicore__ inline void PrepareGroupedMatmulList(

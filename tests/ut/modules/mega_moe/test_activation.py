@@ -16,11 +16,15 @@
 
 from dataclasses import FrozenInstanceError, replace
 import pickle
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
+import torch
+
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, SiTUGLUParameters, SwiGLUParameters
 from hyper_multicore.modules import module as multicore_module
+from hyper_multicore.modules.mega_moe import spec as mega_moe_spec
 
 
 _EXPERT_OPTIONS = {"hidden_size": 16, "intermediate_size": 8, "num_experts": 4, "top_k": 2}
@@ -76,12 +80,50 @@ class TestActivation(TestCase):
             with self.assertRaisesRegex(TypeError, 'activation'):
                 MegaMoeExperts(**_EXPERT_OPTIONS, activation=value)
 
-    def test_unsupported_activation_fails_before_resource_registration(self):
-        """Reject an unsupported activation before creating a resource group."""
+    def test_situglu_layers_share_only_with_matching_parameters(self):
+        """Share a workspace across compatible SiTUGLU layers before execution."""
+        options = {**_EXPERT_OPTIONS, "intermediate_size": 16}
+        layers = [MegaMoeExperts(**options, activation=SiTUGLUParameters(beta=4.0, linear_beta=value))
+                  for value in (25.0, 25.0, 20.0)]
+        for layer in layers:
+            self.addCleanup(layer.close)
+        first, compatible, incompatible = layers
+        with self.assertRaisesRegex(ValueError, "identical configuration"):
+            MegaMoeExperts.share_execution_resources(layers)
+        MegaMoeExperts.share_execution_resources((first, compatible))
+        self.assertIs(first._resource_group, compatible._resource_group)  # pylint: disable=protected-access
+        self.assertIsNot(first._resource_group, incompatible._resource_group)  # pylint: disable=protected-access
+
+    def test_situglu_is_bound_to_bf16(self):
+        """Preserve SiTUGLU parameters and reject MXFP8 before registration."""
         activation = SiTUGLUParameters(beta=3.0)
+        experts = MegaMoeExperts(**{**_EXPERT_OPTIONS, 'intermediate_size': 16}, activation=activation)
+        self.addCleanup(experts.close)
+        self.assertEqual(experts.activation, activation)
         with patch.object(multicore_module, '_RESOURCE_MANAGER') as manager:
-            for precision in ('bf16', 'mxfp8'):
-                with self.subTest(precision=precision):
-                    with self.assertRaisesRegex(NotImplementedError, 'SiTUGLU execution is not implemented'):
-                        MegaMoeExperts(**_EXPERT_OPTIONS, precision=precision, activation=activation)
+            with self.assertRaisesRegex(ValueError, 'SiTUGLU requires BF16'):
+                MegaMoeExperts(**_EXPERT_OPTIONS, precision='mxfp8', activation=activation)
             manager.create_group.assert_not_called()
+
+    def test_situglu_binds_on_arch22_and_arch35(self):
+        """Use one BF16 specification for both supported device architectures."""
+        activation = SiTUGLUParameters(beta=4, linear_beta=25)
+        specification = {
+            **_EXPERT_OPTIONS, "intermediate_size": 16, "activation_parameters": activation,
+            "ep_group": None, "ep_size": 1, "local_num_tokens": 128,
+            "initial_capacity_factor": None,
+        }
+        tensor = SimpleNamespace(device="npu:0", dtype=torch.bfloat16)
+        for architecture, cores in ((2201, 24), (3510, 32)):
+            with (self.subTest(architecture=architecture),
+                  patch.object(mega_moe_spec, "query_npu_arch", return_value=architecture),
+                  patch.object(mega_moe_spec, "get_device_core_spec",
+                               return_value=SimpleNamespace(num_cube_cores=cores))):
+                bound = mega_moe_spec.bind_mega_moe_spec(specification, tensor)
+                self.assertEqual(bound.architecture, architecture)
+                self.assertEqual(bound.activation_parameters, activation)
+                for linear_beta in (1e-40, 1e38):
+                    invalid = {**specification, "activation_parameters":
+                               SiTUGLUParameters(beta=4, linear_beta=linear_beta)}
+                    with self.assertRaisesRegex(ValueError, "linear_beta and its reciprocal"):
+                        mega_moe_spec.bind_mega_moe_spec(invalid, tensor)

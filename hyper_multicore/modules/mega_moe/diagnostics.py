@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
-from hyper_multicore.tasks.swiglu import SwiGluTaskIteration
+from hyper_multicore.tasks.activation import ACTIVATION_TASK_TYPES, ActivationTaskIteration
 from hyper_multicore.scheduler.config import (
     RuntimeConfigC,
     TaskDescC,
@@ -66,14 +66,14 @@ def _resolve_expert_owner(
             return None
         return rank_owner_base + task_desc.task_index // context.num_cube_cores
 
-    if operator.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD):
+    if operator.op_type in ACTIVATION_TASK_TYPES:
         if task_desc.task_split_value == 0:
-            raise ValueError("SwiGLU diagnostic owner requires a non-zero task_split_value")
+            raise ValueError("Activation diagnostic owner requires a non-zero task_split_value")
         num_triggers = (task_desc.task_split_num // topology.single_rank_expert_num
-                        if task_desc.extra_value_1 & SwiGluTaskIteration.PERSISTENT_LANES else
+                        if task_desc.extra_value_1 & ActivationTaskIteration.PERSISTENT_LANES else
                         topology.per_expert_seq // task_desc.task_split_value)
         if num_triggers == 0:
-            raise ValueError("SwiGLU diagnostic owner resolved a zero task count per expert")
+            raise ValueError("Activation diagnostic owner resolved a zero task count per expert")
         return rank_owner_base + task_desc.task_index // num_triggers
 
     if operator.op_type == OpType.ALLTOALL:

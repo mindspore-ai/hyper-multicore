@@ -303,7 +303,9 @@ def build_mega_moe_plan(
         ),
         swiglu_tiling=_tensor_from_bytes(
             prepare_activation_tiling(
-                spec, backward=False, rows_per_task=forward_graph.get_op("activation").split_value,
+                spec.activation_parameters, intermediate_size=spec.intermediate_size,
+                num_cube_cores=spec.num_cube_cores,
+                backward=False, rows_per_task=forward_graph.get_op("activation").split_value,
             ),
             device,
         ),
@@ -333,7 +335,9 @@ def build_mega_moe_plan(
         ),
         swiglu_grad_tiling=_tensor_from_bytes(
             prepare_activation_tiling(
-                spec, backward=True, rows_per_task=backward_graph.get_op("activation").split_value,
+                spec.activation_parameters, intermediate_size=spec.intermediate_size,
+                num_cube_cores=spec.num_cube_cores,
+                backward=True, rows_per_task=backward_graph.get_op("activation").split_value,
             ),
             device,
         ),

@@ -41,7 +41,8 @@ INVALID_PROFILE_OWNER_ID = 0xFFFFFFFF
 DEFAULT_DEPENDENCY_POLL_INTERVAL_US = 0
 FAST_DEPENDENCY_POLL_INTERVAL_US = 5
 EVENT_INVALID_ID         = 0xFFFFFFFF
-RUNTIME_PROTOCOL_VERSION = 1
+SITU_RUNTIME_PROTOCOL_VERSION = 2
+RUNTIME_PROTOCOL_VERSION = 3
 
 
 def mega_moe_event_capacity(num_experts: int, ep_size: int, compute_stages: int = 3) -> int:
@@ -122,6 +123,12 @@ class TaskType(IntEnum):
     TASK_MX_QUANT                   = 143
     TASK_MX_SWIGLU_QUANT             = 145
     TASK_MX_SWIGLU_GRAD_QUANT        = 146
+    TASK_SITU_GLU                    = 147
+    TASK_SITU_GLU_GRAD               = 148
+
+
+SITU_TASKS = (TaskType.TASK_SITU_GLU, TaskType.TASK_SITU_GLU_GRAD)
+ACTIVATION_TASKS = (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD, *SITU_TASKS)
 
 
 class EventType(IntEnum):
@@ -484,8 +491,7 @@ def validate_runtime_config(
         if validator is not None:
             validator(task)
         if task_type not in (
-            TaskType.TASK_SWI_GLU,
-            TaskType.TASK_SWI_GLU_GRAD,
+            *ACTIVATION_TASKS,
             TaskType.TASK_GROUPED_MATMUL,
             TaskType.TASK_SHMEM_PUT_MEM_SIGNAL,
             TaskType.TASK_SHMEM_GET_MEM,
@@ -493,7 +499,9 @@ def validate_runtime_config(
             continue
         _validate_task_bounds(task, descriptor_index)
 
-        if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
+        if task_type in SITU_TASKS and cfg.protocol_version < SITU_RUNTIME_PROTOCOL_VERSION:
+            raise ValueError("SiTUGLU task requires runtime protocol 2 or 3")
+        if task_type in ACTIVATION_TASKS:
             _validate_swiglu_task(task, descriptor_index, group_size)
         elif task_type == TaskType.TASK_GROUPED_MATMUL:
             _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts)
@@ -513,7 +521,8 @@ def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
     if completion_event + ATOMIC_ADD_VALUE_LEN > cfg.event_capacity:
         raise ValueError("ready handshake event exceeds event_capacity.")
     cfg.ready_event = ready_event if tsv.ep > 1 else 0
-    cfg.protocol_version = RUNTIME_PROTOCOL_VERSION if tsv.dispatch_mode == "pull" else 0
+    # Bit 0 selects pull completion; bit 1 opts into SiTUGLU task dispatch.
+    cfg.protocol_version = (cfg.protocol_version & SITU_RUNTIME_PROTOCOL_VERSION) | int(tsv.dispatch_mode == "pull")
     cfg.completion_event = completion_event if tsv.dispatch_mode == "pull" else 0
     cfg.all_event_num_triggers[ready_event] = 1
     cfg.all_event_num_triggers[completion_event] = cfg.num_workers

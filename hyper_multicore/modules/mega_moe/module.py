@@ -89,12 +89,10 @@ def _validate_precision_schedule(precision, scheduler):
 
 def _resolve_activation_parameters(
     activation: SwiGLUParameters | SiTUGLUParameters | None,
-) -> SwiGLUParameters:
+) -> SwiGLUParameters | SiTUGLUParameters:
     """Resolve the default and validate the selected activation type."""
     activation_parameters = SwiGLUParameters() if activation is None else activation
-    if isinstance(activation_parameters, SiTUGLUParameters):
-        raise NotImplementedError("SiTUGLU execution is not implemented in MegaMoeExperts")
-    if not isinstance(activation_parameters, SwiGLUParameters):
+    if not isinstance(activation_parameters, (SwiGLUParameters, SiTUGLUParameters)):
         raise TypeError("activation must be SwiGLUParameters, SiTUGLUParameters or None")
     return activation_parameters
 
@@ -116,6 +114,8 @@ def _resolve_expert_options(precision, activation, numerics_options, tuning_opti
     scheduler = validate_schedule_options(tuning.scheduler)
     _validate_precision_schedule(precision, scheduler)
     activation_parameters = _resolve_activation_parameters(activation)
+    if precision == "mxfp8" and isinstance(activation_parameters, SiTUGLUParameters):
+        raise ValueError("SiTUGLU requires BF16")
     if precision == "mxfp8" and (activation_parameters.clamp_limit is not None or numerics.apply_probs_before_fc2):
         raise ValueError("MXFP8 does not support clamp or before-FC2 probability weighting")
     return numerics, tuning, scheduler, activation_parameters
@@ -171,7 +171,7 @@ class MegaMoeExperts(MulticoreModule):
                 May be omitted for a standalone single-rank process.
             precision: ``"bf16"`` for standard weights or ``"mxfp8"`` for external MX roots.
             activation: Immutable algorithm parameters. None selects ordinary SwiGLU.
-                Passing SiTUGLUParameters raises NotImplementedError at construction.
+                SiTUGLUParameters requires an arch22 or arch35 BF16 backend.
             numerics_options: Probability placement and partial-gradient precision.
                 None uses after-FC2 probability weighting and native partial dW.
             expert_placement: Placement strategy and planner. Adaptive placement

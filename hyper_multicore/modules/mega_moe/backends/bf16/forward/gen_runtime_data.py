@@ -34,13 +34,14 @@ import argparse
 from dataclasses import dataclass
 import os
 
+from hyper_multicore.modules.mega_moe.backends.bf16.activation import prepare_activation_tiling
+from hyper_multicore.modules.mega_moe.numerics import SiTUGLUParameters, SwiGLUParameters
 from hyper_multicore._core_spec import DEFAULT_CORE_SPEC
 from hyper_multicore.modules.mega_moe.backends.bf16.forward.graph import (
     build_forward_graph,
 )
 from hyper_multicore.modules.mega_moe.backends.bf16.forward.tiling_tables import (
     get_down_proj_tiling_bytes,
-    get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
 from hyper_multicore.scheduler.builder import allocate_graph_config
@@ -65,6 +66,7 @@ class _GenerationContext:
     args: argparse.Namespace
     task_values: TaskSplitValue
     graph: ComputeGraph
+    activation: SwiGLUParameters | SiTUGLUParameters
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +87,8 @@ def parse_args() -> argparse.Namespace:
                    help=f'Number of Cube cores (default: {DEFAULT_CORE_SPEC.num_cube_cores})')
     p.add_argument('--output_dir',        type=str,
                    default='mega_moe_tp4_ep4_910b')
+    p.add_argument('--situ_beta', type=float, help='Select BF16 SiTUGLU with this gate scale')
+    p.add_argument('--situ_linear_beta', type=float, default=0.0, help='Optional up-branch tanh scale')
     return p.parse_args()
 
 
@@ -149,6 +153,12 @@ def _prepare_generation(args: argparse.Namespace) -> _GenerationContext:
         all_expert_num=args.all_expert_num,
         top_k=args.top_k,
     )
+    if args.situ_beta is None and args.situ_linear_beta:
+        raise ValueError("situ_linear_beta requires situ_beta")
+    activation = (SwiGLUParameters() if args.situ_beta is None
+                  else SiTUGLUParameters(beta=args.situ_beta, linear_beta=args.situ_linear_beta))
+    if isinstance(activation, SiTUGLUParameters) and args.dtype_size != 2:
+        raise ValueError("SiTUGLU requires BF16 inputs")
     graph = build_forward_graph(task_values,
                                 dispatch_sv=128,  up_proj_sv=4096,
                                 swiglu_sv=128,    down_proj_sv=4096,
@@ -156,9 +166,9 @@ def _prepare_generation(args: argparse.Namespace) -> _GenerationContext:
                                 hidden_size=args.hidden_size,
                                 intermediate_size=args.intermediate_size,
                                 dtype_size=args.dtype_size,
-                                num_cube_cores=args.num_cube_cores)
+                                num_cube_cores=args.num_cube_cores, activation_parameters=activation)
     graph.propagate_splits(task_values)
-    return _GenerationContext(args, task_values, graph)
+    return _GenerationContext(args, task_values, graph, activation)
 
 
 def _describe_graph(context: _GenerationContext) -> None:
@@ -197,8 +207,10 @@ def _write_tiling_files(context: _GenerationContext) -> None:
                                                  intermediate_size=args.intermediate_size,
                                                  num_groups=num_groups,
                                                  num_cube_cores=args.num_cube_cores)
-    swiglu_bytes    = get_swiglu_tiling_bytes(activation_op.split_value,
-                                              intermediate_size=args.intermediate_size)
+    swiglu_bytes    = prepare_activation_tiling(
+        context.activation, backward=False, rows_per_task=activation_op.split_value,
+        intermediate_size=args.intermediate_size, num_cube_cores=args.num_cube_cores,
+    )
 
     write_bin(os.path.join(args.output_dir, 'up_proj_tiling.bin'), up_proj_bytes)
     write_bin(os.path.join(args.output_dir, 'swiglu_tiling.bin'), swiglu_bytes)

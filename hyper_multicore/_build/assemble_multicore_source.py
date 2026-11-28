@@ -85,6 +85,7 @@ def main() -> int:
     if (args.architecture == "arch35") != bool(args.ops_tensor_source):
         raise ValueError("--ops-tensor-source is required for arch35 and only used on that architecture")
     lock = load_dependency_locks(_LOCK_PATH)
+    nn_revisions = dependency_revisions(lock["ops_nn"])
     transformer_revisions = dependency_revisions(lock["ops_transformer"])
     ops_nn_source = Path(args.ops_nn_source).resolve()
     ops_transformer_source = Path(args.ops_transformer_source).resolve()
@@ -95,7 +96,8 @@ def main() -> int:
         (ops_nn_source, ops_transformer_source, *((ops_tensor_source,) if ops_tensor_source else ())),
     )
 
-    verify_git_dependency(lock["ops_nn"], ops_nn_source, dependency_name="ops_nn")
+    for name, revision in nn_revisions.items():
+        verify_git_dependency(revision, ops_nn_source, dependency_name=f"ops_nn.{name}")
     verify_git_dependency(
         transformer_revisions["gmm"],
         ops_transformer_source,
@@ -110,12 +112,13 @@ def main() -> int:
         verify_git_dependency(lock["ops_tensor"], ops_tensor_source, dependency_name="ops_tensor")
 
     ops_nn_copy = work_dir / "adapter-inputs" / "ops-nn"
+    situ_copy = work_dir / "adapter-inputs" / "ops-nn-situ"
     transformer_copy = work_dir / "adapter-inputs" / "ops-transformer"
     transformer_mhc_copy = work_dir / "adapter-inputs" / "ops-transformer-mhc"
     _export_git_tree(
         ops_nn_source,
         ops_nn_copy,
-        lock["ops_nn"]["commit"],
+        nn_revisions["base"]["commit"],
         _OPS_NN_PATHS + (_ARCH35_OPS_NN_PATHS if ops_tensor_source else ()),
     )
     _export_git_tree(
@@ -130,7 +133,10 @@ def main() -> int:
         transformer_revisions["mhc"]["commit"],
         _OPS_TRANSFORMER_MHC_PATHS,
     )
-    _apply_locked_adapters(ops_nn_copy, lock["ops_nn"], architecture=args.architecture)
+    situ_paths = ("activation/situ_glu/op_kernel", "activation/situ_glu_grad/op_kernel")
+    _export_git_tree(ops_nn_source, situ_copy, nn_revisions["situ"]["commit"], situ_paths)
+    _apply_locked_adapters(situ_copy, nn_revisions["situ"], architecture=args.architecture)
+    _apply_locked_adapters(ops_nn_copy, nn_revisions["base"], architecture=args.architecture)
     _apply_locked_adapters(transformer_copy, transformer_revisions["gmm"])
     _apply_locked_adapters(transformer_mhc_copy, transformer_revisions["mhc"])
 
@@ -141,11 +147,16 @@ def main() -> int:
         transformer_copy,
         transformer_mhc_copy,
     )
+    for operator in ("hyper_mega_moe", "hyper_mega_moe_grad"):
+        kernel = source_root / operator / "op_kernel"
+        for name in ("situ_glu", "situ_glu_grad"):
+            (kernel / name).mkdir()
+            shutil.copy2(situ_copy / "activation" / name / "op_kernel" / f"{name}.hpp", kernel / name)
     if ops_tensor_source is not None:
         tensor_copy = work_dir / "adapter-inputs" / "ops-tensor"
         _export_git_tree(ops_tensor_source, tensor_copy, lock["ops_tensor"]["commit"], ("include/blaze",))
         _apply_locked_adapters(tensor_copy, lock["ops_tensor"], architecture="arch35")
-        _compose_arch35_sources(source_root, ops_nn_copy, tensor_copy, lock)
+        _compose_arch35_sources(source_root, ops_nn_copy, tensor_copy, {**lock, "ops_nn": nn_revisions["base"]})
     _require_assembled_files(source_root)
     print(json.dumps({"source_root": str(source_root)}, sort_keys=True))
     return 0

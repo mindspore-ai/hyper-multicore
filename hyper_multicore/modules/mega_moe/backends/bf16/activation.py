@@ -16,10 +16,11 @@
 
 from __future__ import annotations
 
+import struct
+
 from hyper_multicore.modules.mega_moe.numerics import SiTUGLUParameters, SwiGLUParameters
-from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_multicore.scheduler.graph import OperatorNode, OpType, SplitSpec, TensorSpec
-from hyper_multicore.tasks.swiglu import SwiGLUFillConfig
+from hyper_multicore.tasks.activation import ActivationFillConfig
 
 from .backward.tiling_tables import get_swiglu_grad_tiling_bytes
 from .forward.tiling_tables import get_swiglu_tiling_bytes
@@ -31,12 +32,19 @@ def build_activation_node(
     split_value: int, tiling_position: int,
 ) -> OperatorNode:
     """Build the concrete BF16 operator node for the selected activation."""
-    if not isinstance(activation_parameters, SwiGLUParameters):
-        raise NotImplementedError("BF16 currently builds only SwiGLU activation nodes")
+    if isinstance(activation_parameters, SiTUGLUParameters):
+        kind = OpType.SITU_GLU_GRAD if backward else OpType.SITU_GLU
+        label = "SiTUGLU"
+        fill_config = ActivationFillConfig()
+    else:
+        kind = OpType.SWIGLU_GRAD if backward else OpType.SWIGLU
+        label = "SwiGLU"
+        fill_config = ActivationFillConfig(
+            clamp_limit=activation_parameters.clamp_limit,
+            clamp_after_activation=activation_parameters.clamp_after_silu,
+        )
     return OperatorNode(
-        name="swiglu_grad" if backward else "swiglu",
-        op_type=OpType.SWIGLU_GRAD if backward else OpType.SWIGLU,
-        diagnostic_name="SwiGLUGrad" if backward else "SwiGLU",
+        name=kind.value, op_type=kind, diagnostic_name=label + ("Grad" if backward else ""),
         inputs=inputs, outputs=outputs, param_positions=param_positions,
         split_value=split_value,
         split_spec=SplitSpec(
@@ -44,20 +52,24 @@ def build_activation_node(
             task_num_fn=lambda tsv: (tsv.per_expert_seq // split_value) * tsv.single_rank_expert_num,
         ),
         tiling_position=tiling_position,
-        fill_config=SwiGLUFillConfig(clamp_limit=activation_parameters.clamp_limit,
-                                    clamp_after_activation=activation_parameters.clamp_after_silu),
+        fill_config=fill_config,
     )
 
 
-def prepare_activation_tiling(spec: MegaMoeSpec, *, backward: bool, rows_per_task: int) -> bytes:
+def prepare_activation_tiling(parameters: SwiGLUParameters | SiTUGLUParameters, *, backward: bool,
+                              rows_per_task: int, intermediate_size: int, num_cube_cores: int) -> bytes:
     """Build the activation payload for the active workers in the online plan."""
-    if not isinstance(spec.activation_parameters, SwiGLUParameters):
-        raise NotImplementedError("BF16 currently prepares only SwiGLU activation tiling")
+    if isinstance(parameters, SiTUGLUParameters):
+        parameters.validate_bf16()
+        if intermediate_size % 16:
+            raise ValueError("SiTUGLU intermediate_size must be a multiple of 16")
+        return struct.pack("<ff", parameters.beta, max(0.0, parameters.linear_beta))
+    # SwiGLU reserves a writable tail record per worker.
     build_tiling = get_swiglu_grad_tiling_bytes if backward else get_swiglu_tiling_bytes
-    tiling_bytes = build_tiling(rows_per_task, intermediate_size=spec.intermediate_size)
+    tiling_bytes = build_tiling(rows_per_task, intermediate_size=intermediate_size)
     # The standalone tables contain one default record and 48 worker records.
     baseline_records = 49
     if len(tiling_bytes) % baseline_records:
         raise RuntimeError("invalid baseline SwiGLU tiling byte length.")
     record_size = len(tiling_bytes) // baseline_records
-    return tiling_bytes[:record_size] * (2 * spec.num_cube_cores + 1)
+    return tiling_bytes[:record_size] * (2 * num_cube_cores + 1)

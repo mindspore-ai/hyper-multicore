@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 from hyper_multicore.scheduler.config import RuntimeConfigC, TaskSplitValue, TaskType
+from hyper_multicore.tasks.activation import ACTIVATION_TASK_TYPES
 from hyper_multicore.scheduler.graph import ComputeGraph, OpType
 from hyper_multicore.scheduler.worker_queues import install_strided_worker_queues
 
@@ -35,7 +36,7 @@ def compact_graph(graph: ComputeGraph, topology: TaskSplitValue, workers: int, n
             original += topology.all_expert_num * (topology.per_expert_seq_to_other // op.split_value)
             compact += topology.all_expert_num * min(max(1, math.ceil(workers / topology.ep)),
                                                     topology.per_expert_seq_to_other // op.split_value)
-        elif op.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD):
+        elif op.op_type in ACTIVATION_TASK_TYPES:
             original += topology.single_rank_expert_num * (topology.per_expert_seq // op.split_value)
             compact += topology.single_rank_expert_num * min(workers, topology.per_expert_seq // op.split_value)
     # Persistent partitions add loop and pipeline overhead; small graphs retain the dense path.
@@ -45,7 +46,7 @@ def compact_graph(graph: ComputeGraph, topology: TaskSplitValue, workers: int, n
         if op.op_type == OpType.ALLTOALL:
             lanes = min(math.ceil(workers / topology.ep), topology.per_expert_seq_to_other // op.split_value)
             groups = topology.all_expert_num
-        elif op.op_type in (OpType.SWIGLU, OpType.SWIGLU_GRAD):
+        elif op.op_type in ACTIVATION_TASK_TYPES:
             lanes = min(workers, topology.per_expert_seq // op.split_value)
             groups = topology.single_rank_expert_num
         else:
