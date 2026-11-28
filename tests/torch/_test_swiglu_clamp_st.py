@@ -422,7 +422,7 @@ def test_swiglu_clamp_ub_scratch() -> None:
     observed_calls = 0
     comparisons = []
 
-    def check_backward(plan: Any, saved: Any, grad_output: Any, execution: Any, *, stream: Any = None) -> None:
+    def check_backward(plan: Any, saved: Any, grad_output: Any, execution: Any, **launch_options: Any) -> None:
         """Compare native clamp derivatives with the saved-input oracle after each backward launch.
 
         Args:
@@ -430,9 +430,10 @@ def test_swiglu_clamp_ub_scratch() -> None:
             saved: Saved input and projection tensors used by the derivative oracle.
             grad_output: Routed upstream gradient supplied to the native launch.
             execution: Native intermediates containing the computed SwiGLU gradient.
+            **launch_options: Options forwarded to the original launch.
         """
         nonlocal observed_calls
-        original_launch(plan, saved, grad_output, execution, stream=stream)
+        original_launch(plan, saved, grad_output, execution, **launch_options)
         torch.npu.synchronize(baseline.DEVICE)
         rows = int(saved.group_list[-1].item())
         gate, up = saved.up_proj[:rows].detach().cpu().double().chunk(2, dim=-1)

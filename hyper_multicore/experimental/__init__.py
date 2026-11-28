@@ -20,6 +20,12 @@ Importing tuning options does not load the MegaMoe executor or initialize an
 NPU runtime.
 """
 
+from hyper_multicore.modules.base_planner import BasePlanner, ExpertPlacement, PlacementRequest
+from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
+
 from ._mega_moe import MegaMoeTuningOptions, MegaMoeSchedulerOptions
 
-__all__ = ["MegaMoeTuningOptions", "MegaMoeSchedulerOptions"]
+__all__ = [
+    "MegaMoeTuningOptions", "MegaMoeSchedulerOptions",
+    "BasePlanner", "ExpertPlacement", "PlacementRequest", "HotReplicaPlanner",
+]

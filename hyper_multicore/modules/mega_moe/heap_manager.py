@@ -35,13 +35,19 @@ from .spec import (
     MegaMoeSpec,
     _align_capacity,
     _grow_receive_capacity,
+    _grow_source_capacity,
     _resolve_receive_capacity,
 )
 from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
 
 
 _HEAP_GRANULARITY_BYTES = 2 * 1024 * 1024
+_HEAP_SIZE_ENV = "HYPER_MULTICORE_SHMEM_HEAP_SIZE"
 _HEAP_MANAGER = None
+
+
+class _HeapCapacityError(RuntimeError):
+    """An alignment-correct reservation exceeds the configured heap bytes."""
 
 
 def _round_heap_bytes(value: int) -> int:
@@ -107,7 +113,7 @@ def _workspace_layout(
         physical["local_num_tokens"] = token_capacity
     if capacity is None:
         capacity = _resolve_receive_capacity(
-            specification["initial_capacity_factor"],
+            specification["initial_capacity_factor"] if specification.get("dispatch_mode", "push") == "push" else None,
             physical["local_num_tokens"] * specification["top_k"],
             specification["ep_size"],
         )
@@ -169,21 +175,32 @@ class _HeapManager:
         reservations: tuple[tuple[Mapping[str, Any], _WorkspaceLayout], ...],
         *,
         allow_resize: bool,
-        initial_headroom: int = 0,
+        workspace_growth: tuple[MegaMoeWorkspace, int, int] | None = None,
+        preferred_receive: int | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         """Add lazy reservations and resize an attached Runtime when required."""
         with self.access():
             previous_count = len(self.entries)
             previous_configuration = self._configured, self.heap_limit, self.heap_bytes
             added_specifications = self._reserve(reservations)
-            layouts = [entry.layout for entry in self.entries]
             try:
-                configured = os.getenv("HYPER_MULTICORE_SHMEM_HEAP_SIZE")
+                layouts = [entry.layout for entry in self.entries]
+                growth = None
+                if workspace_growth is not None:
+                    if not self._runtime_attached:
+                        raise RuntimeError("Workspace growth requires an attached SHMEM Runtime")
+                    workspace, tokens, received = workspace_growth
+                    growth = self._token_growth_layouts(
+                        self._entry_for_workspace(workspace), tokens, received, preferred_receive=preferred_receive,
+                    )
+                    if growth is not None:
+                        _, layouts = growth
                 if not self._configured:
+                    configured = os.getenv(_HEAP_SIZE_ENV)
                     self._run_and_check_consistency(
-                        lambda: self._configure(configured, initial_headroom),
+                        lambda: self._configure(configured),
                         stage="Configuration",
-                        value=(configured, str(self.dtype), tuple(layouts), initial_headroom),
+                        value=(configured, str(self.dtype), tuple(layouts)),
                     )
                     self._configured = True
                 else:
@@ -193,10 +210,10 @@ class _HeapManager:
                         value=tuple(layouts),
                     )
                     required = self._required_bytes(layouts)
-                    if required > self.heap_bytes:
-                        if self.workspaces and not allow_resize:
-                            raise RuntimeError("Create all resources before initializing a fixed SHMEM layout")
+                    if required > self.heap_bytes or growth is not None:
                         heap_bytes = self._budget(required)
+                        if self.workspaces and not allow_resize:
+                            raise RuntimeError("Cannot grow SHMEM while a static Pull workspace is bound")
                         if self._runtime_attached:
                             self._restart(layouts, heap_bytes)
                         else:
@@ -327,16 +344,15 @@ class _HeapManager:
             entry = self._entry_for_workspace(workspace)
             if entry.bound_spec is None:
                 raise RuntimeError("SHMEM Heap workspace has no bound MegaMoe specification")
-            capacity, minimum = _grow_receive_capacity(
+            capacity = _grow_receive_capacity(
                 entry.bound_spec,
                 entry.layout.receive_capacity,
                 maximum_received_slots,
             )
-            layout = _workspace_layout(entry.specification, self.dtype, capacity, entry.layout.token_capacity)
-            layouts = [layout if item is entry else item.layout for item in self.entries]
-            if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
-                layout = _workspace_layout(entry.specification, self.dtype, minimum, entry.layout.token_capacity)
-                layouts = [layout if item is entry else item.layout for item in self.entries]
+            tokens = entry.layout.token_capacity
+            _, layouts = self._growth_layouts(
+                entry, capacity, tokens, minimum=(_align_capacity(maximum_received_slots), tokens),
+            )
             self._restart(layouts, self._budget(self._required_bytes(layouts)))
 
     def ensure_token_capacity(self, workspace: MegaMoeWorkspace, tokens: int, received: int) -> MegaMoeSpec:
@@ -352,36 +368,61 @@ class _HeapManager:
         """
         with self.access():
             entry = self._entry_for_workspace(workspace)
-            spec = entry.bound_spec
-            if spec is None or not spec.auto_tokens:
-                raise RuntimeError("Automatic token growth requires an automatic workspace")
-            grow_source = tokens > spec.local_num_tokens
-            grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
-            if not grow_source and not grow_receive:
-                return spec
-            factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
-            token_limit = ((2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128) * 128
-            token_capacity = (_align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
-                              if grow_source else spec.local_num_tokens)
-            receive_capacity = entry.layout.receive_capacity
-            if grow_receive:
-                receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
-            layout = _workspace_layout(entry.specification, self.dtype, receive_capacity, token_capacity)
-            layouts = [layout if item is entry else item.layout for item in self.entries]
-            if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
-                layout = _workspace_layout(entry.specification, self.dtype,
-                                           max(entry.layout.receive_capacity, _align_capacity(received)),
-                                           max(spec.local_num_tokens, tokens))
-                layouts = [layout if item is entry else item.layout for item in self.entries]
-            self._restart(layouts, self._budget(self._required_bytes(layouts)))
+            growth = self._token_growth_layouts(entry, tokens, received)
+            if growth is None:
+                return entry.bound_spec
+            _, layouts = growth
+            required = self._required_bytes(layouts)
+            heap_bytes = self._budget(required)
+            self._restart(layouts, heap_bytes)
             return entry.bound_spec
+
+    def _token_growth_layouts(
+        self, entry: _HeapEntry, tokens: int, received: int, *, preferred_receive: int | None = None,
+    ) -> tuple[_WorkspaceLayout, list[_WorkspaceLayout]] | None:
+        """Project one dynamic workspace growth against all pending reservations."""
+        spec = entry.bound_spec
+        if spec is None or not spec.auto_tokens:
+            raise RuntimeError("Automatic token growth requires an automatic workspace")
+        grow_source = tokens > spec.local_num_tokens
+        preferred = max(received, preferred_receive or 0)
+        grow_receive = spec.dispatch_mode == "push" and preferred > entry.layout.receive_capacity
+        if not grow_source and not grow_receive:
+            return None
+        factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
+        token_capacity = spec.local_num_tokens
+        if grow_source:
+            token_capacity = _grow_source_capacity(token_capacity, tokens, factor, spec.hidden_size, spec.top_k)
+        receive_capacity = entry.layout.receive_capacity
+        if grow_receive:
+            receive_capacity = _align_capacity(max(preferred, math.ceil(min(2**31 - 1, receive_capacity * factor))))
+        minimum_tokens = _align_capacity(tokens) if grow_source else spec.local_num_tokens
+        minimum_received = (max(entry.layout.receive_capacity, _align_capacity(received))
+                            if grow_receive else entry.layout.receive_capacity)
+        layout, layouts = self._growth_layouts(
+            entry, receive_capacity, token_capacity, minimum=(minimum_received, minimum_tokens),
+        )
+        return None if layout == entry.layout else (layout, layouts)
+
+    def _growth_layouts(
+        self, entry: _HeapEntry, received: int, tokens: int | None, *, minimum: tuple[int, int | None],
+    ) -> tuple[_WorkspaceLayout, list[_WorkspaceLayout]]:
+        """Try exact route capacity if geometric headroom exceeds the configured heap."""
+        layout = _workspace_layout(entry.specification, self.dtype, received, tokens)
+        layouts = [layout if item is entry else item.layout for item in self.entries]
+        if (self.heap_limit is not None and (received, tokens) != minimum
+                and self._required_bytes(layouts) > self.heap_limit):
+            layout = _workspace_layout(entry.specification, self.dtype, *minimum)
+            layouts = [layout if item is entry else item.layout for item in self.entries]
+        return layout, layouts
 
     @staticmethod
     def _layout_spec(entry: _HeapEntry, layout: _WorkspaceLayout) -> MegaMoeSpec:
         """Project candidate capacities without modifying a committed specification."""
+        spec = entry.bound_spec
         if layout.token_capacity is None:
-            return entry.bound_spec
-        return replace(entry.bound_spec, local_num_tokens=layout.token_capacity,
+            return spec
+        return replace(spec, local_num_tokens=layout.token_capacity,
                        receive_capacity=layout.receive_capacity)
 
     @staticmethod
@@ -390,34 +431,27 @@ class _HeapManager:
         return _round_heap_bytes(sum(layout.required_bytes for layout in layouts))
 
     def _budget(self, required: int) -> int:
-        """Apply the explicit limit or preserve the grow-only physical Heap size."""
-        if self.heap_limit is not None and required > self.heap_limit:
-            raise RuntimeError(
-                f"SHMEM growth exceeds explicit Heap budget: required={required}, limit={self.heap_limit}"
-            )
-        return self.heap_limit if self.heap_limit is not None else max(self.heap_bytes, required)
+        """Use the configured heap size or grow an automatic heap to fit."""
+        if self.heap_limit is None:
+            return max(self.heap_bytes, required)
+        if required > self.heap_limit:
+            raise _HeapCapacityError(f"MegaMoE layout exceeds {_HEAP_SIZE_ENV}: "
+                                     f"required={required} bytes, limit={self.heap_limit} bytes")
+        return self.heap_limit
 
-    def _configure(self, configured: str | None, headroom: int = 0) -> None:
-        """Validate the explicit Heap limit and budget unbound reservations."""
-        required = _round_heap_bytes(sum(entry.layout.required_bytes for entry in self.entries) + headroom)
+    def _configure(self, configured: str | None) -> None:
+        """Freeze the configured limit before the first runtime attach."""
         if configured is not None:
             try:
-                self.heap_limit = int(configured)
+                limit = int(configured)
             except ValueError as error:
-                raise ValueError(
-                    "HYPER_MULTICORE_SHMEM_HEAP_SIZE must be a positive integer number of bytes"
-                ) from error
-            if self.heap_limit <= 0:
-                raise ValueError("HYPER_MULTICORE_SHMEM_HEAP_SIZE must be positive")
-            if self.heap_limit < required:
-                raise RuntimeError(
-                    f"HYPER_MULTICORE_SHMEM_HEAP_SIZE is too small: requires at least {required} bytes"
-                )
-            if self.heap_limit % _HEAP_GRANULARITY_BYTES:
-                raise ValueError(
-                    "HYPER_MULTICORE_SHMEM_HEAP_SIZE must be a multiple of the 2 MiB physical page size"
-                )
-        self.heap_bytes = self._budget(required)
+                raise ValueError(f"{_HEAP_SIZE_ENV} must be a positive integer number of bytes") from error
+            if limit <= 0:
+                raise ValueError(f"{_HEAP_SIZE_ENV} must be positive")
+            if limit % _HEAP_GRANULARITY_BYTES:
+                raise ValueError(f"{_HEAP_SIZE_ENV} must be a multiple of the 2 MiB physical page size")
+            self.heap_limit = limit
+        self.heap_bytes = self._budget(self._required_bytes([entry.layout for entry in self.entries]))
 
     def _reserve(
         self,
@@ -582,14 +616,18 @@ class _HeapManager:
             if entry.workspace is not None:
                 entry.workspace.capacity_floor = layout.receive_capacity
         self.heap_bytes = heap_bytes
+        self._record_growth(started, old_bytes, stages_ms=stages_ms)
+
+    def _record_growth(self, started: float, old_bytes: int, **details: Any) -> None:
+        """Publish the event only after all changed resources and capacities are committed."""
         self.epoch += 1
         self.growth_records.append({
             "epoch": self.epoch,
             "old_heap_bytes": old_bytes,
-            "heap_bytes": heap_bytes,
-            "stages_ms": stages_ms,
+            "heap_bytes": self.heap_bytes,
             "total_ms": (time.perf_counter() - started) * 1000,
             "capacities": [entry.layout.receive_capacity for entry in self.entries],
+            **details,
         })
 
 

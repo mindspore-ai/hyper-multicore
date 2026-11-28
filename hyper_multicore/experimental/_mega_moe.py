@@ -17,6 +17,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from hyper_multicore.modules.base_planner import BasePlanner
+
 
 @dataclass(frozen=True)
 class MegaMoeSchedulerOptions:
@@ -33,7 +35,7 @@ class MegaMoeSchedulerOptions:
             per-expert pipeline ordering. ``None`` is equivalent to ``False``.
         nominal_schedule: On arch22 BF16 compact, ``True`` limits the lane count
             using nominal rows per group. ``None`` is equivalent to ``False``.
-        lowering: ``"auto"`` selects compact for eligible arch22 BF16 Push plans;
+        lowering: ``"auto"`` selects compact for eligible arch22 BF16 plans;
             ``"dense"`` uses fixed partitions and ``"compact"`` requires eligibility.
             On arch35, both precisions use dense lowering.
     """
@@ -56,15 +58,19 @@ class MegaMoeTuningOptions:
     Args:
         dispatch_mode: ``"push"`` uses PUT dispatch; ``"pull"`` uses GET dispatch.
             Both modes use PUT for combine.
-        initial_capacity_factor: Initial push receive capacity multiplier. ``None``
-            selects 1.25 for push. Pull rejects explicit capacity factors.
-        capacity_growth_factor: Push capacity growth multiplier. ``None`` selects
-            1.25 for push; 1.0 grows to the aligned current demand. Explicit
+        initial_capacity_factor: Initial reservation multiplier for Push receive
+            rows or Pull source tokens. ``None`` selects 1.25 for Push and 1.0 for Pull.
+        capacity_growth_factor: Growth multiplier for source tokens and the Push
+            receive reservation. ``None`` selects 1.25; 1.0 grows to the aligned demand. Explicit
             factors must be finite numbers at least 1, excluding bool.
         dispatch_split: Dispatch tile rows in forward and backward; a positive
             integer multiple of 128, excluding bool.
         combine_split: Combine tile rows, with the same constraints as dispatch.
         scheduler: Optional per-instance math scheduling and lowering options.
+        expert_placement: A3 BF16 HotReplica planner for a multi-rank EP group.
+            None keeps experts on their home ranks.
+        replica_bank: "shared" leases one compatible bank across serial layers.
+            "dedicated" reserves a separate bank for this executor's resource group.
     """
 
     dispatch_mode: Literal["push", "pull"] = "push"
@@ -73,3 +79,5 @@ class MegaMoeTuningOptions:
     dispatch_split: int = 128
     combine_split: int = 128
     scheduler: MegaMoeSchedulerOptions | None = None
+    expert_placement: BasePlanner | None = None
+    replica_bank: Literal["shared", "dedicated"] = "shared"

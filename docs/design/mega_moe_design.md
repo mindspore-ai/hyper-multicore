@@ -77,7 +77,7 @@ BF16 的 plan 将实际 H/I 传给 GMM 与 SwiGLU tiling 准备逻辑。
 
 | 内部状态 | BF16 | MXFP8 |
 | --- | --- | --- |
-| 梯度存储 | 按 counts 处理冷专家 dW；已消费的 dispatch 暂存可以用于 dX | 预先清零 partial dW，dX 单独分配 |
+| 梯度存储 | 按 counts 处理冷专家 dW；已消费的 dispatch 暂存可以用于 dX | 根据接收计数为可能为空的专家初始化 partial dW，dX 单独分配 |
 | 反向保存 | 保存对应调用的激活、映射和 plan | 保存反向所需结果及原始权重 root，反向重新解析物理存储 |
 
 BF16 前向的任务图由组件生成。FC2 前概率加权的反向需要恢复未加权激活，数值关系见
@@ -96,6 +96,13 @@ MXFP8 在分发后的专家输入及中间激活上准备量化数据，GMM 使�
 [execution](../../hyper_multicore/modules/mega_moe/backends/mxfp8/execution.py)及
 [权重绑定](../../hyper_multicore/modules/mega_moe/backends/mxfp8/weights.py)解释，
 不能直接套用 BF16 的 task 数、tiling 或 native 算子参数表。
+
+对启用 MXFP8 副本的路由，执行器按投影传输本次调用的量化权重和 scale，再发布各槽位的
+weight-ready 信号。反向在完整 FP32 TN 生产完成后归并副本 dW，两组投影归并共享一轮 ACK。
+使用 UDMA 的 peer 上，token 传输保持 QP0 归属，四个梯度 helper 使用独占 QP。
+普通路由可回读含各目标 rank 本地专家最小接收量的压缩摘要。
+MXFP8 副本训练的完整计数快照同时提供路由校验和冷规划使用的专家总行数。
+执行器仅在该值大于零时省去整块原属专家 dW 的初始化，空专家仍产生零梯度。
 
 ### 辅助计算与诊断
 
@@ -153,6 +160,8 @@ worker 的队列选择、依赖等待和完成发布见[运行时模型](../arch
 normal、profile 和支持 L1 dump 的路径复用队列执行逻辑；采集开销仍可能改变运行中实际观察到的就绪顺序。
 
 arch22 BF16 支持 compact、nominal 和专家批处理；compact 的粒度变化先于队列编排。
+A3 BF16 HotReplica 的 compact Pull 由执行 rank 按实际行数切分每个 peer 和专家的 GET。
+空分片也发布本地完成事件。连续 token 分片达到 4 MiB 时，MTE 单次搬运上限为 32 KiB。
 arch35 BF16 与 MXFP8 将各自数学阶段映射到共享专家调度策略，通信采用固定 owner 和 FIFO 队列，
 数学队列可以进行独立就绪选择。
 
@@ -262,6 +271,22 @@ source 容量、调度行数与实际 owner 接收量分别维护：source/返�
 借用所需通信存储并组织数学计算。Pull 的源发布与消费处于同一租约内，自动扩容发生在占用租约之前。
 各后端独立管理 plan 缓存；反向保留原调用需要的 plan 和状态，不使用模块后来一次调用的“最新结果”。
 
+HotReplica 的放置计数以正向执行提交为准（`placements` 及各模式的 `*_bindings`）。
+内置 planner 根据逻辑路由、拓扑、槽位预算和显式接收上限选择放置，按计算节省、副本启用和搬运成本评分。
+接收工作区扩容及实际 SHMEM 字节预算由资源管理路径处理。
+`placement_candidates` 记录物化后的候选，`heap_rejections` 和 `protocol_rejections` 记录相应的拒绝原因。
+
+Ascend950 BF16 Pull 先选择普通或虚拟专家路由，再取得相应工作区租约并置换到对称源区。
+事件容量兼容的两种布局共用工作区。重算复用保存的落位时，在所选租约内重新发布当前输入。
+
+MXFP8 Push 的 home 和副本路径从首次执行起共用 home 的对称接收区、返回区和完成事件链。
+副本先命中时先物化副本方向事件和 FP32 梯度 bank，再分配 home 工作区。
+两条路径分别维护路由几何与方向事件，共享接收区按观察到的两路需求扩展。
+反向从当前租约取得接收区和返回区。前向留图时保存独立的激活副本。
+MXFP8 Push 在常驻缓冲之后分配接收区。只增长接收区时，若同一堆可容纳最终布局但容不下新旧接收区，
+各 rank 等上一租约完成并达成一致，再释放旧区和分配新区。若各 rank 均遇到对称分配失败，
+先恢复已提交的接收区形状，再进入现有重建流程。
+
 BF16 缓存考虑 token 桶和 partial dW 精度；MXFP8 按覆盖范围与接收容量组织缓存，Pull 使用容量上界复用 plan。
 这些缓存粒度是内部策略，不改变实际输出形状，也不代表两个后端具有相同命中率或存储布局。
 
@@ -273,6 +298,21 @@ BF16 缓存考虑 token 桶和 partial dW 精度；MXFP8 按覆盖范围与接�
 这些机制由[组件 workspace](../../hyper_multicore/modules/mega_moe/workspace.py)维护，SHMEM 不解释专家容量公式。
 资源共享、显式关闭和自动清理的用户约定见[资源共享与关闭](../mega_moe.md#资源共享与关闭)，
 物理重建见 [SHMEM restart](../shmem.md#runtime-restart)。
+
+### 专家布局重放
+
+训练框架为每次 checkpoint 调用创建独立的重放记录，并提供参数逻辑版本查询。
+非重入模式使用 `ReplayCheckpoint.contexts` 提供原前向和重算的上下文。
+重入模式使用 `wrap_checkpoint`，由包装器根据梯度开关进入相应上下文。
+这两个入口位于 [HotReplica 组件内部](../../hyper_multicore/modules/hot_replica/checkpoint.py)。
+
+重放记录保存原前向的落位、有序 Top-K IDs，以及调用方提供的逻辑专家计数。
+重算在设备上检查路由输入，并沿用现有 EP 投票确认布局。非重入反向持有原前向的 plan 和权重绑定，
+因此非重入布局确认失败时全组报错。重入重算可在布局未命中时重新规划。
+
+取得 bank 租约后，重入重算可恢复布局确认通过的 guest 权重快照。
+在 FC2 前乘路由概率且各 rank 激活预算和重放校验均满足时，Push 和 Pull 可复用原前向激活。
+跳过重算前向的次数计入 `skipped_recomputes`。
 
 ### 自动回收与清理接入
 
@@ -291,7 +331,8 @@ SHMEM Python 层通过进程级引用计数管理通信 runtime 的生命周期�
 单个资源组关闭时释放自己的 workspace，资源池完成全部集体清理后再调用一次 `shmem.release()`。
 
 因此，替换不同配置的孤儿 workspace 不会触发通信 runtime 反复关闭和初始化。
-更大模型首次绑定时，可以在这份独占引用内按实际 heap 容量重启 runtime。
+更大模型首次绑定时，Heap Manager 先核对布局能否满足显式堆上限，再在需要时使用独占引用重启 runtime。
+未设置堆上限时，目标堆大小按实际布局增长。
 其他组件直接使用 SHMEM 时持有各自的引用；存在其他使用者时，MegaMoE 不能独占并重启 runtime。
 
 ## 扩展与验证

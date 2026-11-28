@@ -15,9 +15,12 @@
 """BF16 autograd launch and restoration over the common invocation lifecycle."""
 from typing import Any, TYPE_CHECKING
 import torch
+
+from hyper_multicore.modules.hot_replica.shmem_transfer import ReplicaExecutionMode
+
 from ...route import PreparedTopKRoute, restore_topk_output
 
-from .autograd import _CheckpointedPushFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
+from .autograd import _CheckpointedMegaMoeFunction, execute_mega_moe_with_permutation, _execute_mega_moe_without_autograd
 
 if TYPE_CHECKING:
     from .resources import BF16Resources
@@ -31,50 +34,58 @@ def forward(
 ) -> torch.Tensor:
     """Launch BF16 experts over the route prepared by the frontend."""
     del module
-    module_resources = resources
-    resources = route.execution_resources or resources
-    if route.weight_binding is None:
-        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
-    else:
-        placement = route.weight_binding.placement
-        num_experts = placement.counts_by_source.shape[1]
-        placement_owner = module_resources.placement
-        home = module_resources.spec.local_experts
-        nominal = (
-            placement_owner.source_bound is not None
-            and home >= 2 * resources.spec.num_cube_cores and resources.spec.intermediate_size < 2048
-            and resources.spec.lowering != "dense" and resources.spec.ready_depth is None
-        )
-        plan = resources.plan_for_tokens(
-            route.metadata.plan_tokens, hidden_flat.device,
-            weight_grad_dtype=torch.float32 if placement_owner.source_bound is not None else None,
-            route_experts=num_experts, nominal_schedule=nominal,
-            batch_experts=nominal and route.metadata.plan_tokens * resources.spec.top_k <= 128 * home,
-        )
     pull = resources.spec.dispatch_mode == "pull"
     before_fc2 = resources.spec.apply_probs_before_fc2
-    options = {} if route.weight_binding is None else {"weight_binding": route.weight_binding}
+    binding = route.weight_binding
+    plan_options = {}
+    if binding is not None:
+        binding, plan_options = _prepare_replica_binding(binding, route.tensor_dump, resources.spec.num_experts)
+    plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device, **plan_options)
+    options = {} if binding is None else {"weight_binding": binding}
     record = route.checkpoint_record
     if not torch.is_grad_enabled():
         save = None
         if record is not None and before_fc2 and hidden_flat.shape[0]:
             save = _save_replay_activations(record, plan.spec, route, hidden_flat, topk_weights)
-        return _execute_mega_moe_without_autograd(
+        output = _execute_mega_moe_without_autograd(
             topk_weights, *weights, route, plan, resources.workspace,
-            workspace_claimed=pull, save_activation=save, **options).reshape_as(hidden_states)
-    if record is not None and record.allow_activation:
-        module_resources.placement.statistics["skipped_recomputes"] += 1
-        return _CheckpointedPushFunction.apply(
+            workspace_claimed=pull, save_activation=save, **options)
+        if record is not None and binding is not route.weight_binding:
+            # Both bank layouts save the same owned guest records. The
+            # original binding still selects its own replay protocol.
+            route.weight_binding.snapshot = binding.snapshot
+    elif record is not None and record.allow_activation:
+        resources.placement.statistics["skipped_recomputes"] += 1
+        return _CheckpointedMegaMoeFunction.apply(
             hidden_flat, *weights, route.metadata, plan, resources.workspace,
-            record.activation, topk_weights, False, route.weight_binding,
+            record.activation, topk_weights, binding,
         ).reshape_as(hidden_states)
-    output = execute_mega_moe_with_permutation(
-        hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
-        topk_weights=topk_weights if pull or before_fc2 else None,
-        workspace_claimed=pull, **options)
-    if not pull and not before_fc2:
-        output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
+    else:
+        integrated_unpermute = pull or before_fc2
+        output = execute_mega_moe_with_permutation(
+            hidden_flat, topk_ids, *weights, route, plan, resources.workspace,
+            topk_weights=topk_weights if integrated_unpermute else None,
+            workspace_claimed=pull, **options)
+        if not integrated_unpermute:
+            output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
+    if binding is not None:
+        resources.placement.record_submission(binding.mode)
     return output.reshape_as(hidden_states)
+
+
+def _prepare_replica_binding(binding, tensor_dump, num_experts):
+    """Match the plan to the execution slots, gradient precision and diagnostic mode."""
+    options = {}
+    route_experts = binding.placement.counts_by_source.shape[1]
+    if route_experts != num_experts:
+        options["route_experts"] = route_experts
+    if binding.mode is ReplicaExecutionMode.FP32_BAND:
+        options["weight_grad_dtype"] = torch.float32
+    if binding.fused and tensor_dump:
+        binding = binding.for_tensor_dump()
+    if binding.fused:
+        options.update(replica_pipeline=True, reserve_merge_workers=binding.owns_returns)
+    return binding, options
 
 
 def _save_replay_activations(record, spec, route, hidden: torch.Tensor, probs: torch.Tensor):

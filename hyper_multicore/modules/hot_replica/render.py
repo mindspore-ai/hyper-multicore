@@ -12,84 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Render virtual experts with AscendC metadata and existing NPU indexing ops."""
+"""Render immutable expert quotas into executor slot geometry."""
 
-import torch
+import numpy as np
 
-from .allocator import _device_ub_bytes, load_allocator
-
-
-def _native_counts(
-    gathered: torch.Tensor,
-    cumulative: torch.Tensor,
-    copies: torch.Tensor,
-    rank: int,
-    extra: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build counts and labels for each source and virtual expert slot."""
-    ranks, experts = gathered.shape
-    local = experts // ranks
-    width = local + extra
-    home = torch.arange(experts, device=gathered.device, dtype=torch.int32).reshape(ranks, local)
-    table = torch.cat((home, copies[:, :extra]), dim=1)
-    valid = table >= 0
-    indices = table.clamp_min(0).long()
-    destination_starts = torch.cat((torch.zeros_like(cumulative[:, :1]), cumulative[:, :-1]), dim=1)
-    ends = cumulative.T.gather(1, indices)
-    starts = destination_starts.T.gather(1, indices)
-    source_ends = gathered.cumsum(0, dtype=torch.int32)
-    source_starts = source_ends - gathered
-    end_rows = source_ends.index_select(1, indices.flatten()).reshape(ranks, ranks, width)
-    start_rows = source_starts.index_select(1, indices.flatten()).reshape(ranks, ranks, width)
-    counts = (torch.minimum(end_rows, ends) - torch.maximum(start_rows, starts)).clamp_min_(0)
-    counts.masked_fill_(~valid, 0)
-    lookup = torch.zeros((ranks, experts + 1), dtype=torch.int32, device=gathered.device)
-    slots = torch.arange(width, device=gathered.device, dtype=torch.int32).expand(ranks, width)
-    lookup.scatter_(1, table.masked_fill(~valid, experts).long(), slots)
-    repeats = (
-        torch.minimum(source_ends[rank, :, None], cumulative)
-        - torch.maximum(source_starts[rank, :, None], destination_starts)
-    ).clamp_min_(0)
-    labels = lookup[:, :experts].T + torch.arange(ranks, device=gathered.device, dtype=torch.int32) * width
-    # Match the native metadata ABI for unassigned expert/destination pairs.
-    labels.masked_fill_(repeats == 0, 0)
-    return counts.reshape(ranks, ranks * width), repeats.flatten(), labels.flatten()
+from ._planner.plan import ExpertExecutionPlan
 
 
-def render_expert_major(
-    gathered: torch.Tensor,
-    cumulative: torch.Tensor,
-    copies: torch.Tensor,
-    rank: int,
-    extra: int,
-    routes: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expand count-dependent assignments independently of token order."""
-    ranks, experts = gathered.shape
-    width = experts // ranks + extra
-
-    def aligned(value: int) -> int:
-        """Align metadata lengths for the native vector scratch layout."""
-        return (value + 7) // 8 * 8
-
-    scratch_bytes = (5 * aligned(ranks * experts) + aligned(experts) + aligned(ranks * width)) * 4
-    if scratch_bytes <= _device_ub_bytes(gathered.device.index) * 3 // 4:
-        counts, repeats, labels = load_allocator().render(gathered, cumulative, copies, rank, width)
-    else:
-        counts, repeats, labels = _native_counts(gathered, cumulative, copies, rank, extra)
-    return torch.repeat_interleave(labels, repeats, output_size=routes), counts
-
-
-def render_route(
-    ids: torch.Tensor,
-    inverse: torch.Tensor,
-    gathered: torch.Tensor,
-    cumulative: torch.Tensor,
-    copies: torch.Tensor,
-    rank: int,
-    extra: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expand expert-major assignments and restore the current token order."""
-    sorted_ids, counts = render_expert_major(gathered, cumulative, copies, rank, extra, ids.numel())
-    virtual = sorted_ids.index_select(0, inverse.flatten()).reshape_as(ids)
-    return virtual, counts
+def render_plan(
+    plan: ExpertExecutionPlan, rank: int, borrowed: int,
+) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, ...], ...]]:
+    """Trim empty tails and retain the source's stable logical expert order."""
+    config = plan.config
+    home, ranks, full = config.home_experts, config.ep_size, config.slots_per_rank
+    width = home + borrowed
+    owners = tuple(row[home:width] for row in plan.slot_to_logical)
+    table = np.frombuffer(plan.dispatch_counts_bytes, dtype=np.int32).reshape(ranks, ranks, full)
+    table = table[:, :, :width].copy().reshape(ranks, -1)
+    logical = np.asarray(plan.slot_to_logical, dtype=np.int32)[:, :width].reshape(-1)
+    slots = np.argsort(logical, kind="stable").astype(np.int32, copy=False)
+    return np.repeat(slots, table[rank, slots]), table, owners

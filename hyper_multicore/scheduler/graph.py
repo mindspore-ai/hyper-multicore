@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, List, Optional, Tuple, Union
 
-from hyper_multicore.scheduler.config import TaskSplitValue
+from hyper_multicore.scheduler.config import TaskDescC, TaskSplitValue
 
 
 class OpType(Enum):
@@ -115,6 +115,7 @@ class OperatorNode:
     diagnostic_view_resolver: Optional[Callable[..., Any]] = None
     diagnostic_host_ports: bool = False  # Native hard-coded ABI operands, not TaskDesc TensorDesc arrays.
     tensor_effects: tuple[TensorEffect, ...] = ()
+    diagnostic_parameter_position: Optional[Callable[[TaskDescC, str, int, int], int]] = None
 
     predecessors:    List['OperatorNode'] = field(default_factory=list)
     successors:      List['OperatorNode'] = field(default_factory=list)

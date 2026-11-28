@@ -19,7 +19,7 @@ from types import ModuleType
 
 import torch
 
-from .allocator import load_native_extension
+from .native import load_native_extension
 
 
 @lru_cache(maxsize=1)
@@ -65,14 +65,15 @@ def reduce_banks(
     if count:
         for slot, gradient in zip(slots, gradients):
             slot[:count].copy_(gradient[local : local + count])
+    bridge = load_bridge()
+    native_home = getattr(bridge, "native_home_gradient", False) is True
     owners = []
     for i, gradient in enumerate(gradients):
-        home = gradient[:local].float()
-        result = (
-            torch.empty_like(home, dtype=torch.bfloat16)
-            if output_dtypes is not None and output_dtypes[i] == torch.bfloat16
-            else home
-        )
-        load_bridge().reduce(home, result, slots[i], copies, rank, blocks, i == 0, i + 1 == len(banks))
+        home = gradient[:local]
+        bf16 = output_dtypes is not None and output_dtypes[i] == torch.bfloat16
+        if not bf16 or not native_home:
+            home = home.float()
+        result = torch.empty_like(home, dtype=torch.bfloat16) if bf16 else home
+        bridge.reduce(home, result, slots[i], copies, rank, blocks, i == 0, i + 1 == len(banks))
         owners.append(result)
     return tuple(owners)

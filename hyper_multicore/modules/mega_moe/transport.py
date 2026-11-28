@@ -32,11 +32,11 @@ def requested_transport() -> str | None:
 
 
 def transport_queues(cfg, spec, task_ids):
-    """Preserve RATR order on each QP0 owner and distribute independent self copies.
+    """Preserve RATR order on each QP0 owner and distribute independent copies.
 
     This is a MoE planning policy, not a SHMEM hardware requirement. Different
-    peers remain independent; all posts and quiet calls for one peer share one
-    odd AIV owner. Math placement is deliberately outside this function.
+    peers remain independent; all posts and quiet calls for one UDMA peer share
+    one odd AIV owner. MTE Pull can parallelize disjoint reads of a remote source.
     """
     lanes = spec.num_cube_cores
     vectors = [[] for _ in range(2 * lanes)]
@@ -44,6 +44,7 @@ def transport_queues(cfg, spec, task_ids):
                    for peer in range(spec.ep_size) if peer != spec.rank_id}
     idle = [worker for worker in range(1, 2 * lanes, 2) if worker not in peer_owners.values()]
     self_workers = idle or list(range(1, 2 * lanes, 2))
+    read_lanes = max(1, lanes // spec.ep_size)
     for tid in task_ids:
         task = cfg.all_tasks[tid]
         if task.task_type == TaskType.TASK_TERMINATE:
@@ -56,9 +57,13 @@ def transport_queues(cfg, spec, task_ids):
         if width == 0 or tiles == 0:
             raise ValueError("Invalid MoE transport partition")
         peer, local_slot = divmod(task.task_index, width)
+        expert, tile = divmod(local_slot, tiles)
         if peer == spec.rank_id:
-            expert, tile = divmod(local_slot, tiles)
             worker = self_workers[(expert + tile) % len(self_workers)]
+        elif read_lanes > 1 and spec.transport_engine == "mte" and task.task_type == TaskType.TASK_SHMEM_GET_MEM:
+            stripe = (expert + tile) % read_lanes
+            position = (peer - spec.rank_id) % spec.ep_size + stripe * spec.ep_size
+            worker = 2 * position + 1
         else:
             worker = peer_owners[peer]
         set_transfer_engine(task, spec.transport_engine)
@@ -76,6 +81,8 @@ def validate_transport_owners(cfg, spec, vectors):
         for tid in queue:
             task = cfg.all_tasks[tid]
             if task.task_type not in TRANSPORT_TASKS:
+                continue
+            if task.task_type == TaskType.TASK_SHMEM_GET_MEM and spec.transport_engine == "mte":
                 continue
             peer = task.task_index // (task.task_split_num // spec.ep_size)
             if peer == spec.rank_id:

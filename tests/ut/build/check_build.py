@@ -52,6 +52,7 @@ VENDOR = BOOTSTRAP.load_module("vendor_cache")
 WORKSPACE = BOOTSTRAP.load_module("build_workspace")
 ARTIFACTS = BOOTSTRAP.load_module("artifacts")
 MERGE = BOOTSTRAP.load_module("merge_multicore_vendors")
+SOC_SELECTION = BOOTSTRAP.load_module("soc_selection")
 
 
 def write(path: Path, text: str = "fixture") -> Path:
@@ -126,6 +127,31 @@ class BuildChecks(unittest.TestCase):
                 BUILD.parse_arguments(["--soc-list", value])
             self.assertEqual(error.exception.code, 2)
 
+    def test_device_ub_table_uses_platform_identity(self):
+        """Use full INI identities and omit unsupported, incomplete and conflicting rows."""
+        directory = self.root / "aarch64-linux/data/platform_config"
+        rows = (
+            ("Ascend910B2", "Ascend910B", 2201, 196608),
+            ("Ascend910_9382", "Ascend910_93", 2201, 196608),
+            ("Ascend950PR_9599", "Ascend950", 3510, 253952),
+            ("Ascend950DT_9581", "Ascend950", 3510, 253952),
+            ("Ascend910B", "Ascend910", 1001, 262144),
+            ("Ascend310B1", "Ascend310B", 3002, 253952),
+            ("Ascend910_9391", "Ascend910_93", 3510, 253952),
+            ("Ascend910_9381", "Ascend910_93", 2201, 0),
+            ("Ascend910B3", "Ascend910B", 2201, 196608),
+            ("Ascend910B3", "Ascend910B", 2201, 262144),
+        )
+        for index, (name, series, arch, size) in enumerate(rows):
+            write(directory / f"{index}.ini", f"[version]\nSoC_version={name}\nShort_SoC_version={series}\n"
+                  f"NpuArch={arch}\n[AICoreSpec]\nub_size={size}\n")
+        write(directory / "invalid.ini", "missing section\n")
+        self.assertEqual(SOC_SELECTION.read_device_ub_bytes(self.root, "aarch64"), {
+            "2201": {"ascend910b2": 196608, "ascend910_9382": 196608},
+            "3510": {"ascend950pr_9599": 253952, "ascend950dt_9581": 253952},
+        })
+        self.assertEqual(SOC_SELECTION.read_device_ub_bytes(self.root, "x86_64"), {})
+
     def test_native_test_changes_update_identity_and_stop_publication(self):
         """Freeze the contents and membership of the compiled SHMEM test sources."""
         for name in ("setup.py", "MANIFEST.in", "build.sh", "requirements.txt"):
@@ -198,10 +224,19 @@ class BuildChecks(unittest.TestCase):
         self.assertIn(record["id"], record["torch_so"])
         replica_calls = [call for call in commands.calls if "--phase" in call
                       and any(str(value).endswith("/hot_replica/build.py") for value in call)]
-        self.assertEqual([call[call.index("--phase") + 1] for call in replica_calls],
-                         ["common", "adapter"])
-        self.assertEqual(record["hot_replica"]["soc"], "ascend910_93")
-        self.assertEqual(replica_calls[1][replica_calls[1].index("--cxx-standard") + 1], "20")
+        targets = {"arch22": ("ascend910_93", "hot_replica", "2201")}
+        expected = [(backend, target) for backend, target in targets.items()
+                    if target[0] in sdks.get(backend, {}).get("soc_list", ())]
+        phases = [call[call.index("--phase") + 1] for call in replica_calls]
+        self.assertEqual(phases.count("common"), len(expected))
+        self.assertEqual(phases.count("adapter"), len(expected))
+        for backend, (soc, key, arch) in expected:
+            self.assertEqual(record[key]["soc"], soc)
+            device = common / f"shmem/lib/{backend}/hot_replica"
+            common_call = next(call for call in replica_calls if "--npu-arch" in call and str(device) in call)
+            self.assertEqual(common_call[common_call.index("--npu-arch") + 1], arch)
+            adapter = next(call for call in replica_calls if "--device-root" in call and str(device) in call)
+            self.assertEqual(adapter[adapter.index("--cxx-standard") + 1], "20")
         for backend in sdks:
             flag = "-DHP_SHMEM_SOC_TYPE=" + sdks[backend]["sdk_soc_type"]
             binding = next(call for call in configured if flag in call)
@@ -212,7 +247,8 @@ class BuildChecks(unittest.TestCase):
         """Share Torch once and compile every requested binding against its own SDK."""
         previous_common = None
         for socs, mismatch in (("ascend910b,ascend910_93,ascend950", False),
-                               ("ascend910_93", False), ("ascend950", True)):
+                               ("ascend910_93", False), ("ascend950", False),
+                               ("ascend950", True)):
             args = BUILD.parse_arguments(["--soc-list", socs, "--jobs", "1"])
             handoff = {name: {"install_root": str(self.root / name),
                               "sdk_soc_type": BUILD.ARCHITECTURES[name]["sdk_soc_type"],

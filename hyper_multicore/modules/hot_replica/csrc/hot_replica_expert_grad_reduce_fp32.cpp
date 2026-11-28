@@ -28,12 +28,12 @@ __aicore__ inline LocalTensor<T> LocalAt(int32_t offset, TPosition position) {
     return local;
 }
 
-__aicore__ inline void LoadOwner(LocalTensor<float> local,
-                               __gm__ float* source, int32_t elements) {
-    GlobalTensor<float> global;
+template <typename T>
+__aicore__ inline void LoadOwner(LocalTensor<T> local, __gm__ T* source, int32_t elements) {
+    GlobalTensor<T> global;
     global.SetGlobalBuffer(source);
-    DataCopyExtParams copy{1, static_cast<uint32_t>(elements * sizeof(float)), 0, 0, 0};
-    DataCopyPadExtParams<float> padding{false, 0, 0, 0};
+    DataCopyExtParams copy{1, static_cast<uint32_t>(elements * sizeof(T)), 0, 0, 0};
+    DataCopyPadExtParams<T> padding{false, 0, 0, 0};
     DataCopyPad(local, global, copy, padding);
     PipeBarrier<PIPE_ALL>();
 }
@@ -66,11 +66,11 @@ __aicore__ inline void BuildOwnerLists(__gm__ int32_t* plan, __ubuf__ int32_t* h
 }  // namespace
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__
-void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
+void HotReplicaSharedGradReturn(uint64_t ffts, GM_ADDR source_address,
                              GM_ADDR output_address, GM_ADDR slots_address,
                              GM_ADDR plan_address, int32_t experts,
                              int64_t matrix, int32_t ranks, int32_t slots,
-                             int32_t rank, bool bf16, bool publish, bool finish) {
+                             int32_t rank, bool native_home, bool bf16, bool publish, bool finish) {
     util_set_ffts_config(ffts);
     if ASCEND_IS_AIC {
         return;
@@ -89,6 +89,8 @@ void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
     const int64_t tiles = (matrix + kElements - 1) / kElements;
     auto accumulator = LocalAt<float>(kScratch, TPosition::VECIN);
     auto contribution = LocalAt<float>(kScratch + 4*kElements, TPosition::VECIN);
+    auto native = contribution.ReinterpretCast<bfloat16_t>();
+    auto* native_source = reinterpret_cast<__gm__ bfloat16_t*>(source_address);
     for (int32_t expert = 0; expert < experts; ++expert) {
         // Owned native gradients can remain in place when no peer contributes.
         // Every worker still participates in both root barriers.
@@ -99,7 +101,14 @@ void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
             const int64_t begin = tile * kElements;
             const int32_t elements = matrix - begin < kElements ? matrix - begin : kElements;
             const int64_t offset = static_cast<int64_t>(expert) * matrix + begin;
-            LoadOwner(accumulator, source + offset, elements);
+            if (native_home) {
+                LoadOwner(native, native_source + offset, elements);
+                Cast(accumulator, native, RoundMode::CAST_NONE, elements);
+                // The peer read reuses the native input tile after conversion.
+                PipeBarrier<PIPE_ALL>();
+            } else {
+                LoadOwner(accumulator, source + offset, elements);
+            }
             if (heads[expert] >= 0) {
                 for (int32_t rb = heads[expert]; rb >= 0; rb = next[rb]) {
                     const int32_t peer = rb / slots;
@@ -132,23 +141,25 @@ void HotReplicaSharedGradReturnFp32(uint64_t ffts, GM_ADDR source_address,
     if (finish) aclshmemx_barrier_all_vec();
 }
 
-extern "C" ASCEND_HOT_REPLICA_EXPORT int hmc_hot_replica_grad_return_fp32(
+extern "C" ASCEND_HOT_REPLICA_EXPORT int hmc_hot_replica_grad_return(
     void* stream, const void* source, void* output, void* slots,
     const int32_t* plan, int32_t experts, int32_t hidden, int32_t projection,
-    int32_t ranks, int32_t rank, int32_t blocks, int32_t borrowed, bool bf16, bool publish, bool finish) {
-    const int32_t index_entries = (experts + 7) / 8 * 8 + ranks * borrowed;
+    int32_t ranks, int32_t rank, int32_t blocks, int32_t borrowed,
+    bool native_home, bool bf16, bool publish, bool finish) {
+    const int64_t index_entries = (static_cast<int64_t>(experts) + 7) / 8 * 8 +
+                                  static_cast<int64_t>(ranks) * borrowed;
     if (stream == nullptr || source == nullptr || output == nullptr ||
         slots == nullptr || plan == nullptr || experts <= 0 || hidden <= 0 ||
         projection <= 0 || ranks != aclshmem_n_pes() || rank < 0 ||
-        rank >= ranks || blocks <= 0 ||
+        rank >= ranks || blocks <= 0 || borrowed < 0 || borrowed > experts || (native_home && !bf16) ||
         kIndexOffset + index_entries * sizeof(int32_t) > kReservedUb) {
         return ACL_ERROR_INVALID_PARAM;
     }
-    HotReplicaSharedGradReturnFp32<<<blocks, nullptr, stream>>>(
+    HotReplicaSharedGradReturn<<<blocks, nullptr, stream>>>(
         shmemx_get_ffts_config(),
         reinterpret_cast<uint8_t*>(const_cast<void*>(source)),
         reinterpret_cast<uint8_t*>(output), reinterpret_cast<uint8_t*>(slots),
         reinterpret_cast<uint8_t*>(const_cast<int32_t*>(plan)), experts,
-        static_cast<int64_t>(hidden) * projection, ranks, borrowed, rank, bf16, publish, finish);
+        static_cast<int64_t>(hidden) * projection, ranks, borrowed, rank, native_home, bf16, publish, finish);
     return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
 }

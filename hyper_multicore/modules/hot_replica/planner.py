@@ -15,105 +15,122 @@
 """Plan one expert placement over validated EP counts."""
 from __future__ import annotations
 
-from collections import OrderedDict
-from typing import Any
+from sys import float_info
+from typing import Literal
 
-import torch
+import numpy as np
 
 from ..base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from .placement import (
-    bounded_move_pays, build_placement, placement_is_profitable, placement_receive_limit,
-)
+from ._planner.capacity import ExpertReplicaConfig
+from ._planner.receive import bf16_cost, receive_limit, select_replica_plan
 
 
 class HotReplicaPlanner(BasePlanner):
     """Choose execution slots without allocating either backend's workspaces."""
 
-    def __init__(self, *, source_token_bound: int | None = None) -> None:
-        """Set the optional per-rank training row bound used for workspace reservation."""
-        super().__init__(source_token_bound=source_token_bound)
-        self._rejected_routes: OrderedDict[tuple[Any, ...], None] = OrderedDict()
-
-    @torch.no_grad()
-    def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
-        """Return a placement if saved work repays movement or prevents heap growth."""
-        counts = request.counts_by_source
-        ranks, experts = counts.shape
-        local = experts // ranks
-        hidden = request.hidden.shape[-1]
-        size = request.hidden.element_size()
-        target = (request.total_rows + ranks - 1) // ranks
-        maximum = request.maximum_received
-        receive_limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
-        floor = request.ordinary_receive_capacity
-        if floor is not None:
-            if maximum <= target:
-                return None
-
-            def _worth_moving(after):
-                return bounded_move_pays(
-                    maximum, after, hidden, request.intermediate_size, request.cube_cores,
-                    ranks, local, size, training=request.training, replay=request.checkpointing,
-                    apply_probs_before_fc2=request.apply_probs_before_fc2,
-                )
-
-            must_balance = maximum > floor
-            if not must_balance and (maximum <= receive_limit or not _worth_moving(target)):
-                return None
-            placement = self._build(request, target)
-            if placement is not None and (
-                    must_balance and placement.receive_capacity <= floor or _worth_moving(placement.receive_capacity)):
-                return placement
-            return None
-
-        key = request.count_key
-        if key is not None and key in self._rejected_routes:
-            self._rejected_routes.move_to_end(key)
-            return None
-        weight_elements = 3 * local * hidden * request.intermediate_size
-
-        def _pays(after, transfers=None):
-            return placement_is_profitable(
-                maximum, after, hidden, request.intermediate_size, request.cube_cores, weight_elements * size,
-                projection_flops=12 if request.training else 6, ep_size=ranks, local_experts=local,
-                gradient_bytes=weight_elements * 4 if request.training else 0,
-                backward_prefetch_weight_bytes=weight_elements * size if request.training else 0,
-                transfer_experts=transfers,
-            )
-
-        if not _pays(receive_limit):
-            return None
-        placement = self._build(request, receive_limit)
-        if placement is None or _pays(placement.receive_capacity, placement.transfer_experts):
-            return placement
-        if key is not None:
-            self._rejected_routes[key] = None
-            if len(self._rejected_routes) > 32:
-                self._rejected_routes.popitem(last=False)
-        return None
-
-    @torch.no_grad()
-    def plan_native(self, request: PlacementRequest) -> ExpertPlacement | None:
-        """Use the average receive load as the target for framework grouped GEMMs."""
-        ranks, experts = request.counts_by_source.shape
-        local = experts // ranks
-        hidden, size = request.hidden.shape[-1], request.hidden.element_size()
-        target = (request.total_rows + ranks - 1) // ranks
-        limit = placement_receive_limit(target, ranks, local, request.ids.shape[-1], hidden, size)
-        if request.maximum_received <= limit:
-            return None
-        # Native autograd owns the borrowed operands. Replay restores a local
-        # snapshot, so do not charge a second remote fetch before backward.
-        if not bounded_move_pays(
-            request.maximum_received, target, hidden, request.intermediate_size, request.cube_cores,
-            ranks, local, size, training=request.training, replay=False, apply_probs_before_fc2=True,
+    def __init__(
+        self, *, replica_slots_per_rank: int | None = None,
+        receive_capacity_percent: int | Literal["auto"] | None = "auto",
+        cross_node_cost: float | None = None,
+    ) -> None:
+        """Set optional guest and receive limits and a relative inter-node replica charge."""
+        # Placement settings use exact Python scalar types in their collective configuration key.
+        # pylint: disable=unidiomatic-typecheck
+        if replica_slots_per_rank is not None and (
+            type(replica_slots_per_rank) is not int or replica_slots_per_rank <= 0
         ):
-            return None
-        return self._build(request, target)
+            raise ValueError("replica_slots_per_rank must be a positive integer")
+        if receive_capacity_percent is not None and receive_capacity_percent != "auto" and (
+            type(receive_capacity_percent) is not int or receive_capacity_percent < 100
+        ):
+            raise ValueError('receive_capacity_percent must be an integer at least 100 or "auto"')
+        if cross_node_cost is not None:
+            if type(cross_node_cost) not in (int, float) or not 0 < cross_node_cost <= float_info.max:
+                raise ValueError("cross_node_cost must be a finite positive multiplier")
+            cross_node_cost = float(cross_node_cost)
+        # pylint: enable=unidiomatic-typecheck
+        self._replica_slots_per_rank = replica_slots_per_rank
+        self._receive_capacity_percent = "auto" if receive_capacity_percent is None else receive_capacity_percent
+        self._cross_node_cost = cross_node_cost
 
-    @staticmethod
-    def _build(request: PlacementRequest, target: int) -> ExpertPlacement | None:
-        return build_placement(
-            request.hidden, request.ids, request.counts_by_source,
-            target, request.rank, source_inverse=request.source_inverse,
+    @property
+    def replica_slots_per_rank(self) -> int | None:
+        """Return the optional cap on active guest experts on each rank."""
+        return self._replica_slots_per_rank
+
+    @property
+    def receive_capacity_percent(self) -> int | Literal["auto"]:
+        """Return the configured receive policy relative to the actual routed rows."""
+        return self._receive_capacity_percent
+
+    @property
+    def cross_node_cost(self) -> float | None:
+        """Return the optional cross-node replica transfer multiplier."""
+        return self._cross_node_cost
+
+    def configuration_key(self) -> str:
+        """Include the explicit limits in the configuration agreed by EP ranks."""
+        settings = []
+        if self.replica_slots_per_rank is not None:
+            settings.append(f"replica_slots_per_rank={self.replica_slots_per_rank}")
+        if self.receive_capacity_percent != "auto":
+            settings.append(f"receive_capacity_percent={self.receive_capacity_percent}")
+        if self.cross_node_cost is not None:
+            settings.append(f"cross_node_cost={self.cross_node_cost}")
+        return ",".join(settings)
+
+    def _policy(self, hidden_size, intermediate_size, cube_cores, training, transport_engine,
+                peak, total, ranks):
+        """Use one cost, capacity and home-admission rule for both planner callers."""
+        prices = bf16_cost(
+            hidden_size, intermediate_size, cube_cores, training, transport_engine=transport_engine,
+            search_single_slot=self.receive_capacity_percent == "auto",
         )
+        limit = receive_limit(self.receive_capacity_percent, total, ranks)
+        return prices, limit, prices.keep_home(peak, total, ranks, limit=limit)
+
+    def plan(self, request: PlacementRequest) -> ExpertPlacement | None:
+        """Return host quotas if saved work repays movement."""
+        counts = np.asarray(request.counts_by_source)
+        if counts.ndim != 2 or counts.size == 0:
+            raise ValueError("HotReplica counts must describe an ordered EP topology")
+        ranks, experts = counts.shape
+        if not 0 <= request.rank < ranks or not np.issubdtype(counts.dtype, np.integer):
+            raise ValueError("HotReplica requires integer counts and a valid EP rank")
+        if counts.min() < 0 or counts.max() > 2**31 - 1 or counts.sum(dtype=np.int64) > 2**31 - 1:
+            raise ValueError("HotReplica counts must be nonnegative and within the INT32 planner limit")
+        budget = replica_slot_budget(experts // ranks, self.replica_slots_per_rank)
+        config = ExpertReplicaConfig(experts, ranks, budget)
+        prices, limit, keep_home = self._policy(
+            request.hidden_size, request.intermediate_size, request.cube_cores, request.training,
+            request.transport_engine, request.maximum_received, request.total_rows,
+            ranks,
+        )
+        if keep_home:
+            return None
+        plan = select_replica_plan(counts, config, prices=prices, limit=limit,
+                                   nodes=request.rank_nodes, cross_node_cost=self.cross_node_cost)
+        if plan is None:
+            return None
+        return as_placement(plan)
+
+
+
+def replica_slot_budget(home: int, requested: int | None) -> int:
+    """Return the effective slot cap and reject out-of-range explicit requests."""
+    if requested is not None and requested > home:
+        raise ValueError(f"Requested {requested} guest slots, but at most {home} are supported per rank")
+    return home if requested is None else requested
+
+
+def as_placement(plan) -> ExpertPlacement:
+    """Expose compact quotas without generating per-token device metadata."""
+    config = plan.config
+    stop = config.home_experts + plan.compact_borrowed_width
+    stride = config.slots_per_rank
+    copies = tuple(row[config.home_experts:stop] for row in plan.slot_to_logical)
+    dispatch = tuple(
+        tuple(count for offset in range(0, len(row), stride) for count in row[offset:offset + stop])
+        for row in plan.dispatch_counts
+    )
+    return ExpertPlacement(copies, dispatch)

@@ -16,8 +16,15 @@
 
 import unittest
 
+import torch
+
 from hyper_multicore.diagnostics.common.graph import DiagnosticSpec, build_graph_metadata
-from hyper_multicore.modules.mega_moe.diagnostics import _mega_moe_owner_options
+from hyper_multicore.diagnostics.profiler.cycle_trace import (
+    CORE_HEADER, NO_TASK_ID, PROFILE_RECORD, _CycleTraceConfig,
+    _calculate_event_driven_profile_layout, _parse_cycle_buffer, _profile_slot_layouts,
+)
+from hyper_multicore.modules.mega_moe.diagnostics import REPLICA_TRACE_STAGES, _mega_moe_owner_options
+from hyper_multicore.modules.mega_moe.backends.bf16.autograd import _diagnostic_runtime
 from hyper_multicore.modules.mega_moe.backends.bf16.forward.graph import build_forward_graph
 from hyper_multicore.scheduler.config import TaskDescC, TaskSplitValue, TaskType
 from hyper_multicore.scheduler.runtime import allocate_runtime_config
@@ -26,6 +33,53 @@ from tests.common.mark_utils import arg_mark
 
 class TestMegaMoeDiagnostics(unittest.TestCase):
     """Keep business-specific diagnostic rules outside generic tool tests."""
+
+    def test_profiler_retains_replica_launch_suffix(self):
+        """Preserve both runtime images and the device's extension offset."""
+        ordinary = torch.tensor([1, 0, 2], dtype=torch.uint8)
+        profiler = torch.tensor([1, 1, 2], dtype=torch.uint8)
+        extended = torch.tensor([1, 0, 2, 0, 3, 4], dtype=torch.uint8)
+        self.assertEqual(_diagnostic_runtime(profiler, ordinary, extended).tolist(), [1, 1, 2, 0, 3, 4])
+        self.assertEqual(extended.tolist(), [1, 0, 2, 0, 3, 4])
+        self.assertIs(_diagnostic_runtime(profiler, ordinary, None), profiler)
+        with self.assertRaisesRegex(RuntimeError, "runtime extension offset"):
+            _diagnostic_runtime(profiler[:2], ordinary, extended)
+
+    def test_replica_intervals_keep_slot_identity_and_have_record_budget(self):
+        """Decode a guest wait and an owner band wait without inventing graph tasks."""
+        config = allocate_runtime_config(16)
+        config.num_workers = 48
+        config.task_index_num[0] = 1
+        layout = _calculate_event_driven_profile_layout(
+            config, extra_aic_records_per_task=1, extra_aiv_records_per_worker=2 * (4 + 8),
+        )
+        self.assertEqual(layout.aiv_required_records, 24)
+        self.assertEqual(layout.aic_required_records,
+                         _calculate_event_driven_profile_layout(config).aic_required_records + 1)
+        raw = bytearray(layout.buffer_size)
+        for core, worker, offset, capacity in _profile_slot_layouts(
+            layout.aic_record_capacity, layout.aiv_record_capacity, layout.cube_slot_count,
+        ):
+            if worker != 0:
+                continue
+            CORE_HEADER.pack_into(raw, offset, 1000, 1, 0, core, worker, capacity, 0)
+            descriptor, index, physical_expert = (0x10100, 1, 15) if core == 1 else (0x10105, 7, 9)
+            PROFILE_RECORD.pack_into(raw, offset + CORE_HEADER.size, 1050, 1100,
+                                     descriptor, NO_TASK_ID, index, physical_expert)
+        trace = _parse_cycle_buffer(
+            raw, config=_CycleTraceConfig(
+                rank=1, device_id=1, cycle_frequency_mhz=50.0, detailed_task_names=True,
+                kernel_name="mega_moe", owner_label="Expert", stage_names=REPLICA_TRACE_STAGES,
+                soc_name="ascend910_93", cube_slot_count=layout.cube_slot_count,
+            ),
+            aic_record_capacity=layout.aic_record_capacity, aiv_record_capacity=layout.aiv_record_capacity,
+        )
+        durations = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+        self.assertEqual([event["name"] for event in durations],
+                         ["Expert15_ReplicaW13WeightWait", "Expert9_ReplicaDW2LongestBandReadyWait"])
+        self.assertEqual([event["args"]["stage_task_index"] for event in durations], [1, 7])
+        self.assertEqual([event["dur"] for event in durations], [1.0, 1.0])
+        self.assertEqual(trace["megaKernelCycleTrace"]["droppedRecordCount"], 0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

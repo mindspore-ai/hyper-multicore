@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -27,6 +27,12 @@ from hyper_multicore.diagnostics.common.runtime import PreparedDiagnosticRuntime
 from hyper_multicore.diagnostics.common.session import _get_active_session
 from hyper_multicore.scheduler.config import RuntimeConfigC, TaskDescC
 from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode
+
+
+def is_tensor_dump_active() -> bool:
+    """Report whether the current diagnostic window captures tensor operands."""
+    session = _get_active_session("tensor_dump")
+    return session is not None and session.is_capture_enabled()
 
 
 class MegaKernelDiagnostics:
@@ -85,6 +91,9 @@ def prepare_mega_kernel_diagnostics(
     owner_context: Any = None,
     execution_mode: str = "event_driven", vector_worker_stride: int = 2,
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None,
+    profile_extra_stages: Mapping[int, str] | None = None,
+    profile_extra_aic_records_per_task: int = 0,
+    profile_extra_aiv_records_per_worker: int = 0,
 ) -> MegaKernelDiagnostics:
     """Prepare only normal execution storage and defer all diagnostic graph work.
 
@@ -106,6 +115,9 @@ def prepare_mega_kernel_diagnostics(
         graph_adapter: Optional lazy business-owned binding of graph ports to the
             real native ABI. It receives a private Host config; ordinary storage
             and the caller's graph must remain unchanged.
+        profile_extra_stages: Names for native intervals outside the graph stage IDs.
+        profile_extra_aic_records_per_task: Upper bound on additional records per AIC task.
+        profile_extra_aiv_records_per_worker: Upper bound on additional records per AIV worker.
 
     Returns:
         Adapter used by any MegaKernel; dynamic view resolvers remain dump-owned.
@@ -136,6 +148,7 @@ def prepare_mega_kernel_diagnostics(
         graph, runtime_config, DiagnosticSpec(
             kernel_name, owner_label, owner_resolver, owner_context,
             execution_mode, vector_worker_stride, graph_adapter,
+            profile_extra_stages, profile_extra_aic_records_per_task, profile_extra_aiv_records_per_worker,
         ),
         parameter_count=parameter_count, tensor_factory=tensor_factory, rank=rank, device_id=device_id,
     )

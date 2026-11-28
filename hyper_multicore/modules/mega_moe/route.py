@@ -21,14 +21,17 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from itertools import accumulate
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 import torch.distributed as dist
 
+from hyper_multicore._device import device_ub_bytes
 from hyper_multicore._loader import load_torch_npu
 from hyper_multicore.torch import ops as multicore_ops
 
+from .heap_manager import _HeapCapacityError
+from .route_metadata import RouteMetadata
 from .spec import MegaMoeSpec, _align_capacity
 
 if TYPE_CHECKING:
@@ -43,57 +46,7 @@ _ROUTE_CACHE_REPROBE_STEPS = 8
 _HOST_ROUTE_CACHE_ENTRIES = 8
 _METADATA_ALIGNMENT = 512
 _PULL_STAGING_MAX_BYTES = 64 * 1024 * 1024
-
-
-@dataclass(frozen=True)
-class RouteMetadata:
-    """Exact offsets and counts consumed by the low-level native ABI."""
-
-    dispatch_src_off: torch.Tensor
-    dispatch_target_off: torch.Tensor
-    dispatch_size: torch.Tensor
-    combine_src_off: torch.Tensor
-    combine_target_off: torch.Tensor
-    combine_size: torch.Tensor
-    group_list: torch.Tensor
-    expert_capacity: int
-    local_num_tokens: int | None = None
-    plan_tokens: int | None = None
-    all_experts_active: bool = False
-    _elements: tuple[int, RouteMetadata] | None = field(default=None, repr=False, compare=False)
-
-    def for_kernel(self, hidden_size: int) -> RouteMetadata:
-        """Convert row descriptors once; keep the public row-unit contract unchanged."""
-        if hidden_size == 1:
-            return self
-        if self._elements is not None and self._elements[0] == hidden_size:
-            return self._elements[1]
-        return replace(
-            self,
-            dispatch_src_off=self.dispatch_src_off * hidden_size,
-            dispatch_target_off=self.dispatch_target_off * hidden_size,
-            dispatch_size=self.dispatch_size * hidden_size,
-            combine_src_off=self.combine_src_off * hidden_size,
-            combine_target_off=self.combine_target_off * hidden_size,
-            combine_size=self.combine_size * hidden_size,
-            _elements=None,
-        )
-
-    def record_stream(self, stream: Any) -> None:
-        """Retain row descriptors and cached element descriptors on their consumer stream."""
-        views = (self,) if self._elements is None else (self, self._elements[1])
-        for view in views:
-            for value in vars(view).values():
-                if isinstance(value, torch.Tensor):
-                    value.record_stream(stream)
-
-    def with_active_experts(self, active: bool, tokens: int, plan_tokens: int) -> RouteMetadata:
-        """Bind source rows and activity to both immutable descriptor views."""
-        native = self._elements
-        return replace(
-            self, all_experts_active=active, local_num_tokens=tokens, plan_tokens=plan_tokens,
-            _elements=(native[0], replace(native[1], all_experts_active=active)) if native else None,
-        )
+_HISTC_FP32_LIMIT = 2**24
 
 
 @dataclass(frozen=True)
@@ -106,12 +59,21 @@ class PreparedTopKRoute:
     received_counts: torch.Tensor
     metadata: RouteMetadata
     maximum_received_slots: int = 0
-    execution_resources: Any = field(default=None, repr=False, compare=False)
     weight_binding: Any = field(default=None, repr=False, compare=False)
     checkpoint_record: Any = field(default=None, repr=False, compare=False)
+    tensor_dump: bool = False
 
 
 _record_metadata_stream = RouteMetadata.record_stream
+
+
+class _RouteSummary(NamedTuple):
+    """Validated sizes and expert activity for the current receive route."""
+
+    capacity: int
+    plan_tokens: int
+    maximum: int
+    all_experts_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,7 +82,7 @@ class _HostRouteCache:
 
     signature: tuple[Any, ...]
     raw: list[list[int]]
-    summary: tuple[int, int, int]
+    summary: _RouteSummary
     metadata: RouteMetadata | None
     source_totals: tuple[int, ...] = ()
     stream: Any = None
@@ -183,32 +145,54 @@ def _validate_topk_inputs(
     return topk_ids.reshape(-1)
 
 
-def _resolve_counts(
-    flat_ids: torch.Tensor,
-    supplied_counts: torch.Tensor | None,
-    spec: MegaMoeSpec,
-) -> torch.Tensor:
-    """Use trusted Router counts or compute them only when omitted."""
-    if supplied_counts is None:
-        return (
-            torch.bincount(flat_ids.to(torch.int64), minlength=spec.num_experts)
-            .to(torch.int32)
-            .contiguous()
-        )
-    if tuple(supplied_counts.shape) != (spec.num_experts,):
+def _validate_supplied_counts(
+    supplied_counts: torch.Tensor, num_experts: int, device: torch.device,
+) -> None:
+    """Check the logical count tensor without reading its contents."""
+    if not isinstance(supplied_counts, torch.Tensor):
+        raise TypeError("tokens_per_expert must be a Tensor.")
+    if tuple(supplied_counts.shape) != (num_experts,):
         raise ValueError(
-            f"tokens_per_expert must have shape ({spec.num_experts},), "
+            f"tokens_per_expert must have shape ({num_experts},), "
             f"got {tuple(supplied_counts.shape)}."
         )
-    if supplied_counts.device != flat_ids.device:
+    if supplied_counts.device != device:
         raise ValueError("tokens_per_expert must be on the route tensor device.")
     if supplied_counts.dtype not in (torch.int32, torch.int64):
         raise TypeError(
             f"tokens_per_expert must be int32 or int64, got {supplied_counts.dtype}."
         )
-    if supplied_counts.dtype == torch.int32 and supplied_counts.is_contiguous():
-        return supplied_counts
-    return supplied_counts.to(torch.int32).contiguous()
+
+
+def _histc_counts(flat_ids: torch.Tensor, bins: int) -> torch.Tensor:
+    """Count one chunk, dropping the bin for out-of-range IDs."""
+    # Drop ID num_experts so the existing total-count check rejects it across EP.
+    return torch.histc(flat_ids, bins=bins, min=0, max=bins)[:-1].to(torch.int32).contiguous()
+
+
+def _resolve_counts(
+    flat_ids: torch.Tensor,
+    supplied_counts: torch.Tensor | None,
+    spec: MegaMoeSpec,
+) -> torch.Tensor:
+    """Use validated Router counts or compute them only when omitted."""
+    if supplied_counts is not None:
+        if supplied_counts.dtype == torch.int32 and supplied_counts.is_contiguous():
+            return supplied_counts
+        return supplied_counts.to(torch.int32).contiguous()
+
+    num_experts = spec.num_experts
+    bins = num_experts + 1
+    if spec.dynamic_tokens and flat_ids.device.type == "npu" and bins <= _HISTC_FP32_LIMIT:
+        if flat_ids.numel() <= _HISTC_FP32_LIMIT:
+            return _histc_counts(flat_ids, bins)
+        # FP32 represents each partial exactly. Accumulate the partials in INT32.
+        first, *remaining = flat_ids.split(_HISTC_FP32_LIMIT)
+        counts = _histc_counts(first, bins)
+        for chunk in remaining:
+            counts.add_(_histc_counts(chunk, bins))
+        return counts
+    return torch.bincount(flat_ids.to(torch.int64), minlength=num_experts).to(torch.int32).contiguous()
 
 
 def _start_count_gather(
@@ -306,6 +290,45 @@ def _permute_topk_input_out(
     return output, mapping
 
 
+def _packed_route_ub(wire: torch.Tensor, spec: MegaMoeSpec, *, header: int = 0) -> int | None:
+    """Return the available UB when this count table fits the native descriptor kernel."""
+    if wire.device.type != "npu" or wire.dtype != torch.int32 or wire.stride(1) != 1:
+        return None
+    ub = device_ub_bytes(wire.device.index)
+    if ub is None:
+        return None
+    experts, peers, local = spec.num_experts, spec.ep_size, spec.local_experts
+    stride = (experts + 31) // 32 * 32
+    span = (peers - 1) * wire.stride(0) + experts + header
+    scratch = ((span + 7) // 8 * 8 + 3 * stride + 2 * ((local + 7) // 8 * 8)) * 4
+    return ub if wire.stride(0) >= experts + header and scratch <= ub // 4 * 3 else None
+
+
+def _unpack_route_offsets(
+    off: torch.Tensor, sz: torch.Tensor, spec: MegaMoeSpec, expert_capacity: int,
+) -> RouteMetadata:
+    """Describe row and element offsets as views of this invocation's native output."""
+    experts, local = spec.num_experts, spec.local_experts
+    stride = (experts + 31) // 32 * 32
+    units = 1 if off.numel() == 4 * stride + local else 2
+    offsets = off.split(((experts, stride - experts) * 4 + (local,)) * units)
+    sizes = sz.split((experts, stride - experts) * (2 * units))
+    pull = spec.dispatch_mode == "pull"
+
+    def describe(unit: int) -> RouteMetadata:
+        """Read one offset plane and its shared size fields."""
+        offset_index, size_index = 9 * unit, 4 * unit
+        src, target, length = offsets[offset_index + 4], offsets[offset_index + 6], sizes[size_index + 2]
+        return RouteMetadata(
+            target if pull else offsets[offset_index], src if pull else offsets[offset_index + 2],
+            length if pull else sizes[size_index], src, target, length,
+            offsets[offset_index + 8], expert_capacity,
+        )
+
+    rows = describe(0)
+    return rows if spec.hidden_size == 1 else replace(rows, _elements=(spec.hidden_size, describe(1)))
+
+
 def _compute_route_metadata(
     counts: torch.Tensor,
     counts_by_source: torch.Tensor,
@@ -314,39 +337,10 @@ def _compute_route_metadata(
     expert_capacity: int,
 ) -> RouteMetadata:
     """Build exact element offsets without padding or route truncation."""
-    if counts_by_source.device.type == "npu" and counts_by_source.dtype == torch.int32:
-        from hyper_multicore._device import device_ub_bytes  # pylint: disable=import-outside-toplevel
-        ub = device_ub_bytes(counts_by_source.device.index)
-        e,p,local = spec.num_experts,spec.ep_size,spec.local_experts
-        stride=(e+31)//32*32
-        span = (p - 1) * counts_by_source.stride(0) + e
-        if (counts_by_source.stride(1) == 1 and counts_by_source.stride(0) >= e
-                and ((span+7)//8*8+3*stride+2*((local+7)//8*8))*4 <= ub//4*3):
-            off,sz=multicore_ops.route_offsets(counts_by_source, spec.rank_id, ub, spec.hidden_size)
-            pull = spec.dispatch_mode == "pull"
-            offset_count = 4 * stride + local
-            # Split once in ATen instead of dispatching a Python slice for
-            # every field. Both row and element descriptors remain public views
-            # of this invocation's storage; no cache can outlive its contents.
-            units = 1 if off.numel() == offset_count else 2
-            offsets = off.split((e, stride - e) * 4 + (local,) if units == 1
-                                else ((e, stride - e) * 4 + (local,)) * 2)
-            sizes = sz.split((e, stride - e) * (2 * units))
-
-            def describe(unit: int) -> RouteMetadata:
-                """Describe row or element offsets from the packed native output."""
-                offset_index, size_index = 9 * unit, 4 * unit
-                src, target, length = offsets[offset_index + 4], offsets[offset_index + 6], sizes[size_index + 2]
-                return RouteMetadata(
-                    target if pull else offsets[offset_index], src if pull else offsets[offset_index + 2],
-                    length if pull else sizes[size_index], src, target, length,
-                    offsets[offset_index + 8], expert_capacity,
-                )
-
-            rows = describe(0)
-            if spec.hidden_size == 1:
-                return rows
-            return replace(rows, _elements=(spec.hidden_size, describe(1)))
+    ub = _packed_route_ub(counts_by_source, spec)
+    if ub is not None:
+        offsets, sizes = multicore_ops.route_offsets(counts_by_source, spec.rank_id, ub, spec.hidden_size)
+        return _unpack_route_offsets(offsets, sizes, spec, expert_capacity)
 
     if received_counts is None:
         start = spec.rank_id * spec.local_experts
@@ -507,8 +501,9 @@ def prepare_topk_route(
     workspace: MegaMoeWorkspace | None = None,
     *,
     autograd_mask: int = 0,
-    prepare_workspace: Callable[[int, int], None] | None = None,
+    prepare_workspace: Callable[..., None] | None = None,
     select_placement: Callable | None = None,
+    reuse_placement_geometry: bool = False,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -520,16 +515,24 @@ def prepare_topk_route(
         tokens_per_expert: Optional trusted Router histogram.
         workspace: Optional workspace ordered before the count exchange. Pull
             requires a lease acquired by the caller or the automatic-capacity callback.
-        autograd_mask: Group-consistent gradient participation flags in dynamic mode.
-        prepare_workspace: Capacity callback, run before pull publication.
+        autograd_mask: Gradient participation and tensor dump flags in dynamic mode.
+        prepare_workspace: Capacity and lease callback.
 
     Returns:
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    if tokens_per_expert is not None:
+        try:
+            _validate_supplied_counts(tokens_per_expert, spec.num_experts, flat_ids.device)
+        except (TypeError, ValueError):
+            if not spec.dynamic_tokens or spec.ep_size == 1:
+                raise
+            autograd_mask |= _INVALID_COUNTS_MASK
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
-                                      workspace, autograd_mask, prepare_workspace, select_placement)
+                                      workspace, autograd_mask, prepare_workspace, select_placement,
+                                      reuse_placement_geometry)
     permuted = None
     if _can_fuse_count(hidden_states, spec, tokens_per_expert):
         permuted, counts = _permute_and_count(hidden_states, topk_ids, spec)
@@ -580,33 +583,56 @@ def _validate_dynamic_sizes(rows: list[list[int]], spec: MegaMoeSpec) -> None:
 
 
 _INVALID_WEIGHT_MASK = 1 << 5
+_TENSOR_DUMP_MASK = 1 << 6
+_INVALID_COUNTS_MASK = 1 << 9
+_INVALID_ROUTE_INPUT_MASK = _INVALID_WEIGHT_MASK | _INVALID_COUNTS_MASK
+
+
+def _reject_invalid_route_inputs(flags: list[int]) -> None:
+    """Reject input errors reported by any participant in the route exchange."""
+    if any(flag & _INVALID_WEIGHT_MASK for flag in flags):
+        raise ValueError("expert weights do not match the bound layout on all EP ranks")
+    if any(flag & _INVALID_COUNTS_MASK for flag in flags):
+        raise ValueError("tokens_per_expert must be an int32 or int64 histogram of shape (num_experts,) "
+                         "on the route tensor device on all EP ranks")
+
+
+def _validate_route_flags(rows: list[list[int]]) -> None:
+    """Check route participation before reusing geometry or selecting a protocol."""
+    flags = rows[0][2]
+    if flags & _INVALID_ROUTE_INPUT_MASK or any(row[2] != flags for row in rows):
+        _reject_invalid_route_inputs([row[2] for row in rows])
+        if any((row[2] ^ flags) & _TENSOR_DUMP_MASK for row in rows):
+            raise RuntimeError("MegaMoe Tensor Dump mode differs across EP ranks")
+        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
 
 
 def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
     """Validate every rank before any automatic allocation or SHMEM write."""
     _validate_dynamic_sizes(rows, spec)
-    if rows[0][2] & _INVALID_WEIGHT_MASK or any(row[2] != rows[0][2] for row in rows):
-        if any(row[2] & _INVALID_WEIGHT_MASK for row in rows):
-            raise ValueError("expert weights do not match the bound layout on all EP ranks")
-        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    _validate_route_flags(rows)
     if any(not _valid_route_counts(row, spec.top_k) for row in rows):
         raise RuntimeError("MegaMoe counts must describe the actual distinct Top-K routes")
 
 
-def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec, source_rows: list | None = None) -> tuple[int, int, int]:
+def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec, source_rows: list | None = None) -> _RouteSummary:
     """Use one Host summary for shape, participation, receive limits, and schedule."""
     counts = payload[:, 3:]
-    loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum(dim=(0, 2))
+    # Each column belongs to one expert. Reduce over every source before checking for empty experts.
+    expert_loads = counts.sum(0).reshape(spec.ep_size, spec.local_experts)
     summary = torch.cat((payload[:, :3], counts.sum(1, keepdim=True),
-                         counts.amin(1, keepdim=True), counts.amax(1, keepdim=True), loads[:, None]), dim=1)
+                         counts.amin(1, keepdim=True), counts.amax(1, keepdim=True),
+                         expert_loads.sum(1, keepdim=True), expert_loads.amin(1, keepdim=True)), dim=1)
     rows = summary.tolist()
-    result = _summarize_dynamic_rows(rows, spec)
+    result = _summarize_dynamic_rows(rows, spec, all_experts_active=rows[spec.rank_id][7] > 0)
     if source_rows is not None:
         source_rows.extend(row[3] for row in rows)
     return result
 
 
-def _summarize_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> tuple[int, int, int]:
+def _summarize_dynamic_rows(
+    rows: list[list[int]], spec: MegaMoeSpec, *, all_experts_active: bool = False,
+) -> _RouteSummary:
     """Keep overflow and participation checks common to both metadata policies."""
     _validate_dynamic_rows(rows, spec)
     maximum = max(row[6] for row in rows)
@@ -619,14 +645,14 @@ def _summarize_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> tuple[i
     plan_tokens = max(128, _align_capacity(max(row[1] for row in rows)))
     if plan_tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 or maximum > 2**31 - 1:
         raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
-    return max(1, rows[spec.rank_id][6]), plan_tokens, maximum
+    return _RouteSummary(max(1, rows[spec.rank_id][6]), plan_tokens, maximum, all_experts_active)
 
 
 def _read_dynamic_route(
     payload: torch.Tensor,
     spec: MegaMoeSpec,
     source_rows: list | None = None,
-) -> tuple[tuple[int, int, int], list[list[int]] | None]:
+) -> tuple[_RouteSummary, list[list[int]] | None]:
     """Reuse the required readback for small descriptors; reduce large tables on device."""
     if spec.ep_size * spec.num_experts > _HOST_ROUTE_MAX_COUNTS:
         return _dynamic_summary(payload, spec, source_rows), None
@@ -637,7 +663,7 @@ def _read_dynamic_route(
     return summary, raw
 
 
-def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> tuple[int, int, int]:
+def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> _RouteSummary:
     """Validate a bounded Host table before allocating or publishing source rows."""
     counts = [row[3:] for row in raw]
     local = spec.local_experts
@@ -645,7 +671,9 @@ def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> tuple[int,
         sum(sum(values[start : start + local]) for values in counts) for start in range(0, spec.num_experts, local)
     ]
     rows = [row[:3] + [sum(values), min(values), max(values), load] for row, values, load in zip(raw, counts, loads)]
-    return _summarize_dynamic_rows(rows, spec)
+    start = spec.rank_id * local
+    active = all(sum(row[expert] for row in counts) > 0 for expert in range(start, start + local))
+    return _summarize_dynamic_rows(rows, spec, all_experts_active=active)
 
 
 def _route_cache_signature(spec: MegaMoeSpec, device: Any) -> tuple[Any, ...]:
@@ -655,13 +683,13 @@ def _route_cache_signature(spec: MegaMoeSpec, device: Any) -> tuple[Any, ...]:
 
 
 def _route_descriptor_key(raw: list[list[int]]) -> tuple[tuple[int, ...], ...]:
-    """Gradient flags participate in validation, not immutable offset geometry."""
+    """Participation flags can change independently of immutable offset geometry."""
     return tuple(tuple(row[:2] + row[3:]) for row in raw)
 
 
 def _reuse_previous_route(
     previous: Any, raw: list[list[int]], source_rows: list | None, device: Any, stream: Any,
-) -> tuple[tuple[int, int, int], list[list[int]], RouteMetadata | None]:
+) -> tuple[_RouteSummary, list[list[int]], RouteMetadata | None]:
     """Reuse the last immutable descriptor when only the route snapshot repeated."""
     if source_rows is not None:
         source_rows.extend(previous.source_totals)
@@ -672,14 +700,10 @@ def _reuse_previous_route(
 def _reuse_cached_route(
     cached: Any, raw: list[list[int]], spec: MegaMoeSpec, source_rows: list | None,
     device: Any, stream: Any,
-) -> tuple[tuple[int, int, int], list[list[int]], RouteMetadata | None]:
+) -> tuple[_RouteSummary, list[list[int]], RouteMetadata | None]:
     """Validate and reuse one exact cached descriptor."""
     _validate_dynamic_sizes(raw, spec)
-    expected_mask = raw[0][2] & ~_INVALID_WEIGHT_MASK
-    if any(row[2] != expected_mask for row in raw):
-        if any(row[2] & _INVALID_WEIGHT_MASK for row in raw):
-            raise ValueError("expert weights do not match the bound layout on all EP ranks")
-        raise RuntimeError("MegaMoe autograd participation differs across EP ranks")
+    _validate_route_flags(raw)
     if source_rows is not None:
         source_rows.extend(cached.source_totals)
     cached.wait(device, stream)
@@ -700,7 +724,7 @@ def _same_route_topology(previous: Any, signature: tuple) -> bool:
 def _read_cached_route(
     payload: torch.Tensor, spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None, device: Any,
     source_rows: list | None = None, *, stream: Any = None,
-) -> tuple[tuple[int, int, int], list[list[int]] | None, RouteMetadata | None]:
+) -> tuple[_RouteSummary, list[list[int]] | None, RouteMetadata | None]:
     """Reuse exact validated geometry without repeating stable Host preparation."""
     if not _host_route_cache_available(spec, workspace):
         summary, raw = _read_dynamic_route(payload, spec, source_rows)
@@ -733,7 +757,7 @@ def _read_cached_route(
 
 def _cache_host_route(
     workspace: MegaMoeWorkspace | None, spec: MegaMoeSpec, raw: list[list[int]],
-    summary: tuple[int, int, int], metadata: RouteMetadata | None, device: Any,
+    summary: _RouteSummary, metadata: RouteMetadata | None, device: Any,
 ) -> None:
     """Retain a bounded set of owned descriptors; live graphs own their saved views."""
     if workspace is None or not spec.auto_tokens:
@@ -818,6 +842,14 @@ def _publish_staged_pull(
     return output, permuted[1]
 
 
+def _materialize_route_permutation(hidden, ids, spec, workspace, permuted=None):
+    """Prepare the selected route in the storage its dispatch will consume."""
+    if spec.dispatch_mode == "pull":
+        return (_permute_dynamic_pull(hidden, ids, spec, workspace) if permuted is None else
+                _publish_staged_pull(permuted, hidden, spec, workspace))
+    return _permute_topk_input(hidden, ids) if permuted is None else permuted
+
+
 def _dynamic_header(
     values: tuple[int, int, int], dtype: torch.dtype, device: Any, workspace: MegaMoeWorkspace | None,
     *, stream: Any = None,
@@ -855,14 +887,15 @@ def _dynamic_route_payload(
     """Pack one group-consistent wire format, including coordinated overflow flags."""
     tokens = hidden_states.shape[0]
     flexible = spec.auto_tokens
-    invalid = (tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 if flexible
-               else tokens > spec.max_local_num_tokens)
+    overflow = (tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 if flexible
+                else tokens > spec.max_local_num_tokens)
+    invalid = overflow or bool(autograd_mask & _INVALID_COUNTS_MASK)
     counts = (torch.zeros(spec.num_experts, dtype=torch.int32, device=hidden_states.device) if invalid
               else _resolve_counts(flat_ids, supplied_counts, spec))
     payload_dtype = torch.int32 if flexible else torch.int64
     # An invalid source must still join the same collective before all ranks reject it.
     header_tokens = min(tokens, 2**31 - 1) if flexible else tokens
-    header = _dynamic_header((int(invalid), header_tokens, autograd_mask), payload_dtype,
+    header = _dynamic_header((int(overflow), header_tokens, autograd_mask), payload_dtype,
                              hidden_states.device, workspace if flexible else None, stream=stream)
     payload = torch.cat((header, counts.to(payload_dtype)))
     return counts, payload, invalid
@@ -881,9 +914,9 @@ def _start_dynamic_gather(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[tor
 def _resolve_dynamic_permutation(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, spec: MegaMoeSpec,
     workspace: MegaMoeWorkspace | None, permuted: tuple | None, invalid: bool,
-    route_stream: Any, prepare_workspace: Callable[[int, int], None] | None,
+    route_stream: Any, prepare_workspace: Callable[..., None] | None,
     gathered: torch.Tensor, work: Any,
-) -> tuple[tuple | None, tuple | None, list | None, RouteMetadata | None, Any]:
+) -> tuple[tuple | None, _RouteSummary | None, list | None, RouteMetadata | None, Any]:
     """Resolve the automatic/pull/ordinary permutation branch after the exchange."""
     summary, host_rows, metadata = None, None, None
     if spec.auto_tokens:
@@ -894,19 +927,14 @@ def _resolve_dynamic_permutation(
             gathered, spec, workspace, hidden_states.device, stream=route_stream)
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
-        prepare_workspace(summary[1], summary[2])
-    if invalid:
-        permuted = None
-    elif spec.dispatch_mode == "pull":
-        permuted = (_permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if permuted is None else
-                    _publish_staged_pull(permuted, hidden_states, spec, workspace))
-    elif permuted is None:
-        permuted = _permute_topk_input(hidden_states, topk_ids)
+        prepare_workspace(summary.plan_tokens, summary.maximum)
+    permuted = (None if invalid else
+                _materialize_route_permutation(hidden_states, topk_ids, spec, workspace, permuted))
     return permuted, summary, host_rows, metadata, work
 
 
 def _finalize_dynamic_route(
-    permuted: tuple, counts: torch.Tensor, summary: tuple | None, host_rows: list | None,
+    permuted: tuple, counts: torch.Tensor, summary: _RouteSummary | None, host_rows: list | None,
     metadata: RouteMetadata | None, work: Any, gathered: torch.Tensor, spec: MegaMoeSpec,
     workspace: MegaMoeWorkspace | None, device: Any, tokens: int,
 ) -> PreparedTopKRoute:
@@ -915,23 +943,16 @@ def _finalize_dynamic_route(
         work.wait()
     if summary is None:
         summary, host_rows = _read_dynamic_route(gathered, spec)
-    capacity, plan_tokens, maximum = summary
     if metadata is None:
-        metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, capacity)
-        if host_rows is not None:
-            start = spec.rank_id * spec.local_experts
-            active = all(sum(row[3 + expert] for row in host_rows) > 0
-                         for expert in range(start, start + spec.local_experts))
-            metadata = metadata.with_active_experts(active, tokens, plan_tokens)
-        else:
-            metadata = replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens)
+        metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, summary.capacity)
+        metadata = metadata.with_active_experts(summary.all_experts_active, tokens, summary.plan_tokens)
         if host_rows is not None:
             _cache_host_route(workspace, spec, host_rows, summary, metadata, device)
     received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
     return PreparedTopKRoute(
         routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
         received_counts=received_counts,
-        maximum_received_slots=maximum,
+        maximum_received_slots=summary.maximum,
         metadata=metadata,
     )
 
@@ -939,8 +960,9 @@ def _finalize_dynamic_route(
 def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
-    prepare_workspace: Callable[[int, int], None] | None = None,
+    prepare_workspace: Callable[..., None] | None = None,
     select_placement: Callable | None = None,
+    reuse_placement_geometry: bool = False,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
     # Invalid dynamic ranks must still enter the original collective before failing.
@@ -963,7 +985,7 @@ def _prepare_dynamic_route(
     if select_placement is not None:
         return _prepare_placed_route(hidden_states, topk_ids, spec, workspace, permuted,
                                      counts, gathered, work, route_stream, prepare_workspace,
-                                     select_placement, autograd_mask)
+                                     select_placement, autograd_mask, reuse_placement_geometry)
     permuted, summary, host_rows, metadata, work = _resolve_dynamic_permutation(
         hidden_states, topk_ids, spec, workspace, permuted, invalid, route_stream,
         prepare_workspace, gathered, work)
@@ -973,36 +995,57 @@ def _prepare_dynamic_route(
 
 
 def _prepare_placed_route(hidden, ids, spec, workspace, permuted, counts, gathered,
-                          work, stream, prepare_workspace, select_placement, autograd_mask=0):
+                          work, stream, prepare_workspace, select_placement, autograd_mask=0,
+                          reuse_placement_geometry=False):
     """Select a per-call route between count validation and capacity commitment."""
     if work is not None:
         work.wait()
-    source_rows = []
-    summary, host_rows, metadata = _read_cached_route(
-        gathered, spec, workspace, hidden.device, source_rows, stream=stream)
-    selected = select_placement(
-        hidden, ids, gathered, summary, source_rows, permuted[1], autograd_mask, host_rows=host_rows,
-    )
+    inverse = None if permuted is None else permuted[1]
+    if reuse_placement_geometry:
+        from ..hot_replica.bounded_placement import read_placement_wire  # pylint: disable=import-outside-toplevel
+
+        snapshot = read_placement_wire(gathered, spec, workspace, stream)
+        summary = snapshot.summary
+        host_rows = None
+        metadata = None
+        selected = select_placement(hidden, ids, gathered, summary, snapshot.source_rows,
+                                    inverse, autograd_mask, snapshot=snapshot)
+    else:
+        source_rows = []
+        summary, host_rows, metadata = _read_cached_route(
+            gathered, spec, workspace, hidden.device, source_rows, stream=stream)
+        selected = select_placement(
+            hidden, ids, gathered, summary, source_rows, inverse, autograd_mask, host_rows=host_rows,
+        )
+    if selected is not None:
+        try:
+            prepare_workspace(summary.plan_tokens, selected.placement.receive_capacity, placed=True)
+        except _HeapCapacityError:
+            if selected.mandatory:
+                raise
+            selected = None
     if selected is None:
-        # Preserve every ordinary route, schedule and capacity decision.
-        prepare_workspace(summary[1], summary[2])
+        if reuse_placement_geometry:
+            metadata = snapshot.ordinary_metadata(spec, hidden)
+        prepare_workspace(summary.plan_tokens, summary.maximum)
+        permuted = _materialize_route_permutation(hidden, ids, spec, workspace, permuted)
         return _finalize_dynamic_route(
             permuted, counts, summary, host_rows, metadata, None, gathered, spec,
             workspace, hidden.device, hidden.shape[0])
-    resources, placement, binding = selected
-    virtual_spec, virtual_workspace = resources.spec, resources.workspace
+    binding = selected
+    placement = binding.placement
     table = placement.counts_by_source
-    virtual_spec = replace(virtual_spec, num_experts=table.shape[1])
+    virtual_spec = replace(spec, num_experts=table.shape[1])
     virtual_counts = table[virtual_spec.rank_id].contiguous()
-    virtual_table = torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
-    local_load = placement.received_rows(virtual_spec.rank_id)
-    virtual_summary = max(1, local_load), summary[1], placement.receive_capacity
-    resources.prepare_auto_workspace(virtual_summary[1], virtual_summary[2], hidden)
-    virtual_tokens = _permute_topk_input(hidden, placement.virtual_ids)
+    metadata = placement.route_metadata
+    virtual_table = gathered if metadata is not None else torch.cat((gathered[:, :3], table.to(gathered.dtype)), dim=1)
+    local_load = placement.local_receive_capacity
+    virtual_summary = _RouteSummary(max(1, local_load), summary.plan_tokens, placement.receive_capacity)
+    virtual_tokens = _materialize_route_permutation(hidden, placement.virtual_ids, virtual_spec, workspace)
     route = _finalize_dynamic_route(
-        virtual_tokens, virtual_counts, virtual_summary, None, None, None, virtual_table,
-        virtual_spec, virtual_workspace, hidden.device, hidden.shape[0])
-    return replace(route, execution_resources=resources, weight_binding=binding)
+        virtual_tokens, virtual_counts, virtual_summary, None, metadata, None, virtual_table,
+        virtual_spec, workspace, hidden.device, hidden.shape[0])
+    return replace(route, weight_binding=binding, tensor_dump=bool(autograd_mask & _TENSOR_DUMP_MASK))
 
 
 class _EmptyTopKOutput(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ

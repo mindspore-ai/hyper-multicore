@@ -12,21 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Checkpoint-owned routing and replica state for reentrant BF16 push."""
+"""Checkpoint-owned routing and replica state for reentrant BF16 Push and Pull."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 import os
 from threading import Lock
+from types import TracebackType
 from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
+
+from hyper_multicore.modules.mega_moe.route import (
+    _INVALID_COUNTS_MASK, _INVALID_ROUTE_INPUT_MASK, _reject_invalid_route_inputs, _validate_supplied_counts,
+)
 
 
 @dataclass
@@ -35,13 +40,14 @@ class ReplayRecord:
 
     owner: Any
     ids: torch.Tensor | None = None
+    supplied_counts: torch.Tensor | None = None
     route: Any = None
     stream: Any = None
+    autograd_mask: int = 0
     inputs: tuple[torch.Tensor, torch.Tensor] | None = None
     input_versions: tuple[int, int] | None = None
     activation: Any = None
     allow_activation: bool = False
-    weight_binding: Any = None
 
 
 @dataclass
@@ -49,36 +55,66 @@ class _CheckpointScope:
     records: list[ReplayRecord]
     replay: bool
     same_parameters: bool
+    non_reentrant: bool = False
     cursor: int = 0
 
 
 _ACTIVE: ContextVar[_CheckpointScope | None] = ContextVar("hmc_hot_replica_checkpoint", default=None)
+_REPLAY_ACTIVATION_MASK = 1 << 7
+_REPLAY_SCOPES: ContextVar[tuple[AbstractContextManager, ...]] = ContextVar("hmc_replay_scopes", default=())
+
+
+class _ReplayContext(AbstractContextManager):
+    """Start a new replay cursor each time Torch re-enters its recompute context."""
+
+    def __init__(self, tape: ReplayCheckpoint) -> None:
+        """Keep the original invocation's tape alive for each recomputation."""
+        self.tape = tape
+
+    def __enter__(self) -> None:
+        """Enter a fresh replay scope when Torch starts recomputation."""
+        scope = self.tape.scope(True, non_reentrant=True)
+        scope.__enter__()
+        _REPLAY_SCOPES.set((*_REPLAY_SCOPES.get(), scope))
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None,
+    ) -> bool | None:
+        """Restore the previous scope on completion or error."""
+        scopes = _REPLAY_SCOPES.get()
+        _REPLAY_SCOPES.set(scopes[:-1])
+        return scopes[-1].__exit__(exc_type, exc, traceback)
 
 
 class ReplayCheckpoint:
     """Hold one checkpoint invocation's tape across original and replay contexts."""
 
-    def __init__(self, parameter_version: Callable[[], Any], *, prepare_replay: bool = False) -> None:
-        """Register the caller's version lookup and opt in to early restoration."""
+    def __init__(self, parameter_version: Callable[[], Any]) -> None:
+        """Register the caller's logical parameter version lookup."""
         self.parameter_version = parameter_version
-        self.prepare_replay = prepare_replay
         self.records: list[ReplayRecord] = []
         self.forward_version = None
+        self.started = False
+
+    def contexts(self) -> tuple[AbstractContextManager, AbstractContextManager]:
+        """Provide the context_fn for one non-reentrant torch checkpoint call."""
+        return self.scope(False, non_reentrant=True), _ReplayContext(self)
 
     @contextmanager
-    def scope(self, replay: bool) -> Iterator[None]:
+    def scope(self, replay: bool, *, non_reentrant: bool = False) -> Iterator[None]:
         """Enter the tape before running any operator of the checkpointed block."""
         version = self.parameter_version()
         if not replay:
-            self.records.clear()
+            if self.started:
+                raise RuntimeError("Create a separate wrap_checkpoint wrapper or ReplayCheckpoint for each forward")
+            self.started = True
             self.forward_version = version
-        state = _CheckpointScope(self.records, replay, version is not None and version == self.forward_version)
+        state = _CheckpointScope(
+            self.records, replay, version is not None and version == self.forward_version,
+            non_reentrant=non_reentrant,
+        )
         token = _ACTIVE.set(state)
         try:
-            if replay and state.same_parameters and self.prepare_replay and len(self.records) == 1:
-                binding = self.records[0].weight_binding
-                if binding is not None:
-                    binding.prepare_replay()
             yield
         finally:
             _ACTIVE.reset(token)
@@ -91,10 +127,11 @@ def wrap_checkpoint(
 
     The framework supplies a lightweight logical parameter version for its
     sharded module. A changed version disables weight and activation reuse.
-    When requested, restore the saved borrowed suffix before recompute reads
-    any FSDP parameters. Route agreement still happens at the consumer.
+    The consumer restores saved guest weights after route agreement.
+    The legacy ``prepare_replay`` argument is accepted for compatibility.
     """
-    tape = ReplayCheckpoint(parameter_version, prepare_replay=prepare_replay)
+    del prepare_replay
+    tape = ReplayCheckpoint(parameter_version)
 
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -106,7 +143,7 @@ def wrap_checkpoint(
 
 
 def is_checkpointing() -> bool:
-    """Report whether route selection is in a reentrant checkpoint call."""
+    """Report whether route selection is in a checkpoint call."""
     return _ACTIVE.get() is not None
 
 
@@ -122,42 +159,78 @@ def route_record(owner: Any) -> tuple[ReplayRecord | None, bool]:
     index = scope.cursor
     scope.cursor += 1
     if index < len(scope.records) and scope.records[index].owner is owner:
-        return scope.records[index], True
+        # Reuse the saved tensors while keeping each replay's agreement local to that invocation.
+        return replace(scope.records[index]), True
     return None, True
 
 
 def agree_replay(
     record: ReplayRecord | None, hidden: torch.Tensor, ids: torch.Tensor, probs: torch.Tensor,
-    counts: torch.Tensor | None, spec: Any, mask: int, *, weight_error: bool,
+    counts: torch.Tensor | None, spec: Any, mask: int,
 ) -> bool:
-    """Agree across EP on exact routing and independent activation validity."""
+    """Agree across EP on exact routing and activation validity."""
     scope = _ACTIVE.get()
-    valid = (
-        record is not None and record.route is not None and counts is None
-        and not weight_error and record.ids.shape == ids.shape and record.ids.dtype == ids.dtype
-        and record.stream == torch.npu.current_stream(hidden.device)
-        and scope is not None and scope.same_parameters
-    )
+    assert scope is not None
+    if counts is not None:
+        try:
+            _validate_supplied_counts(counts, spec.num_experts, hidden.device)
+        except (TypeError, ValueError):
+            mask |= _INVALID_COUNTS_MASK
+    invalid = mask & _INVALID_ROUTE_INPUT_MASK
     with torch.no_grad():
-        if valid:
-            same_ids = (ids == record.ids).all()
-            flag = same_ids.to(torch.int32).reshape(1) * mask
-            if record.activation is not None and record.inputs is not None:
-                value, score = record.inputs
-                if (value.shape == hidden.shape and score.shape == probs.shape
-                        and record.input_versions == (value._version, score._version)):
-                    same_values = same_ids & (value == hidden).all() & (score == probs).all()
-                    flag += same_values.to(torch.int32).reshape(1) * 32
+        if not invalid and _can_replay(record, ids, counts, mask, scope):
+            flag = _replay_vote(record, hidden, ids, probs, counts, mask)
         else:
-            flag = torch.zeros(1, dtype=torch.int32, device=hidden.device)
+            flag = torch.full((1,), invalid, dtype=torch.int32, device=hidden.device)
         gathered = flag.new_empty(spec.ep_size)
         dist.all_gather_into_tensor(gathered, flag.contiguous(), group=spec.ep_group)
         flags = gathered.tolist()
-    first = flags[0] % 32
-    reuse = first != 0 and all(value % 32 == first for value in flags)
+    route_mask = ~_REPLAY_ACTIVATION_MASK
+    first = flags[0] & route_mask
+    reuse = first != 0 and not first & _INVALID_ROUTE_INPUT_MASK and all(
+        (value & route_mask) == first for value in flags)
+    if not reuse:
+        _reject_invalid_route_inputs(flags)
+        if scope.non_reentrant:
+            raise RuntimeError("Non-reentrant MegaMoe checkpoint could not replay its original expert layout "
+                               "on all EP ranks")
     if record is not None:
-        record.allow_activation = reuse and all(value >= 32 for value in flags)
+        record.allow_activation = reuse and all(value & _REPLAY_ACTIVATION_MASK for value in flags)
     return reuse
+
+
+def _can_replay(
+    record: ReplayRecord | None, ids: torch.Tensor, counts: torch.Tensor | None,
+    mask: int, scope: _CheckpointScope,
+) -> bool:
+    """Check the saved metadata and execution mode before comparing tensors."""
+    if not scope.same_parameters or record is None:
+        return False
+    return (
+        record.route is not None and record.ids is not None
+        and record.ids.shape == ids.shape and record.ids.dtype == ids.dtype and record.ids.device == ids.device
+        and (counts is None) == (record.supplied_counts is None)
+        and record.stream == torch.npu.current_stream(ids.device)
+        and (not scope.non_reentrant or record.autograd_mask == mask)
+    )
+
+
+def _replay_vote(record: ReplayRecord, hidden, ids, probs, counts, mask):
+    """Vote on exact route identity and whether saved activations still match."""
+    same_route = (ids == record.ids).all()
+    if counts is not None:
+        same_route = same_route & (counts == record.supplied_counts).all()
+    flag = same_route.to(torch.int32).reshape(1) * mask
+    if record.activation is not None and record.inputs is not None:
+        value, score = record.inputs
+        if value.shape != hidden.shape or score.shape != probs.shape:
+            return flag
+        # The tensor version counters detect writes through aliases to the saved inputs.
+        versions = value._version, score._version  # pylint: disable=protected-access
+        if record.input_versions == versions:
+            same_values = same_route & (value == hidden).all() & (score == probs).all()
+            flag += same_values.to(torch.int32).reshape(1) * _REPLAY_ACTIVATION_MASK
+    return flag
 
 
 class ActivationReservation:
@@ -171,13 +244,12 @@ class ActivationReservation:
 
     @classmethod
     def reserve(
-        cls, flat: torch.Tensor, required: int, group: dist.ProcessGroup, *, native: bool = False,
+        cls, flat: torch.Tensor, required: int, group: dist.ProcessGroup,
     ) -> ActivationReservation | None:
         """Charge a local snapshot while retaining headroom for FSDP."""
         device = flat.device
         key = (device, id(group))
         with cls.lock:
-            key = (*key, native)
             if key not in cls.limits:
                 total = torch.npu.get_device_properties(device).total_memory
                 free = torch.npu.mem_get_info(device)[0]
@@ -186,7 +258,7 @@ class ActivationReservation:
                 # heap. Leave headroom for transient allocations. Admission can
                 # differ by rank, and the existing replay consensus handles
                 # a local miss without introducing a conditional collective.
-                default_limit = total // (4 if native else 6)
+                default_limit = total // 6
                 limit = default_limit if configured is None else max(0, int(configured))
                 local_limit = min(limit, max(0, free - total // 3))
                 cls.limits[key] = local_limit, free

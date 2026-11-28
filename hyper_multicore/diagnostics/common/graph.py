@@ -37,6 +37,9 @@ class DiagnosticSpec:
     execution_mode: str = "event_driven"
     vector_worker_stride: int = 2
     graph_adapter: Callable[[Any, RuntimeConfigC], ComputeGraph] | None = None
+    profile_extra_stages: Mapping[int, str] | None = None
+    profile_extra_aic_records_per_task: int = 0
+    profile_extra_aiv_records_per_worker: int = 0
 
 
 @dataclass(frozen=True)
@@ -141,7 +144,7 @@ def _validate_operator(operator: OperatorNode, parameter_count: int) -> None:
 
 
 def _validate_task_ports(
-    task: TaskDescC, operator: OperatorNode, task_id: int,
+    task: TaskDescC, operator: OperatorNode, task_id: int, parameter_count: int,
 ) -> None:
     """Check a scheduled task's operand descriptors against the graph contract."""
     if operator.diagnostic_host_ports:
@@ -156,7 +159,11 @@ def _validate_task_ports(
             raise ValueError(f"task {task_id} stage {operator.name!r} {io} count does not match graph/ABI capacity")
         for index, spec in enumerate(specs):
             descriptor = descriptors[index]
-            if int(descriptor.input_position) != spec.param_position:
+            position = spec.param_position
+            if operator.diagnostic_parameter_position is not None:
+                position = operator.diagnostic_parameter_position(task, io, index, position)
+                _validate_parameter_position(position, parameter_count, f"task {task_id} {io}{index}")
+            if int(descriptor.input_position) != position:
                 raise ValueError(f"task {task_id} {io}{index} parameter position disagrees with Tensor {spec.name!r}")
             if int(descriptor.data_type) != spec.dtype_size:
                 raise ValueError(f"task {task_id} {io}{index} element byte size disagrees with Tensor {spec.name!r}")
@@ -216,7 +223,7 @@ def validate_mega_kernel_diagnostic_contract(
         if task_id + operator.task_num > runtime_config.task_num:
             raise ValueError(f"graph tasks for stage {operator.name!r} exceed RuntimeConfig.task_num")
         for current_task_id in range(task_id, task_id + operator.task_num):
-            _validate_task_ports(runtime_config.all_tasks[current_task_id], operator, current_task_id)
+            _validate_task_ports(runtime_config.all_tasks[current_task_id], operator, current_task_id, parameter_count)
         task_id += operator.task_num
     _validate_task_schedule(runtime_config, task_id)
 

@@ -37,9 +37,9 @@ from .resources import _MegaMoeExecutionResources
 from ..base_planner import BasePlanner
 from .spec import (
     _COMMUNICATION_SPLIT,
+    _grow_source_capacity,
     _resolve_capacity_factors,
 )
-from .placement_options import MegaMoePlacementOptions
 from .transport import requested_transport
 from .schedule import validate_schedule_options
 
@@ -61,23 +61,6 @@ def _resolve_ep_size(ep_group: Any | None) -> int:
     if dist.is_initialized() and dist.get_world_size() > 1:
         raise ValueError("Pass ep_group explicitly for distributed MegaMoeExperts")
     return 1
-
-
-def _placement_planner(options: MegaMoePlacementOptions | None) -> BasePlanner | None:
-    """Validate the placement strategy before allocating any EP resources."""
-    if options is None:
-        return None
-    if not isinstance(options, MegaMoePlacementOptions):
-        raise TypeError("expert_placement must be MegaMoePlacementOptions or None")
-    if options.strategy == "none":
-        if options.planner is not None:
-            raise ValueError("placement strategy 'none' requires planner=None")
-        return None
-    if options.strategy != "adaptive":
-        raise ValueError(f"Unsupported expert placement strategy: {options.strategy!r}")
-    if not isinstance(options.planner, BasePlanner):
-        raise TypeError("placement strategy 'adaptive' requires a BasePlanner instance")
-    return options.planner
 
 
 def _validate_precision_schedule(precision, scheduler):
@@ -121,6 +104,41 @@ def _resolve_expert_options(precision, activation, numerics_options, tuning_opti
     return numerics, tuning, scheduler, activation_parameters
 
 
+def _placement_options(planner, replica_bank, precision, ep_size, num_experts):
+    """Resolve the placement contract used for resource compatibility and EP agreement."""
+    options = {
+        "hot_replica": planner is not None,
+        "planner_key": None,
+        "replica_bank": replica_bank,
+        "replica_slots_per_rank": None,
+        "cross_node_cost": None,
+        "receive_capacity_percent": None,
+    }
+    if planner is None:
+        return options
+    if precision != "bf16":
+        raise ValueError("HotReplica requires BF16 precision")
+    from ..hot_replica.planner import HotReplicaPlanner, replica_slot_budget  # pylint: disable=import-outside-toplevel
+
+    if ep_size <= 1:
+        raise ValueError("HotReplica requires an explicit EP group with more than one rank")
+    if isinstance(planner, HotReplicaPlanner):
+        slots = planner.replica_slots_per_rank
+        # Other topology types are handled by the common topology validator.
+        # pylint: disable-next=unidiomatic-typecheck
+        if slots is not None and type(num_experts) is int and num_experts % ep_size == 0:
+            replica_slot_budget(num_experts // ep_size, slots)
+        options["replica_slots_per_rank"] = slots
+        options["cross_node_cost"] = planner.cross_node_cost
+        if planner.receive_capacity_percent != "auto":
+            options["receive_capacity_percent"] = planner.receive_capacity_percent
+    settings = planner.configuration_key()
+    if not isinstance(settings, str):
+        raise TypeError("Planner configuration_key() must return a string")
+    options["planner_key"] = (type(planner).__module__, type(planner).__qualname__, settings)
+    return options
+
+
 class MegaMoeExperts(MulticoreModule):
     """Execute Router-selected local experts with the Torch MegaMoe kernel.
 
@@ -156,7 +174,6 @@ class MegaMoeExperts(MulticoreModule):
         activation: SwiGLUParameters | SiTUGLUParameters | None = None,
         numerics_options: MegaMoeNumericsOptions | None = None,
         tuning_options: MegaMoeTuningOptions | None = None,
-        expert_placement: MegaMoePlacementOptions | None = None,
     ) -> None:
         """Initialize a parameterless lazy execution owner.
 
@@ -174,12 +191,11 @@ class MegaMoeExperts(MulticoreModule):
                 Passing SiTUGLUParameters raises NotImplementedError at construction.
             numerics_options: Probability placement and partial-gradient precision.
                 None uses after-FC2 probability weighting and native partial dW.
-            expert_placement: Placement strategy and planner. Adaptive placement
-                requires A3 BF16 push execution and a multi-rank EP group.
             tuning_options: Public experimental tuning controls, imported from
                 ``hyper_multicore.experimental``. None selects the default policy.
                 Options are validated and copied into the instance configuration;
-                they do not change the chosen probability or clamp semantics.
+                An expert_placement planner enables A3 BF16 MTE Push or Pull on a
+                multi-rank EP group. Pull requires a wheel with runtime-row GET support.
 
         Numerical choices and tuning options are fixed for this instance.
         Construct another executor to change them.
@@ -187,16 +203,15 @@ class MegaMoeExperts(MulticoreModule):
         numerics, tuning, scheduler, activation_parameters = _resolve_expert_options(
             precision, activation, numerics_options, tuning_options,
         )
-        planner = _placement_planner(expert_placement)
-        if planner is not None and (precision != "bf16" or tuning.dispatch_mode != "push"):
-            raise ValueError("HotReplica requires BF16 precision and push dispatch")
-        source_bound = planner.source_token_bound if planner is not None else None
-        planner_key = None
-        if planner is not None:
-            settings = planner.configuration_key()
-            if not isinstance(settings, str):
-                raise TypeError("Planner configuration_key() must return a string")
-            planner_key = (type(planner).__module__, type(planner).__qualname__, settings)
+        planner = tuning.expert_placement
+        if planner is not None and not isinstance(planner, BasePlanner):
+            raise TypeError("expert_placement must be a BasePlanner or None")
+        if tuning.replica_bank not in ("shared", "dedicated"):
+            raise ValueError("replica_bank must be shared or dedicated")
+        if tuning.replica_bank == "dedicated" and planner is None:
+            raise ValueError("A dedicated replica bank requires expert_placement")
+        ep_size = _resolve_ep_size(ep_group)
+        placement_options = _placement_options(planner, tuning.replica_bank, precision, ep_size, num_experts)
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
@@ -206,7 +221,7 @@ class MegaMoeExperts(MulticoreModule):
             "partial_weight_grad_dtype": numerics.partial_weight_grad_dtype,
             "activation_parameters": activation_parameters,
             "apply_probs_before_fc2": numerics.apply_probs_before_fc2,
-            "ep_size": _resolve_ep_size(ep_group),
+            "ep_size": ep_size,
             "ep_group": ep_group,
             "dispatch_mode": tuning.dispatch_mode,
             "initial_capacity_factor": tuning.initial_capacity_factor,
@@ -214,9 +229,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": tuning.dispatch_split,
             "combine_split": tuning.combine_split,
             "precision": precision,
-            "hot_replica": planner is not None,
-            "planner_key": planner_key,
-            "source_token_bound": source_bound,
+            **placement_options,
             "transport_engine": requested_transport(),
             "ready_depth": scheduler.queue_ready_lookahead,
             "schedule_policy": scheduler.policy or "auto",
@@ -224,12 +237,6 @@ class MegaMoeExperts(MulticoreModule):
             "nominal_schedule": bool(scheduler.nominal_schedule),
             "lowering": scheduler.lowering,
         }
-        if planner is not None and specification["ep_size"] <= 1:
-            raise ValueError("HotReplica requires an explicit EP group with more than one rank")
-        if source_bound is not None:
-            limit = (2**31 - 1) // max(hidden_size, top_k) // _COMMUNICATION_SPLIT * _COMMUNICATION_SPLIT
-            if source_bound > limit:
-                raise ValueError(f"HotReplica source_token_bound exceeds {limit} rows")
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
@@ -296,8 +303,15 @@ class MegaMoeExperts(MulticoreModule):
             combine_split=specification["combine_split"],
             auto_tokens=specification.get("auto_tokens", False),
         )
+        local_num_tokens = specification["local_num_tokens"]
+        if specification["dispatch_mode"] == "pull" and initial_capacity_factor > 1.0:
+            local_num_tokens = _grow_source_capacity(
+                local_num_tokens, local_num_tokens, initial_capacity_factor,
+                specification["hidden_size"], specification["top_k"],
+            )
         return {
             **specification,
+            "local_num_tokens": local_num_tokens,
             "initial_capacity_factor": initial_capacity_factor,
             "capacity_growth_factor": capacity_growth_factor,
         }
@@ -415,7 +429,6 @@ class MegaMoeExperts(MulticoreModule):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        tokens_per_expert: torch.Tensor | None,
         expert_weights: tuple,
     ) -> torch.Tensor:
         """Validate input shapes and return flattened local token states."""
@@ -435,13 +448,6 @@ class MegaMoeExperts(MulticoreModule):
                 f"topk_weights must have shape {route_shape}, "
                 f"got {tuple(topk_weights.shape)}."
             )
-        if tokens_per_expert is not None and tuple(tokens_per_expert.shape) != (
-            self.num_experts,
-        ):
-            raise ValueError(
-                f"tokens_per_expert must have shape ({self.num_experts},), "
-                f"got {tuple(tokens_per_expert.shape)}."
-            )
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
 
@@ -450,13 +456,12 @@ class MegaMoeExperts(MulticoreModule):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        tokens_per_expert: torch.Tensor | None,
         expert_weights: tuple,
     ) -> tuple[torch.Tensor, bool]:
         """Defer rank-local weight errors until the binding or route collective."""
         try:
             return self._validate_forward_inputs(
-                hidden_states, topk_ids, topk_weights, tokens_per_expert, expert_weights,
+                hidden_states, topk_ids, topk_weights, expert_weights,
             ), False
         except (_InvalidExpertWeights, _InvalidExpertWeightType):
             if self.ep_size == 1:
@@ -497,13 +502,15 @@ class MegaMoeExperts(MulticoreModule):
         """
         weights = expert_weights
         hidden_flat, weight_error = self._prepare_forward_inputs(
-            hidden_states, topk_ids, topk_weights, tokens_per_expert, weights,
+            hidden_states, topk_ids, topk_weights, weights,
         )
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
-        with prepare_expert_invocation(hidden_flat, topk_ids, topk_weights, tokens_per_expert,
-                                       weights, resources, weight_error=weight_error, planner=self._planner) as route:
+        with prepare_expert_invocation(
+            hidden_flat, topk_ids, topk_weights, tokens_per_expert, weights, resources,
+            weight_error=weight_error, planner=self._planner,
+        ) as route:
             return self._backend.forward(
                 self, hidden_states, hidden_flat, topk_ids, topk_weights, weights, resources, route,
             )

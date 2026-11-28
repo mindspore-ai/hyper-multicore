@@ -33,8 +33,7 @@ class ShmemTaskPartition(IntEnum):
     """Partition each peer/expert transfer into contiguous row ranges.
 
     FIXED_ROWS uses task_split_value rows per task. RUNTIME_ROWS divides the
-    actual runtime row count evenly among that PUT's task descriptors.
-    GET continues to use fixed row tiles.
+    actual runtime row count evenly among that transfer's task descriptors.
     Both modes publish one completion credit per task, including empty ranges.
     """
 

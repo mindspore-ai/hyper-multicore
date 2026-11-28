@@ -24,31 +24,21 @@ from hyper_multicore.diagnostics import (
 )
 
 if TYPE_CHECKING:
-    from hyper_multicore.modules.mega_moe.placement_options import MegaMoePlacementOptions
-    from hyper_multicore.modules.base_planner import BasePlanner, ExpertPlacement, PlacementRequest
     from hyper_multicore.modules.mega_gate.module import MegaGate
     from hyper_multicore.modules.mega_mhc.module import MegaMhc
     from hyper_multicore.modules.mega_moe.module import MegaMoeExperts
 
 __all__ = [
-    "BasePlanner", "ExpertPlacement", "PlacementRequest", "SiTUGLUParameters", "SwiGLUParameters",
+    "SiTUGLUParameters", "SwiGLUParameters",
     "MegaGate", "MegaMhc", "MegaMoeExperts", "MegaMoeNumericsOptions",
-    "MegaMoePlacementOptions", "MegaKernelDiagnostics",
+    "MegaKernelDiagnostics",
     "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
 ]
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     """Load optional multicore modules only when their API is requested."""
-    if name in ("BasePlanner", "ExpertPlacement", "PlacementRequest"):
-        from hyper_multicore.modules import base_planner  # pylint: disable=import-outside-toplevel
-
-        value = getattr(base_planner, name)
-    elif name == "MegaMoePlacementOptions":
-        from hyper_multicore.modules.mega_moe.placement_options import (  # pylint: disable=import-outside-toplevel
-            MegaMoePlacementOptions as value,
-        )
-    elif name == "MegaMhc":
+    if name == "MegaMhc":
         from hyper_multicore.modules.mega_mhc.module import (  # pylint: disable=import-outside-toplevel
             MegaMhc as value,
         )

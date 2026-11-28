@@ -80,9 +80,10 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         Description: Both transports grow source rows without modifying retained plans or shrinking on reuse.
         Expectation: Source and receive capacity commit together and smaller inputs reuse the committed layout.
         """
-        for mode in ("push", "pull"):
-            with self.subTest(mode=mode):
+        for mode, arch in (("push", 2201), ("push", 3510), ("pull", 2201)):
+            with self.subTest(mode=mode, arch=arch):
                 manager, workspace, retained_spec = self._automatic_workspace(mode)
+                manager.entries[0].bound_spec = retained_spec = replace(retained_spec, architecture=arch)
                 old_routed = workspace.routed_buffer
                 with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
                     committed = manager.ensure_token_capacity(workspace, 512, 1700)
@@ -103,45 +104,55 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_automatic_budget_failure_preserves_committed_source_and_receive_capacity(self) -> None:
-        """Feature: Automatic MegaMoe token storage.
+    def test_automatic_growth_respects_explicit_heap_limit(self) -> None:
+        """Reject oversized Push and Pull layouts before replacing their buffers."""
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                limit = 2 * 1024**2
+                with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(limit)}):
+                    manager, workspace, spec = self._automatic_workspace(mode)
+                original = workspace.routed_buffer
+                with patch.object(shmem, "_restart") as restart:
+                    with self.assertRaisesRegex(RuntimeError, rf"HEAP_SIZE: required=\d+ bytes, limit={limit} bytes"):
+                        manager.ensure_token_capacity(workspace, 131072, 262144)
+                    restart.assert_not_called()
+                self.assertEqual(manager.heap_bytes, limit)
+                self.assertEqual(manager.epoch, 0)
+                self.assertEqual(manager.state, "ready")
+                self.assertIs(manager.workspace_spec(workspace), spec)
+                self.assertIs(workspace.routed_buffer, original)
 
-        Description: An over-budget source growth fails before any restart or specification mutation.
-        Expectation: A rejected layout preserves both committed capacities and the current heap state.
-        """
+    def test_automatic_growth_without_an_explicit_limit(self) -> None:
+        """Keep automatic physical heap growth for Push and Pull with no explicit limit."""
         for mode in ("push", "pull"):
             with self.subTest(mode=mode):
                 manager, workspace, spec = self._automatic_workspace(mode)
-                manager.heap_limit = manager.heap_bytes
+                initial_bytes = manager.heap_bytes
                 original = workspace.routed_buffer
-                with (patch.object(shmem, "_restart") as restart,
-                      self.assertRaisesRegex(RuntimeError, "explicit Heap budget")):
-                    manager.ensure_token_capacity(workspace, 131072, 262144)
-                restart.assert_not_called()
-                self.assertIs(manager.entries[0].bound_spec, spec)
-                self.assertIs(workspace.routed_buffer, original)
-                self.assertEqual(manager.epoch, 0)
+                with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+                    committed = manager.ensure_token_capacity(workspace, 131072, 262144)
+                restart.assert_called_once()
+                self.assertGreater(manager.heap_bytes, initial_bytes)
+                self.assertEqual(manager.growth_records[-1]["old_heap_bytes"], initial_bytes)
+                self.assertEqual(committed.local_num_tokens, 131072)
+                self.assertEqual(spec.local_num_tokens, 128)
+                self.assertIsNot(workspace.routed_buffer, original)
+                if mode == "push":
+                    self.assertEqual(workspace.capacity_floor, 262144)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_automatic_growth_falls_back_to_required_rows_within_heap_budget(self) -> None:
-        """Feature: Automatic MegaMoe token storage.
-
-        Description: A geometric source reservation may exceed the budget while the actual request still fits.
-        Expectation: The required aligned layout fits without applying the larger growth factor.
-        """
-        for mode in ("push", "pull"):
-            with self.subTest(mode=mode):
-                manager, workspace, _ = self._automatic_workspace(mode)
-                with patch.object(shmem, "_restart", side_effect=self._cpu_restart):
-                    manager.ensure_token_capacity(workspace, 16384, 0)
-                    manager.heap_limit = manager.heap_bytes
-                    entry = manager.entries[0]
-                    entry.bound_spec = replace(entry.bound_spec, capacity_growth_factor=2.0)
-                    committed = manager.ensure_token_capacity(workspace, 17024, 0)
-                self.assertEqual(committed.local_num_tokens, 17024)
-                self.assertEqual(workspace.routed_slots, 34048)
-                self.assertEqual(manager.heap_bytes, manager.heap_limit)
+    def test_fixed_heap_retries_growth_without_geometric_headroom(self) -> None:
+        """Commit the same route when its exact aligned capacities fit inside the limit."""
+        limit = 2 * 1024**2
+        with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(limit)}):
+            manager, workspace, _ = self._automatic_workspace("push")
+        with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+            manager.ensure_token_capacity(workspace, 20480, 16384)
+            committed = manager.ensure_token_capacity(workspace, 21120, 16512)
+        self.assertEqual(restart.call_count, 2)
+        self.assertEqual(restart.call_args.kwargs["heap_size_bytes"], limit)
+        self.assertEqual(manager.heap_bytes, limit)
+        self.assertEqual(committed.local_num_tokens, 21120)
+        self.assertEqual(committed.receive_capacity, 16512)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -200,6 +211,52 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             manager.reserve(reservations, allow_resize=True)
             self.assertEqual(restart.call_count, 1)
         self.assertEqual(manager.epoch, 1)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_home_workspace_growth_and_bank_bind_use_one_restart(self) -> None:
+        """Grow the reused source and receive buffers while reserving a cold replica bank."""
+        manager, workspace, retained = self._automatic_workspace("push")
+        manager._runtime_attached = True
+        bank = {"kind": "expert_bank"}
+        reservations = ((bank, self._layout(4 * 1024**2, 2, "bank")),)
+        with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+            manager.reserve(reservations, allow_resize=True, workspace_growth=(workspace, 512, 1792))
+            self.assertEqual(len(manager.entries), 2)
+            self.assertEqual(workspace.routed_slots, 1024)
+            self.assertEqual(workspace.capacity_floor, 1792)
+            self.assertEqual(retained.local_num_tokens, 128)
+            manager.ensure_token_capacity(workspace, 512, 1792)
+            restart.assert_called_once()
+
+    def test_fixed_heap_distinguishes_required_and_preferred_receive_for_first_bank(self) -> None:
+        """Commit the exact layout when it fits, and roll back a bank that cannot fit."""
+        page = 2 * 1024**2
+        tokens, required, preferred = 32768, 32768, 81920
+        bank = self._layout(page, 1, name="replica bank")
+        for shortfall in (0, page):
+            with self.subTest(shortfall=shortfall):
+                manager, workspace, _ = self._automatic_workspace("push")
+                manager._runtime_attached = True
+                home = manager.entries[0]
+                exact = _workspace_layout(home.specification, torch.bfloat16, required, tokens)
+                desired = _workspace_layout(home.specification, torch.bfloat16, preferred, tokens)
+                minimum = manager._required_bytes([exact, bank])
+                self.assertGreater(manager._required_bytes([desired, bank]), minimum)
+                manager.heap_bytes = manager.heap_limit = minimum - shortfall
+                with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+                    if shortfall:
+                        with self.assertRaisesRegex(RuntimeError, f"required={minimum} bytes"):
+                            manager.reserve((({"kind": "replica"}, bank),), allow_resize=True,
+                                            workspace_growth=(workspace, tokens, required), preferred_receive=preferred)
+                        self.assertEqual(len(manager.entries), 1)
+                        restart.assert_not_called()
+                    else:
+                        manager.reserve((({"kind": "replica"}, bank),), allow_resize=True,
+                                        workspace_growth=(workspace, tokens, required), preferred_receive=preferred)
+                        self.assertEqual(len(manager.entries), 2)
+                        self.assertEqual(workspace.capacity_floor, required)
+                        restart.assert_called_once()
 
     def setUp(self) -> None:
         """Install one-rank lifecycle and configuration boundaries."""
@@ -277,7 +334,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         self.assertEqual(added, tuple(item[0] for item in reservations))
         self.assertIs(self.dist.all_gather_object.call_args.kwargs["group"], self.root_group)
         configuration, failure = self.dist.all_gather_object.call_args.args[1]
-        self.assertEqual(configuration, (None, str(self.reference.dtype), tuple(item[1] for item in reservations), 0))
+        self.assertEqual(configuration, (None, str(self.reference.dtype), tuple(item[1] for item in reservations)))
         self.assertIsNone(failure)
 
         first = {"shape": 1}
@@ -303,7 +360,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
         workspace = Mock()
         manager.bind(workspace, SimpleNamespace(name="fixed"), first)
-        with self.assertRaisesRegex(RuntimeError, "fixed SHMEM layout"):
+        with self.assertRaisesRegex(RuntimeError, "static Pull workspace"):
             manager.reserve(((equal, self._layout(3 * 1024**2, 2)),), allow_resize=False)
         self.assertEqual([entry.specification for entry in manager.entries], [first])
 
@@ -358,6 +415,35 @@ class TestMegaMoeHeapManager(unittest.TestCase):
                 self.assertEqual(manager.entries, [])
                 self.assertFalse(manager._configured)
                 self.assertEqual(manager.heap_bytes, 0)
+
+    def test_explicit_limit_rolls_back_oversized_reservations(self) -> None:
+        """Reject initial and late owners without changing the configured runtime."""
+        manager = _HeapManager(self.root_group, self.reference)
+        limit = 2 * 1024**2
+        home, bank = {"kind": "home"}, {"kind": "expert_bank"}
+        home_layout = self._layout(1024, 128, "home")
+        bank_layout = self._layout(limit, 2, "bank")
+        error = rf"HEAP_SIZE: required={2 * limit} bytes, limit={limit} bytes"
+        with (
+            patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(limit)}),
+            patch.object(shmem, "acquire") as acquire,
+            patch.object(shmem, "_restart") as restart,
+        ):
+            with self.assertRaisesRegex(RuntimeError, error):
+                manager.reserve(((home, home_layout), (bank, bank_layout)), allow_resize=True)
+            self.assertEqual(manager.entries, [])
+            self.assertIsNone(manager.heap_limit)
+            acquire.assert_not_called()
+            manager.reserve(((home, home_layout),), allow_resize=True)
+            manager.attach_runtime()
+            acquire.assert_called_once_with(self.root_group, heap_size_bytes=limit)
+            with patch.dict(heap_manager_module.os.environ, {"HYPER_MULTICORE_SHMEM_HEAP_SIZE": str(2 * limit)}):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    manager.reserve(((bank, bank_layout),), allow_resize=True)
+            restart.assert_not_called()
+        self.assertEqual([entry.specification for entry in manager.entries], [home])
+        self.assertEqual(manager.heap_bytes, limit)
+        self.assertEqual(manager.state, "ready")
 
     def test_manager_owns_and_reuses_one_retryable_runtime_reference(self) -> None:
         """Reuse an attached manager and commit detach only after its sole release succeeds."""
@@ -501,11 +587,8 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_capacity_fast_path_and_explicit_limit_fallback(self) -> None:
-        """Feature: receive capacity budgeting.
-        Description: Keep the sufficient-capacity path and fall back to minimum rows within the heap limit.
-        Expectation: Reuse needs no lock; growth preserves source reservation and fits the explicit budget.
-        """
+    def test_receive_capacity_fast_path_and_geometric_growth(self) -> None:
+        """Keep the receive fast path and grow beyond the initial heap when required."""
         manager = _HeapManager(self.root_group, self.reference)
         workspace = SimpleNamespace(capacity_floor=2)
         with patch.object(manager, "access") as access:
@@ -514,16 +597,14 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
         specification = {"shape": "dynamic"}
         manager = self._manager_with_reservation(specification, self._layout(512, 1))
-        manager.heap_limit = 2 * 1024**2
-        manager.heap_bytes = manager.heap_limit
         workspace = Mock(capacity_floor=1)
         workspace.describe_restart_allocations.return_value = ()
         workspace.validate_restart_allocations.return_value = False
         manager.bind(workspace, SimpleNamespace(name="bound"), specification)
 
         def layout(specification: dict, dtype: torch.dtype, capacity: int,
-                   token_capacity: int | None) -> _WorkspaceLayout:
-            """Return a capacity-dependent layout for fallback selection."""
+                   token_capacity: int | None, **_options) -> _WorkspaceLayout:
+            """Return a capacity-dependent layout for this growth."""
             del specification, dtype, token_capacity
             required = 3 * 1024**2 if capacity == 3 else 1024
             return self._layout(required, capacity)
@@ -535,13 +616,14 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             return _lifecycle._RestartResult((), {})
 
         with (
-            patch.object(heap_manager_module, "_grow_receive_capacity", return_value=(3, 2)),
+            patch.object(heap_manager_module, "_grow_receive_capacity", return_value=3),
             patch.object(heap_manager_module, "_workspace_layout", side_effect=layout),
             patch.object(shmem, "_restart", side_effect=restart),
         ):
             manager.ensure_capacity(workspace, 2)
-        self.assertEqual(manager.entries[0].layout.receive_capacity, 2)
-        self.assertEqual(workspace.capacity_floor, 2)
+        self.assertEqual(manager.entries[0].layout.receive_capacity, 3)
+        self.assertEqual(workspace.capacity_floor, 3)
+        self.assertEqual(manager.heap_bytes, 4 * 1024**2)
 
     def test_resize_lock_rejects_concurrent_access(self) -> None:
         """Reject another submission while one capacity change owns the manager lock."""
@@ -564,7 +646,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             return _lifecycle._RestartResult((), {})
 
         with (
-            patch.object(heap_manager_module, "_grow_receive_capacity", return_value=(2, 2)),
+            patch.object(heap_manager_module, "_grow_receive_capacity", return_value=2),
             patch.object(heap_manager_module, "_workspace_layout", return_value=self._layout(1024, 2)),
             patch.object(shmem, "_restart", side_effect=restart),
         ):

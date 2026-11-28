@@ -114,7 +114,7 @@ class TestFrontendContracts(unittest.TestCase):
         self.assertIs(type(converted), MegaMoeExperts)
         specification = converted._resource_group.specification  # pylint: disable=protected-access
         self.assertEqual((specification["dispatch_mode"], specification["dispatch_split"]), ("pull", 256))
-        self.assertIsNone(specification["initial_capacity_factor"])
+        self.assertEqual(specification["initial_capacity_factor"], 1.0)
         with self.assertRaisesRegex(TypeError, "dispatch_mode"):
             # This negative test deliberately passes a removed public keyword.
             # pylint: disable-next=unexpected-keyword-arg

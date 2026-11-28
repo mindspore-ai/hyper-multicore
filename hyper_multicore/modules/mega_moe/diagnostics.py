@@ -34,6 +34,21 @@ from hyper_multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType
 
 MEGA_MOE_OWNER_LABEL = "Expert"
 
+# Native stage IDs mirror ops/common/mega_moe/replica_trace.h.
+REPLICA_TRACE_STAGES = {
+    0x10100: "ReplicaW13WeightWait",
+    0x10101: "ReplicaW2WeightWait",
+    0x10102: "ReplicaDW13OwnerReduce",
+    0x10103: "ReplicaDW2OwnerReduce",
+    0x10104: "ReplicaDW13LongestBandReadyWait",
+    0x10105: "ReplicaDW2LongestBandReadyWait",
+    0x10106: "ReplicaDW13OwnerDrain",
+    0x10107: "ReplicaDW2OwnerDrain",
+    0x10108: "ReplicaDW13AckPublish",
+    0x10109: "ReplicaDW2AckPublish",
+    0x1010A: "ReplicaDW13GuestAckWait",
+    0x1010B: "ReplicaDW2GuestAckWait",
+}
 
 @dataclass(frozen=True)
 class _MegaMoeDiagnosticContext:

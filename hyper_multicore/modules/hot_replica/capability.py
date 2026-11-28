@@ -14,12 +14,16 @@
 # ============================================================================
 """Validate the actual input device and selected HotReplica artifacts before allocation."""
 
+from pathlib import Path
+import socket
+
 import torch
 from hyper_multicore import _collective
 from hyper_multicore._loader import load_torch_npu, query_npu_arch, validate_native_compatibility
+from ._planner.native_host import load_replica_planner
 
 
-def _require_a3(tensor):
+def _require_a3(tensor, *, dispatch_mode: str = "push") -> bool:
     """Reject devices sharing arch22 unless their actual SOC is Atlas A3."""
     if tensor.device.type != "npu" or tensor.dtype != torch.bfloat16:
         raise ValueError("HotReplica requires BF16 input on an Atlas A3 NPU")
@@ -34,11 +38,40 @@ def _require_a3(tensor):
     artifacts = selected["variant"].get("hot_replica")
     if not artifacts or artifacts.get("soc") != "ascend910_93":
         raise RuntimeError("The selected Torch/PTA adapter has no Atlas A3 HotReplica artifacts")
-    for key in ("allocator", "bridge", "kernels"):
+    for key in ("bridge", "kernels"):
         if not (selected["root"] / artifacts[key]).is_file():
             raise RuntimeError(f"Selected HotReplica artifact is missing: {key}")
+    if "planner" in artifacts:
+        load_replica_planner(selected["root"] / artifacts["planner"])
+    build_info = selected["build_info"]
+    if dispatch_mode == "pull" and not build_info.get("a3_bf16_pull_runtime_rows", False):
+        raise RuntimeError("BF16 HotReplica Pull on Ascend910_93 requires an A3 wheel with runtime-row GET support")
+    return bool(build_info.get("a3_replica_bf16_partials", False))
 
 
-def require_capability(tensor: torch.Tensor, group: torch.distributed.ProcessGroup) -> None:
-    """Converge capability failures before any rank allocates a bank or enters transfer."""
-    _collective.collective_call(lambda: _require_a3(tensor), stage="HotReplica capability", group=group)
+def require_capability(
+    tensor: torch.Tensor, group: torch.distributed.ProcessGroup, *,
+    dispatch_mode: str = "push",
+) -> tuple[bool, tuple[int, ...]]:
+    """Agree on the device artifacts and node labels before planning any route."""
+    local_error = None
+    bf16_partials = False
+    try:
+        bf16_partials = _require_a3(tensor, dispatch_mode=dispatch_mode)
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        local_error = error
+    try:
+        node = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        node = ""
+    failure = None if local_error is None else _collective.failure_report(local_error)
+    reports = _collective.exchange(
+        (bf16_partials, node or socket.gethostname(), failure), group=group,
+        failure_prefix="HotReplica capability failed while converging ranks",
+    )
+    capabilities, nodes, failures = zip(*reports)
+    if any(failure is not None for failure in failures):
+        details = _collective.format_collective_failures(failures)
+        raise RuntimeError(f"HotReplica capability failed on {details}") from local_error
+    labels = {node: rank for rank, node in enumerate(dict.fromkeys(nodes))}
+    return all(capabilities), tuple(labels[node] for node in nodes)

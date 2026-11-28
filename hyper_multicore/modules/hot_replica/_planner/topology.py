@@ -12,21 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Placement policy for a MegaMoE executor."""
-from __future__ import annotations
+"""Immutable EP-rank node identities independent of rank numbering and device count."""
 
-from dataclasses import dataclass
-from typing import Literal
-
-from ..base_planner import BasePlanner
+from collections.abc import Sequence
 
 
-@dataclass(frozen=True)
-class MegaMoePlacementOptions:
-    """Select ordinary routing or cost-based replication of hot experts.
 
-    Use "adaptive" with a BasePlanner to consider a new placement for
-    each fresh route. Use "none" without a planner to keep ordinary routing.
-    """
-    strategy: Literal["none", "adaptive"] = "none"
-    planner: BasePlanner | None = None
+
+
+
+def _validate_rank_nodes(nodes: Sequence[int], size: int) -> tuple[int, ...]:
+    """Freeze optional node labels and reject malformed process-group topology."""
+    frozen = tuple(nodes)
+    invalid = any(not isinstance(node, int) or isinstance(node, bool) or node < 0 for node in frozen)
+    if frozen and (len(frozen) != size or invalid):
+        raise ValueError('Replica rank_nodes must contain one nonnegative integer node label per EP rank')
+    return frozen

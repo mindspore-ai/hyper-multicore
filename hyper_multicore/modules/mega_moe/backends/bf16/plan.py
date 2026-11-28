@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -53,8 +53,9 @@ from hyper_multicore.scheduler.config import (
     TaskSplitValue,
 )
 from hyper_multicore.scheduler.graph import ComputeGraph
+from hyper_multicore.tasks.gmm import GroupedMatmulTaskMode
 
-from ...diagnostics import _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
+from ...diagnostics import REPLICA_TRACE_STAGES, _mega_moe_owner_options, _adapt_mega_moe_diagnostic_graph
 from ...probability import (
     PROBABILITY_POSITION_FORWARD, PROBABILITY_POSITION_BACKWARD,
 )
@@ -62,7 +63,7 @@ from ...probability import (
 from ...schedule_policy import (
     MegaMoeSchedulePolicy, compact_graph,
 )
-from ...spec import MegaMoeSpec
+from ...spec import MegaMoeSpec, _COMMUNICATION_SPLIT, _align_capacity
 from ...tensor_dump import attach_mega_moe_l1_view_resolvers
 from .activation import prepare_activation_tiling
 
@@ -74,6 +75,7 @@ class MegaMoePlan:
     spec: MegaMoeSpec
     forward_graph: ComputeGraph
     fwd_diagnostics: MegaKernelDiagnostics
+    event_counter_bytes: int
     up_proj_tiling: Any
     swiglu_tiling: Any
     down_proj_tiling: Any
@@ -86,7 +88,6 @@ class MegaMoePlan:
     swiglu_grad_tiling: Any
     reuse_backward_dispatch: bool = False
     weight_grad_dtype: torch.dtype | None = None
-    event_counter_bytes: int | None = None
     _recorded_streams: set = field(default_factory=set, repr=False, compare=False)
 
     @property
@@ -159,17 +160,36 @@ def _uses_explicit_queues(spec: MegaMoeSpec) -> bool:
     return explicit_queues
 
 
+def _communication_splits(spec: MegaMoeSpec, explicit_queues: bool) -> tuple[int, int]:
+    """Resolve the default communication splits for large arch35 Pull routes."""
+    dispatch_split, combine_split = spec.dispatch_split, spec.combine_split
+    if (explicit_queues and spec.auto_tokens and spec.lowering == "auto"
+            and spec.dispatch_mode == "pull" and spec.transport_engine == "mte"):
+        # Coarsen default descriptors when EP already supplies communication
+        # concurrency. Keep at least four fragments at large source lengths.
+        fragments = max(4, 2 * spec.num_cube_cores // spec.ep_size)
+        rows = (spec.plan_tokens + fragments - 1) // fragments
+        split = min(_align_capacity(rows), 8 * _COMMUNICATION_SPLIT)
+        if dispatch_split == _COMMUNICATION_SPLIT:
+            dispatch_split = split
+        if combine_split == _COMMUNICATION_SPLIT:
+            combine_split = split
+    return dispatch_split, combine_split
+
+
 def _build_runtime_artifacts(
-    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None,
+    spec: MegaMoeSpec, weight_grad_dtype: torch.dtype | None = None, *,
+    replica_pipeline: bool = False, reserve_merge_workers: bool = False,
 ) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     explicit_queues = _uses_explicit_queues(spec)
     task_values = _build_task_values(spec)
+    dispatch_split, combine_split = _communication_splits(spec, explicit_queues)
     forward_graph = build_forward_graph(
         task_values,
-        dispatch_sv=spec.dispatch_split,
+        dispatch_sv=dispatch_split,
         swiglu_sv=spec.swiglu_split,
-        combine_sv=spec.combine_split,
+        combine_sv=combine_split,
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
@@ -177,7 +197,8 @@ def _build_runtime_artifacts(
         apply_probs_before_fc2=spec.apply_probs_before_fc2,
         expert_weight_layout=spec.expert_weight_layout,
     )
-    compact = (not explicit_queues and spec.lowering != "dense" and spec.dispatch_mode == "push"
+    compact_dispatch = spec.dispatch_mode == "push" or spec.compact_pull
+    compact = (not explicit_queues and spec.lowering != "dense" and compact_dispatch
                and spec.intermediate_size < 2048
                and compact_graph(forward_graph, task_values, 2 * spec.num_cube_cores, spec.nominal_schedule))
     if not compact and (spec.lowering == "compact" or spec.nominal_schedule):
@@ -192,9 +213,9 @@ def _build_runtime_artifacts(
     )
     backward_graph = build_backward_graph(
         task_values,
-        dispatch_sv=spec.dispatch_split,
+        dispatch_sv=dispatch_split,
         swiglu_sv=spec.swiglu_split,
-        combine_sv=spec.combine_split,
+        combine_sv=combine_split,
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
         num_cube_cores=spec.num_cube_cores,
@@ -216,9 +237,23 @@ def _build_runtime_artifacts(
         spec.num_cube_cores,
     )
     if explicit_queues:
-        forward_data = configure_expert_queues(forward_data, forward_graph, spec, forward=True)
-        backward_data = configure_expert_queues(backward_data, backward_graph, spec, forward=False)
-        return forward_graph, forward_data, backward_graph, backward_data
+        forward_data = configure_expert_queues(
+            forward_data, forward_graph, spec, forward=True)
+        backward_data = configure_expert_queues(
+            backward_data, backward_graph, spec, forward=False)
+    else:
+        _schedule_arch22(
+            spec, task_values, forward_graph, forward_data, backward_graph, backward_data,
+            compact=compact, replica_pipeline=replica_pipeline, reserve_merge_workers=reserve_merge_workers,
+        )
+    return forward_graph, forward_data, backward_graph, backward_data
+
+
+def _schedule_arch22(
+    spec, task_values, forward_graph, forward_data, backward_graph, backward_data, *,
+    compact, replica_pipeline, reserve_merge_workers,
+) -> None:
+    """Configure dependency lookahead, projection waves and replica consumers."""
     if not compact and spec.ready_depth not in (None, 0):
         raise ValueError("Ready lookahead on arch22 requires compact lowering")
     policy = MegaMoeSchedulePolicy(
@@ -229,9 +264,20 @@ def _build_runtime_artifacts(
         batch_experts=spec.batch_experts,
         dependency_poll_interval=FAST_DEPENDENCY_POLL_INTERVAL_US,
     )
-    policy.apply(forward_data, forward_graph, task_values, spec.num_cube_cores, forward=True)
-    policy.apply(backward_data, backward_graph, task_values, spec.num_cube_cores, forward=False)
-    return forward_graph, forward_data, backward_graph, backward_data
+    # Complete backward projection waves in builder order for replica gradient returns.
+    backward_policy = replace(policy, pipeline_cube=False) if replica_pipeline else policy
+    for graph, config, schedule, forward in (
+        (forward_graph, forward_data, policy, True), (backward_graph, backward_data, backward_policy, False),
+    ):
+        schedule.apply(config, graph, task_values, spec.num_cube_cores, forward=forward)
+        if replica_pipeline and not schedule.pipeline_cube:
+            for task_id in config.cube_task_indices[:config.task_index_num[0]]:
+                config.all_tasks[task_id].extra_value_1 = GroupedMatmulTaskMode.SINGLE_GROUP
+    if compact and reserve_merge_workers:
+        end = backward_data.task_index_num[1]
+        for worker, queue in enumerate(backward_data.worker_queues[spec.num_cube_cores:]):
+            queue.begin = min(worker // 2, end) if worker % 2 else end
+            queue.stride = spec.num_cube_cores
 
 
 def _prepare_diagnostics(
@@ -241,6 +287,8 @@ def _prepare_diagnostics(
     backward_graph: ComputeGraph,
     backward_config: Any,
     device: Any,
+    *,
+    replica_pipeline: bool,
 ) -> tuple[MegaKernelDiagnostics, MegaKernelDiagnostics]:
     """Bind forward/backward plans to the public diagnostics integration API."""
     topology = _build_task_values(spec)
@@ -252,18 +300,26 @@ def _prepare_diagnostics(
         "rank": dist.get_rank() if dist.is_initialized() else spec.rank_id,
         **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
     }
+    backward_options = {}
+    if replica_pipeline:
+        options.update(profile_extra_stages=REPLICA_TRACE_STAGES, profile_extra_aic_records_per_task=1)
+        # Per projection: reduce, longest ready wait, drain, publish and at
+        # most one ACK wait per guest. The physical width bounds guest slots.
+        backward_options["profile_extra_aiv_records_per_worker"] = 2 * (4 + spec.local_experts)
     return (
         prepare_mega_kernel_diagnostics(
             forward_graph, forward_config,
             parameter_count=PROBABILITY_POSITION_FORWARD + 1 if spec.apply_probs_before_fc2 else 16, **options),
         prepare_mega_kernel_diagnostics(
             backward_graph, backward_config,
-            parameter_count=PROBABILITY_POSITION_BACKWARD + 1 if spec.apply_probs_before_fc2 else 20, **options),
+            parameter_count=PROBABILITY_POSITION_BACKWARD + 1 if spec.apply_probs_before_fc2 else 20,
+            **options, **backward_options),
     )
 
 
 def build_mega_moe_plan(
     spec: MegaMoeSpec, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
+    replica_pipeline: bool = False, reserve_merge_workers: bool = False,
 ) -> MegaMoePlan:
     """Build trimmed dense forward/backward runtime images without fusion slots.
 
@@ -271,26 +327,34 @@ def build_mega_moe_plan(
         spec: Validated local-token and expert topology specification.
         device: NPU device receiving serialized descriptors and tiling tensors.
         weight_grad_dtype: Keep partial expert weight gradients in FP32.
+        replica_pipeline: Use one GMM group per split weight destination.
+        reserve_merge_workers: Give the even AIV lanes to owner gradient consumers.
 
     Returns:
         Rank-local forward and backward runtime resources.
     """
     if weight_grad_dtype not in (None, torch.float32):
         raise ValueError("Partial expert gradients support only the native dtype or FP32")
+    if replica_pipeline and (spec.architecture != 2201 or spec.batch_experts):
+        raise ValueError("BF16 replica pipeline requires per-expert GMMs")
+    if reserve_merge_workers and not replica_pipeline:
+        raise ValueError("A3 replica merge workers require a split-weight replica plan")
     forward_graph, forward_config, backward_graph, backward_config = _build_runtime_artifacts(
-        spec, weight_grad_dtype)
+        spec, weight_grad_dtype, replica_pipeline=replica_pipeline, reserve_merge_workers=reserve_merge_workers)
     fwd_diagnostics, bwd_diagnostics = _prepare_diagnostics(
-        spec, forward_graph, forward_config, backward_graph, backward_config, device,
+        spec, forward_graph, forward_config, backward_graph, backward_config, device, replica_pipeline=replica_pipeline,
     )
     gmm_options = {
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
-        "num_groups": (1 if not spec.batch_experts and hasattr(forward_graph.get_op("dispatch"), "compact_lanes")
+        "num_groups": (1 if replica_pipeline or (
+                       not spec.batch_experts and hasattr(forward_graph.get_op("dispatch"), "compact_lanes"))
                        else spec.local_experts),
         "num_cube_cores": spec.num_cube_cores,
     }
     return MegaMoePlan(
         spec=spec,
+        event_counter_bytes=forward_config.event_capacity * 4,
         weight_grad_dtype=weight_grad_dtype,
         reuse_backward_dispatch=can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,

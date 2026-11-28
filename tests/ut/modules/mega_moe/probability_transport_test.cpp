@@ -46,18 +46,20 @@ using GM_ADDR = uint8_t *;
 struct CopyCall {
   int64_t elements;
   int peer;
+  uint64_t burst_bytes;
 };
 std::vector<CopyCall> calls;
 
 template <typename T>
-void PullToLocal(GM_ADDR destination, GM_ADDR source, int64_t elements, int peer) {
-  calls.push_back({elements, peer});
+void PullToLocal(GM_ADDR destination, GM_ADDR source, int64_t elements, int peer,
+                 uint64_t burst_bytes = 4 * 1024) {
+  calls.push_back({elements, peer, burst_bytes});
   std::memcpy(destination, source, elements * sizeof(T));
 }
 #define HYPER_MULTICORE_MULTICORE_GET_MEM_H
 #include "hyper_multicore/ops/common/mega_moe/transport.h"
 
-void CheckTransfer(bool weighted, int32_t size) {
+void CheckTransfer(bool weighted, bool runtime_rows, int32_t size, int start, int elements) {
   using namespace MulticoreRuntime;  // NOLINT(build/namespaces)
   uint16_t source[64], destination[64];
   float probabilities[4 * 32];
@@ -78,7 +80,7 @@ void CheckTransfer(bool weighted, int32_t size) {
   parameters[4] = reinterpret_cast<GM_ADDR>(&size);
   parameters[ProbabilityLayout::FORWARD_POSITION] = reinterpret_cast<GM_ADDR>(probabilities);
   TaskDesc task = {};
-  task.task_index = 5;  // Peer 1, second two-row tile.
+  task.task_index = 5;  // Peer 1, second tile.
   task.task_split_num = 8;
   task.task_split_value = 2;
   task.inputs[0].input_position = 2;
@@ -90,23 +92,27 @@ void CheckTransfer(bool weighted, int32_t size) {
   task.outputs[1].dim[1] = 32;
   task.num_outputs = weighted ? 2 : 1;
   task.extra_value_1 = weighted ? static_cast<uint32_t>(MegaMoeTransportPayload::TOKENS_WITH_PROBABILITIES) : 0;
+  if (runtime_rows) {
+    task.extra_value_1 |= static_cast<uint32_t>(ShmemTaskPartition::RUNTIME_ROWS);
+  }
   calls.clear();
   ExecuteMoeShmemGetMem<uint16_t>(task, parameters, reinterpret_cast<GM_ADDR>(tiling));
-  if (size <= 8) {
+  if (elements == 0) {
     assert(calls.empty());
     assert(probabilities[32 + 5] == -1.0f);
     assert(destination[20] == 0);
     return;
   }
-  const int elements = size - 8 < 8 ? size - 8 : 8;
   assert(calls.size() == (weighted ? 2U : 1U));
   assert(calls.back().peer == 1);
   assert(calls.back().elements == elements);
+  assert(calls.back().burst_bytes == 4 * 1024);
   for (int index = 0; index < elements; ++index) {
-    assert(destination[20 + index] == source[12 + index]);
+    assert(destination[destination_offset + start + index] == source[source_offset + start + index]);
   }
   for (int row = 0; row < 32; ++row) {
-    const bool copied = weighted && row >= 5 && row < 5 + elements / 4;
+    const int first = (destination_offset + start) / 4;
+    const bool copied = weighted && row >= first && row < first + elements / 4;
     assert(probabilities[32 + row] == (copied ? probabilities[row - 2] : -1.0f));
     assert(probabilities[64 + row] == -1.0f);
     assert(probabilities[96 + row] == -1.0f);
@@ -119,8 +125,12 @@ void CheckTransfer(bool weighted, int32_t size) {
 
 int main() {
   for (bool weighted : {false, true}) {
-    for (int32_t size : {0, 8, 12, 20}) {
-      CheckTransfer(weighted, size);
-    }
+    CheckTransfer(weighted, false, 0, 8, 0);
+    CheckTransfer(weighted, false, 8, 8, 0);
+    CheckTransfer(weighted, false, 12, 8, 4);
+    CheckTransfer(weighted, false, 20, 8, 8);
+    CheckTransfer(weighted, true, 4, 4, 0);
+    CheckTransfer(weighted, true, 8, 4, 4);
+    CheckTransfer(weighted, true, 20, 12, 8);
   }
 }

@@ -86,6 +86,14 @@
                 "path": "hyper_multicore/ops/patches/grouped_matmul_fusion.patch",
                 "sha256": "61506f77d380a36617c6e5e7ffbca689d18030c13c3f205a53113b2f07d7884c",
                 "purpose": "expose the selected grouped-matmul path as an inline building block"
+              },
+              {
+                "path": "hyper_multicore/ops/patches/grouped_matmul_replica_bands.patch",
+                "sha256": "9613ceb3905e5e96597db9e0b10b121bcafdf96e1b44327320ba492f643d100b",
+                "purpose": "publish FP32 TN output bands after full-K output completion",
+                "architectures": [
+                  "arch22"
+                ]
               }
             ],
             "upgrade_policy": "a version change must rebase the adapter and pass the full multicore kernel matrix"

@@ -26,6 +26,7 @@ import torch
 
 from hyper_multicore.modules.mega_moe import route as route_module
 from hyper_multicore.modules.mega_moe.route import (
+    _INVALID_COUNTS_MASK,
     _HOST_DESCRIPTOR_MAX_COUNTS,
     _HOST_ROUTE_CACHE_ENTRIES,
     _HostRouteCache,
@@ -40,6 +41,7 @@ from hyper_multicore.modules.mega_moe.route import (
     _dynamic_summary,
     _expert_capacity,
     _host_route_metadata,
+    _packed_route_ub,
     _prepare_dynamic_route,
     _publish_staged_pull,
     _read_cached_route,
@@ -55,6 +57,17 @@ from tests.common.mark_utils import arg_mark
 
 class TestMegaMoeRoute(unittest.TestCase):
     """Validate trusted Router counts and bounded capacity without hardware."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_packed_route_requires_a_known_capacity_and_scratch_fit(self) -> None:
+        """Keep the generic route available for unknown devices and preserve the scratch limit."""
+        spec = replace(self._spec(ep_size=2), num_experts=16)
+        wire = SimpleNamespace(device=SimpleNamespace(type="npu", index=0),
+                               dtype=torch.int32, stride=(16, 1).__getitem__)
+        for capacity, expected in ((None, None), (764, None), (768, 768)):
+            with self.subTest(capacity=capacity), patch.object(route_module, "device_ub_bytes", return_value=capacity):
+                self.assertEqual(_packed_route_ub(wire, spec), expected)
 
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -265,11 +278,12 @@ class TestMegaMoeRoute(unittest.TestCase):
         payload = torch.cat((header, counts), dim=1)
         for rank in range(2):
             spec = replace(self._spec(ep_size=2, rank_id=rank), max_local_num_tokens=257)
-            capacity, plan_tokens, maximum = _dynamic_summary(payload, spec)
-            self.assertEqual((capacity, plan_tokens), ((4, 128) if rank == 0 else (2, 128)))
-            self.assertEqual(maximum, 4)
+            summary = _dynamic_summary(payload, spec)
+            self.assertEqual((summary.capacity, summary.plan_tokens), (4, 128) if rank == 0 else (2, 128))
+            self.assertEqual(summary.maximum, 4)
+            self.assertEqual(summary.all_experts_active, rank == 0)
             received = counts[:, rank * 2:rank * 2 + 2]
-            meta = _compute_route_metadata(counts[rank], counts, received, spec, capacity)
+            meta = _compute_route_metadata(counts[rank], counts, received, spec, summary.capacity)
             self.assertEqual(meta.dispatch_src_off.tolist(), [0, 0, 0, 0] if rank == 0 else [0, 3, 4, 6])
             self.assertEqual(meta.group_list.tolist(), [3, 4] if rank == 0 else [2, 2])
             self.assertEqual(int(meta.dispatch_size.sum()), 0 if rank == 0 else 6)
@@ -385,10 +399,12 @@ class TestMegaMoeRoute(unittest.TestCase):
         flat_ids = torch.tensor([0, 1, 1, 3], dtype=torch.int32)
         supplied_counts = torch.tensor([4, 0, 0, 0], dtype=torch.int32)
 
-        with patch.object(torch, "bincount") as mock_bincount:
+        with (patch.object(torch, "bincount") as mock_bincount,
+              patch.object(torch, "histc") as mock_histc):
             supplied = _resolve_counts(flat_ids, supplied_counts, spec)
 
         mock_bincount.assert_not_called()
+        mock_histc.assert_not_called()
         self.assertIs(supplied, supplied_counts)
         computed = _resolve_counts(flat_ids, None, spec)
         expected = torch.tensor([1, 2, 0, 1], dtype=torch.int32)
@@ -396,6 +412,38 @@ class TestMegaMoeRoute(unittest.TestCase):
             torch.equal(computed, expected),
             f"computed counts mismatch: expected={expected}, got={computed}",
         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dynamic_npu_histogram_excludes_out_of_range_bin(self) -> None:
+        """Check that the NPU histogram retains only the logical expert bins."""
+        spec = replace(self._spec(ep_size=1), auto_tokens=True)
+        flat_ids = Mock(device=SimpleNamespace(type="npu"))
+        flat_ids.numel.return_value = 5
+        with patch.object(torch, "histc", return_value=torch.tensor([1., 2., 0., 1., 1.])) as histc:
+            counts = _resolve_counts(flat_ids, None, spec)
+
+        histc.assert_called_once_with(flat_ids, bins=5, min=0, max=5)
+        torch.testing.assert_close(counts, torch.tensor([1, 2, 0, 1], dtype=torch.int32))
+        self.assertTrue(counts.is_contiguous())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_large_npu_histogram_accumulates_exact_integer_counts(self) -> None:
+        """Keep the low bit of a large count by casting each chunk before addition."""
+        spec = replace(self._spec(ep_size=1), auto_tokens=True)
+        limit = 2**24
+        flat_ids = Mock(device=SimpleNamespace(type="npu"))
+        flat_ids.numel.return_value = limit + 2
+        flat_ids.split.return_value = (Mock(), Mock())
+        chunks = (torch.tensor([limit, 0, 0, 0, 0], dtype=torch.float32),
+                  torch.tensor([1, 0, 0, 0, 1], dtype=torch.float32))
+        with patch.object(torch, "histc", side_effect=chunks) as histc:
+            counts = _resolve_counts(flat_ids, None, spec)
+
+        flat_ids.split.assert_called_once_with(limit)
+        self.assertEqual(histc.call_count, len(chunks))
+        torch.testing.assert_close(counts, torch.tensor([limit + 1, 0, 0, 0], dtype=torch.int32))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -583,13 +631,15 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         return torch.tensor(rows, dtype=dtype)
 
     @staticmethod
-    def _reference(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int]:
+    def _reference(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int, bool]:
         """Use tensor reductions to independently check the Host list implementation."""
         counts = payload[:, 3:]
         loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum((0, 2))
         maximum_tokens = int(payload[:, 1].max())
         schedule = max(128, (maximum_tokens + 127) // 128 * 128)
-        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max())
+        first = spec.rank_id * spec.local_experts
+        incoming = counts[:, first:first + spec.local_experts].sum(0)
+        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max()), bool((incoming > 0).all())
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
@@ -598,7 +648,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         """Feature: dynamic count summary.
 
         Description: Cross table sizes, integer widths, transports and empty-source ranks.
-        Expectation: Every policy preserves exact destination loads and aligned schedules.
+        Expectation: Every policy preserves destination loads, aligned schedules and expert activity.
         """
         for experts in (24, 256, 260, 512, 1024, 2048):
             for dtype in (torch.int32, torch.int64):
@@ -1005,29 +1055,35 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         spec = self._spec(experts, rank=1)
         payload = self._payload(experts, torch.int32)
         workspace = SimpleNamespace(route_cache=None, route_cache_probe_after=0)
-        summary, raw, _ = _read_cached_route(payload, spec, workspace, "cpu")
-        metadata = _dynamic_route_metadata(payload[1, 3:], payload, raw, spec, summary[0])
-        _cache_host_route(workspace, spec, raw, summary, metadata, "cpu")
+
+        def _prepare(wire):
+            count = wire[spec.rank_id, 3:]
+            summary, raw, metadata = _read_cached_route(wire, spec, workspace, "cpu")
+            permuted = torch.empty(0, 16), torch.empty(0, dtype=torch.int32)
+            return route_module._finalize_dynamic_route(  # pylint: disable=protected-access
+                permuted, count, summary, raw, metadata, None, wire, spec, workspace, "cpu", int(wire[1, 1]),
+            ).metadata
+
+        _prepare(payload)
         payload[1, 3 + 3] -= 1
         payload[1, 3 + 5] += 1
-        changed, raw, _ = _read_cached_route(payload, spec, workspace, "cpu")
-        metadata = _dynamic_route_metadata(payload[1, 3:], payload, raw, spec, changed[0])
-        _cache_host_route(workspace, spec, raw, changed, metadata, "cpu")
+        metadata = _prepare(payload)
         self.assertEqual(workspace.route_cache_probe_after, _ROUTE_CACHE_REPROBE_STEPS)
-        with (patch.object(payload, "tolist", side_effect=AssertionError("unexpected full Host table read")),
-              patch.object(route_module, "_dynamic_summary", wraps=_dynamic_summary) as device_summary):
+        empty = payload.clone()
+        expert = spec.rank_id * spec.local_experts
+        empty[:, 3 + expert - 1] += empty[:, 3 + expert]
+        empty[:, 3 + expert] = 0
+        with patch.object(route_module, "_dynamic_summary", wraps=_dynamic_summary) as device_summary:
             for remaining in range(_ROUTE_CACHE_REPROBE_STEPS - 1, -1, -1):
-                observed, host, cached = _read_cached_route(payload, spec, workspace, "cpu")
-                self.assertEqual(observed, changed)
-                self.assertIsNone(host)
-                self.assertIsNone(cached)
+                wire = empty if remaining % 2 else payload
+                with patch.object(wire, "tolist", side_effect=AssertionError("unexpected full Host table read")):
+                    # A changing route must not inherit the previous route's activity.
+                    observed = _prepare(wire)
+                self.assertEqual(observed.all_experts_active, wire is payload)
+                self.assertEqual(observed.for_kernel(spec.hidden_size).all_experts_active, wire is payload)
                 self.assertEqual(workspace.route_cache_probe_after, remaining)
             self.assertEqual(device_summary.call_count, _ROUTE_CACHE_REPROBE_STEPS)
-        _, raw, cached = _read_cached_route(payload, spec, workspace, "cpu")
-        self.assertIs(cached, metadata)
-        _cache_host_route(workspace, spec, raw, changed, metadata, "cpu")
-        _, _, cached = _read_cached_route(payload, spec, workspace, "cpu")
-        self.assertIs(cached, metadata)
+        self.assertIs(_prepare(payload), metadata)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -1095,6 +1151,34 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         exchange.assert_called_once()
         callback.assert_not_called()
         permute.assert_not_called()
+
+    def test_invalid_supplied_count_shape_is_rejected_by_the_existing_gather(self) -> None:
+        """Both ranks reject malformed counts before the placement callback."""
+        hidden, ids, probs = torch.ones(1, 16), torch.tensor([[0, 1]]), torch.ones(1, 2)
+        counts = torch.tensor([1, 1] + [0] * 22, dtype=torch.int32)
+        good = torch.cat((counts.new_tensor([0, 1, 31]), counts))
+        bad = counts.new_zeros(good.shape)
+        bad[:3] = counts.new_tensor([0, 1, 31 | _INVALID_COUNTS_MASK])
+        wire = torch.stack((good, bad, good, good))
+        for rank, current in ((0, counts), (1, counts[:-1])):
+            def _gather(output, value, *, local_rank=rank, **_kwargs):
+                self.assertTrue(torch.equal(value, wire[local_rank]))
+                output.copy_(wire.flatten())
+                return Mock()
+
+            plan, allocate = Mock(), Mock()
+            with (self.subTest(rank=rank),
+                  patch.object(route_module.dist, "all_gather_into_tensor", side_effect=_gather) as exchange,
+                  patch.object(route_module, "_permute_topk_input", return_value=(hidden, ids)) as permute,
+                  self.assertRaisesRegex(ValueError, "tokens_per_expert")):
+                prepare_topk_route(hidden, ids, probs, self._spec(rank=rank), current, workspace=Mock(),
+                                   autograd_mask=31, prepare_workspace=allocate, select_placement=plan,
+                                   reuse_placement_geometry=True)
+            exchange.assert_called_once()
+            plan.assert_not_called()
+            allocate.assert_not_called()
+            if rank == 1:
+                permute.assert_not_called()
 
 
 if __name__ == "__main__":

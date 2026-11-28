@@ -315,6 +315,7 @@ CANN 注册和查找索引按所选 SoC 保存，并指向对应架构的 kernel
 ### 查询构建记录与源码包
 
 `build_info.json` 记录构建环境、来源和资源摘要，`adapters/manifest.json` 记录运行选择信息。
+其中 `device_ub_bytes` 来自构建所用 CANN 的平台配置，按 NpuArch 和完整 SoC 名称提供 UB 容量。MegaMoE 遇到未收录的设备时使用通用路由 offsets。
 查询已安装制品的完整记录及文件列表：
 
 ```bash
@@ -462,7 +463,7 @@ python -c 'from hyper_multicore import MegaMoeExperts; print(MegaMoeExperts.__na
 [MegaMoeExperts](mega_moe.md#基本用法)。
 
 `ascend950` 的 SHMEM 默认启用 `mte_udma`。如需让专家通信使用 MTE，在各 rank 启动前设置
-`HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte`。固定堆预算和日志均沿用
+`HYPER_MULTICORE_SHMEM_DATA_ENGINE=mte`。SHMEM 堆预算和日志均沿用
 [SHMEM 配置](shmem.md#6-配置与日志)，默认设置足以运行常规示例。
 
 ### 独立回放与队列诊断

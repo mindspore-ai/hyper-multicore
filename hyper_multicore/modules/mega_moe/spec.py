@@ -68,6 +68,7 @@ class MegaMoeSpec:
     ready_depth: int | None = None
     schedule_policy: str = "auto"
     lowering: str = "auto"
+    compact_pull: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -110,30 +111,33 @@ def _resolve_receive_capacity(
     return _align_capacity(requested)
 
 
-def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> tuple[int, int]:
-    """Return geometric and minimum capacities without exceeding the lossless bound."""
+def _grow_receive_capacity(spec: MegaMoeSpec, current: int, required: int) -> int:
+    """Return geometric capacity without exceeding the lossless bound."""
     upper = _align_capacity(spec.ep_size * spec.routed_slots)
     if required > upper:
         raise ValueError("MegaMoe route exceeds the lossless token bound")
     requested = max(required, math.ceil(min(upper, current * spec.capacity_growth_factor)))
-    return min(upper, _align_capacity(requested)), _align_capacity(required)
+    return min(upper, _align_capacity(requested))
+
+
+def _grow_source_capacity(current: int, required: int, factor: float, hidden_size: int, top_k: int) -> int:
+    """Size the source token reservation within the descriptor's INT32 range."""
+    limit = ((2**31 - 1) // max(hidden_size, top_k) // _COMMUNICATION_SPLIT) * _COMMUNICATION_SPLIT
+    return _align_capacity(max(required, math.ceil(min(limit, current * factor))))
 
 
 def _resolve_capacity_factors(
     dispatch_mode: str,
     initial_capacity_factor: float | None,
     capacity_growth_factor: float | None,
-) -> tuple[float | None, float | None]:
-    """Resolve push defaults and reject capacity knobs for pull before allocation."""
+) -> tuple[float, float]:
+    """Resolve factors for the initial directional buffer and dynamic growth."""
     if dispatch_mode not in ("push", "pull"):
         raise ValueError("dispatch_mode must be push or pull")
-    if dispatch_mode == "pull":
-        if initial_capacity_factor is not None or capacity_growth_factor is not None:
-            raise ValueError("initial_capacity_factor and capacity_growth_factor are only supported for push")
-        return None, None
+    initial_default = 1.0 if dispatch_mode == "pull" else _DEFAULT_CAPACITY_FACTOR
     factors = {
         "initial_capacity_factor": (
-            _DEFAULT_CAPACITY_FACTOR if initial_capacity_factor is None else initial_capacity_factor),
+            initial_default if initial_capacity_factor is None else initial_capacity_factor),
         "capacity_growth_factor": (
             _DEFAULT_CAPACITY_FACTOR if capacity_growth_factor is None else capacity_growth_factor),
     }
@@ -205,8 +209,9 @@ def bind_mega_moe_spec(
     local_num_tokens = specification["local_num_tokens"]
     top_k = specification["top_k"]
     initial_capacity_factor = specification["initial_capacity_factor"]
+    dispatch_mode = specification.get("dispatch_mode", "push")
     receive_capacity = _resolve_receive_capacity(
-        initial_capacity_factor,
+        initial_capacity_factor if dispatch_mode == "push" else None,
         local_num_tokens * top_k,
         ep_size,
     )
@@ -224,7 +229,7 @@ def bind_mega_moe_spec(
         num_cube_cores=core_spec.num_cube_cores,
         activation_parameters=specification["activation_parameters"],
         partial_weight_grad_dtype=specification.get("partial_weight_grad_dtype"),
-        dispatch_mode=specification.get("dispatch_mode", "push"),
+        dispatch_mode=dispatch_mode,
         expert_weight_layout=specification.get("expert_weight_layout", "EIO"),
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
         dispatch_split=specification.get("dispatch_split", _COMMUNICATION_SPLIT),
@@ -240,4 +245,5 @@ def bind_mega_moe_spec(
         ready_depth=specification.get("ready_depth"),
         schedule_policy=specification.get("schedule_policy", "auto"),
         lowering=specification.get("lowering", "auto"),
+        compact_pull=specification.get("compact_pull", False),
     )
