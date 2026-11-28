@@ -25,7 +25,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions, SwiGLUParameters
-from hyper_multicore.experimental import MegaMoeTuningOptions, wrap_checkpoint
+from hyper_multicore.experimental import MegaMoeTuningOptions
+from hyper_multicore.modules.hot_replica.checkpoint import wrap_checkpoint
 from hyper_multicore.modules.hot_replica.pipeline import _band_layout, projection_shapes
 from tests.torch._test_hot_replica import SkewPlanner
 

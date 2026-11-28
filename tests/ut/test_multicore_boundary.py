@@ -41,11 +41,13 @@ import sys
 import hyper_multicore
 assert 'hyper_multicore.modules.mega_moe.module' not in sys.modules
 from hyper_multicore.experimental import (
-    BasePlanner, ExpertPlacement, HotReplicaPlanner, MegaMoeTuningOptions, PlacementRequest, wrap_checkpoint,
+    BasePlanner, ExpertPlacement, HotReplicaPlanner, MegaMoeTuningOptions, PlacementRequest,
 )
 import hyper_multicore.experimental as experimental
 assert isinstance(HotReplicaPlanner(), BasePlanner)
-assert callable(wrap_checkpoint) and ExpertPlacement and PlacementRequest
+assert ExpertPlacement and PlacementRequest
+assert not hasattr(experimental, 'ReplayCheckpoint')
+assert not hasattr(experimental, 'wrap_checkpoint')
 assert not hasattr(hyper_multicore, 'BasePlanner')
 assert not hasattr(hyper_multicore, 'MegaMoePlacementOptions')
 assert MegaMoeTuningOptions().dispatch_mode == 'push'

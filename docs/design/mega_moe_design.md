@@ -275,11 +275,6 @@ HotReplica 的放置计数以正向执行提交为准（`placements` 及各模�
 内置 planner 根据逻辑路由、拓扑、槽位预算和显式接收上限选择放置，按计算节省、副本启用和搬运成本评分。
 接收工作区扩容及实际 SHMEM 字节预算由资源管理路径处理。
 `placement_candidates` 记录物化后的候选，`heap_rejections` 和 `protocol_rejections` 记录相应的拒绝原因。
-checkpoint 跳过重算时单独计入 `skipped_recomputes`。
-
-重放记录保存每次前向的落位、有序 Top-K IDs，以及调用方提供的逻辑专家计数。
-重算在设备上检查路由输入，并沿用现有 EP 投票确认布局。非重入反向持有原前向的 plan 和权重绑定，
-因此非重入布局确认失败时全组报错。重入重算可在路由未命中时重新规划。
 
 Ascend950 BF16 Pull 先选择普通或虚拟专家路由，再取得相应工作区租约并置换到对称源区。
 事件容量兼容的两种布局共用工作区。重算复用保存的落位时，在所选租约内重新发布当前输入。
@@ -303,6 +298,21 @@ BF16 缓存考虑 token 桶和 partial dW 精度；MXFP8 按覆盖范围与接�
 这些机制由[组件 workspace](../../hyper_multicore/modules/mega_moe/workspace.py)维护，SHMEM 不解释专家容量公式。
 资源共享、显式关闭和自动清理的用户约定见[资源共享与关闭](../mega_moe.md#资源共享与关闭)，
 物理重建见 [SHMEM restart](../shmem.md#runtime-restart)。
+
+### 专家布局重放
+
+训练框架为每次 checkpoint 调用创建独立的重放记录，并提供参数逻辑版本查询。
+非重入模式使用 `ReplayCheckpoint.contexts` 提供原前向和重算的上下文。
+重入模式使用 `wrap_checkpoint`，由包装器根据梯度开关进入相应上下文。
+这两个入口位于 [HotReplica 组件内部](../../hyper_multicore/modules/hot_replica/checkpoint.py)。
+
+重放记录保存原前向的落位、有序 Top-K IDs，以及调用方提供的逻辑专家计数。
+重算在设备上检查路由输入，并沿用现有 EP 投票确认布局。非重入反向持有原前向的 plan 和权重绑定，
+因此非重入布局确认失败时全组报错。重入重算可在布局未命中时重新规划。
+
+取得 bank 租约后，重入重算可恢复布局确认通过的 guest 权重快照。
+在 FC2 前乘路由概率且各 rank 激活预算和重放校验均满足时，Push 和 Pull 可复用原前向激活。
+跳过重算前向的次数计入 `skipped_recomputes`。
 
 ### 自动回收与清理接入
 

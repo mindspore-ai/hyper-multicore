@@ -167,10 +167,6 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
   各 rank 根据同一份逐源逻辑计数返回一致的 Host 配额与 guest 槽映射，无需借槽时均返回 `None`。
   每个 source 的行按目的 rank、home 槽、guest 槽的顺序排列。空槽用 -1 表示，接收行数为零。
   执行器在申请副本 bank 前校验所有 source 的逻辑专家守恒、逐位置 Top-K 身份、物理槽直方图和全组配额一致性。
-  Reentrant checkpoint 可使用同一实验命名空间的 `wrap_checkpoint`。每次原前向创建一个 wrapper。
-  省略 `tokens_per_expert` 时，全 EP 验证 Top-K 顺序、参数代际和流后可复用原落位。
-  保存的 guest 权重在重放路由达成一致后、取得 bank 租约时恢复。
-  在 FC2 前乘路由概率且各 rank 激活预算和重放校验均满足时，Push 和 Pull 都可复用前向激活并跳过重算前向。
   首次启用副本时，同一次 SHMEM 预留覆盖权重 bank 与实际路由所需的 workspace。固定字节预算优先容纳这次调用所需的对齐布局。
   副本布局超出固定预算时，可以在原属布局符合接收行数要求且放得下的情况下沿用原属布局。两种布局都超预算，或显式行数上限要求使用副本时，调用报错。
   `partial_weight_grad_dtype="float32"` 要求被拆专家的 partial 从 GEMM 产出起为 FP32。显式 FP32 配置预留 3L bank。
@@ -190,22 +186,12 @@ tuning = MegaMoeTuningOptions(expert_placement=HotReplicaPlanner())
 反向把副本的梯度累加到对应原属专家。首次进入新容量或首次启用副本可能扩容 SHMEM，
 测量稳态性能前应覆盖代表性的路由和容量。
 
-#### 非重入 checkpoint
+#### 激活重算
 
-配置了 `expert_placement` 时，使用 `ReplayCheckpoint` 在非重入重算中复用原始专家布局。
-每次调用 `checkpoint` 创建一份记录。`parameter_version` 由调用方提供，返回原前向与重算之间可比较的参数逻辑版本。
-
-```python
-from torch.utils.checkpoint import checkpoint
-from hyper_multicore.experimental import ReplayCheckpoint
-
-tape = ReplayCheckpoint(parameter_version)
-output = checkpoint(experts_forward, *inputs, use_reentrant=False, context_fn=tape.contexts)
-```
-
-通过 `context_fn=tape.contexts` 重算时，整个 EP 组必须确认原始布局，否则全组报错。
-调用方应保持参数逻辑版本、有序 Top-K IDs、执行流和诊断模式一致。
-原前向和重算可以都省略 `tokens_per_expert`，或都传入内容相同的逻辑专家计数。
+同时使用 `expert_placement` 和非重入激活重算时，训练框架需要接入 HotReplica 的布局重放。
+重放时，整个 EP 组必须确认原始布局，否则全组报错。原前向和重算应保持参数逻辑版本、
+有序 Top-K IDs、执行流和诊断模式一致，并同时省略 `tokens_per_expert` 或传入相同的计数。
+接入机制见[专家布局重放](design/mega_moe_design.md#专家布局重放)。
 
 ### 旧 HotReplica 接口退役
 

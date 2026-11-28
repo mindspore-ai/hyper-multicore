@@ -21,12 +21,11 @@ NPU runtime.
 """
 
 from hyper_multicore.modules.base_planner import BasePlanner, ExpertPlacement, PlacementRequest
-from hyper_multicore.modules.hot_replica.checkpoint import ReplayCheckpoint, wrap_checkpoint
 from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
 
 from ._mega_moe import MegaMoeTuningOptions, MegaMoeSchedulerOptions
 
 __all__ = [
     "MegaMoeTuningOptions", "MegaMoeSchedulerOptions",
-    "BasePlanner", "ExpertPlacement", "PlacementRequest", "HotReplicaPlanner", "ReplayCheckpoint", "wrap_checkpoint",
+    "BasePlanner", "ExpertPlacement", "PlacementRequest", "HotReplicaPlanner",
 ]

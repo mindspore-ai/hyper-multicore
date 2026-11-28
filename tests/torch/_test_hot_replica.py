@@ -29,11 +29,10 @@ from torch.utils.checkpoint import checkpoint
 
 from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
 from hyper_multicore.diagnostics import dump, profiler
-from hyper_multicore.experimental import (
-    BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions, ReplayCheckpoint, wrap_checkpoint,
-)
+from hyper_multicore.experimental import BasePlanner, HotReplicaPlanner, MegaMoeTuningOptions
 from hyper_multicore.modules.hot_replica._planner.capacity import ExpertReplicaConfig
 from hyper_multicore.modules.hot_replica._planner.receive import select_replica_plan
+from hyper_multicore.modules.hot_replica.checkpoint import ReplayCheckpoint, wrap_checkpoint
 from hyper_multicore.modules.hot_replica.planner import as_placement
 
 
