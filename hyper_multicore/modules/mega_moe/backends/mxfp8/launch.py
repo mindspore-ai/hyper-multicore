@@ -33,8 +33,12 @@ def serialize_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tenso
 def prepare_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
                          events: torch.Tensor, spec: MegaMoeSpec, *, cache=None) -> torch.Tensor:
     """Reuse exact immutable bounds while retaining cross-stream upload ordering."""
-    metadata = serialize_mxfp8_launch(buffers, runtime, events, spec)
-    cached = None if cache is None else cache.get(metadata)
+    # Bounds describe storage sizes, never a previous invocation's addresses.
+    sizes = tuple(tensor.numel() * tensor.element_size() for tensor in buffers)
+    geometry = (spec.rank_id, spec.ep_size, spec.num_experts, spec.hidden_size,
+                spec.local_num_tokens, spec.num_cube_cores, runtime.numel(), events.numel())
+    key = (runtime.device, sizes, geometry)
+    cached = None if cache is None else cache.get(key)
     stream = torch.npu.current_stream(runtime.device) if runtime.device.type == 'npu' else None
     if cached is not None:
         tensor, producer, ready = cached
@@ -42,15 +46,18 @@ def prepare_mxfp8_launch(buffers: Sequence[torch.Tensor], runtime: torch.Tensor,
             if producer != stream:
                 stream.wait_event(ready)
             tensor.record_stream(stream)
-        cache.move_to_end(metadata)
+        cache.move_to_end(key)
         return tensor
+    metadata = serialize_mx_launch_metadata(
+        sizes, rank=geometry[0], ep=geometry[1], experts=geometry[2], hidden=geometry[3],
+        local_tokens=geometry[4], cube_count=geometry[5], runtime_bytes=geometry[6], event_bytes=geometry[7])
     tensor = torch.frombuffer(bytearray(metadata), dtype=torch.uint8).to(device=runtime.device)
     if cache is not None:
         ready = None
         if stream is not None:
             ready = torch.npu.Event()
             ready.record(stream)
-        cache[metadata] = tensor, stream, ready
+        cache[key] = tensor, stream, ready
         while len(cache) > 8:
             cache.popitem(last=False)
     return tensor

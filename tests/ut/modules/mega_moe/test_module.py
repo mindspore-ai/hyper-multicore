@@ -739,7 +739,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                                                          apply_probs_before_fc2=False),
                                     plan=object(), workspace=object(), ensure_capacity=Mock(), placement=None,
                                     plan_for_tokens=Mock())
-        route = SimpleNamespace(execution_resources=None, weight_binding=None, checkpoint_record=None,
+        route = SimpleNamespace(forward_preparation=None, execution_resources=None, weight_binding=None, checkpoint_record=None,
             routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
             unpermute_mapping=object(), maximum_received_slots=512
         )
@@ -809,12 +809,12 @@ class TestMegaMoeExperts(unittest.TestCase):
         ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
         weights = torch.ones(2, 2)
         route = SimpleNamespace(
-            execution_resources=None, weight_binding=None, checkpoint_record=None,
+            forward_preparation=None, execution_resources=None, weight_binding=None, checkpoint_record=None,
             metadata=SimpleNamespace(plan_tokens=128),
         )
         workspace = Mock()
         resources = SimpleNamespace(
-            spec=SimpleNamespace(auto_tokens=True, apply_probs_before_fc2=False,
+            spec=SimpleNamespace(auto_tokens=True, device_route_capacity_factor=None, apply_probs_before_fc2=False,
                                  dispatch_mode=experts._resource_group.specification["dispatch_mode"]),
             workspace=workspace, prepare_auto_workspace=Mock(), plan_for_tokens=Mock(return_value=object()),
             placement=None,
@@ -856,7 +856,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         expert_weights = (torch.empty(4, 16, 16, dtype=torch.bfloat16),
                           torch.empty(4, 8, 16, dtype=torch.bfloat16))
         route = SimpleNamespace(
-            execution_resources=None, weight_binding=None, checkpoint_record=None,
+            forward_preparation=None, execution_resources=None, weight_binding=None, checkpoint_record=None,
             metadata=SimpleNamespace(plan_tokens=128), maximum_received_slots=4,
         )
         resources = SimpleNamespace(

@@ -128,6 +128,7 @@ class _MegaMoeExecutionResources:
             self.spec.schedule_policy, self.spec.lowering,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
+            self.spec.device_route_capacity_factor,
         )
 
     def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
@@ -144,6 +145,10 @@ class _MegaMoeExecutionResources:
         if self.spec.dispatch_mode == "pull":
             self.workspace.claim()
 
+    def prepare_forward(self, tokens: int, capacity: int, rows: torch.Tensor) -> Any:
+        """Optionally prepare backend-owned, count-independent per-call storage."""
+        return None
+
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""
         return ((self._workspace_closed or self.workspace.can_close())
@@ -157,7 +162,7 @@ class _MegaMoeExecutionResources:
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
                   "dispatch_split", "combine_split", "activation_parameters",
                   "apply_probs_before_fc2", "partial_weight_grad_dtype", "expert_weight_layout",
-                  "ep_size", "auto_tokens",
+                  "ep_size", "auto_tokens", "device_route_capacity_factor",
                   "precision", "transport_engine", "ready_depth", "schedule_policy", "lowering",
                   "batch_experts", "nominal_schedule", "hot_replica", "source_token_bound", "planner_key")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.

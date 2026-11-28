@@ -149,6 +149,7 @@ launcher 已经负责启动分布式 worker，以下 pytest 命令不要再套�
 | [test_mega_gate.py](torch/test_mega_gate.py) | 1 | text/vision 路由、正反向、数学顺序、动态形状、训练图和符号解析并发 |
 | [test_mega_mhc.py](torch/test_mega_mhc.py) | 1 | 同形状前向/反向在多 stream 下与串行 native 执行结果一致 |
 | [test_mega_moe.py](torch/test_mega_moe.py) | 按用例为 2、4 或 8 | 输出及完整梯度、概率/clamp 位置、checkpoint 重算、SGD、push/pull、Router、容量、生命周期、subgroup 和动态 token |
+| [test_mega_moe_device_route.py](torch/test_mega_moe_device_route.py) | 按用例为 1 或 2 | 默认/摘要/预算描述一致性、合成 EP64、连续下发、非法计数拒绝及 BF16/MXFP8 预算训练；MXFP8 需要 arch35 |
 | [test_swiglu_clamp_st.py](torch/test_swiglu_clamp_st.py) | 1 | SiLU 前后 clamp 的前向与反向数值、边界梯度 |
 | [test_mega_moe_profiling.py](torch/test_mega_moe_profiling.py)、[test_mega_moe_tensor_dump.py](torch/test_mega_moe_tensor_dump.py) | 2 | kernel trace 和 tensor dump |
 | [shmem/test_binding.py](torch/shmem/test_binding.py) | 按用例为 1 或 2 | 分配、释放、通信、stream 顺序、错误及原生日志 |

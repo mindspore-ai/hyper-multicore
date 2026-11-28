@@ -28,6 +28,12 @@ class BF16Resources(_MegaMoeExecutionResources):
         options = {} if dtype is None else {"weight_grad_dtype": dtype}
         return build_mega_moe_plan(self.spec, tensor.device, **options) if not self.spec.dynamic_tokens else None
 
+    def prepare_forward(self, tokens: int, capacity: int, rows: torch.Tensor) -> Any:
+        """Reuse the immutable plan and allocate this invocation's own activations."""
+        from .autograd import _prepare_forward_execution  # pylint: disable=import-outside-toplevel
+        plan = self.plan_for_tokens(tokens, rows.device)
+        return plan, _prepare_forward_execution(self.workspace, plan, rows, capacity)
+
     def plan_for_tokens(
         self, tokens: int, device: Any, *, weight_grad_dtype: torch.dtype | None = None,
         route_experts: int | None = None, batch_experts: bool = False, nominal_schedule: bool = False,

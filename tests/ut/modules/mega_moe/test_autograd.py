@@ -233,6 +233,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         if permuted:
             ids = torch.tensor([[0, 1]] * tokens, dtype=torch.int32)
             prepared = SimpleNamespace(
+                forward_preparation=None,
                 routed_tokens=source.detach().repeat_interleave(2, dim=0),
                 metadata=route,
                 unpermute_mapping=(torch.arange(tokens * 2, dtype=torch.int32) if vary_tokens

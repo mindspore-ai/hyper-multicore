@@ -81,6 +81,8 @@ def prepare_expert_invocation(
         options["select_placement"] = partial(resources.placement.select, planner=planner)
     if resources.spec.auto_tokens:
         options["prepare_workspace"] = prepare_workspace
+        if resources.spec.device_route_capacity_factor is not None:
+            options["prepare_execution"] = resources.prepare_forward
     elif pull:
         with torch.inference_mode(False):
             resources.workspace.ensure(resources.spec, hidden.dtype, hidden.device)

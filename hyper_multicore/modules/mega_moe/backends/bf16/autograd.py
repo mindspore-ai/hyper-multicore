@@ -606,6 +606,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         topk_weights: torch.Tensor | None,
         workspace_claimed: bool,
         weight_binding: Any = None,
+        prepared_execution: _ForwardExecution | None = None,
     ) -> Any:
         """Launch the BF16 forward op and save owned backward inputs.
 
@@ -654,12 +655,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 acquired = True
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
-            execution = _prepare_forward_execution(
-                workspace,
-                plan,
-                routed_tokens,
-                capacity,
-            )
+            execution = (prepared_execution if prepared_execution is not None else
+                         _prepare_forward_execution(workspace, plan, routed_tokens, capacity))
             if spec.apply_probs_before_fc2:
                 probs = topk_weights.float().contiguous()
                 _stage_probabilities(workspace, unpermute_mapping, probs, spec)
@@ -775,7 +772,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_topk_weights,
                 None,
             )
-            return gradients + (None,) if len(ctx.needs_input_grad) == 10 else gradients
+            return gradients + (None,) * (len(ctx.needs_input_grad) - len(gradients))
         finally:
             if acquired:
                 binding.release()
@@ -895,6 +892,7 @@ def execute_mega_moe_with_permutation(
         topk_weights,
         workspace_claimed,
         weight_binding,
+        None if route.forward_preparation is None else route.forward_preparation[1],
     )
 
 
@@ -929,8 +927,8 @@ def _execute_mega_moe_without_autograd(
             acquired = True
             if route.checkpoint_record is not None:
                 weight_binding.save_snapshot((weight1, weight2))
-        execution = _prepare_forward_execution(
-            workspace, plan, route.routed_tokens, route.metadata.expert_capacity)
+        execution = (route.forward_preparation[1] if route.forward_preparation is not None else
+                     _prepare_forward_execution(workspace, plan, route.routed_tokens, route.metadata.expert_capacity))
         if plan.spec.apply_probs_before_fc2:
             _stage_probabilities(workspace, route.unpermute_mapping, topk_weights.float().contiguous(), plan.spec)
         _launch_forward_kernel(

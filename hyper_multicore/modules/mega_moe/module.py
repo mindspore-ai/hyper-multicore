@@ -38,6 +38,7 @@ from ..base_planner import BasePlanner
 from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
+    _device_route_capacity_factor,
 )
 from .placement_options import MegaMoePlacementOptions
 from .transport import requested_transport
@@ -198,6 +199,7 @@ class MegaMoeExperts(MulticoreModule):
                 raise TypeError("Planner configuration_key() must return a string")
             planner_key = (type(planner).__module__, type(planner).__qualname__, settings)
         specification = {
+            "device_route_capacity_factor": _device_route_capacity_factor(),
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
@@ -268,6 +270,11 @@ class MegaMoeExperts(MulticoreModule):
         return self._resource_group.specification["precision"]
 
     @property
+    def device_route_capacity_factor(self) -> float | None:
+        """Return the fixed-input receive budget, or None for exact Host sizing."""
+        return self._resource_group.specification["device_route_capacity_factor"]
+
+    @property
     def activation(self) -> SwiGLUParameters | SiTUGLUParameters:
         """Return the immutable activation parameters fixed for this executor."""
         return self._resource_group.specification["activation_parameters"]
@@ -285,6 +292,8 @@ class MegaMoeExperts(MulticoreModule):
             specification["initial_capacity_factor"],
             specification["capacity_growth_factor"],
         )
+        if specification.get("device_route_capacity_factor") is not None and specification["dispatch_mode"] != "pull":
+            raise ValueError("Device routing currently requires Pull dispatch")
         cls._validate_topology(
             local_num_tokens=specification["local_num_tokens"],
             hidden_size=specification["hidden_size"],

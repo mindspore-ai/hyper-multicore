@@ -1071,6 +1071,13 @@ def prepare_route(payload: torch.Tensor, rank: int, ub_bytes: int,
     return torch.ops.hyper_multicore.prepare_route(payload, rank, ub_bytes, hidden_size)
 
 
+def bounded_route(payload: torch.Tensor, rank: int, ub_bytes: int, hidden_size: int,
+                  capacity: int, tokens: int, topk: int) -> list[torch.Tensor]:
+    """Validate counts and bind per-call row/element views in one native entry."""
+    _load_native()
+    return torch.ops.hyper_multicore.bounded_route(payload, rank, ub_bytes, hidden_size, capacity, tokens, topk)
+
+
 def bf16_forward_buffers(like: torch.Tensor, rows: int, intermediate: int,
                          include_dispatch: bool) -> list[torch.Tensor]:
     """Allocate exact per-invocation activations through one native entry."""

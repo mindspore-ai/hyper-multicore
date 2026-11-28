@@ -19,36 +19,6 @@
 #include "csrc/cached_op_api.h"
 
 namespace {
-// The extension bridge otherwise resolves these helpers on every call.
-// As in native op-plugin, cache code addresses while the provider stays loaded.
-// SHMEM addresses and TLS lifecycle remain per-call, including after heap growth.
-void InitExecCommonCtx() {
-  static const auto initialize =
-    reinterpret_cast<int (*)(void *, bool)>(GetOpApiFuncAddr("InitHugeMemThreadLocal"));
-  if (initialize != nullptr) {
-    initialize(nullptr, false);
-  }
-}
-
-void ReleaseExecCommonCtx() {
-  static const auto release = reinterpret_cast<void (*)(void *, bool)>(GetOpApiFuncAddr("ReleaseHugeMem"));
-  if (release != nullptr) {
-    release(nullptr, false);
-  }
-}
-
-void UnInitExecCommonCtx() {
-  static const auto uninitialize =
-    reinterpret_cast<void (*)(void *, bool)>(GetOpApiFuncAddr("UnInitHugeMemThreadLocal"));
-  static const auto clear_cache = reinterpret_cast<void (*)()>(GetOpApiFuncAddr("UnInitPTACacheThreadLocal"));
-  if (uninitialize != nullptr) {
-    uninitialize(nullptr, false);
-  }
-  if (clear_cache != nullptr) {
-    clear_cache();
-  }
-}
-
 using PermuteOutputs = std::tuple<at::Tensor &, at::Tensor &>;
 
 void check_permute_outputs(const at::Tensor &tokens, const at::Tensor &indices, const at::Tensor &output,

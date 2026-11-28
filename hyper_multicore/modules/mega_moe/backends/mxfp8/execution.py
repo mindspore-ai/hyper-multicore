@@ -35,6 +35,30 @@ def _quantized_buffers(rows: int, columns: int, experts: int, device: Any) -> tu
     )
 
 
+@dataclass(frozen=True)
+class _ForwardBuffers:
+    """Invocation-owned buffers; never retained in the shared plan cache."""
+    dispatch: torch.Tensor
+    x: tuple[torch.Tensor, ...]
+    activation: tuple[torch.Tensor, ...]
+    up: torch.Tensor
+    down: torch.Tensor
+
+
+def _prepare_forward_buffers(resources: Any, capacity: int, rows: torch.Tensor) -> _ForwardBuffers:
+    """Allocate from known capacity without consuming current route counts."""
+    spec, workspace, device = resources.spec, resources.workspace, rows.device
+    dispatch = (torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
+                if spec.dispatch_mode == 'pull' else workspace.expert_buffer)
+    return _ForwardBuffers(
+        dispatch,
+        _quantized_buffers(capacity, spec.hidden_size, spec.local_experts, device),
+        _quantized_buffers(capacity, spec.intermediate_size, spec.local_experts, device),
+        torch.empty((capacity, 2 * spec.intermediate_size), dtype=torch.bfloat16, device=device),
+        torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device),
+    )
+
+
 class MXFP8Execution:
     """Own one autograd invocation's orchestration while borrowing serial resources."""
 
@@ -67,23 +91,22 @@ class MXFP8Execution:
                 retain_backward: bool) -> MXFP8ForwardState:
         """Prepare MX operands and restore the forward output to token order."""
         resources, workspace = self.resources, self.resources.workspace
-        spec, device = resources.spec, hidden.device
+        spec = resources.spec
         metadata = route.metadata
         kernel_metadata = metadata.for_kernel(spec.hidden_size)
         pull = spec.dispatch_mode == "pull"
         capacity = metadata.expert_capacity if pull else workspace.expert_capacity
-        plan = resources.plan_for_capacity(capacity, device, tokens=metadata.plan_tokens)
-        if pull:
-            dispatch_buffer = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
-            source_buffer = workspace.source_buffer
+        if route.forward_preparation is None:
+            plan = resources.plan_for_capacity(capacity, hidden.device, tokens=metadata.plan_tokens)
+            prepared = _prepare_forward_buffers(resources, capacity, route.routed_tokens)
+            events = None
         else:
-            dispatch_buffer = workspace.expert_buffer
-            source_buffer = route.routed_tokens
-        x_row, x_scale, x_col, x_col_scale = _quantized_buffers(capacity, spec.hidden_size, spec.local_experts, device)
-        a_row, a_scale, a_col, a_col_scale = _quantized_buffers(
-            capacity, spec.intermediate_size, spec.local_experts, device)
-        up = torch.empty((capacity, 2 * spec.intermediate_size), dtype=torch.bfloat16, device=device)
-        down = torch.empty((capacity, spec.hidden_size), dtype=torch.bfloat16, device=device)
+            plan, (prepared, events) = route.forward_preparation
+        dispatch_buffer = prepared.dispatch
+        source_buffer = workspace.source_buffer if pull else route.routed_tokens
+        x_row, x_scale, x_col, x_col_scale = prepared.x
+        a_row, a_scale, a_col, a_col_scale = prepared.activation
+        up, down = prepared.up, prepared.down
         if not pull:
             workspace.claim()
         try:
@@ -96,7 +119,8 @@ class MXFP8Execution:
                 x_row, x_scale, x_col, x_col_scale, a_scale, a_col, a_col_scale,
                 weight1.col_scale, weight2.col_scale, plan.forward.gmm, plan.forward.quant,
             ]
-            events = workspace.prepare_event_counters(forward=True)
+            if events is None:
+                events = workspace.prepare_event_counters(forward=True)
             self._launch(buffers, plan.forward, events, plan)
             expert_output = workspace.routed_buffer[:route.routed_tokens.shape[0]]
             if retain_backward or not self.nograd_no_clone:

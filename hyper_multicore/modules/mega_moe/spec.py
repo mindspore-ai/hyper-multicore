@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -59,6 +60,7 @@ class MegaMoeSpec:
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    device_route_capacity_factor: float | None = None
     batch_experts: bool = False
     nominal_schedule: bool = False
     apply_probs_before_fc2: bool = False
@@ -88,6 +90,35 @@ class MegaMoeSpec:
     def routed_slots(self) -> int:
         """Return routed rows produced by local Top-K expansion."""
         return self.local_num_tokens * self.top_k
+
+
+def _device_route_capacity_factor() -> float | None:
+    """Resolve the experimental fixed-input Pull budget once per executor."""
+    enabled = os.environ.get("HYPER_MULTICORE_MEGAMOE_DEVICE_ROUTE", "0")
+    if enabled not in ("0", "1"):
+        raise ValueError("HYPER_MULTICORE_MEGAMOE_DEVICE_ROUTE must be 0 or 1")
+    if enabled == "0":
+        return None
+    name = "HYPER_MULTICORE_MEGAMOE_RECEIVE_CAPACITY_FACTOR"
+    try:
+        factor = float(os.environ.get(name, "1.05"))
+    except ValueError as error:
+        raise ValueError(f"{name} must be a finite number >= 1") from error
+    if not math.isfinite(factor) or factor < 1:
+        raise ValueError(f"{name} must be a finite number >= 1")
+    return factor
+
+
+def _device_route_capacity(spec: MegaMoeSpec, tokens: int) -> int:
+    """Bound receive storage without reading this invocation's counts to Host."""
+    factor = spec.device_route_capacity_factor
+    if factor is None:
+        raise ValueError("Device routing requires a configured receive capacity factor")
+    rows = _align_capacity(math.ceil(min(factor, spec.ep_size) * tokens * spec.top_k))
+    rows = max(128, rows)
+    if rows * spec.hidden_size > 2**31 - 1:
+        raise ValueError("Device routing receive budget exceeds int32 element offsets")
+    return rows
 
 
 def _align_capacity(capacity: int) -> int:
@@ -231,6 +262,7 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        device_route_capacity_factor=specification.get("device_route_capacity_factor"),
         batch_experts=specification.get("batch_experts", False),
         nominal_schedule=specification.get("nominal_schedule", False),
         apply_probs_before_fc2=specification.get("apply_probs_before_fc2", False),

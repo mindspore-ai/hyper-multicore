@@ -9,7 +9,7 @@ import torch
 from hyper_multicore.scheduler.runtime import serialize_runtime_config
 from ...resources import _MegaMoeExecutionResources
 from .diagnostics import prepare_mx_diagnostics
-from .execution import MXFP8Execution
+from .execution import MXFP8Execution, _ForwardBuffers, _prepare_forward_buffers
 from .autograd import execute_mxfp8_experts
 from .graph import build_mxfp8_runtime
 from .weights import MXFP8ExpertWeightBinding
@@ -68,6 +68,14 @@ class Resources(_MegaMoeExecutionResources):
         # Capability rejection participates in the common construction collective.
         if self.spec.architecture != 3510:
             raise ValueError("MXFP8 experts require arch35")
+
+    def prepare_forward(self, tokens: int, capacity: int, rows: torch.Tensor
+                        ) -> tuple[_MXFP8Plan, tuple[_ForwardBuffers, torch.Tensor]]:
+        """Prepare one bounded invocation while count metadata remains on Device."""
+        plan = self.plan_for_capacity(capacity, rows.device, tokens=tokens)
+        buffers = _prepare_forward_buffers(self, capacity, rows)
+        events = self.workspace.prepare_event_counters(forward=True)
+        return plan, (buffers, events)
 
     def plan_for_capacity(self, capacity, device, *, tokens=None):
         """Cache pointer-free Pull plans independently of the live per-expert loads."""

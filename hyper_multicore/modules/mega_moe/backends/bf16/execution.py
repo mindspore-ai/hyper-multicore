@@ -33,7 +33,9 @@ def forward(
     del module
     module_resources = resources
     resources = route.execution_resources or resources
-    if route.weight_binding is None:
+    if route.forward_preparation is not None:
+        plan = route.forward_preparation[0]
+    elif route.weight_binding is None:
         plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
     else:
         placement = route.weight_binding.placement

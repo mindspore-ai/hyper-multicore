@@ -23,7 +23,7 @@ import torch
 
 from hyper_multicore.modules.mega_moe import invocation
 from hyper_multicore.modules.mega_moe.route import _INVALID_WEIGHT_MASK
-from hyper_multicore.modules.mega_moe.backends.mxfp8 import backend
+from hyper_multicore.modules.mega_moe.backends.mxfp8 import backend, execution
 from hyper_multicore.modules.mega_moe.backends.mxfp8.graph import build_mxfp8_runtime
 from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 
@@ -31,7 +31,7 @@ from hyper_multicore.modules.mega_moe.spec import MegaMoeSpec
 @pytest.mark.parametrize('mode', ['push', 'pull'])
 def test_error_converges_in_existing_route_and_releases_source_lease(mode):
     """Use the existing collective to reject weights and release the Pull lease."""
-    resources = SimpleNamespace(spec=SimpleNamespace(dispatch_mode=mode, auto_tokens=True),
+    resources = SimpleNamespace(spec=SimpleNamespace(dispatch_mode=mode, auto_tokens=True, device_route_capacity_factor=None),
                                 workspace=Mock(), prepare_auto_workspace=Mock(), placement=None)
     hidden, ids, probs = torch.ones(1, 64), torch.zeros(1, 1), torch.ones(1, 1)
     def _reject(*args, **options):
@@ -80,3 +80,62 @@ def test_mx_plan_cache_distinguishes_committed_token_coverage():
         assert small.forward.graph.get_op('dispatch').task_num < large.forward.graph.get_op('dispatch').task_num
         with pytest.raises(ValueError, match='committed'):
             resources.plan_for_capacity(8192, 'cpu', tokens=2048)
+
+
+def test_mx_early_preparation_preserves_pending_invocation_buffers():
+    """A shared plan must never reuse activations or event views of an older call."""
+    resources = backend.Resources.__new__(backend.Resources)
+    resources.spec = SimpleNamespace(dispatch_mode='pull', hidden_size=64,
+                                     intermediate_size=128, local_experts=6)
+    first_event, second_event = torch.zeros(16), torch.ones(16)
+    resources.workspace = SimpleNamespace(prepare_event_counters=Mock(side_effect=[first_event, second_event]))
+    plan = object()
+    resources.plan_for_capacity = Mock(return_value=plan)
+    rows = torch.empty((128, 64), dtype=torch.bfloat16)
+    first = resources.prepare_forward(128, 128, rows)
+    second = resources.prepare_forward(256, 256, rows)
+    assert first[0] is second[0] is plan
+    for prepared_invocation, capacity, event in ((first, 128, first_event), (second, 256, second_event)):
+        buffers, found_event = prepared_invocation[1]
+        assert found_event is event
+        assert buffers.dispatch.shape == (capacity, 64)
+        assert buffers.up.shape == (capacity, 256)
+        assert buffers.down.shape == (capacity, 64)
+        assert buffers.x[0].shape == (capacity, 64)
+        assert buffers.activation[0].shape == (capacity, 128)
+    assert first[1][0].dispatch.data_ptr() != second[1][0].dispatch.data_ptr()
+    assert first[1][0].x[2].data_ptr() != second[1][0].x[2].data_ptr()
+    assert first[1][0].up.data_ptr() != second[1][0].up.data_ptr()
+    assert [call.kwargs for call in resources.plan_for_capacity.call_args_list] == [{'tokens': 128}, {'tokens': 256}]
+
+
+@pytest.mark.parametrize('early', [False, True])
+def test_mx_forward_consumes_current_invocation_preparation(early):
+    """Default and budget launches bind this invocation's operands and events."""
+    hidden = torch.zeros(2, 64, dtype=torch.bfloat16)
+    spec = SimpleNamespace(dispatch_mode='pull', hidden_size=64, intermediate_size=128, local_experts=2)
+    workspace = SimpleNamespace(source_buffer=torch.empty(8, 64), routed_buffer=torch.zeros(4, 64),
+                                prepare_event_counters=Mock(return_value=torch.zeros(16)))
+    plan = SimpleNamespace(forward=SimpleNamespace(gmm=torch.empty(1), quant=torch.empty(1)))
+    resources = SimpleNamespace(spec=spec, workspace=workspace, plan_for_capacity=Mock(return_value=plan))
+    prepared = execution._prepare_forward_buffers(resources, 128, hidden)
+    events = torch.zeros(32)
+    metadata = Mock(expert_capacity=128, plan_tokens=2)
+    metadata.for_kernel.return_value = metadata
+    route = SimpleNamespace(metadata=metadata, routed_tokens=hidden, unpermute_mapping=torch.arange(2),
+                            forward_preparation=(plan, (prepared, events)) if early else None)
+    weight = SimpleNamespace(col_data=torch.empty(1), col_scale=torch.empty(1))
+    adapter = execution.MXFP8Execution(resources)
+    adapter._launch = Mock()
+    with patch.object(execution.torch_npu, 'npu_moe_token_unpermute', return_value=hidden.clone()):
+        adapter.forward(hidden, route, torch.ones(2, 1), weight, weight, True)
+    buffers, _, found_events, found_plan = adapter._launch.call_args.args
+    assert found_plan is plan
+    assert buffers[2] is workspace.source_buffer
+    if early:
+        assert buffers[0] is prepared.dispatch and found_events is events
+        resources.plan_for_capacity.assert_not_called()
+        workspace.prepare_event_counters.assert_not_called()
+    else:
+        resources.plan_for_capacity.assert_called_once_with(128, hidden.device, tokens=2)
+        workspace.prepare_event_counters.assert_called_once_with(forward=True)

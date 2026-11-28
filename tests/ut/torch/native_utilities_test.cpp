@@ -49,6 +49,19 @@ extern "C" void HmcLaunchRoutePreparation_arch3510(unsigned, void*, uint8_t*, ui
   launch_test::last_status = launch_test::injected_status;
 }
 
+extern "C" void HmcLaunchBoundedRoute_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t, int32_t, int32_t) {
+  launch_test::selected_arch = 2201;
+  ++launch_test::launch_calls;
+  launch_test::last_status = launch_test::injected_status;
+}
+extern "C" void HmcLaunchBoundedRoute_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t, int32_t, int32_t) {
+  launch_test::selected_arch = 3510;
+  ++launch_test::launch_calls;
+  launch_test::last_status = launch_test::injected_status;
+}
+
 void CheckAllocations() {
   const auto options = at::TensorOptions().dtype(at::kBFloat16);
   auto like = at::empty({7, 4}, options);
@@ -119,7 +132,18 @@ int main(int argc, char** argv) {
   bool raised = false;
   try {
     auto counts = at::zeros({2, 4}, at::TensorOptions().dtype(at::kInt));
-    if (std::string(argv[3]) == "prepare") {
+    if (std::string(argv[3]) == "bounded") {
+      using Route = std::vector<at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t,
+                                            int64_t, int64_t, int64_t);
+      auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::bounded_route", "").typed<Route>();
+      auto payload = at::zeros({2, 7}, counts.options());
+      auto views = route.redispatch(c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), payload,
+                                    0, 262144, 128, 384, 128, 2);
+      TORCH_CHECK(views.size() == 14 && views[6].numel() == 2 && views[13].numel() == 2,
+                  "bounded route must return row and element views");
+      TORCH_CHECK(views[0].data_ptr() == views[4].data_ptr() && views[1].data_ptr() == views[3].data_ptr() &&
+                  views[2].data_ptr() == views[5].data_ptr(), "Pull metadata aliases changed");
+    } else if (std::string(argv[3]) == "prepare") {
       using Route = std::tuple<at::Tensor, at::Tensor, at::Tensor>(const at::Tensor&, int64_t, int64_t, int64_t);
       auto route = c10::Dispatcher::singleton().findSchemaOrThrow("hyper_multicore::prepare_route", "").typed<Route>();
       auto payload = at::zeros({2, 7}, counts.options());

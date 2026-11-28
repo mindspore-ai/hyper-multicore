@@ -65,7 +65,9 @@ foreach(utility_arch IN LISTS HP_MULTICORE_NPU_ARCHS)
             "-I${CANN_ROOT}/asc/include/interface" "-I${CANN_ROOT}/asc/include/utils"
             "-I${CANN_ROOT}/asc/impl" "-I${CANN_ROOT}/include"
             "-I${CANN_ROOT}/include/runtime" "-I${CANN_ROOT}/pkg_inc" "-I${CANN_ROOT}/pkg_inc/runtime"
-        DEPENDS "${UTILITY_SOURCE}" VERBATIM)
+        DEPENDS "${UTILITY_SOURCE}"
+            "${CMAKE_CURRENT_LIST_DIR}/../ops/common/mega_moe/route_metadata.h"
+            "${CMAKE_CURRENT_LIST_DIR}/../ops/common/mega_moe/route_validation.h" VERBATIM)
     set_source_files_properties("${utility_object}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
     list(APPEND UTILITY_OBJECTS "${utility_object}")
 endforeach()

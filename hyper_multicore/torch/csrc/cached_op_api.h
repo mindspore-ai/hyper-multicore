@@ -47,6 +47,27 @@ class CachedOpApiResolver final {
   std::once_flag resolve_once_;
 };
 
+// Match native op-plugin TLS semantics. Only code addresses are retained;
+// execution contexts, workspace pointers and release calls remain per-call.
+inline void InitExecCommonCtx() {
+  static const auto initialize =
+      reinterpret_cast<int (*)(void *, bool)>(::GetOpApiFuncAddr("InitHugeMemThreadLocal"));
+  if (initialize != nullptr) initialize(nullptr, false);
+}
+inline void ReleaseExecCommonCtx() {
+  static const auto release =
+      reinterpret_cast<void (*)(void *, bool)>(::GetOpApiFuncAddr("ReleaseHugeMem"));
+  if (release != nullptr) release(nullptr, false);
+}
+inline void UnInitExecCommonCtx() {
+  static const auto uninitialize =
+      reinterpret_cast<void (*)(void *, bool)>(::GetOpApiFuncAddr("UnInitHugeMemThreadLocal"));
+  static const auto clear =
+      reinterpret_cast<void (*)()>(::GetOpApiFuncAddr("UnInitPTACacheThreadLocal"));
+  if (uninitialize != nullptr) uninitialize(nullptr, false);
+  if (clear != nullptr) clear();
+}
+
 }  // namespace hyper_multicore
 
 /**
@@ -62,6 +83,9 @@ class CachedOpApiResolver final {
  */
 #define HYPER_EXEC_NPU_CMD_EXT(aclnn_api, ...)                                       \
   do {                                                                               \
+    using ::hyper_multicore::InitExecCommonCtx;                                      \
+    using ::hyper_multicore::ReleaseExecCommonCtx;                                   \
+    using ::hyper_multicore::UnInitExecCommonCtx;                                     \
     const auto hyper_task_queue_enable = OpApiGetTaskQueueEnable();                  \
     if (hyper_task_queue_enable == 2) {                                              \
       static ::hyper_multicore::CachedOpApiResolver hyper_v2_api_resolver; \

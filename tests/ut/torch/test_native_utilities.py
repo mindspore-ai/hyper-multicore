@@ -128,7 +128,7 @@ class TestNativeUtilities(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="hmc-native-utilities-") as directory:
             executable = _compile_native_utilities(Path(directory))
             for (arch, status), operation in product(
-                    ((2201, 0), (2201, 17), (3510, 0), (3510, 17), (9999, 0)), ("offsets", "prepare")):
+                    ((2201, 0), (2201, 17), (3510, 0), (3510, 17), (9999, 0)), ("offsets", "prepare", "bounded")):
                 with self.subTest(arch=arch, status=status, operation=operation):
                     result = subprocess.run([str(executable), str(status), str(arch), operation],
                                             check=False, capture_output=True, text=True)

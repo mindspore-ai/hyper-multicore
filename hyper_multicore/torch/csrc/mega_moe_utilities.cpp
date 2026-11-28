@@ -126,13 +126,20 @@ extern "C" void HmcLaunchRoutePreparation_arch2201(unsigned, void*, uint8_t*, ui
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
 extern "C" void HmcLaunchRoutePreparation_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
+extern "C" void HmcLaunchBoundedRoute_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t, int32_t, int32_t);
+extern "C" void HmcLaunchBoundedRoute_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t, int32_t, int32_t);
 namespace {
 using PreparedRoute = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
-PreparedRoute BuildRouteMetadata(const at::Tensor& input, int64_t rank, int64_t ub,
-                                int64_t hidden_size, bool with_summary) {
+using RouteBuffers = std::tuple<at::Tensor, at::Tensor>;
+struct RouteLayout {
+  int64_t peers, experts, local, stride, row_stride, bytes, group, programs, copies;
+};
+RouteLayout CheckRouteLayout(const at::Tensor& input, int64_t rank, int64_t ub,
+                            int64_t hidden_size, int64_t header) {
   TORCH_CHECK(input.dim() == 2 && input.scalar_type() == at::kInt && input.stride(1) == 1,
               "expected row-contiguous int32 [source,expert] or [source,header+expert]");
-  const int64_t header = with_summary ? 3 : 0;
   const int64_t p = input.size(0), e = input.size(1) - header;
   TORCH_CHECK(p > 0 && e > 0 && e % p == 0 && rank >= 0 && rank < p && p <= INT32_MAX && e <= INT32_MAX / p,
               "invalid geometry");
@@ -145,42 +152,78 @@ PreparedRoute BuildRouteMetadata(const at::Tensor& input, int64_t rank, int64_t 
   const auto bytes = (aligned(span) + 3 * stride + 2 * aligned(local)) * 4;
   TORCH_CHECK(ub > 0 && bytes <= ub / 4 * 3 && bytes <= INT32_MAX, "route offset scratch exceeds device UB");
   TORCH_CHECK(hidden_size > 0 && hidden_size <= INT32_MAX, "invalid hidden size");
-  const int64_t copies = hidden_size == 1 ? 1 : 2;
-  c10::DeviceGuard guard(input.device());
-  auto offsets = at::empty({copies * (4 * stride + local)}, input.options().dtype(at::kLong));
-  auto sizes = at::empty({copies * 2 * stride}, input.options());
-  at::Tensor summary;
-  if (with_summary) summary = at::empty({p, 8}, input.options().dtype(at::kLong));
   int64_t group = 1;
   while ((group * local) % 16 != 0) ++group;
-  const auto programs = (p + group - 1) / group;
+  return {p, e, local, stride, row_stride, bytes, group, (p + group - 1) / group, hidden_size == 1 ? 1 : 2};
+}
+// Shared storage/stream lifetime only. Entry-specific contracts and native
+// arguments remain in RouteOffsets, PrepareRoute and BoundedRoute below.
+template <typename Launch>
+RouteBuffers BuildRouteMetadata(const at::Tensor& input, const RouteLayout& layout,
+                                const char* name, Launch launch) {
+  c10::DeviceGuard guard(input.device());
+  auto offsets = at::empty({layout.copies * (4 * layout.stride + layout.local)}, input.options().dtype(at::kLong));
+  auto sizes = at::empty({layout.copies * 2 * layout.stride}, input.options());
   const auto stream = c10_npu::getCurrentNPUStream().stream(false);
   auto run = [=]() -> int {
-    if (with_summary) {
-      auto launch = SelectUtility(input.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRoutePreparation),
-                                  HMC_UTILITY_ARCH35(HmcLaunchRoutePreparation));
-      launch(2 * programs, stream, static_cast<uint8_t*>(input.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
-             static_cast<uint8_t*>(sizes.data_ptr()), static_cast<uint8_t*>(summary.data_ptr()),
-             p, e, rank, stride, group, programs, bytes, row_stride, hidden_size);
-    } else {
-      auto launch = SelectUtility(input.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRouteMetadata),
-                                  HMC_UTILITY_ARCH35(HmcLaunchRouteMetadata));
-      launch(2 * programs, stream, static_cast<uint8_t*>(input.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
-             static_cast<uint8_t*>(sizes.data_ptr()), p, e, rank, stride, group, programs, bytes,
-             row_stride, hidden_size);
-    }
+    launch(offsets, sizes, stream);
     return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
   };
-  at_npu::native::OpCommand::RunOpApi(with_summary ? "HmcPrepareRoute" : "HmcRouteOffsets", run);
-  return {offsets, sizes, summary};
+  at_npu::native::OpCommand::RunOpApi(name, run);
+  return {offsets, sizes};
 }
-std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_t rank, int64_t ub,
-                                              int64_t hidden_size) {
-  auto result = BuildRouteMetadata(counts, rank, ub, hidden_size, false);
-  return {std::get<0>(result), std::get<1>(result)};
+RouteBuffers RouteOffsets(const at::Tensor& counts, int64_t rank, int64_t ub, int64_t hidden_size) {
+  const auto g = CheckRouteLayout(counts, rank, ub, hidden_size, 0);
+  return BuildRouteMetadata(counts, g, "HmcRouteOffsets", [=](const auto& offsets, const auto& sizes, void* stream) {
+    auto launch = SelectUtility(counts.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRouteMetadata),
+                                HMC_UTILITY_ARCH35(HmcLaunchRouteMetadata));
+    launch(2 * g.programs, stream, static_cast<uint8_t*>(counts.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
+           static_cast<uint8_t*>(sizes.data_ptr()), g.peers, g.experts, rank, g.stride, g.group,
+           g.programs, g.bytes, g.row_stride, hidden_size);
+  });
 }
 PreparedRoute PrepareRoute(const at::Tensor& payload, int64_t rank, int64_t ub, int64_t hidden_size) {
-  return BuildRouteMetadata(payload, rank, ub, hidden_size, true);
+  const auto g = CheckRouteLayout(payload, rank, ub, hidden_size, 3);
+  c10::DeviceGuard guard(payload.device());
+  auto summary = at::empty({g.peers, 8}, payload.options().dtype(at::kLong));
+  auto buffers = BuildRouteMetadata(payload, g, "HmcPrepareRoute", [=](const auto& offsets, const auto& sizes, void* stream) {
+    auto launch = SelectUtility(payload.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRoutePreparation),
+                                HMC_UTILITY_ARCH35(HmcLaunchRoutePreparation));
+    launch(2 * g.programs, stream, static_cast<uint8_t*>(payload.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
+           static_cast<uint8_t*>(sizes.data_ptr()), static_cast<uint8_t*>(summary.data_ptr()), g.peers, g.experts,
+           rank, g.stride, g.group, g.programs, g.bytes, g.row_stride, hidden_size);
+  });
+  return {std::get<0>(buffers), std::get<1>(buffers), summary};
+}
+std::vector<at::Tensor> BoundedRoute(const at::Tensor& payload, int64_t rank,
+    int64_t ub, int64_t hidden_size, int64_t capacity, int64_t tokens, int64_t topk) {
+  const auto g = CheckRouteLayout(payload, rank, ub, hidden_size, 3);
+  TORCH_CHECK(capacity > 0 && capacity <= INT32_MAX / hidden_size && tokens >= 0 &&
+              tokens <= INT32_MAX / hidden_size && topk > 0 && topk <= g.experts &&
+              tokens <= INT32_MAX / topk, "invalid device route capacity or input bound");
+  auto buffers = BuildRouteMetadata(payload, g, "HmcBoundedRoute", [=](const auto& offsets, const auto& sizes, void* stream) {
+    auto launch = SelectUtility(payload.get_device(), HMC_UTILITY_ARCH22(HmcLaunchBoundedRoute),
+                                HMC_UTILITY_ARCH35(HmcLaunchBoundedRoute));
+    launch(2 * g.programs, stream, static_cast<uint8_t*>(payload.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
+           static_cast<uint8_t*>(sizes.data_ptr()), g.peers, g.experts, rank, g.stride, g.group,
+           g.programs, g.bytes, g.row_stride, hidden_size, capacity, tokens, topk);
+  });
+  const auto& offsets = std::get<0>(buffers);
+  const auto& sizes = std::get<1>(buffers);
+  std::vector<at::Tensor> views;
+  views.reserve(g.copies * 7);
+  for (int64_t unit = 0; unit < g.copies; ++unit) {
+    const auto off = unit * (4 * g.stride + g.local), len = unit * 2 * g.stride;
+    // Pull ABI: dispatch source/target/length, combine source/target/length, groups.
+    views.push_back(offsets.narrow(0, off + 3 * g.stride, g.experts));
+    views.push_back(offsets.narrow(0, off + 2 * g.stride, g.experts));
+    views.push_back(sizes.narrow(0, len + g.stride, g.experts));
+    views.push_back(views[unit * 7 + 1]);
+    views.push_back(views[unit * 7]);
+    views.push_back(views[unit * 7 + 2]);
+    views.push_back(offsets.narrow(0, off + 4 * g.stride, g.local));
+  }
+  return views;
 }
 std::vector<at::Tensor> Bf16ForwardBuffers(const at::Tensor& like, int64_t rows,
                                          int64_t intermediate, bool include_dispatch) {
@@ -217,6 +260,7 @@ std::vector<at::Tensor> Bf16BackwardBuffers(const at::Tensor& like, const at::Te
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
   m.def("route_offsets(Tensor counts, int rank, int ub, int hidden_size=1) -> (Tensor, Tensor)");
   m.def("prepare_route(Tensor payload, int rank, int ub, int hidden_size) -> (Tensor, Tensor, Tensor)");
+  m.def("bounded_route(Tensor payload, int rank, int ub, int hidden_size, int capacity, int tokens, int topk) -> Tensor[]");
   m.def("bf16_forward_buffers(Tensor like, int rows, int intermediate, bool include_dispatch) -> Tensor[]");
   m.def("bf16_backward_buffers(Tensor like, Tensor weight1, Tensor weight2, int rows, int intermediate, "
         "bool include_dx, bool zero_weights, ScalarType? weight_grad_dtype=None) -> Tensor[]");
@@ -224,6 +268,7 @@ TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
 TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
   m.impl("route_offsets", RouteOffsets);
   m.impl("prepare_route", PrepareRoute);
+  m.impl("bounded_route", BoundedRoute);
   m.impl("bf16_forward_buffers", Bf16ForwardBuffers);
   m.impl("bf16_backward_buffers", Bf16BackwardBuffers);
 }
