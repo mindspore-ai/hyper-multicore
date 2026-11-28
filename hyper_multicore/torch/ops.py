@@ -1062,3 +1062,33 @@ def route_offsets(counts: torch.Tensor, rank: int, ub_bytes: int,
     """Build row and element descriptors through the normal framework adapter."""
     _load_native()
     return torch.ops.hyper_multicore.route_offsets(counts, rank, ub_bytes, hidden_size)
+
+
+def prepare_route(payload: torch.Tensor, rank: int, ub_bytes: int,
+                  hidden_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare current row/element descriptors and the validated Host summary together."""
+    _load_native()
+    return torch.ops.hyper_multicore.prepare_route(payload, rank, ub_bytes, hidden_size)
+
+
+def bounded_route(payload: torch.Tensor, rank: int, ub_bytes: int, hidden_size: int,
+                  capacity: int, tokens: int, topk: int) -> list[torch.Tensor]:
+    """Validate counts and bind per-call row/element views in one native entry."""
+    _load_native()
+    return torch.ops.hyper_multicore.bounded_route(payload, rank, ub_bytes, hidden_size, capacity, tokens, topk)
+
+
+def bf16_forward_buffers(like: torch.Tensor, rows: int, intermediate: int,
+                         include_dispatch: bool) -> list[torch.Tensor]:
+    """Allocate exact per-invocation activations through one native entry."""
+    _load_native()
+    return torch.ops.hyper_multicore.bf16_forward_buffers(like, rows, intermediate, include_dispatch)
+
+
+def bf16_backward_buffers(like: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor,
+                          rows: int, intermediate: int, include_dx: bool, zero_weights: bool,
+                          weight_grad_dtype: torch.dtype | None) -> list[torch.Tensor]:
+    """Allocate current backward outputs without retaining a receive-capacity pool."""
+    _load_native()
+    return torch.ops.hyper_multicore.bf16_backward_buffers(
+        like, weight1, weight2, rows, intermediate, include_dx, zero_weights, weight_grad_dtype)

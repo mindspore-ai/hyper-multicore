@@ -178,7 +178,7 @@ class TestProbabilityWeighting(unittest.TestCase):
         mapping = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
         probs = torch.tensor([[0., .25], [.5, .75]])
         rows = torch.arange(8.).reshape(4, 2)
-        route = SimpleNamespace(routed_tokens=rows, unpermute_mapping=mapping,
+        route = SimpleNamespace(forward_preparation=None, routed_tokens=rows, unpermute_mapping=mapping,
                                 metadata=SimpleNamespace(expert_capacity=4, for_kernel=lambda width: None))
         spec.hidden_size = 2
         execution = SimpleNamespace(source=rows, combine=rows)

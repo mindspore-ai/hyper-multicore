@@ -168,6 +168,7 @@ class MegaMoeWorkspace:
     heap_manager: Any | None = field(default=None, repr=False)
     route_cache: Any | None = field(default=None, repr=False)
     route_header_cache: Any | None = field(default=None, repr=False)
+    route_preparation_stream: Any | None = field(default=None, repr=False)
     route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
     graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
@@ -538,6 +539,7 @@ class MegaMoeWorkspace:
             self.closing = True
             self.route_cache = None
             self.route_header_cache = None
+            self.route_preparation_stream = None
             self.planned_route_cache = None
             self.route_cache_probe_after = 0
         # An empty rank must still participate when peers retain buffers after a failure.

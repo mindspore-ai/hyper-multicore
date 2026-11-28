@@ -33,24 +33,7 @@ def forward(
     del module
     module_resources = resources
     resources = route.execution_resources or resources
-    if route.weight_binding is None:
-        plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
-    else:
-        placement = route.weight_binding.placement
-        num_experts = placement.counts_by_source.shape[1]
-        placement_owner = module_resources.placement
-        home = module_resources.spec.local_experts
-        nominal = (
-            placement_owner.source_bound is not None
-            and home >= 2 * resources.spec.num_cube_cores and resources.spec.intermediate_size < 2048
-            and resources.spec.lowering != "dense" and resources.spec.ready_depth is None
-        )
-        plan = resources.plan_for_tokens(
-            route.metadata.plan_tokens, hidden_flat.device,
-            weight_grad_dtype=torch.float32 if placement_owner.source_bound is not None else None,
-            route_experts=num_experts, nominal_schedule=nominal,
-            batch_experts=nominal and route.metadata.plan_tokens * resources.spec.top_k <= 128 * home,
-        )
+    plan = _forward_plan(resources, module_resources, route, hidden_flat.device)
     pull = resources.spec.dispatch_mode == "pull"
     before_fc2 = resources.spec.apply_probs_before_fc2
     options = {} if route.weight_binding is None else {"weight_binding": route.weight_binding}
@@ -75,6 +58,29 @@ def forward(
     if not pull and not before_fc2:
         output = restore_topk_output(output, route.unpermute_mapping, topk_weights)
     return output.reshape_as(hidden_states)
+
+
+def _forward_plan(resources, module_resources, route: PreparedTopKRoute, device: torch.device):
+    """Use the already prepared plan, or bind the current placement."""
+    if route.forward_preparation is not None:
+        return route.forward_preparation[0]
+    if route.weight_binding is None:
+        return resources.plan_for_tokens(route.metadata.plan_tokens, device)
+    placement = route.weight_binding.placement
+    num_experts = placement.counts_by_source.shape[1]
+    placement_owner = module_resources.placement
+    home = module_resources.spec.local_experts
+    nominal = (
+        placement_owner.source_bound is not None
+        and home >= 2 * resources.spec.num_cube_cores and resources.spec.intermediate_size < 2048
+        and resources.spec.lowering != "dense" and resources.spec.ready_depth is None
+    )
+    return resources.plan_for_tokens(
+        route.metadata.plan_tokens, device,
+        weight_grad_dtype=torch.float32 if placement_owner.source_bound is not None else None,
+        route_experts=num_experts, nominal_schedule=nominal,
+        batch_experts=nominal and route.metadata.plan_tokens * resources.spec.top_k <= 128 * home,
+    )
 
 
 def _save_replay_activations(record, spec, route, hidden: torch.Tensor, probs: torch.Tensor):

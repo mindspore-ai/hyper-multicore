@@ -328,6 +328,25 @@ d_a = BF16(FP32(d_fc2_input) * p)
 `HYPER_MULTICORE_SHMEM_HEAP_SIZE` 可设置固定字节预算；预算不足或不能安全重启时明确失败。
 容量策略、固定预算和失败恢复的完整契约见 [SHMEM runtime restart](shmem.md#runtime-restart)。
 
+### 设备路由
+
+使用 Pull 分发且能保证每次调用的各 EP rank 路由负载均衡时，可启用设备路由来避免稳态计数读回。
+在构造 `MegaMoeExperts` 前设置：
+
+```bash
+export HYPER_MULTICORE_MEGAMOE_DEVICE_ROUTE=1
+```
+
+各 EP rank 须使用相同的设置，并在同一次调用中提供相同数量的输入 token。
+接收空间按每 rank 的平均路由行数 `输入 token 数 × top_k` 向上对齐到 128 行分配，
+最少 128 行。每个 rank 的实际接收量均须放入该空间。固定路由也需要满足这个条件。
+
+该选项适用于 BF16 和 MXFP8 的 Pull 分发。Push 和 HotReplica 会在构造时被拒绝。
+输入长度不一致、计数非法或接收量超出可用空间时，设备执行会报错并终止作业。
+元数据超过设备可用空间时，调用会报错。
+
+默认值为 `0`，按实际接收量分配，支持各 EP rank 输入长度不同的场景。
+
 ### 资源共享与关闭
 
 相同配置的串行层可在首次 forward 前共享 workspace，各层参数、梯度和待反向激活仍独立：

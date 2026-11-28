@@ -8,6 +8,7 @@
 #include <acl/acl.h>
 #include <cstdint>
 #include <tuple>
+#include <vector>
 
 #include "ATen/ATen.h"
 #include "ATen/MemoryOverlap.h"
@@ -26,13 +27,27 @@ extern "C" void HmcLaunchZeroCold_arch3510(unsigned blocks, void* stream, uint8_
 #define HMC_UTILITY_ARCH35(name) (static_cast<decltype(&name##_arch3510)>(nullptr))
 #endif
 namespace {
+template <int32_t Attribute>
+int64_t UtilityDeviceAttribute(int32_t device, const char* name) {
+  // Cache immutable device attributes on the calling thread, keyed by the
+  // logical device. Dynamic execution limits are read separately by the plan.
+  thread_local int32_t previous_device = INT32_MIN;
+  thread_local int64_t previous_value = 0;
+  if (device == previous_device) return previous_value;
+  int64_t value = 0;
+  const auto status = aclrtGetDeviceInfo(device, static_cast<aclrtDevAttr>(Attribute), &value);
+  TORCH_CHECK(status == ACL_SUCCESS && value > 0, "cannot query NPU ", name, " for device ", device,
+              ": status=", status, ", value=", value);
+  previous_device = device;
+  previous_value = value;
+  return value;
+}
+
+// Older PTA-bundled ACL headers omit the NPU architecture attribute name.
+constexpr int32_t kNpuArchAttribute = 601;
+
 template <typename Fn> Fn SelectUtility(int32_t device, Fn arch22, Fn arch35) {
-  int64_t npu_arch = 0;
-  // Older PTA-bundled ACL headers omit the enum name; CANN's public attribute
-  // number matches _loader._ACL_DEV_ATTR_NPU_ARCH and is supported by the runtime.
-  constexpr auto kNpuArchAttribute = static_cast<aclrtDevAttr>(601);
-  const auto status = aclrtGetDeviceInfo(device, kNpuArchAttribute, &npu_arch);
-  TORCH_CHECK(status == ACL_SUCCESS, "cannot query NPU architecture for device ", device, ": ", status);
+  const auto npu_arch = UtilityDeviceAttribute<kNpuArchAttribute>(device, "architecture");
   switch (npu_arch) {
     case 2201:
       TORCH_CHECK(arch22 != nullptr, "MoE utility provider is missing arch22 (Atlas A2/A3 series)");
@@ -72,9 +87,7 @@ Outputs ZeroEmptyNpu(at::Tensor& first, at::Tensor& second, const at::Tensor& gr
   }
   const c10::DeviceGuard guard(first.device());
   const int32_t device = first.get_device();
-  int64_t cores = 0;
-  const auto status = aclrtGetDeviceInfo(device, ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
-  TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
+  const auto cores = UtilityDeviceAttribute<ACL_DEV_ATTR_VECTOR_CORE_NUM>(device, "vector-core count");
   const int64_t experts = groups.numel();
   const int64_t first_bytes = first.numel() * first.element_size() / experts;
   const int64_t second_bytes = second.numel() * second.element_size() / experts;
@@ -111,47 +124,167 @@ extern "C" void HmcLaunchRouteMetadata_arch3510(unsigned blocks, void* stream, u
                                        uint8_t* sizes, int32_t ep, int32_t experts,
                                        int32_t rank, int32_t stride, int32_t group,
                                        int32_t programs, int32_t bytes, int32_t row_stride, int32_t hidden_size);
+extern "C" void HmcLaunchRoutePreparation_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
+extern "C" void HmcLaunchRoutePreparation_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
+extern "C" void HmcLaunchBoundedRoute_arch2201(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t, int32_t, int32_t);
+extern "C" void HmcLaunchBoundedRoute_arch3510(unsigned, void*, uint8_t*, uint8_t*, uint8_t*,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int64_t, int32_t, int32_t);
 namespace {
-std::tuple<at::Tensor, at::Tensor> RouteOffsets(const at::Tensor& counts, int64_t rank, int64_t ub,
-                                                int64_t hidden_size) {
-  TORCH_CHECK(counts.dim() == 2 && counts.scalar_type() == at::kInt && counts.stride(1) == 1,
-              "expected row-contiguous int32 [source,expert]");
-  const int64_t p = counts.size(0), e = counts.size(1);
+using PreparedRoute = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
+using RouteBuffers = std::tuple<at::Tensor, at::Tensor>;
+struct RouteLayout {
+  int64_t peers, experts, local, stride, row_stride, bytes, group, programs, copies;
+};
+RouteLayout CheckRouteLayout(const at::Tensor& input, int64_t rank, int64_t ub,
+                            int64_t hidden_size, int64_t header) {
+  TORCH_CHECK(input.dim() == 2 && input.scalar_type() == at::kInt && input.stride(1) == 1,
+              "expected row-contiguous int32 [source,expert] or [source,header+expert]");
+  const int64_t p = input.size(0), e = input.size(1) - header;
   TORCH_CHECK(p > 0 && e > 0 && e % p == 0 && rank >= 0 && rank < p && p <= INT32_MAX && e <= INT32_MAX / p,
               "invalid geometry");
-  const auto row_stride = counts.stride(0);
-  TORCH_CHECK(row_stride >= e && row_stride <= INT32_MAX, "invalid count row stride");
-  const auto span = (p - 1) * row_stride + e;
+  const auto row_stride = input.stride(0);
+  TORCH_CHECK(row_stride >= e + header && row_stride <= INT32_MAX, "invalid count row stride");
+  const auto span = (p - 1) * row_stride + e + header;
   TORCH_CHECK(span <= INT32_MAX, "count matrix span exceeds the native bound");
   const auto local = e / p, stride = (e + 31) / 32 * 32;
   auto aligned = [](int64_t x) { return (x + 7) / 8 * 8; };
   const auto bytes = (aligned(span) + 3 * stride + 2 * aligned(local)) * 4;
   TORCH_CHECK(ub > 0 && bytes <= ub / 4 * 3 && bytes <= INT32_MAX, "route offset scratch exceeds device UB");
   TORCH_CHECK(hidden_size > 0 && hidden_size <= INT32_MAX, "invalid hidden size");
-  const int64_t copies = hidden_size == 1 ? 1 : 2;
-  c10::DeviceGuard guard(counts.device());
-  auto offsets = at::empty({copies * (4 * stride + local)}, counts.options().dtype(at::kLong));
-  auto sizes = at::empty({copies * 2 * stride}, counts.options());
   int64_t group = 1;
   while ((group * local) % 16 != 0) ++group;
-  const auto programs = (p + group - 1) / group;
+  return {p, e, local, stride, row_stride, bytes, group, (p + group - 1) / group, hidden_size == 1 ? 1 : 2};
+}
+// Shared storage/stream lifetime only. Entry-specific contracts and native
+// arguments remain in RouteOffsets, PrepareRoute and BoundedRoute below.
+template <typename Launch>
+RouteBuffers BuildRouteMetadata(const at::Tensor& input, const RouteLayout& layout,
+                                const char* name, Launch launch) {
+  c10::DeviceGuard guard(input.device());
+  auto offsets = at::empty({layout.copies * (4 * layout.stride + layout.local)}, input.options().dtype(at::kLong));
+  auto sizes = at::empty({layout.copies * 2 * layout.stride}, input.options());
   const auto stream = c10_npu::getCurrentNPUStream().stream(false);
   auto run = [=]() -> int {
-    auto launch = SelectUtility(counts.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRouteMetadata),
-                                HMC_UTILITY_ARCH35(HmcLaunchRouteMetadata));
-    launch(2 * programs, stream, static_cast<uint8_t*>(counts.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
-           static_cast<uint8_t*>(sizes.data_ptr()), p, e, rank, stride, group, programs, bytes,
-           row_stride, hidden_size);
+    launch(offsets, sizes, stream);
     return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
   };
-  at_npu::native::OpCommand::RunOpApi("HmcRouteOffsets", run);
+  at_npu::native::OpCommand::RunOpApi(name, run);
   return {offsets, sizes};
+}
+RouteBuffers RouteOffsets(const at::Tensor& counts, int64_t rank, int64_t ub, int64_t hidden_size) {
+  const auto g = CheckRouteLayout(counts, rank, ub, hidden_size, 0);
+  return BuildRouteMetadata(counts, g, "HmcRouteOffsets", [=](const auto& offsets, const auto& sizes, void* stream) {
+    auto launch = SelectUtility(counts.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRouteMetadata),
+                                HMC_UTILITY_ARCH35(HmcLaunchRouteMetadata));
+    launch(2 * g.programs, stream, static_cast<uint8_t*>(counts.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
+           static_cast<uint8_t*>(sizes.data_ptr()), g.peers, g.experts, rank, g.stride, g.group,
+           g.programs, g.bytes, g.row_stride, hidden_size);
+  });
+}
+PreparedRoute PrepareRoute(const at::Tensor& payload, int64_t rank, int64_t ub, int64_t hidden_size) {
+  const auto g = CheckRouteLayout(payload, rank, ub, hidden_size, 3);
+  c10::DeviceGuard guard(payload.device());
+  auto summary = at::empty({g.peers, 8}, payload.options().dtype(at::kLong));
+  auto buffers = BuildRouteMetadata(payload, g, "HmcPrepareRoute",
+      [=](const auto& offsets, const auto& sizes, void* stream) {
+    auto launch = SelectUtility(payload.get_device(), HMC_UTILITY_ARCH22(HmcLaunchRoutePreparation),
+                                HMC_UTILITY_ARCH35(HmcLaunchRoutePreparation));
+    launch(2 * g.programs, stream, static_cast<uint8_t*>(payload.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
+           static_cast<uint8_t*>(sizes.data_ptr()), static_cast<uint8_t*>(summary.data_ptr()), g.peers, g.experts,
+           rank, g.stride, g.group, g.programs, g.bytes, g.row_stride, hidden_size);
+  });
+  return {std::get<0>(buffers), std::get<1>(buffers), summary};
+}
+std::vector<at::Tensor> BoundedRoute(const at::Tensor& payload, int64_t rank,
+    int64_t ub, int64_t hidden_size, int64_t capacity, int64_t tokens, int64_t topk) {
+  const auto g = CheckRouteLayout(payload, rank, ub, hidden_size, 3);
+  TORCH_CHECK(capacity > 0 && capacity <= INT32_MAX / hidden_size && tokens >= 0 &&
+              tokens <= INT32_MAX / hidden_size && topk > 0 && topk <= g.experts &&
+              tokens <= INT32_MAX / topk, "invalid device route capacity or input bound");
+  auto buffers = BuildRouteMetadata(payload, g, "HmcBoundedRoute",
+      [=](const auto& offsets, const auto& sizes, void* stream) {
+    auto launch = SelectUtility(payload.get_device(), HMC_UTILITY_ARCH22(HmcLaunchBoundedRoute),
+                                HMC_UTILITY_ARCH35(HmcLaunchBoundedRoute));
+    launch(2 * g.programs, stream, static_cast<uint8_t*>(payload.data_ptr()), static_cast<uint8_t*>(offsets.data_ptr()),
+           static_cast<uint8_t*>(sizes.data_ptr()), g.peers, g.experts, rank, g.stride, g.group,
+           g.programs, g.bytes, g.row_stride, hidden_size, capacity, tokens, topk);
+  });
+  const auto& offsets = std::get<0>(buffers);
+  const auto& sizes = std::get<1>(buffers);
+  std::vector<at::Tensor> views;
+  views.reserve(g.copies * 7);
+  for (int64_t unit = 0; unit < g.copies; ++unit) {
+    const auto off = unit * (4 * g.stride + g.local), len = unit * 2 * g.stride;
+    // Pull ABI: dispatch source/target/length, combine source/target/length, groups.
+    views.push_back(offsets.narrow(0, off + 3 * g.stride, g.experts));
+    views.push_back(offsets.narrow(0, off + 2 * g.stride, g.experts));
+    views.push_back(sizes.narrow(0, len + g.stride, g.experts));
+    views.push_back(views[unit * 7 + 1]);
+    views.push_back(views[unit * 7]);
+    views.push_back(views[unit * 7 + 2]);
+    views.push_back(offsets.narrow(0, off + 4 * g.stride, g.local));
+  }
+  return views;
+}
+std::vector<at::Tensor> Bf16ForwardBuffers(const at::Tensor& like, int64_t rows,
+                                         int64_t intermediate, bool include_dispatch) {
+  TORCH_CHECK(like.dim() == 2 && rows >= 0 && intermediate > 0 && intermediate <= INT64_MAX / 2,
+              "invalid BF16 forward buffer dimensions");
+  TORCH_CHECK(like.scalar_type() == at::kBFloat16, "BF16 forward buffers require BF16 input");
+  const auto options = like.options();
+  std::vector<at::Tensor> result;
+  if (include_dispatch) result.push_back(at::empty({rows, like.size(1)}, options));
+  result.push_back(at::empty({rows, 2 * intermediate}, options));
+  result.push_back(at::empty({rows, intermediate}, options));
+  result.push_back(at::empty({rows, like.size(1)}, options));
+  return result;
+}
+std::vector<at::Tensor> Bf16BackwardBuffers(const at::Tensor& like, const at::Tensor& weight1,
+    const at::Tensor& weight2, int64_t rows, int64_t intermediate, bool include_dx,
+    bool zero_weights, const std::optional<at::ScalarType> weight_grad_dtype) {
+  TORCH_CHECK(like.dim() == 2 && rows >= 0 && intermediate > 0 && intermediate <= INT64_MAX / 2,
+              "invalid BF16 backward buffer dimensions");
+  TORCH_CHECK(like.scalar_type() == at::kBFloat16 && weight1.device() == like.device() &&
+              weight2.device() == like.device(), "BF16 backward operands must share a device");
+  const auto options = like.options();
+  const auto dtype = weight_grad_dtype.value_or(weight1.scalar_type());
+  auto first = zero_weights ? at::zeros_like(weight1, weight1.options().dtype(dtype))
+                           : at::empty_like(weight1, weight1.options().dtype(dtype), at::MemoryFormat::Contiguous);
+  auto second = zero_weights ? at::zeros_like(weight2, weight2.options().dtype(dtype))
+                            : at::empty_like(weight2, weight2.options().dtype(dtype), at::MemoryFormat::Contiguous);
+  std::vector<at::Tensor> result{first, second, at::empty({rows, intermediate}, options),
+                                at::empty({rows, 2 * intermediate}, options)};
+  if (include_dx) result.push_back(at::empty({rows, like.size(1)}, options));
+  return result;
 }
 }  // namespace
 TORCH_LIBRARY_FRAGMENT(hyper_multicore, m) {
   m.def("route_offsets(Tensor counts, int rank, int ub, int hidden_size=1) -> (Tensor, Tensor)");
+  m.def("prepare_route(Tensor payload, int rank, int ub, int hidden_size) -> (Tensor, Tensor, Tensor)");
+  m.def("bounded_route(Tensor payload, int rank, int ub, int hidden_size, "
+        "int capacity, int tokens, int topk) -> Tensor[]");
+  m.def("bf16_forward_buffers(Tensor like, int rows, int intermediate, bool include_dispatch) -> Tensor[]");
+  m.def("bf16_backward_buffers(Tensor like, Tensor weight1, Tensor weight2, int rows, int intermediate, "
+        "bool include_dx, bool zero_weights, ScalarType? weight_grad_dtype=None) -> Tensor[]");
 }
-TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) { m.impl("route_offsets", RouteOffsets); }
+TORCH_LIBRARY_IMPL(hyper_multicore, PrivateUse1, m) {
+  m.impl("route_offsets", RouteOffsets);
+  m.impl("prepare_route", PrepareRoute);
+  m.impl("bounded_route", BoundedRoute);
+  m.impl("bf16_forward_buffers", Bf16ForwardBuffers);
+  m.impl("bf16_backward_buffers", Bf16BackwardBuffers);
+}
+TORCH_LIBRARY_IMPL(hyper_multicore, CPU, m) {
+  m.impl("bf16_forward_buffers", Bf16ForwardBuffers);
+  m.impl("bf16_backward_buffers", Bf16BackwardBuffers);
+}
+TORCH_LIBRARY_IMPL(hyper_multicore, Meta, m) {
+  m.impl("bf16_forward_buffers", Bf16ForwardBuffers);
+  m.impl("bf16_backward_buffers", Bf16BackwardBuffers);
+}
 
 extern "C" void HmcLaunchPermuteFromMapping_arch2201(unsigned blocks, void* stream, uint8_t* tokens, uint8_t* mapping,
                                             uint8_t* probabilities, uint8_t* output, uint8_t* output_probabilities,
@@ -203,12 +336,11 @@ Outputs PermuteFromMappingNpu(const at::Tensor& tokens, const at::Tensor& mappin
     return {output, output_probabilities};
   }
   const c10::DeviceGuard guard(tokens.device());
-  int64_t cores = 0;
-  const auto status = aclrtGetDeviceInfo(tokens.get_device(), ACL_DEV_ATTR_VECTOR_CORE_NUM, &cores);
-  TORCH_CHECK(status == ACL_SUCCESS && cores > 0, "cannot query current NPU vector-core count: ", status);
-  auto stream = c10_npu::getCurrentNPUStream(tokens.get_device()).stream(false);
+  const int32_t device = tokens.get_device();
+  const auto cores = UtilityDeviceAttribute<ACL_DEV_ATTR_VECTOR_CORE_NUM>(device, "vector-core count");
+  auto stream = c10_npu::getCurrentNPUStream(device).stream(false);
   auto run = [=]() -> int {
-    auto launch = SelectUtility(tokens.get_device(), HMC_UTILITY_ARCH22(HmcLaunchPermuteFromMapping),
+    auto launch = SelectUtility(device, HMC_UTILITY_ARCH22(HmcLaunchPermuteFromMapping),
                                 HMC_UTILITY_ARCH35(HmcLaunchPermuteFromMapping));
     launch(cores, stream, static_cast<uint8_t*>(tokens.data_ptr()), static_cast<uint8_t*>(mapping.data_ptr()),
            static_cast<uint8_t*>(probabilities.data_ptr()), static_cast<uint8_t*>(output.data_ptr()),

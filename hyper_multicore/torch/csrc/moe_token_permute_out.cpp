@@ -19,7 +19,6 @@
 #include "csrc/cached_op_api.h"
 
 namespace {
-
 using PermuteOutputs = std::tuple<at::Tensor &, at::Tensor &>;
 
 void check_permute_outputs(const at::Tensor &tokens, const at::Tensor &indices, const at::Tensor &output,

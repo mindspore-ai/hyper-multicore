@@ -101,14 +101,16 @@ def _workspace_tensor(tensor: Any | None, name: str) -> Any:
     return tensor
 
 
-def _dispatch_and_source(spec: Any, workspace: Any, rows: Any, capacity: int) -> tuple[Any, Any]:
+def _dispatch_and_source(spec: Any, workspace: Any, rows: Any, capacity: int,
+                         dispatch: Any | None = None) -> tuple[Any, Any]:
     """Select transport storage while retaining a source-ready stream dependency."""
     if getattr(spec, "dispatch_mode", "push") == "push":
         return _workspace_tensor(workspace.expert_buffer, "expert_buffer"), rows
     source = _workspace_tensor(workspace.source_buffer, "source_buffer")[:rows.shape[0]]
     if source.data_ptr() != rows.data_ptr():
         source.copy_(rows)
-    dispatch = torch.empty((capacity, spec.hidden_size), dtype=rows.dtype, device=rows.device)
+    if dispatch is None:
+        dispatch = torch.empty((capacity, spec.hidden_size), dtype=rows.dtype, device=rows.device)
     return dispatch, source
 
 
@@ -194,6 +196,15 @@ def _allocate_backward_intermediates(
     all_experts_active: bool = False,
 ) -> _BackwardIntermediates:
     """Allocate overwritten activations and zero-safe expert gradients."""
+    if grad_output.device.type == "npu":
+        buffers = multicore_ops.bf16_backward_buffers(
+            grad_output, weight1, weight2, capacity, spec.intermediate_size,
+            reusable_dispatch is None, group_list is None, weight_grad_dtype)
+        grad_weight1, grad_weight2, act_grad, swiglu_grad = buffers[:4]
+        if group_list is not None and not all_experts_active:
+            multicore_ops.zero_empty_expert_gradients(grad_weight1, grad_weight2, group_list)
+        gate_dx = buffers[4] if reusable_dispatch is None else reusable_dispatch
+        return _BackwardIntermediates(grad_weight1, grad_weight2, act_grad, swiglu_grad, gate_dx)
     if group_list is None:
         # Without count metadata, cold rows cannot be identified; initialize every expert.
         grad_weight1 = torch.zeros_like(weight1, dtype=weight_grad_dtype)
@@ -252,7 +263,15 @@ def _prepare_forward_execution(
     capacity: int,
 ) -> _ForwardExecution:
     """Resolve workspace, event counters, and intermediate tensors for forward."""
-    dispatch, source = _dispatch_and_source(plan.spec, workspace, routed_tokens, capacity)
+    intermediates = None
+    dispatch = None
+    if routed_tokens.device.type == "npu":
+        buffers = multicore_ops.bf16_forward_buffers(
+            routed_tokens, capacity, plan.spec.intermediate_size, plan.spec.dispatch_mode == "pull")
+        intermediates = _ForwardIntermediates(*buffers[-3:])
+        if plan.spec.dispatch_mode == "pull":
+            dispatch = buffers[0]
+    dispatch, source = _dispatch_and_source(plan.spec, workspace, routed_tokens, capacity, dispatch)
     combine = _workspace_tensor(workspace.routed_buffer, "routed_buffer")
     return _ForwardExecution(
         dispatch=dispatch,
@@ -260,7 +279,7 @@ def _prepare_forward_execution(
         combine=combine,
         event_counters=_plan_events(workspace, plan, forward=True),
         gmm_workspace=_kernel_workspace(workspace, plan.spec),
-        intermediates=_allocate_forward_intermediates(
+        intermediates=intermediates if intermediates is not None else _allocate_forward_intermediates(
             plan.spec,
             capacity,
             routed_tokens,
@@ -587,6 +606,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         topk_weights: torch.Tensor | None,
         workspace_claimed: bool,
         weight_binding: Any = None,
+        prepared_execution: _ForwardExecution | None = None,
     ) -> Any:
         """Launch the BF16 forward op and save owned backward inputs.
 
@@ -635,12 +655,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 acquired = True
             # Dispatch and combine overwrite disjoint route ranges before consumers run.
             capacity = metadata.expert_capacity
-            execution = _prepare_forward_execution(
-                workspace,
-                plan,
-                routed_tokens,
-                capacity,
-            )
+            execution = (prepared_execution if prepared_execution is not None else
+                         _prepare_forward_execution(workspace, plan, routed_tokens, capacity))
             if spec.apply_probs_before_fc2:
                 probs = topk_weights.float().contiguous()
                 _stage_probabilities(workspace, unpermute_mapping, probs, spec)
@@ -756,7 +772,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 grad_topk_weights,
                 None,
             )
-            return gradients + (None,) if len(ctx.needs_input_grad) == 10 else gradients
+            return gradients + (None,) * (len(ctx.needs_input_grad) - len(gradients))
         finally:
             if acquired:
                 binding.release()
@@ -876,6 +892,7 @@ def execute_mega_moe_with_permutation(
         topk_weights,
         workspace_claimed,
         weight_binding,
+        None if route.forward_preparation is None else route.forward_preparation[1],
     )
 
 
@@ -910,8 +927,8 @@ def _execute_mega_moe_without_autograd(
             acquired = True
             if route.checkpoint_record is not None:
                 weight_binding.save_snapshot((weight1, weight2))
-        execution = _prepare_forward_execution(
-            workspace, plan, route.routed_tokens, route.metadata.expert_capacity)
+        execution = (route.forward_preparation[1] if route.forward_preparation is not None else
+                     _prepare_forward_execution(workspace, plan, route.routed_tokens, route.metadata.expert_capacity))
         if plan.spec.apply_probs_before_fc2:
             _stage_probabilities(workspace, route.unpermute_mapping, topk_weights.float().contiguous(), plan.spec)
         _launch_forward_kernel(

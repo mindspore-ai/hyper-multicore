@@ -34,3 +34,33 @@ def native_source(relative: Path, output: Path) -> Path:
             source = output / relative.name
             source.write_bytes(content.read())
     return source
+
+
+MXFP8_DESCRIPTOR_STUB = r'''#pragma once
+#include <ATen/ATen.h>
+#include <memory>
+#include <vector>
+constexpr int ACL_UINT8=4, ACL_FORMAT_ND=2, ACL_FORMAT_NCHW=0;
+struct TensorStruct {
+  void* data_ptr;
+  int acl_type, acl_format;
+  size_t nbytes, itemsize;
+  int64_t storage_offset;
+  std::vector<int64_t> sizes, strides, storage_sizes;
+};
+using TensorStructPtr = std::shared_ptr<TensorStruct>;
+struct aclTensorList {};
+inline int native_copies=0;
+inline std::vector<TensorStructPtr> CopyTypeV2(at::TensorList tensors) {
+  ++native_copies;
+  std::vector<TensorStructPtr> result;
+  for (const auto& t:tensors) result.push_back(std::make_shared<TensorStruct>(TensorStruct{
+    t.storage().mutable_data(), -1, ACL_FORMAT_ND, t.storage().nbytes(), t.element_size(),
+    t.storage_offset(), t.sizes().vec(), t.strides().vec(), {int64_t(t.storage().nbytes()/t.element_size())}}));
+  return result;
+}
+inline TensorStructPtr CopyTypeV2(const at::Tensor& t) { return CopyTypeV2(at::TensorList(&t,1))[0]; }
+inline aclTensorList* ConvertTypeV2(const std::vector<TensorStructPtr>&) { return nullptr; }
+inline void add_param_to_buf(int64_t) {}
+inline void add_param_to_buf(at::TensorList) {}
+'''
